@@ -145,10 +145,18 @@ impl Drop for ReceiptRegistryGuard<'_> {
         drop(self.guard.take());
         if let Some(store) = &self.state.store {
             let mut failed = 0;
+            let mut retry_ids = Vec::new();
             for receipt in receipts {
                 if store.upsert(&receipt).is_err() {
                     failed += 1;
+                    retry_ids.push(receipt.snapshot.job_id);
                 }
+            }
+            if !retry_ids.is_empty() {
+                // Retry only persistence on a later registry unlock, never the
+                // original Job. The existing candidate set deduplicates retries;
+                // expired or removed Jobs are discarded by capture above.
+                self.state.candidates.lock().unwrap().extend(retry_ids);
             }
             if failed > 0 {
                 // Never log adapter errors or payloads: they may contain SQL data.

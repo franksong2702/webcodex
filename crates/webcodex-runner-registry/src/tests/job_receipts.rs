@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 struct MemoryReceipts {
     rows: Mutex<Vec<RetainedJobReceipt>>,
     fail: bool,
+    failures_remaining: std::sync::atomic::AtomicUsize,
     registry: Mutex<Option<Weak<crate::receipts::ReceiptRegistryState>>>,
 }
 impl JobReceiptStore for MemoryReceipts {
@@ -26,7 +27,16 @@ impl JobReceiptStore for MemoryReceipts {
                 "storage must run after registry unlock"
             );
         }
-        if self.fail {
+        if self.fail
+            || self
+                .failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+        {
             return Err("injected failure".into());
         }
         let mut rows = self.rows.lock().unwrap();
@@ -176,7 +186,6 @@ async fn terminal_events_emit_once_only_after_accepted_sequenced_terminal_truth(
     assert_eq!(events.rows.lock().unwrap().len(), 1);
 }
 
-
 #[tokio::test]
 async fn terminal_event_sink_failure_requeues_candidate_until_a_later_registry_unlock() {
     let store = Arc::new(MemoryReceipts::default());
@@ -193,7 +202,10 @@ async fn terminal_event_sink_failure_requeues_candidate_until_a_later_registry_u
     assert!(events.rows.lock().unwrap().is_empty());
 
     // Any later registry guard release retries the exact bounded candidate.
-    assert_eq!(registry.get_job(&job.job_id).await.unwrap().status, "completed");
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().status,
+        "completed"
+    );
     {
         let rows = events.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
@@ -231,7 +243,10 @@ async fn same_instance_reconciliation_preserves_exact_job_identity_for_terminal_
         },
     )
     .await;
-    assert_eq!(registry.get_job(&job.job_id).await.unwrap().job_id, job.job_id);
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().job_id,
+        job.job_id
+    );
     assert!(events.rows.lock().unwrap().is_empty());
 
     registry
@@ -272,7 +287,14 @@ async fn terminal_events_share_protocol_violation_lost_and_stopped_classificatio
 
     let (stopped, _) = start_and_take_over(&registry, INSTANCE_A).await;
     registry
-        .update_job(update(INSTANCE_A, &stopped.job_id, 1, "running", None, false))
+        .update_job(update(
+            INSTANCE_A,
+            &stopped.job_id,
+            1,
+            "running",
+            None,
+            false,
+        ))
         .await
         .unwrap();
     registry
@@ -280,15 +302,40 @@ async fn terminal_events_share_protocol_violation_lost_and_stopped_classificatio
         .await
         .unwrap();
     registry
-        .update_job(update(INSTANCE_A, &stopped.job_id, 2, "stopped", None, true))
+        .update_job(update(
+            INSTANCE_A,
+            &stopped.job_id,
+            2,
+            "stopped",
+            None,
+            true,
+        ))
         .await
         .unwrap();
 
     let rows = events.rows.lock().unwrap();
     let event = |job_id: &str| rows.iter().find(|event| event.job_id == job_id).unwrap();
-    assert_eq!((event(&protocol.job_id).status.as_str(), event(&protocol.job_id).outcome.as_str()), ("failed", "failed"));
-    assert_eq!((event(&lost.job_id).status.as_str(), event(&lost.job_id).outcome.as_str()), ("lost", "failed"));
-    assert_eq!((event(&stopped.job_id).status.as_str(), event(&stopped.job_id).outcome.as_str()), ("stopped", "cancelled"));
+    assert_eq!(
+        (
+            event(&protocol.job_id).status.as_str(),
+            event(&protocol.job_id).outcome.as_str()
+        ),
+        ("failed", "failed")
+    );
+    assert_eq!(
+        (
+            event(&lost.job_id).status.as_str(),
+            event(&lost.job_id).outcome.as_str()
+        ),
+        ("lost", "failed")
+    );
+    assert_eq!(
+        (
+            event(&stopped.job_id).status.as_str(),
+            event(&stopped.job_id).outcome.as_str()
+        ),
+        ("stopped", "cancelled")
+    );
 }
 
 #[tokio::test]
@@ -807,4 +854,31 @@ async fn receipts_unowned_admission_preserves_only_existing_global_visibility() 
         .get_job_for_auth(Some(&access(Some("tester"), None)), &job.job_id)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn receipts_transient_storage_failure_retries_without_job_reexecution() {
+    let store = Arc::new(MemoryReceipts {
+        failures_remaining: std::sync::atomic::AtomicUsize::new(1),
+        ..Default::default()
+    });
+    let registry = durable(&store).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            2,
+            "completed",
+            Some("done\n"),
+            true,
+        ))
+        .await
+        .unwrap();
+    let observed = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(observed.exit_code, Some(0));
+    let rows = store.rows.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].snapshot.job_id, job.job_id);
 }
