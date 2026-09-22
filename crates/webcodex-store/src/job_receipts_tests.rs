@@ -19,6 +19,32 @@ fn receipt(now: i64, id: &str) -> RetainedJobReceipt {
 }
 
 #[test]
+fn job_receipts_upgrade_preserves_legacy_deadline_without_accepting_arbitrary_ttl() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("legacy.db");
+    let now = chrono::Utc::now().timestamp();
+    let db = Database::open(&path).unwrap();
+    let mut legacy = receipt(now - 890, "legacy");
+    db.upsert_job_receipt(&legacy, now).unwrap();
+    // Reproduce the old binary's persisted 15-minute contract, independently
+    // of the current writer and its 24-hour constant.
+    legacy.expires_at = legacy.terminal_observed_at + 900;
+    db.conn_for_tests().execute(
+        "UPDATE wc_job_receipts SET expires_at = terminal_observed_at + 900",
+        [],
+    ).unwrap();
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.load_job_receipts(now).unwrap(), vec![legacy.clone()]);
+    for ttl in [899, 901, JOB_TERMINAL_RETENTION_SECS + 1] {
+        let mut invalid = receipt(now, "invalid");
+        invalid.expires_at = now + ttl;
+        assert!(db.upsert_job_receipt(&invalid, now).is_err());
+    }
+    assert!(db.load_job_receipts(legacy.expires_at).unwrap().is_empty());
+}
+
+#[test]
 fn job_receipts_schema_additive_reopen_first_write_and_fixed_expiry() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("receipts.db");
