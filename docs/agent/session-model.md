@@ -583,6 +583,18 @@ a `finish_coding_task` verdict.
   ledgers restore it as empty without a version bump; feedback remains a
   projection over that existing state.
 
+### Optional external observations
+
+`record_external_observation` and `list_external_observations` expose bounded,
+explicitly authorized external reports for one exact Project and Workflow Session.
+They do not append synthetic native execution/validation facts, mutate Goal state,
+or derive a Session from a window or local directory. The report's adapter/event
+IDs provide scoped replay correlation, not authentication or execution proof.
+Unknown outcomes remain unknown. See
+[`../../integrations/codex/README.md`](../../integrations/codex/README.md) for the
+optional adapter, capacity/recovery contract and unverified Host boundaries.
+These reports are read separately; `handoff_brief` does not yet integrate them.
+
 ### Task handoff brief (`handoff_brief`)
 
 `session_handoff_summary` and `finish_coding_task` return the same version-1

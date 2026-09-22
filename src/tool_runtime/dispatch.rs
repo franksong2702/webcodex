@@ -2002,6 +2002,8 @@ impl ToolRuntime {
             | ToolCall::UpdateSessionContext { .. }
             | ToolCall::CloseSession { .. }
             | ToolCall::ValidationSummary { .. }
+            | ToolCall::RecordExternalObservation { .. }
+            | ToolCall::ListExternalObservations { .. }
             | ToolCall::PostSessionMessage { .. }
             | ToolCall::ListSessionMessages { .. }
             | ToolCall::GetSessionAssignment { .. }

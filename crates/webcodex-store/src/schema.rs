@@ -71,6 +71,16 @@ impl Database {
         let mut conn = self.lock_connection(crate::StoreDomain::Schema);
         conn.execute_batch(
             "
+            CREATE TABLE IF NOT EXISTS wc_external_observations (
+                session_id TEXT NOT NULL,
+                project TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                exit_code INTEGER,
+                recorded_at INTEGER NOT NULL,
+                PRIMARY KEY(session_id, adapter_id, event_id)
+            );
             CREATE TABLE IF NOT EXISTS wc_job_receipts (
                 job_id TEXT PRIMARY KEY,
                 client_id TEXT NOT NULL,

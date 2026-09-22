@@ -3088,3 +3088,6 @@ async fn http_mcp_get_discovery_returns_metadata() {
         "MCP auth metadata must not regress to PAT-only placeholder: {auth_json}"
     );
 }
+
+#[path = "external_observations.rs"]
+mod external_observations;

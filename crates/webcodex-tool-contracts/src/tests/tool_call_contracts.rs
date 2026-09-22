@@ -1986,3 +1986,35 @@ fn guidance_profile_code_mode_fails_closed_when_feature_is_unavailable() {
         "{error}"
     );
 }
+
+#[test]
+fn external_observation_contract_uses_explicit_identities_and_no_raw_payload() {
+    let mut value = json!({"project":"agent:r:p", "session_id":format!("wc_sess_{}","1".repeat(32)),
+        "adapter_id":"a".repeat(64),"event_id":"b".repeat(64),"tool":"Bash"});
+    let call = ToolCall::from_tool_name("record_external_observation", value.clone()).unwrap();
+    assert_eq!(call.project(), Some("agent:r:p"));
+    assert_eq!(call.session_id(), value["session_id"].as_str());
+    assert!(matches!(
+        call,
+        ToolCall::RecordExternalObservation {
+            exit_code: None,
+            ..
+        }
+    ));
+    value["command"] = json!("must not be accepted");
+    assert!(ToolCall::from_tool_name("record_external_observation", value).is_err());
+    for name in ["record_external_observation", "list_external_observations"] {
+        let spec = registered_tool_specs()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap();
+        assert!(spec.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("session_id")));
+        assert!(spec.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("project")));
+    }
+}

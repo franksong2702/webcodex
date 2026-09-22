@@ -184,3 +184,5 @@ pub(crate) use surface::registered_tool_categories;
 
 #[cfg(test)]
 mod tests;
+
+mod external_observations;

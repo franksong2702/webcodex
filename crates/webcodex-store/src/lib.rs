@@ -19,6 +19,12 @@ mod agent_wake;
 mod audit;
 mod communication;
 mod connection_observation;
+mod external_observations;
+#[cfg(test)]
+mod external_observations_tests;
+pub use external_observations::{
+    ExternalObservation, ExternalObservationError, MAX_EXTERNAL_OBSERVATIONS_PER_SESSION,
+};
 mod goal;
 mod goal_plan;
 #[cfg(test)]

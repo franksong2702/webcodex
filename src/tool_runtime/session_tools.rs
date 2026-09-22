@@ -21,6 +21,35 @@ impl ToolRuntime {
         trusted_recording_session_id: Option<&str>,
     ) -> ToolResult {
         match call {
+            ToolCall::RecordExternalObservation {
+                project,
+                session_id,
+                adapter_id,
+                event_id,
+                tool,
+                exit_code,
+            } => {
+                self.external_observation_tool(
+                    project,
+                    session_id,
+                    Some(webcodex_store::ExternalObservation {
+                        adapter_id,
+                        event_id,
+                        tool,
+                        exit_code,
+                        recorded_at: chrono::Utc::now().timestamp(),
+                    }),
+                    auth,
+                )
+                .await
+            }
+            ToolCall::ListExternalObservations {
+                project,
+                session_id,
+            } => {
+                self.external_observation_tool(project, session_id, None, auth)
+                    .await
+            }
             ToolCall::StartSession {
                 project,
                 title,

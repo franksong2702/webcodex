@@ -1565,6 +1565,29 @@ pub enum ToolCall {
         limit: Option<usize>,
     },
 
+    /// Record a bounded external claim without creating native execution evidence.
+    RecordExternalObservation {
+        project: String,
+        session_id: String,
+        /// SHA-256 of the adapter's local conversation identity; not an authority token.
+        #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+        adapter_id: String,
+        /// Stable SHA-256 event identity within this adapter and exact Session.
+        #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+        event_id: String,
+        /// Tool name only; no command, argument, output or transcript text.
+        #[schemars(length(min = 1, max = 64), regex(pattern = "^[A-Za-z0-9_.:-]+$"))]
+        tool: String,
+        /// External receipt claim only. Omit when no trustworthy execution receipt is available.
+        #[serde(default)]
+        exit_code: Option<i32>,
+    },
+    /// Read external claims separately from native Session/Job evidence.
+    ListExternalObservations {
+        project: String,
+        session_id: String,
+    },
+
     /// Post a bounded session-local ledger message for collaboration, progress,
     /// guidance, or design discussion. This is session metadata only.
     PostSessionMessage {
@@ -5323,6 +5346,8 @@ impl ToolCall {
             Self::UpdateSessionContext { .. } => "update_session_context",
             Self::CloseSession { .. } => "close_session",
             Self::ValidationSummary { .. } => "validation_summary",
+            Self::RecordExternalObservation { .. } => "record_external_observation",
+            Self::ListExternalObservations { .. } => "list_external_observations",
             Self::PostSessionMessage { .. } => "post_session_message",
             Self::PostPeerMessage { .. } => "post_peer_message",
             Self::ListSessionMessages { .. } => "list_session_messages",
@@ -5497,6 +5522,8 @@ impl ToolCall {
 
     pub fn session_id(&self) -> Option<&str> {
         match self {
+            Self::RecordExternalObservation { session_id, .. }
+            | Self::ListExternalObservations { session_id, .. } => Some(session_id),
             #[cfg(feature = "experimental-code-mode")]
             Self::CodeModeExec { session_id, .. }
             | Self::CodeModeExecEffectful { session_id, .. }
@@ -5635,6 +5662,8 @@ impl ToolCall {
 
     pub fn project(&self) -> Option<&str> {
         match self {
+            Self::RecordExternalObservation { project, .. }
+            | Self::ListExternalObservations { project, .. } => Some(project),
             #[cfg(feature = "experimental-code-mode")]
             Self::CodeModeExec { project, .. }
             | Self::CodeModeExecEffectful { project, .. }

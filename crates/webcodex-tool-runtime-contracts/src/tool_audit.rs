@@ -5510,6 +5510,17 @@ impl ToolCallAuditProjection for ToolCall {
                 "checkpoint_id": checkpoint_id,
                 "confirm": confirm,
             }),
+            Self::RecordExternalObservation {
+                project,
+                session_id,
+                ..
+            }
+            | Self::ListExternalObservations {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project, "session_id": session_id,
+            }),
             Self::PostSessionMessage {
                 session_id,
                 kind,

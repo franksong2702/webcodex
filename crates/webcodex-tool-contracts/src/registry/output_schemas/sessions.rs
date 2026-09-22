@@ -14,6 +14,19 @@ use super::common::{
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "record_external_observation" => Some(wrapped_output_schema(vec![
+            ("session_id", schema_type("string", "Exact Workflow Session.")),
+            ("project", schema_type("string", "Exact authorized Project.")),
+            ("provenance", schema_type("string", "Always external_report; not native execution evidence.")),
+            ("inserted", schema_type("boolean", "False for an identical retained replay.")),
+            ("observation", open_object_schema("Bounded external claim; missing exit_code produces unknown.")),
+        ])),
+        "list_external_observations" => Some(wrapped_output_schema(vec![
+            ("session_id", schema_type("string", "Exact Workflow Session.")),
+            ("project", schema_type("string", "Exact authorized Project.")),
+            ("provenance", schema_type("string", "Always external_report; not native execution evidence.")),
+            ("observations", array_schema(open_object_schema("Untrusted external report."), "At most 256 retained reports.")),
+        ])),
         "start_session" => Some(wrapped_output_schema(vec![
             (
                 "success",

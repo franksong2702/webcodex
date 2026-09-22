@@ -72,3 +72,5 @@ mod validation_summary;
 mod work_on_project;
 mod work_result;
 mod write_project_file;
+
+mod external_observations;
