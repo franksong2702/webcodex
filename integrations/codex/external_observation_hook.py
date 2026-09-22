@@ -79,7 +79,7 @@ def observation(config, payload):
         "project": config["project"], "session_id": config["workflow_session_id"],
         "adapter_id": digest("codex-session\0" + config["local_session_id"]),
         "event_id": digest("codex-tool\0" + config["local_session_id"] + "\0" + call_id),
-        "tool": tool,
+        "observed_tool": tool,
         # Generic PostToolUse text is not a terminal execution receipt. This
         # first adapter intentionally reports unknown even if text says success.
         "exit_code": None,
@@ -115,7 +115,8 @@ def send(config, event, timeout):
     if (result.get("success") is not True or output.get("project") != event["project"]
             or output.get("session_id") != event["session_id"]
             or output.get("provenance") != "external_report"
-            or any(received.get(key) != event[key] for key in ("adapter_id", "event_id", "tool", "exit_code"))):
+            or received.get("tool") != event["observed_tool"]
+            or any(received.get(key) != event[key] for key in ("adapter_id", "event_id", "exit_code"))):
         raise AdapterError("recording_not_acknowledged")
 
 
@@ -187,15 +188,15 @@ def deliver(config, event=None, sender=send):
                 raise AdapterError("pending_association_mismatch")
             saved = envelope["event"]
             if (not isinstance(saved, dict)
-                    or set(saved) != {"project", "session_id", "adapter_id", "event_id", "tool", "exit_code"}
+                    or set(saved) != {"project", "session_id", "adapter_id", "event_id", "observed_tool", "exit_code"}
                     or saved["project"] != config["project"]
                     or saved["session_id"] != config["workflow_session_id"]
                     or saved["adapter_id"] != digest("codex-session\0" + config["local_session_id"])
                     or not isinstance(saved["event_id"], str)
                     or not re.fullmatch(r"[0-9a-f]{64}", saved["event_id"])
                     or name != digest(association + saved["event_id"]) + ".json"
-                    or not isinstance(saved["tool"], str)
-                    or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", saved["tool"])
+                    or not isinstance(saved["observed_tool"], str)
+                    or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", saved["observed_tool"])
                     or saved["exit_code"] is not None):
                 raise AdapterError("invalid_pending_observation")
             remaining = deadline - time.monotonic()

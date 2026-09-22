@@ -98,6 +98,26 @@ class AdapterTests(unittest.TestCase):
     def test_redirect_is_never_followed(self):
         self.assertIsNone(hook.NoRedirect().redirect_request(None,None,302,None,None,None))
 
+    def test_http_request_and_matching_acknowledgement(self):
+        event = self.event()
+        report = {k: event[k] for k in ('adapter_id', 'event_id', 'exit_code')}
+        report['tool'] = event['observed_tool']
+        body = dict(success=True, output=dict(project=event['project'],
+            session_id=event['session_id'], provenance='external_report', observation=report))
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, n): return json.dumps(body).encode()
+        with patch.object(hook.urllib.request, 'build_opener') as opener:
+            opener.return_value.open.return_value = Response()
+            hook.send(self.config, event, 1)
+            request = opener.return_value.open.call_args.args[0]
+            self.assertEqual(json.loads(request.data),
+                {'tool': 'record_external_observation', 'params': event})
+            self.assertNotIn('tool', json.loads(request.data)['params'])
+            body['output']['observation']['tool'] = 'DifferentTool'
+            with self.assertRaises(hook.AdapterError): hook.send(self.config, event, 1)
+
     def test_response_identity_checked_before_ack(self):
         class Response:
             def __enter__(self):return self

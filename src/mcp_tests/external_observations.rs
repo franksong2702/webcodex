@@ -34,7 +34,7 @@ async fn roundtrip() {
                 .post(crate::runtime_http::tools_call),
         ),
     );
-    let event = json!({"project":project,"session_id":session,"adapter_id":"a".repeat(64),"event_id":"b".repeat(64),"tool":"Bash","exit_code":null});
+    let event = json!({"project":project,"session_id":session,"adapter_id":"a".repeat(64),"event_id":"b".repeat(64),"observed_tool":"Bash","exit_code":null});
     let mut rejected = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("wrong-token")
         .json(&json!({"tool":"record_external_observation","params":event}))

@@ -117,7 +117,7 @@ fn sample_field_value(field: &str) -> Value {
         "query" => json!("ToolRuntime"),
         "diff" => json!("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n"),
         "adapter_id" | "event_id" => json!("a".repeat(64)),
-        "tool" => json!("Bash"),
+        "observed_tool" => json!("Bash"),
         "job_id" => json!("job_123"),
         "idempotency_key" => json!("sample-detached-key"),
         "handle" => json!("reviewer"),

@@ -7,7 +7,7 @@ projection of `session_handoff_summary` remain follow-up work.
 
 ## Server contract
 
-- `record_external_observation(project, session_id, adapter_id, event_id, tool,
+- `record_external_observation(project, session_id, adapter_id, event_id, observed_tool,
   exit_code?)`: exact authorized Project and Workflow Session; `session:collaborate`
   plus normal Project authority. A closed Session rejects new writes.
 - `list_external_observations(project, session_id)`: authorized read of the same

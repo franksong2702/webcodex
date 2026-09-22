@@ -26,7 +26,7 @@ impl ToolRuntime {
                 session_id,
                 adapter_id,
                 event_id,
-                tool,
+                observed_tool,
                 exit_code,
             } => {
                 self.external_observation_tool(
@@ -35,7 +35,7 @@ impl ToolRuntime {
                     Some(webcodex_store::ExternalObservation {
                         adapter_id,
                         event_id,
-                        tool,
+                        tool: observed_tool,
                         exit_code,
                         recorded_at: chrono::Utc::now().timestamp(),
                     }),

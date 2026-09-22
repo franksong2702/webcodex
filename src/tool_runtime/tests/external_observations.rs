@@ -9,7 +9,7 @@ fn record(project: &str, session: &str) -> ToolCall {
         session_id: session.into(),
         adapter_id: "a".repeat(64),
         event_id: "b".repeat(64),
-        tool: "Bash".into(),
+        observed_tool: "Bash".into(),
         exit_code: None,
     }
 }

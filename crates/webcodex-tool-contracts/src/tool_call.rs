@@ -1577,16 +1577,13 @@ pub enum ToolCall {
         event_id: String,
         /// Tool name only; no command, argument, output or transcript text.
         #[schemars(length(min = 1, max = 64), regex(pattern = "^[A-Za-z0-9_.:-]+$"))]
-        tool: String,
+        observed_tool: String,
         /// External receipt claim only. Omit when no trustworthy execution receipt is available.
         #[serde(default)]
         exit_code: Option<i32>,
     },
     /// Read external claims separately from native Session/Job evidence.
-    ListExternalObservations {
-        project: String,
-        session_id: String,
-    },
+    ListExternalObservations { project: String, session_id: String },
 
     /// Post a bounded session-local ledger message for collaboration, progress,
     /// guidance, or design discussion. This is session metadata only.
