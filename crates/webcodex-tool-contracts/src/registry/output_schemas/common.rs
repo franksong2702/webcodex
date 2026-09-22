@@ -601,6 +601,7 @@ fn wrapped_output_schema_from_properties(mut properties: Map<String, Value>) -> 
         ),
         ("session_hint".to_string(), session_hint_schema()),
         ("permission".to_string(), permission_decision_schema()),
+        ("checkpoint_persistence".to_string(), open_object_schema("Optional opted-in project checkpoint delivery state. Separate from the original tool result; pending or failed is never completion evidence.")),
         ("recovery_kind".to_string(), recovery_kind_schema()),
     ]);
     json!({

@@ -158,3 +158,70 @@ async fn exact_project_read_revalidates_placement_before_dequeue() {
         "{response:?}"
     );
 }
+
+#[tokio::test]
+async fn handoff_dequeue_preserves_read_capability_and_revoked_write_guard() {
+    for write in [false, true] {
+        let registry = RunnerRegistry::default();
+        let mut registration =
+            current_runner_registration(runner_registration("handoff-fence", "inst", Vec::new()));
+        registration.capabilities.project_handoff = true;
+        registration.owner = Some("handoff-fixture-owner".into());
+        // Generation 2 requires the file_write capability even for read-only
+        // projects. Project allow_patch, not the wire baseline, gates writes.
+        registry.register(registration).await.unwrap();
+        crate::test_support::apply_project_inventory_snapshot(
+            &registry,
+            "handoff-fence",
+            "inst",
+            vec![project_summary("demo", "/tmp/project")],
+        )
+        .await;
+        let mut request = read_request("handoff-fence", "/tmp/project");
+        request.op = if write {
+            "handoff_write"
+        } else {
+            "handoff_read"
+        }
+        .into();
+        request.path = ".".into();
+        request.content = Some(
+            serde_json::json!({"action": if write { "append" } else { "status" }}).to_string(),
+        );
+        request.max_bytes = None;
+        request.start_line = None;
+        request.end_line = None;
+        let access = auth_context(Some("handoff-fixture-owner"), false);
+        let (_, rx) = registry
+            .enqueue_handoff_file_op(request, "demo", "tool_runtime".into(), Some(&access))
+            .await
+            .unwrap();
+        let mut project = project_summary("demo", "/tmp/project");
+        project.allow_patch = false;
+        crate::test_support::apply_project_inventory_snapshot(
+            &registry,
+            "handoff-fence",
+            "inst",
+            vec![project],
+        )
+        .await;
+        let dispatched = registry
+            .poll(RunnerPollRequest {
+                client_id: "handoff-fence".into(),
+                runner_instance_id: "inst".into(),
+            })
+            .await
+            .unwrap();
+        if write {
+            assert!(dispatched.is_none());
+            let response = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.request_dispatched, Some(false));
+            assert!(response.error.unwrap().contains("stale_project"));
+        } else {
+            assert_eq!(dispatched.unwrap().kind, "file_handoff_read");
+        }
+    }
+}

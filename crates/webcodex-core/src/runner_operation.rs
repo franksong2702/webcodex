@@ -324,6 +324,8 @@ runner_file_operations!(
     (Write, "file_write", "write"),
     (List, "file_list", "list"),
     (ProjectOverview, "file_project_overview", "project_overview"),
+    (HandoffRead, "file_handoff_read", "handoff_read"),
+    (HandoffWrite, "file_handoff_write", "handoff_write"),
     (
         DeleteProjectFiles,
         "file_delete_project_files",
@@ -1717,6 +1719,38 @@ fn validate_job_context_coherence(
 }
 
 fn validate_file_payload(kind: &str, payload: &RunnerFilePayload) -> Result<(), String> {
+    if matches!(kind, "file_handoff_read" | "file_handoff_write") {
+        if payload.path != "."
+            || !payload
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| std::path::Path::new(cwd).is_absolute())
+            || payload.max_bytes.is_some()
+        {
+            return Err("handoff requires an absolute project cwd and path=.".into());
+        }
+        let content = payload
+            .content
+            .as_deref()
+            .ok_or("handoff requires a JSON request")?;
+        if content.len() > 128 * 1024 {
+            return Err("handoff request is too large".into());
+        }
+        let request: serde_json::Value =
+            serde_json::from_str(content).map_err(|_| "invalid handoff request")?;
+        let action = request.get("action").and_then(serde_json::Value::as_str);
+        let allowed = if kind == "file_handoff_read" {
+            matches!(action, Some("status" | "read"))
+        } else {
+            matches!(
+                action,
+                Some("create" | "append" | "bind" | "disable" | "archive")
+            )
+        };
+        if !allowed {
+            return Err("handoff action is incompatible with operation authority".into());
+        }
+    }
     if payload.path.is_empty() || payload.path.contains('\0') {
         return Err("file operation path is required and cannot contain NUL".to_string());
     }
@@ -1967,6 +2001,10 @@ fn ensure_empty_generic_execution_fields(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "runner_operation_handoff_tests.rs"]
+mod handoff_tests;
 
 #[cfg(test)]
 mod tests {

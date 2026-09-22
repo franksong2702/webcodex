@@ -373,6 +373,7 @@ async fn register_agent_projects_for_auth(
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
                     RunnerCapabilities {
+                        project_handoff: false,
                         shell: true,
                         explicit_shell_selection: false,
                         file_read: true,

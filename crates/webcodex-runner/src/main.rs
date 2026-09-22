@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 use webcodex_process::{GracefulTermination, ManagedChild};
 use webcodex_runner::shutdown::{lock_unpoison, ActivityTracker, BackgroundThreads};
 
+mod project_handoff_job;
 mod webcodex_runner;
 use webcodex_runner::job_manager::JobManager;
 #[cfg(test)]
@@ -1408,6 +1409,7 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     capabilities.jobs = true;
     capabilities.file_read = true;
     capabilities.file_write = true;
+    capabilities.project_handoff = cfg!(unix);
     // This binary implements the narrow internal seek/read export-chunk path.
     // Older binaries omit the field so Control uses the existing slow fallback.
     capabilities.artifact_export_chunk_read = true;
@@ -1924,6 +1926,8 @@ fn handle_file_operation(policy: &RunnerPolicy, operation: &RunnerFileOperation)
         | RunnerFileOperation::Write(_)
         | RunnerFileOperation::List(_)
         | RunnerFileOperation::ProjectOverview(_)
+        | RunnerFileOperation::HandoffRead(_)
+        | RunnerFileOperation::HandoffWrite(_)
         | RunnerFileOperation::DeleteProjectFiles(_)
         | RunnerFileOperation::SkillListPackages(_)
         | RunnerFileOperation::SkillReadFile(_) => {

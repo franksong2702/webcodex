@@ -289,6 +289,8 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         | "write"
         | "list"
         | "project_overview"
+        | "handoff_read"
+        | "handoff_write"
         | "delete_project_files"
         | "write_project_file"
         | "apply_text_edits"
@@ -383,6 +385,8 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
             ));
         }
         if body.op != "write"
+            && body.op != "handoff_read"
+            && body.op != "handoff_write"
             && body.op != "project_overview"
             && body.op != "apply_text_edits"
             && !structured_edit_payload

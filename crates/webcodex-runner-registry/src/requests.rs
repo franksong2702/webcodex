@@ -473,7 +473,11 @@ impl RunnerRegistry {
         validate_file_request(&body)?;
         if matches!(
             body.op.as_str(),
-            "read_project_artifact_export_chunk" | "skill_list_packages" | "skill_read_file"
+            "read_project_artifact_export_chunk"
+                | "skill_list_packages"
+                | "skill_read_file"
+                | "handoff_read"
+                | "handoff_write"
         ) {
             return Err(format!(
                 "{} is internal-only; generic file-op enqueue is forbidden",
@@ -518,6 +522,73 @@ impl RunnerRegistry {
             ));
         }
         self.enqueue_validated_file_op(body, requested_by).await
+    }
+
+    /// Internal checkpoint primitive. The caller must resolve Project authority
+    /// and separately authorize writes; generic operator file calls cannot use it.
+    pub async fn enqueue_handoff_file_op(
+        &self,
+        body: ShellFileOpRequest,
+        expected_project_id: &str,
+        requested_by: String,
+        auth: Option<&crate::RunnerAccess>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        if !matches!(body.op.as_str(), "handoff_read" | "handoff_write") {
+            return Err("handoff enqueue only accepts checkpoint operations".into());
+        }
+        validate_file_request(&body)?;
+        let cwd = body
+            .cwd
+            .as_deref()
+            .ok_or("handoff requires a project cwd")?;
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_file_operation(&request_id, &body, requested_by)?;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let current = inner
+            .runners
+            .get(&body.client_id)
+            .ok_or("handoff Runner unavailable")?;
+        assert_runner_access(auth, current)?;
+        let write = body.op == "handoff_write";
+        if !current
+            .runner_features
+            .supports(RunnerFeature::ProjectHandoff)
+            || !current.runner_features.supports(if write {
+                RunnerFeature::FileWrite
+            } else {
+                RunnerFeature::FileRead
+            })
+        {
+            return Err("project_handoff capability unavailable".into());
+        }
+        if !current.projects.iter().any(|p| {
+            !p.disabled && p.id == expected_project_id && p.path == cwd && (!write || p.allow_patch)
+        }) {
+            return Err("handoff project authority changed".into());
+        }
+        let owner = current.owner.clone();
+        let instance = current.runner_instance_id.clone();
+        enqueue_pending_request_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &body.client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )?;
+        let pending = inner
+            .pending_by_id
+            .get_mut(&request_id)
+            .expect("just enqueued");
+        pending.expected_runner_owner = owner;
+        pending.expected_project_runner_instance_id = Some(instance);
+        pending.expected_project_id = Some(expected_project_id.into());
+        pending.expected_project_cwd = Some(cwd.into());
+        notify_runner_locked(&inner, &body.client_id);
+        Ok((request_id, rx))
     }
 
     async fn enqueue_validated_file_op(

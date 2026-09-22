@@ -1479,6 +1479,19 @@ impl ToolRuntime {
                 projected.output["goal_context"] = goal_context;
             }
         }
+        if projected.success {
+            if let (Some(project), Some(session)) = (
+                projected.output["resolved_project"].as_str(),
+                projected.output["session_id"].as_str(),
+            ) {
+                if let Some(handoff) = self
+                    .project_handoff_for_startup(project, session, auth)
+                    .await
+                {
+                    projected.output["project_handoff"] = handoff;
+                }
+            }
+        }
         projected
     }
 

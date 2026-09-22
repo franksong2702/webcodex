@@ -5455,6 +5455,7 @@ dependencies = [
  "webcodex-admin",
  "webcodex-core",
  "webcodex-runner-config",
+ "webcodex-workspace",
  "windows-sys 0.61.2",
 ]
 
@@ -5680,10 +5681,13 @@ dependencies = [
 name = "webcodex-workspace"
 version = "0.4.1"
 dependencies = [
+ "fs2",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "uuid",
  "webcodex-core",
 ]
 

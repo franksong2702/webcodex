@@ -5763,6 +5763,20 @@ impl ToolCallAuditProjection for ToolCall {
                 "summary_only": summary_only,
                 "limit": limit,
             }),
+            Self::ProjectHandoffRead {
+                project,
+                task_id,
+                session_id,
+            } => serde_json::json!({
+                "project": project, "task_id": task_id, "session_id": session_id,
+            }),
+            Self::ProjectHandoffWrite {
+                project,
+                session_id,
+                ..
+            } => serde_json::json!({
+                "project": project, "session_id": session_id,
+            }),
             Self::SessionSummary { session_id, limit } => serde_json::json!({
                 "session_id": session_id,
                 "limit": limit,

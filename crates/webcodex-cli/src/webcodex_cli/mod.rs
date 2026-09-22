@@ -1,6 +1,7 @@
 pub(crate) mod connect;
 pub(crate) mod connections;
 pub(crate) mod env;
+pub(crate) mod handoff;
 pub(crate) mod http;
 pub(crate) mod login;
 pub(crate) mod ops;

@@ -1222,6 +1222,72 @@ fn nullable_stdin_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema 
     })
 }
 
+/// Model-authored handoff actions cannot manufacture execution receipts.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectHandoffAction {
+    Create,
+    Bind,
+    Append,
+    Disable,
+    Archive,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectHandoffEventType {
+    NoteAdded,
+    StageStarted,
+    StageFinished,
+    TaskCompleted,
+    TaskBlocked,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectHandoffTaskStatus {
+    Active,
+    Completed,
+    Unknown,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectHandoffEvent {
+    #[schemars(regex(pattern = "^[a-zA-Z0-9._:-]{1,128}$"))]
+    pub event_id: String,
+    #[serde(rename = "type")]
+    pub event_type: ProjectHandoffEventType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 64))]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_status: Option<ProjectHandoffTaskStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectHandoffRequest {
+    pub action: ProjectHandoffAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = "^[a-z0-9][a-z0-9_-]{0,47}$"))]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 256))]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub expected_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<ProjectHandoffEvent>,
+}
+
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(
     tag = "tool",
@@ -1230,6 +1296,27 @@ fn nullable_stdin_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema 
     deny_unknown_fields
 )]
 pub enum ToolCall {
+    /// Project-local handoff discovery; never infers or creates a task binding.
+    ProjectHandoffRead {
+        #[schemars(length(min = 1))]
+        project: String,
+        #[serde(default)]
+        #[schemars(regex(pattern = "^[a-z0-9][a-z0-9_-]{0,47}$"))]
+        task_id: Option<String>,
+        #[serde(default)]
+        #[schemars(length(min = 1))]
+        session_id: Option<String>,
+    },
+    /// Explicit checkpoint mutation, authorized by the normal dispatch chain.
+    ProjectHandoffWrite {
+        #[schemars(length(min = 1))]
+        project: String,
+        #[schemars(length(min = 1))]
+        session_id: String,
+        /// Create needs task_id/title, bind needs task_id, append needs task_id/revision/event.
+        /// Archive needs task_id/revision; disable optionally checks the index revision.
+        request: ProjectHandoffRequest,
+    },
     /// List registered tool runtime tools.
     ListTools {
         /// Optional tool_manifest category filter such as artifact, edit, session, git, or runtime.
@@ -5190,6 +5277,8 @@ impl ToolCall {
             Self::ListTools { .. } => "list_tools",
             Self::StartSession { .. } => "start_session",
             Self::WorkOnProject { .. } => "work_on_project",
+            Self::ProjectHandoffRead { .. } => "project_handoff_read",
+            Self::ProjectHandoffWrite { .. } => "project_handoff_write",
             Self::FinishCodingTask { .. } => "finish_coding_task",
             Self::PresentWorkResult { .. } => "present_work_result",
             Self::WorkResultState { .. } => "work_result_state",
@@ -5448,7 +5537,9 @@ impl ToolCall {
             Self::WorkResultState { .. } | Self::ChangesFileDiff { .. } => None,
             Self::ImportConversationFilesToProject { session_id, .. } => session_id.as_deref(),
             Self::CallHierarchy { session_id, .. } => session_id.as_deref(),
-            Self::WorkOnProject { session_id, .. } => session_id.as_deref(),
+            Self::WorkOnProject { session_id, .. }
+            | Self::ProjectHandoffRead { session_id, .. } => session_id.as_deref(),
+            Self::ProjectHandoffWrite { session_id, .. } => Some(session_id.as_str()),
             Self::OpenSessionShell { session_id, .. }
             | Self::SessionShellExec { session_id, .. }
             | Self::SessionShellStatus { session_id, .. }
@@ -5585,6 +5676,8 @@ impl ToolCall {
             | Self::WorkspaceCheckpointShow { project, .. }
             | Self::WorkspaceCheckpointRestore { project, .. }
             | Self::WorkspaceCheckpointDelete { project, .. } => Some(project.as_str()),
+            Self::ProjectHandoffRead { project, .. }
+            | Self::ProjectHandoffWrite { project, .. } => Some(project.as_str()),
             Self::CallHierarchy { project, .. } => Some(project.as_str()),
             Self::WorkOnProject { project, .. } if !project.trim().is_empty() => {
                 Some(project.as_str())

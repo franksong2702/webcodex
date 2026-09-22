@@ -147,6 +147,7 @@ pub const RUNNER_CAPABILITY_SHELL: &str = "shell";
 pub const RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION: &str = "explicit_shell_selection";
 pub const RUNNER_CAPABILITY_FILE_READ: &str = "file_read";
 pub const RUNNER_CAPABILITY_FILE_WRITE: &str = "file_write";
+pub const RUNNER_CAPABILITY_PROJECT_HANDOFF: &str = "project_handoff";
 /// The Runner implements a narrow internal project-artifact export chunk read
 /// that seeks and reads only the requested bounded segment. Missing on older
 /// Runners is false and must never be inferred from ordinary file_read.
@@ -445,6 +446,7 @@ pub const RUNNER_CAPABILITY_NAMES: &[&str] = &[
     RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION,
     RUNNER_CAPABILITY_FILE_READ,
     RUNNER_CAPABILITY_FILE_WRITE,
+    RUNNER_CAPABILITY_PROJECT_HANDOFF,
     RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
     RUNNER_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA,
     RUNNER_CAPABILITY_STRUCTURED_FILE_DELETE,
@@ -537,6 +539,9 @@ pub struct RunnerCapabilities {
     pub file_read: bool,
     #[serde(default)]
     pub file_write: bool,
+    /// Typed project-local checkpoint protocol; never inferred for old Runners.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub project_handoff: bool,
     /// Internal bounded export-segment read that does not recompute whole-file
     /// MIME/SHA metadata. Missing on older Runners is false.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1013,6 +1018,7 @@ impl Default for RunnerCapabilities {
             explicit_shell_selection: false,
             file_read: false,
             file_write: false,
+            project_handoff: false,
             artifact_export_chunk_read: false,
             artifact_export_streaming_metadata: false,
             structured_file_delete: false,
@@ -2575,6 +2581,7 @@ mod envelope_tests {
             hostname: None,
             host_context: None,
             capabilities: RunnerCapabilities {
+                project_handoff: false,
                 shell: true,
                 explicit_shell_selection: false,
                 file_read: true,

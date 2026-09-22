@@ -124,6 +124,8 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
     ToolDiscoveryGroup {
         name: TOOL_DISCOVERY_GROUP_PROJECTS,
         tools: &[
+            "project_handoff_read",
+            "project_handoff_write",
             "list_projects",
             "register_project",
             "unregister_project",
@@ -544,6 +546,8 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
 /// not define direct admission. ToolDefinition rank remains the direct SSOT.
 pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     "work_on_project",
+    "project_handoff_read",
+    "project_handoff_write",
     "project_overview",
     "search_and_read",
     "search_project_texts",

@@ -286,6 +286,7 @@ only for local/trusted-network demos."
     let mut tool_runtime_builder =
         tool_runtime::ToolRuntime::new(runner_registry.clone(), runtime_info.clone())
             .with_window_activity_database(db.clone())
+            .with_project_handoff_database(db.clone())
             .with_memory_database(db.clone())
             .with_project_reference_database(db.clone())
             .with_communication_database(db.clone())

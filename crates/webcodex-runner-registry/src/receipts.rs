@@ -148,6 +148,13 @@ impl Drop for ReceiptRegistryGuard<'_> {
             for receipt in receipts {
                 if store.upsert(&receipt).is_err() {
                     failed += 1;
+                    // Retain the exact candidate for the next registry pass.
+                    // This retries storage only, never the original Job.
+                    self.state
+                        .candidates
+                        .lock()
+                        .unwrap()
+                        .insert(receipt.snapshot.job_id.clone());
                 }
             }
             if failed > 0 {

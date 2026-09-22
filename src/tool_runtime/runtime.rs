@@ -172,6 +172,9 @@ pub struct ToolRuntime {
     /// Durable ActionAudit-backed Window activity query handle. This shares the
     /// normal Server SQLite database and never becomes an authorization store.
     pub(crate) window_activity_db: Option<Arc<crate::Database>>,
+    /// Existing Server DB, separate bounded checkpoint delivery tables.
+    pub(crate) handoff_retirement_gate: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) project_handoff_db: Option<Arc<crate::Database>>,
     /// Optional Control-owned durable project Memory store. It is injected by
     /// the server from the existing webcodex.db handle; Runner-native project
     /// filesystems never own Memory v1 persistence.
@@ -247,6 +250,8 @@ impl ToolRuntime {
             window_activity: Arc::new(super::window_activity::WindowActivityRegistry::default()),
             metrics: Arc::new(super::runtime_metrics::TracingRuntimeMetrics),
             window_activity_db: None,
+            handoff_retirement_gate: Arc::new(tokio::sync::RwLock::new(())),
+            project_handoff_db: None,
             memory_db: None,
             project_reference_db: None,
             communication_db: None,
@@ -266,6 +271,11 @@ impl ToolRuntime {
 
     pub(crate) fn with_window_activity_database(mut self, db: Arc<crate::Database>) -> Self {
         self.window_activity_db = Some(db);
+        self
+    }
+
+    pub(crate) fn with_project_handoff_database(mut self, db: Arc<crate::Database>) -> Self {
+        self.project_handoff_db = Some(db);
         self
     }
 

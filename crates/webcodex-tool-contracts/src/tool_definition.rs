@@ -28,6 +28,7 @@ mod lsp;
 mod memory;
 mod patches;
 mod plugins;
+mod project_handoff;
 mod runner_config;
 mod sessions;
 mod skills;
@@ -1244,6 +1245,7 @@ pub fn tool_definitions() -> impl Iterator<Item = &'static ToolDefinition> {
 const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     TOOL_DEFINITION_HEAD,
     sessions::DEFINITIONS,
+    project_handoff::DEFINITIONS,
     communication::DEFINITIONS,
     goals::DEFINITIONS,
     agent_tasks::DEFINITIONS,

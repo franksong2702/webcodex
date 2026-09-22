@@ -87,6 +87,33 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_job_receipts_runner_history
                 ON wc_job_receipts(client_id, terminal_observed_at DESC, job_id DESC);
 
+            CREATE TABLE IF NOT EXISTS wc_handoff_bindings (
+                session_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                client_id TEXT NOT NULL,
+                project_path TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                root_fingerprint TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS wc_handoff_retirements (
+                project_id TEXT NOT NULL, client_id TEXT NOT NULL,
+                project_path TEXT NOT NULL, task_id TEXT NOT NULL,
+                root_fingerprint TEXT NOT NULL, retired INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(project_id,client_id,project_path,task_id,root_fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS wc_handoff_capture_gaps (
+                session_id TEXT PRIMARY KEY REFERENCES wc_handoff_bindings(session_id),
+                reason TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS wc_handoff_outbox (
+                event_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES wc_handoff_bindings(session_id),
+                event_json TEXT NOT NULL CHECK(length(CAST(event_json AS BLOB)) <= 16384),
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_handoff_outbox_session
+                ON wc_handoff_outbox(session_id, created_at, event_id);
+
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,

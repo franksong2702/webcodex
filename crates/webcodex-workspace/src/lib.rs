@@ -2,6 +2,7 @@
 
 pub mod file_read_normalize;
 pub mod file_read_range;
+pub mod handoff_checkpoint;
 pub mod path_policy;
 pub mod project_context;
 pub mod project_overview;

@@ -1928,3 +1928,46 @@ fn guidance_profile_code_mode_fails_closed_when_feature_is_unavailable() {
         "{error}"
     );
 }
+
+#[test]
+fn project_handoff_typed_contract_preserves_identity_and_rejects_forged_receipts() {
+    let project = "agent:test:demo";
+    let session = format!("wc_sess_{}", "a".repeat(32));
+    let read =
+        ToolCall::from_tool_name("project_handoff_read", json!({"project":project})).unwrap();
+    assert_eq!(read.project(), Some(project));
+    assert_eq!(read.session_id(), None);
+    let write = ToolCall::from_tool_name(
+        "project_handoff_write",
+        json!({
+            "project":project,"session_id":session,
+            "request":{"action":"append","task_id":"demo","expected_revision":1,
+            "event":{"event_id":"note-1","type":"note_added","summary":"Next step remains open"}}
+        }),
+    )
+    .unwrap();
+    assert_eq!(write.project(), Some(project));
+    assert_eq!(write.session_id(), Some(session.as_str()));
+    for request in [
+        json!({"action":"bind","task_id":"demo","client_id":"forged"}),
+        json!({"action":"append","task_id":"demo","expected_revision":1,
+               "event":{"event_id":"fake","type":"tool_finished"}}),
+        json!({"action":"append","task_id":"demo","expected_revision":1,
+               "event":{"event_id":"fake","type":"note_added","source":"local_codex"}}),
+    ] {
+        assert!(ToolCall::from_tool_name(
+            "project_handoff_write",
+            json!({
+                "project":project,"session_id":session,"request":request
+            })
+        )
+        .is_err());
+    }
+    for name in ["project_handoff_read", "project_handoff_write"] {
+        let spec = registered_tool_specs()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap();
+        assert_eq!(spec.input_schema, input_schema_for_tool(name));
+    }
+}

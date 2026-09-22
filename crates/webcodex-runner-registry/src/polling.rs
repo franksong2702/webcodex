@@ -585,6 +585,8 @@ impl RunnerRegistry {
                 continue;
             }
             let stale_project_error = inner.pending_by_id.get(&request_id).and_then(|pending| {
+                let handoff = matches!(pending.request.kind.as_str(), "file_handoff_read" | "file_handoff_write");
+                let handoff_write = pending.request.kind == "file_handoff_write";
                 match (
                     pending.expected_project_id.as_deref(),
                     pending.expected_project_cwd.as_deref(),
@@ -606,12 +608,12 @@ impl RunnerRegistry {
                         ),
                         Some(runner) => {
                             let required_feature = match &pending.operation {
-                                RunnerOperation::File(RunnerFileOperation::Read(_)) => {
+                                RunnerOperation::File(RunnerFileOperation::Read(_) | RunnerFileOperation::HandoffRead(_)) => {
                                     RunnerFeature::FileRead
                                 }
                                 _ => RunnerFeature::FileWrite,
                             };
-                            if !runner.runner_features.supports(required_feature) {
+                            if !runner.runner_features.supports(required_feature) || (handoff && !runner.runner_features.supports(RunnerFeature::ProjectHandoff)) {
                                 Some(format!(
                                     "stale_authority: target Runner no longer advertises {} before dispatch",
                                     required_feature.as_wire_name()
@@ -620,6 +622,7 @@ impl RunnerRegistry {
                                 !project.disabled
                                     && project.id == project_id
                                     && project.path == project_cwd
+                                    && (!handoff_write || project.allow_patch)
                             }) {
                                 None
                             } else {

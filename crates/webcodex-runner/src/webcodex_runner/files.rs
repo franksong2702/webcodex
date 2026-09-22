@@ -59,6 +59,8 @@ pub(crate) fn is_basic_file_request_kind(kind: &str) -> bool {
             | "file_write"
             | "file_list"
             | "file_project_overview"
+            | "file_handoff_read"
+            | "file_handoff_write"
             | "file_delete_project_files"
             | "file_skill_list_packages"
             | "file_skill_read_file"
@@ -85,6 +87,24 @@ pub(crate) fn handle_basic_file_request(
             handle_skill_read_file_request(policy, request, resolved, start)
         }
         RunnerFileOperation::ProjectOverview(_) => handle_project_overview_request(request, start),
+        RunnerFileOperation::HandoffRead(_) | RunnerFileOperation::HandoffWrite(_) => {
+            let result = serde_json::from_str(request.content.as_deref().unwrap_or(""))
+                .map_err(|_| serde_json::json!({"code":"invalid_request"}))
+                .and_then(|input| {
+                    webcodex_workspace::handoff_checkpoint::execute_from_runner(resolved, input)
+                });
+            let (exit_code, output) = match result {
+                Ok(output) => (0, serde_json::json!({"success":true,"output":output})),
+                Err(error) => (1, serde_json::json!({"success":false,"error":error})),
+            };
+            CommandResult {
+                exit_code: Some(exit_code),
+                stdout: Some(output.to_string()),
+                stderr: None,
+                duration_ms: Some(start.elapsed().as_millis() as u64),
+                error: None,
+            }
+        }
         RunnerFileOperation::DeleteProjectFiles(_) => {
             handle_delete_project_files_request(request, resolved, start)
         }

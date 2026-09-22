@@ -211,6 +211,8 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
         poll_interval_ms: opts.poll_interval_ms,
         project_registry_dir: opts.project_registry_dir.clone(),
         capabilities: RunnerCapabilities {
+            // Only a running binary with the checkpoint handler advertises this.
+            project_handoff: false,
             shell: true,
             // Structured explicit-shell selection is advertised only by the
             // running binary that implements the selector.

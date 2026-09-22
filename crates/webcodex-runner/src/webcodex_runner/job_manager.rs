@@ -21,6 +21,7 @@ use super::shell::{
 use super::shutdown::{lock_unpoison, ActivityTracker};
 use super::ssh::{is_transport_failure, SshConnectionPool};
 use super::transport::RunnerSink;
+use crate::project_handoff_job;
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(all(test, unix))]
 use std::io::Write;
@@ -335,6 +336,7 @@ struct DetachedJobRef {
 
 #[derive(Debug, Clone)]
 struct RunningJob {
+    handoff_target: Option<project_handoff_job::HandoffTarget>,
     client_id: String,
     runner_instance_id: String,
     snapshot: ShellJobSnapshot,
@@ -1393,6 +1395,29 @@ impl JobManager {
             );
         }
         self.delivery_signal.notify();
+        if semantic || update.update_seq == Some(1) {
+            let checkpoint = {
+                let jobs = lock_unpoison(&self.jobs);
+                jobs.get(&job_id).and_then(|job| {
+                    job.handoff_target
+                        .as_ref()
+                        .map(|target| (target.clone(), job.client_id.clone(), job.snapshot.clone()))
+                })
+            };
+            if let Some((target, client, mut snapshot)) = checkpoint {
+                // Context is immutable, but another lifecycle update may have
+                // advanced the retained snapshot after this update was queued.
+                // Persist this exact update's facts, never the later status.
+                snapshot.update_seq = update.update_seq.unwrap_or(snapshot.update_seq);
+                snapshot.status = update.status.clone();
+                snapshot.exit_code = update.exit_code;
+                // Lifecycle state and delivery are already committed/unlocked.
+                // A failed checkpoint cannot change the Job's result.
+                if project_handoff_job::record(&target, &client, &snapshot).is_err() {
+                    tracing::warn!(job_id = %job_id, "project handoff Job fact was not confirmed saved");
+                }
+            }
+        }
     }
 
     fn record_update(
@@ -1770,6 +1795,7 @@ impl JobManager {
                 jobs.insert(
                     job_id.clone(),
                     RunningJob {
+                        handoff_target: None,
                         client_id: client_id.to_string(),
                         runner_instance_id: runner_instance_id.to_string(),
                         snapshot,
@@ -2092,6 +2118,12 @@ impl JobManager {
         self.install_sink(sink.clone());
         let client_id = sink.client_id().to_string();
         let runner_instance_id = sink.runner_instance_id().to_string();
+        let handoff_target = project_handoff_job::prepare(
+            &start.project_registry_dir,
+            &client_id,
+            &start.policy,
+            &context,
+        );
         let (queue_locally, immediate_failure) = {
             let _lifecycle = lock_unpoison(&self.lifecycle);
             let shutting_down = self.shutting_down.load(Ordering::SeqCst);
@@ -2129,6 +2161,7 @@ impl JobManager {
             jobs.insert(
                 job_id.clone(),
                 RunningJob {
+                    handoff_target,
                     client_id: client_id.clone(),
                     runner_instance_id,
                     snapshot: ShellJobSnapshot {
@@ -3621,3 +3654,7 @@ mod utf8_truncation_tests {
         assert!(stream.tail.bytes().all(|byte| byte == b'x'));
     }
 }
+
+#[cfg(test)]
+#[path = "../project_handoff_job_tests.rs"]
+mod project_handoff_tests;

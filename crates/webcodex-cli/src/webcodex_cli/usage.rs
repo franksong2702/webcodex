@@ -15,6 +15,7 @@ Daily self-hosted setup:\n\
 Existing Server:\n\
   connect                       Connect the current project to an existing Server\n\n\
 Project / diagnostics:\n\
+  handoff                       Read or update an explicitly selected project checkpoint\n\
   status                        Show concise project coding readiness\n\
   doctor                        Diagnose project readiness\n\
   setup                         Configure the current Git project without starting it\n\

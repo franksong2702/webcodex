@@ -33,6 +33,7 @@ mod edit_tool_telemetry;
 mod file_tools;
 pub(crate) mod files;
 mod git;
+mod project_handoff;
 mod runner_authorization;
 mod runner_config;
 mod runner_instructions;

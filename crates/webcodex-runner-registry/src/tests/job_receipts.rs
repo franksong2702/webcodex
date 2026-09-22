@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 struct MemoryReceipts {
     rows: Mutex<Vec<RetainedJobReceipt>>,
     fail: bool,
+    failures_remaining: std::sync::atomic::AtomicUsize,
     registry: Mutex<Option<Weak<crate::receipts::ReceiptRegistryState>>>,
 }
 impl JobReceiptStore for MemoryReceipts {
@@ -26,7 +27,16 @@ impl JobReceiptStore for MemoryReceipts {
                 "storage must run after registry unlock"
             );
         }
-        if self.fail {
+        if self.fail
+            || self
+                .failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+        {
             return Err("injected failure".into());
         }
         let mut rows = self.rows.lock().unwrap();
@@ -807,4 +817,31 @@ async fn receipts_unowned_admission_preserves_only_existing_global_visibility() 
         .get_job_for_auth(Some(&access(Some("tester"), None)), &job.job_id)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn receipts_transient_storage_failure_retries_without_job_reexecution() {
+    let store = Arc::new(MemoryReceipts {
+        failures_remaining: std::sync::atomic::AtomicUsize::new(1),
+        ..Default::default()
+    });
+    let registry = durable(&store).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            2,
+            "completed",
+            Some("done\n"),
+            true,
+        ))
+        .await
+        .unwrap();
+    let observed = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(observed.exit_code, Some(0));
+    let rows = store.rows.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].snapshot.job_id, job.job_id);
 }

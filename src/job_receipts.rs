@@ -14,7 +14,8 @@ impl JobReceiptStore for SqliteJobReceiptStore {
     fn upsert(&self, receipt: &RetainedJobReceipt) -> Result<(), String> {
         self.0
             .upsert_job_receipt(receipt, chrono::Utc::now().timestamp())
-            .map_err(|_| "Job receipt write failed".to_string())
+            .map_err(|_| "Job receipt write failed".to_string())?;
+        Ok(())
     }
     fn load(&self, now: i64) -> Result<Vec<RetainedJobReceipt>, String> {
         self.0

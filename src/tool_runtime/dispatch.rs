@@ -1346,12 +1346,14 @@ impl ToolRuntime {
         start: Option<sessions::ToolCallStart>,
         tool_name: &str,
         error_kind: Option<&str>,
+        auth: Option<&AuthContext>,
         model_facing: bool,
         ack_observation: Option<&sessions::SessionAckObservation>,
         ack_requested: bool,
     ) {
         let success = result.success;
         let error = result.error.clone();
+        let handoff_fact = self.capture_handoff_fact(start.as_ref(), result);
         if model_facing {
             let session_output =
                 super::tool_audit::session_log_result_for_tool(tool_name, &result.output);
@@ -1381,6 +1383,14 @@ impl ToolRuntime {
                 error_kind,
             );
             add_session_hint(result, &self.sessions, session_id);
+        }
+        if let Some(mut checkpoint_status) = handoff_fact {
+            if checkpoint_status["status"] == "pending" {
+                checkpoint_status = self.flush_project_handoff(session_id, auth).await;
+            }
+            if let Some(output) = result.output.as_object_mut() {
+                output.insert("checkpoint_persistence".into(), checkpoint_status);
+            }
         }
     }
 
@@ -1574,6 +1584,7 @@ impl ToolRuntime {
                 session_start,
                 call.tool_name(),
                 Some(session_context::SESSION_PROJECT_MISMATCH_KIND),
+                auth,
                 inner_model_facing_recording,
                 inner_ack_observation.as_ref(),
                 inner_ack_requested,
@@ -1646,6 +1657,7 @@ impl ToolRuntime {
                     session_start,
                     call.tool_name(),
                     Some(error_kind.as_str()),
+                    auth,
                     inner_model_facing_recording,
                     inner_ack_observation.as_ref(),
                     inner_ack_requested,
@@ -1675,6 +1687,7 @@ impl ToolRuntime {
                     session_start,
                     call.tool_name(),
                     Some("session_guard_denied"),
+                    auth,
                     inner_model_facing_recording,
                     inner_ack_observation.as_ref(),
                     inner_ack_requested,
@@ -1717,6 +1730,7 @@ impl ToolRuntime {
                     session_start,
                     call.tool_name(),
                     None,
+                    auth,
                     inner_model_facing_recording,
                     inner_ack_observation.as_ref(),
                     inner_ack_requested,
@@ -1754,6 +1768,7 @@ impl ToolRuntime {
                         session_start,
                         call.tool_name(),
                         None,
+                        auth,
                         inner_model_facing_recording,
                         inner_ack_observation.as_ref(),
                         inner_ack_requested,
@@ -1761,6 +1776,60 @@ impl ToolRuntime {
                     .await;
                 }
                 return result;
+            }
+        }
+        // Keep admitted foreground mutations fenced through fact capture. Try
+        // locking avoids queued-writer deadlocks in nested generic dispatch.
+        let is_archive = matches!(&call, ToolCall::ProjectHandoffWrite { request, .. }
+            if request.action == webcodex_tool_contracts::ProjectHandoffAction::Archive);
+        let _handoff_activity =
+            if (session_contract.write_like || session_contract.shell_like) && !is_archive {
+                match self.handoff_retirement_gate.try_read() {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        return ToolResult::err_with_output(
+                            "handoff_retirement_busy",
+                            serde_json::json!({"execution_state":"not_started"}),
+                        )
+                    }
+                }
+            } else {
+                None
+            };
+        if !call.tool_name().starts_with("project_handoff_")
+            && (session_contract.write_like || session_contract.shell_like)
+        {
+            if let Some(resolved) = resolved_project {
+                let bound_session = session_id.as_deref().or_else(|| {
+                    recorder_metadata
+                        .recording_session_authorized
+                        .then_some(recorder_metadata.recording_session_id.as_deref())
+                        .flatten()
+                });
+                if let Err(mut result) = self.handoff_admission(resolved, bound_session, auth).await
+                {
+                    decorate_structured_execution_prestart_denial(
+                        call.tool_name(),
+                        &mut result,
+                        "handoff_task_selection_required",
+                    );
+                    result.output["execution_state"] = "not_started".into();
+                    if let Some(session_id) = session_id.as_deref() {
+                        self.record_dispatch_session_result(
+                            &mut result,
+                            session_id,
+                            session_start,
+                            call.tool_name(),
+                            None,
+                            auth,
+                            inner_model_facing_recording,
+                            inner_ack_observation.as_ref(),
+                            inner_ack_requested,
+                        )
+                        .await;
+                    }
+                    return result;
+                }
             }
         }
         let activity_context =
@@ -1872,6 +1941,7 @@ impl ToolRuntime {
                 session_start,
                 tool_name,
                 None,
+                auth,
                 inner_model_facing_recording,
                 inner_ack_observation.as_ref(),
                 inner_ack_requested,
@@ -2009,6 +2079,9 @@ impl ToolRuntime {
                 self.dispatch_session_tool(call, auth, transport).await
             }
 
+            call @ (ToolCall::ProjectHandoffRead { .. } | ToolCall::ProjectHandoffWrite { .. }) => {
+                self.dispatch_project_handoff(call, auth).await
+            }
             call @ (ToolCall::WorkOnProject { .. } | ToolCall::FinishCodingTask { .. }) => {
                 // Startup/closeout aggregation retains relatively large typed workflow state.
                 // Keep that future off the shared dispatch future so unrelated tool calls do

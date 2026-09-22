@@ -96,6 +96,7 @@ fn sample_field_value(field: &str) -> Value {
         "text" => json!("// hi\n"),
         "content" => json!("fn main() {}\n"),
         "instruction" => json!("implement the requested change"),
+        "request" => json!({"action":"bind","task_id":"sample-task"}),
         "objective" => json!("Preserve durable high-level intent without execution authority."),
         "summary" => json!("Recovery-worthy checkpoint summary"),
         "title" => json!("Durable agent work"),

@@ -25,9 +25,12 @@ impl Database {
         let mut conn = self.lock_connection(crate::StoreDomain::JobReceipts);
         let tx = conn.transaction()?;
         prune_expired(&tx, now)?;
-        tx.execute("INSERT INTO wc_job_receipts (job_id, client_id, runner_instance_id, auth_kind, auth_partition, owner_at_admission, kind, snapshot, terminal_observed_at, expires_at)
+        let inserted = tx.execute("INSERT INTO wc_job_receipts (job_id, client_id, runner_instance_id, auth_kind, auth_partition, owner_at_admission, kind, snapshot, terminal_observed_at, expires_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(job_id) DO NOTHING",
             params![receipt.snapshot.job_id, receipt.client_id, receipt.runner_instance_id, auth_kind, auth_partition, receipt.owner_at_admission, receipt.kind, payload, receipt.terminal_observed_at, receipt.expires_at])?;
+        if inserted == 1 {
+            crate::project_handoff::capture_terminal(&tx, receipt)?;
+        }
         // Bound history by logical Runner, across process replacements and auth
         // partitions. Oldest-first, with a stable tie break for same-second jobs.
         tx.execute(

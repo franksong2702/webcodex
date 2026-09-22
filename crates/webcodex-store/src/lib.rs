@@ -28,6 +28,8 @@ mod job_receipts;
 mod job_terminal_wait;
 #[cfg(test)]
 mod job_terminal_wait_tests;
+mod project_handoff;
+pub use project_handoff::{HandoffBinding, HandoffPendingEvent};
 mod memory;
 pub mod models;
 mod oauth;
@@ -193,3 +195,5 @@ pub use goal_stall::{
     GOAL_ACTIVITY_ATTENTION_AFTER_MS, GOAL_CARD_OBSERVATION_ADVANCE_MS,
     GOAL_CARD_OBSERVATION_LEASE_MS,
 };
+#[cfg(test)]
+mod project_handoff_tests;

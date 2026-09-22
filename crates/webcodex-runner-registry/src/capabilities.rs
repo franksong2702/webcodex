@@ -12,6 +12,7 @@ pub enum RunnerFeature {
     ExplicitShellSelection,
     FileRead,
     FileWrite,
+    ProjectHandoff,
     ArtifactExportChunkRead,
     ArtifactExportStreamingMetadata,
     StructuredFileDelete,
@@ -81,6 +82,7 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::ExplicitShellSelection,
     RunnerFeature::FileRead,
     RunnerFeature::FileWrite,
+    RunnerFeature::ProjectHandoff,
     RunnerFeature::ArtifactExportChunkRead,
     RunnerFeature::ArtifactExportStreamingMetadata,
     RunnerFeature::StructuredFileDelete,
@@ -168,6 +170,7 @@ impl RunnerFeature {
             Self::ExplicitShellSelection => wire::RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION,
             Self::FileRead => wire::RUNNER_CAPABILITY_FILE_READ,
             Self::FileWrite => wire::RUNNER_CAPABILITY_FILE_WRITE,
+            Self::ProjectHandoff => wire::RUNNER_CAPABILITY_PROJECT_HANDOFF,
             Self::ArtifactExportChunkRead => wire::RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
             Self::ArtifactExportStreamingMetadata => {
                 wire::RUNNER_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA
@@ -255,6 +258,7 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION => Self::ExplicitShellSelection,
             wire::RUNNER_CAPABILITY_FILE_READ => Self::FileRead,
             wire::RUNNER_CAPABILITY_FILE_WRITE => Self::FileWrite,
+            wire::RUNNER_CAPABILITY_PROJECT_HANDOFF => Self::ProjectHandoff,
             wire::RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ => Self::ArtifactExportChunkRead,
             wire::RUNNER_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA => {
                 Self::ArtifactExportStreamingMetadata
@@ -339,6 +343,7 @@ impl RunnerFeature {
 
     pub(crate) const fn inference(self) -> RunnerFeatureInference {
         match self {
+            Self::ProjectHandoff => RunnerFeatureInference::RegistrationRequired,
             Self::FileRead
             | Self::FileWrite
             | Self::ArtifactExportChunkRead
@@ -414,6 +419,7 @@ impl RunnerFeature {
             Self::ExplicitShellSelection => capabilities.explicit_shell_selection,
             Self::FileRead => capabilities.file_read,
             Self::FileWrite => capabilities.file_write,
+            Self::ProjectHandoff => capabilities.project_handoff,
             Self::ArtifactExportChunkRead => capabilities.artifact_export_chunk_read,
             Self::ArtifactExportStreamingMetadata => {
                 capabilities.artifact_export_streaming_metadata

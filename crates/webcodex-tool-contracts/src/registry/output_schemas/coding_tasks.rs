@@ -35,6 +35,31 @@ fn finish_changes_schema() -> Value {
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "project_handoff_read" | "project_handoff_write" => Some(wrapped_output_schema(vec![
+            ("enabled", schema_type("boolean", "Whether project-local handoff is explicitly enabled.")),
+            ("status", schema_type("string", "Checkpoint action status: ready, saved, duplicate, bound, archived or disabled.")),
+            ("checkpoint", nullable_schema("object", "Bounded persisted facts and exact project identity; historical evidence only.")),
+            ("source_status", open_object_schema("Exact source delivery status: pending count, latched capture gaps, and known-recorded-events coverage only.")),
+            ("source_pending_facts", nullable_schema("integer", "Known facts awaiting delivery; null means unavailable.")),
+            ("event_id", schema_type("string", "Exact acknowledged append event.")),
+            ("integrity", schema_type("string", "Projection consistency, including index_stale.")),
+            ("capacity", open_object_schema("Explicit task, event and byte bounds.")),
+            ("checkpoint_status", schema_type("string", "saved, failed, unknown, or disabled; independent of prior execution verdicts.")),
+            ("revision", schema_type("integer", "Exact checkpoint revision for conditional updates.")),
+            ("task_id", schema_type("string", "Exact project-local task identifier.")),
+            ("bound_task_id", nullable_schema("string", "Task selected for this explicit Session, or null when unbound.")),
+            ("tasks", array_schema(open_object_schema("Bounded task identity and revision."), "Available project handoff tasks; never ordered to imply current task.")),
+            ("archived", schema_type("boolean", "Exact checkpoint is retained read-only history, not current work.")),
+            ("archived_tasks", array_schema(open_object_schema("Retained task identity and revision."), "Archived tasks; never selected as current work.")),
+            ("archive_capacity", open_object_schema("Separate bounded retained-history capacity.")),
+            ("retirement", schema_type("string", "retired only after confirmed checkpoint archival; pending requires exact-task reconciliation.")),
+            ("jobs", array_schema(open_object_schema("Exact Job ID, terminal flag, latest observed sequence, status and exit code."), "Historical Job projection; late running events cannot replace terminal evidence.")),
+            ("index_revision", schema_type("integer", "Project index revision, distinct from task revision.")),
+            ("index_repaired", schema_type("boolean", "Whether a stale index projection was repaired.")),
+            ("client_id", schema_type("string", "Explicit checkpoint client binding key; not a credential.")),
+            ("markdown", schema_type("string", "Markdown projection state, including preserved_unmanaged.")),
+            ("error_kind", schema_type("string", "Stable checkpoint failure code.")),
+        ])),
         "work_on_project" => Some(work_on_project_output_schema()),
         "finish_coding_task" => Some(wrapped_output_schema(vec![
             ("goal_follow_up", super::goals::active_goal_context_schema()),
@@ -1258,6 +1283,7 @@ fn work_on_project_output_schema() -> Value {
     });
     let compact_repository = startup_repository_schema();
     let output_properties = vec![
+        ("project_handoff", open_object_schema("Read-only discovery of explicitly enabled project checkpoints. Exact tasks and selection are historical context, not Session recovery or permission. Omitted for disabled or unsupported Runners.")),
         (
             "session_id",
             schema_type("string", "Explicit Workflow Session id for exact continuation or recording on later calls."),

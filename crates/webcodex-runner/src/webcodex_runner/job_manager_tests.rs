@@ -26,6 +26,7 @@ fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
     snapshot.exit_code = Some(0);
     snapshot.duration_ms = Some(1);
     RunningJob {
+        handoff_target: None,
         client_id: "test-agent".to_string(),
         runner_instance_id: "test-instance".to_string(),
         snapshot,
@@ -45,6 +46,7 @@ fn job_reconciliation_inventory_prioritizes_active_and_bounds_terminal_history()
     lock_unpoison(&manager.jobs).insert(
         active.job_id.clone(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot: active,
@@ -165,6 +167,7 @@ fn job_reconciliation_inventory_drops_terminal_payload_before_active_jobs() {
     lock_unpoison(&manager.jobs).insert(
         active.job_id.clone(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot: active,
@@ -208,6 +211,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     lock_unpoison(&manager.jobs).insert(
         snapshot.job_id.clone(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot,
@@ -823,6 +827,7 @@ fn job_manager_stop_terminates_the_process_group() {
     manager.jobs.lock().unwrap().insert(
         "process-group-job".into(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("process-group-job"),
@@ -870,6 +875,7 @@ fn job_shutdown_reaps_a_sigterm_responsive_child() {
     lock_unpoison(&manager.jobs).insert(
         "term-responsive".into(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-responsive"),
@@ -918,6 +924,7 @@ fn job_shutdown_escalates_ignored_sigterm_for_parent_and_descendant() {
     lock_unpoison(&manager.jobs).insert(
         "term-ignoring".into(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-ignoring"),
@@ -1805,6 +1812,7 @@ fn phase_e2_prestart_structured_failure_releases_slot_for_queued_job() {
     lock_unpoison(&manager.jobs).insert(
         failed_job_id.to_string(),
         RunningJob {
+            handoff_target: None,
             client_id: "structured-agent".to_string(),
             runner_instance_id: "structured-instance".to_string(),
             snapshot: failed_snapshot,
@@ -2159,6 +2167,7 @@ fn output_only_delivery_coalescing_preserves_authoritative_snapshot_invariants()
     lock_unpoison(&manager.jobs).insert(
         snapshot.job_id.clone(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
@@ -3161,6 +3170,7 @@ fn structured_job_snapshot_preserves_post_spawn_outcome_unknown() {
     lock_unpoison(&manager.jobs).insert(
         snapshot.job_id.clone(),
         RunningJob {
+            handoff_target: None,
             client_id: "structured-agent".to_string(),
             runner_instance_id: "structured-instance".to_string(),
             snapshot,
@@ -3513,6 +3523,7 @@ fn arbitrary_process_output_cannot_forge_cargo_activity() {
     lock_unpoison(&manager.jobs).insert(
         snapshot.job_id.clone(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
@@ -3584,6 +3595,7 @@ fn cargo_activity_returns_to_validation_plan_after_fine_phase_ends() {
     lock_unpoison(&manager.jobs).insert(
         snapshot.job_id.clone(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
@@ -3688,6 +3700,7 @@ fn activity_only_delivery_coalesces_without_consuming_required_semantic_queue() 
     lock_unpoison(&manager.jobs).insert(
         snapshot.job_id.clone(),
         RunningJob {
+            handoff_target: None,
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
@@ -4489,6 +4502,7 @@ fn insert_running_job(
     lock_unpoison(&manager.jobs).insert(
         job_id.to_string(),
         RunningJob {
+            handoff_target: None,
             client_id: "tree-agent".to_string(),
             runner_instance_id: "tree-instance".to_string(),
             snapshot: test_job_snapshot(job_id),
@@ -4683,6 +4697,7 @@ fn runner_real_process_job_stop_all_terminates_all_trees_and_preserves_completed
         lock_unpoison(&manager.jobs).insert(
             "completed-job".to_string(),
             RunningJob {
+                handoff_target: None,
                 client_id: "tree-agent".to_string(),
                 runner_instance_id: "tree-instance".to_string(),
                 snapshot,
@@ -5183,6 +5198,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
     jobs.jobs.lock().unwrap().insert(
         "running-job".to_string(),
         RunningJob {
+            handoff_target: None,
             client_id: "ws-client".to_string(),
             runner_instance_id: "ws-instance".to_string(),
             snapshot: test_job_snapshot("running-job"),

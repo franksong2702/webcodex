@@ -107,6 +107,7 @@ fn default_runner_service_scope(effective_root: bool) -> ServiceScope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
+    Handoff(webcodex_cli::handoff::Options),
     Project(Vec<String>),
     ProjectRegister(ProjectRegisterOptions),
     ProjectActivate(ProjectActivateOptions),
@@ -318,6 +319,10 @@ where
         };
     }
     match args[0].as_str() {
+        "handoff" => match webcodex_cli::handoff::parse(&args[1..]) {
+            Ok(options) => CliAction::Handoff(options),
+            Err(message) => cli_parse_error(message),
+        },
         "--help" | "-h" => CliAction::Exit {
             code: 0,
             stdout: usage().to_string(),
@@ -2648,6 +2653,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     match cli_action(args) {
+        CliAction::Handoff(options) => {
+            let (code, output) = webcodex_cli::handoff::run(options, std::io::stdin().lock());
+            println!("{}", output);
+            std::process::exit(code);
+        }
         CliAction::Project(args) => {
             let output = webcodex::run_project_command(args).await;
             if !output.stdout.is_empty() {

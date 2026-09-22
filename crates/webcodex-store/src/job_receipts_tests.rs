@@ -160,3 +160,127 @@ fn job_receipts_failed_result_roundtrips_all_explicit_authorization_partitions()
         expected
     );
 }
+
+#[test]
+fn handoff_terminal_is_atomic_with_receipt_and_survives_receipt_expiry() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("handoff.db");
+    let now = chrono::Utc::now().timestamp();
+    let db = Database::open(&path).unwrap();
+    let binding = crate::HandoffBinding {
+        session_id: "wc_sess_11111111111111111111111111111111".into(),
+        project_id: "agent:receipt-runner:p".into(),
+        client_id: "receipt-runner".into(),
+        project_path: "/fixture/p".into(),
+        task_id: "t".into(),
+        root_fingerprint: "a".repeat(64),
+    };
+    db.handoff_bind(&binding).unwrap();
+    let mut fact = receipt(now, "same-job");
+    fact.snapshot.context.workflow_session_id =
+        Some("wc_sess_11111111111111111111111111111111".into());
+    fact.snapshot.context.runtime_project_id = Some(binding.project_id.clone());
+    fact.snapshot.context.project_cwd = Some(binding.project_path.clone());
+    // A storage failure must not commit just the receipt and lose its fact.
+    db.conn_for_tests().execute_batch("CREATE TRIGGER fail_handoff BEFORE INSERT ON wc_handoff_outbox BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+    assert!(db.upsert_job_receipt(&fact, now).is_err());
+    assert!(db.load_job_receipts(now).unwrap().is_empty());
+    db.conn_for_tests()
+        .execute_batch("DROP TRIGGER fail_handoff")
+        .unwrap();
+    db.upsert_job_receipt(&fact, now).unwrap();
+    assert_eq!(
+        db.handoff_pending("wc_sess_11111111111111111111111111111111")
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(db);
+    let db = Database::open(&path).unwrap();
+    db.prune_job_receipts(now + JOB_TERMINAL_RETENTION_SECS + 1)
+        .unwrap();
+    let pending = db
+        .handoff_pending("wc_sess_11111111111111111111111111111111")
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event["job_id"], "same-job");
+    assert!(!pending[0].event.to_string().contains("echo done"));
+    assert_eq!(
+        db.handoff_source_status(
+            &binding.project_id,
+            &binding.project_path,
+            Some("t"),
+            Some(&binding.root_fingerprint)
+        )
+        .unwrap()["status"],
+        "pending"
+    );
+    db.handoff_capture_gap("wc_sess_11111111111111111111111111111111")
+        .unwrap();
+    db.handoff_ack(
+        "wc_sess_11111111111111111111111111111111",
+        &pending[0].event_id,
+    )
+    .unwrap();
+    assert_eq!(
+        db.handoff_source_status(
+            &binding.project_id,
+            &binding.project_path,
+            Some("t"),
+            Some(&binding.root_fingerprint)
+        )
+        .unwrap()["status"],
+        "incomplete"
+    );
+}
+
+#[test]
+fn handoff_relative_root_terminal_keeps_exact_binding_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("relative.db")).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let binding = crate::HandoffBinding {
+        session_id: "wc_sess_22222222222222222222222222222222".into(),
+        project_id: "agent:receipt-runner:p".into(),
+        client_id: "receipt-runner".into(),
+        project_path: "/fixture/p".into(),
+        task_id: "task-a".into(),
+        root_fingerprint: "a".repeat(64),
+    };
+    db.handoff_bind(&binding).unwrap();
+    let mut fact = receipt(now, "relative-job");
+    fact.snapshot.context.workflow_session_id = Some(binding.session_id.clone());
+    fact.snapshot.context.runtime_project_id = Some(binding.project_id.clone());
+    fact.snapshot.context.project_cwd = Some(".".into());
+    fact.snapshot.status = "failed".into();
+    fact.snapshot.exit_code = Some(7);
+    db.upsert_job_receipt(&fact, now).unwrap();
+    let pending = db.handoff_pending(&binding.session_id).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].event["job_id"], "relative-job");
+    assert_eq!(pending[0].event["exit_code"], 7);
+    for mismatch in 0..5 {
+        let mut other = fact.clone();
+        other.snapshot.job_id = format!("unrelated-{mismatch}");
+        match mismatch {
+            0 => {
+                other.snapshot.context.runtime_project_id =
+                    Some("agent:receipt-runner:other".into())
+            }
+            1 => other.client_id = "other-runner".into(),
+            2 => other.snapshot.context.project_cwd = Some("/different/root".into()),
+            3 => other.snapshot.context.project_cwd = Some("..".into()),
+            _ => {
+                other.client_id = "other-runner".into();
+                other.snapshot.context.runtime_project_id = Some("agent:other-runner:p".into());
+            }
+        }
+        if mismatch == 1 {
+            // An internally inconsistent receipt is rejected before capture.
+            assert!(db.upsert_job_receipt(&other, now).is_err());
+        } else {
+            db.upsert_job_receipt(&other, now).unwrap();
+        }
+        assert_eq!(db.handoff_pending(&binding.session_id).unwrap().len(), 1);
+    }
+}
