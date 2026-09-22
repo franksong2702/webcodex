@@ -92,6 +92,12 @@ pub(crate) fn handle_basic_file_request(
                 .map_err(|_| serde_json::json!({"code":"invalid_request"}))
                 .and_then(|input| {
                     webcodex_workspace::handoff_checkpoint::execute_from_runner(resolved, input)
+                })
+                .inspect_err(|error| {
+                    // The checkpoint error constructor uses fixed messages;
+                    // do not log requests, paths, content, or OS error text.
+                    tracing::warn!(code = ?error.get("code"), stage = ?error.get("message"),
+                        "project handoff operation failed");
                 });
             let (exit_code, output) = match result {
                 Ok(output) => (0, serde_json::json!({"success":true,"output":output})),

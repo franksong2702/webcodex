@@ -58,6 +58,9 @@ const NOTES_END: &str = "<!-- webcodex-handoff:notes:end -->";
 const LOCK_WAIT: Duration = Duration::from_secs(5);
 const LOCK_POLL: Duration = Duration::from_millis(10);
 
+#[cfg(unix)]
+mod volume_anchor;
+
 /// Stable error object returned by [`execute`].  The `code` field is the
 /// contract; `message` is intentionally generic and never contains OS text.
 pub fn error(code: &'static str, message: &'static str) -> Value {
@@ -231,6 +234,15 @@ pub fn execute_from_runner(root: &Path, request: Value) -> Result<Value, Value> 
 
 #[cfg(unix)]
 fn execute_unix(root: &Path, request: Value, server_coordinated: bool) -> Result<Value, Value> {
+    if request.get("action").and_then(Value::as_str) == Some("anchor_identity") {
+        if server_coordinated {
+            return Err(error(
+                "invalid_action",
+                "identity repair requires the local operator",
+            ));
+        }
+        return volume_anchor::repair(root, request);
+    }
     let parsed = parse_request(request)?;
     let project = open_project_root(root)?;
     let identity = &project.identity;
@@ -238,7 +250,11 @@ fn execute_unix(root: &Path, request: Value, server_coordinated: bool) -> Result
     match parsed.action.as_str() {
         "status" => with_read_lock(&project, |handoff| status(handoff, identity, &parsed)),
         "read" => with_read_lock(&project, |handoff| read(handoff, identity, &parsed)),
-        "create" => with_write_lock(&project, |handoff| create(handoff, identity, &parsed)),
+        "create" => with_write_lock(&project, |handoff| {
+            let result = create(handoff, identity, &parsed)?;
+            volume_anchor::create(&project, handoff).map_err(mark_state_changed)?;
+            Ok(result)
+        }),
         "append" => {
             with_existing_write_lock(&project, |handoff| append(handoff, identity, &parsed))
         }
@@ -903,7 +919,7 @@ fn open_project_root(root: &Path) -> Result<ProjectRoot, Value> {
     hasher.update(device.to_le_bytes());
     hasher.update(inode.to_le_bytes());
     let root_fingerprint = format!("{:x}", hasher.finalize());
-    Ok(ProjectRoot {
+    let mut root = ProjectRoot {
         identity: ProjectIdentity {
             canonical_root,
             device,
@@ -911,7 +927,9 @@ fn open_project_root(root: &Path) -> Result<ProjectRoot, Value> {
             root_fingerprint,
         },
         directory,
-    })
+    };
+    volume_anchor::resolve(&mut root)?;
+    Ok(root)
 }
 
 #[cfg(unix)]

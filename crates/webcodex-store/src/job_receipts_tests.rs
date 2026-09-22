@@ -29,10 +29,12 @@ fn job_receipts_upgrade_preserves_legacy_deadline_without_accepting_arbitrary_tt
     // Reproduce the old binary's persisted 15-minute contract, independently
     // of the current writer and its 24-hour constant.
     legacy.expires_at = legacy.terminal_observed_at + 900;
-    db.conn_for_tests().execute(
-        "UPDATE wc_job_receipts SET expires_at = terminal_observed_at + 900",
-        [],
-    ).unwrap();
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_job_receipts SET expires_at = terminal_observed_at + 900",
+            [],
+        )
+        .unwrap();
     drop(db);
     let db = Database::open(&path).unwrap();
     assert_eq!(db.load_job_receipts(now).unwrap(), vec![legacy.clone()]);

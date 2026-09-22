@@ -810,3 +810,83 @@ fn archive_rejects_unknown_active_and_server_uncoordinated_tasks() {
     )
     .is_err());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_device_repair_preserves_bytes_and_refuses_stale_or_remote_requests() {
+    let root = tempfile::tempdir().unwrap();
+    execute(root.path(), create_request("legacy", "旧任务")).unwrap();
+    fs::remove_file(root.path().join("handoff/.volume-anchor.json")).unwrap();
+    let project = open_project_root(root.path()).unwrap();
+    let mut old = project.identity.clone();
+    old.device += 1;
+    let mut hash = Sha256::new();
+    hash.update(old.canonical_root.as_bytes());
+    hash.update(b"\0");
+    hash.update(old.device.to_le_bytes());
+    hash.update(old.inode.to_le_bytes());
+    old.root_fingerprint = format!("{:x}", hash.finalize());
+    for file in ["index.json", "legacy.json"] {
+        let path = root.path().join("handoff").join(file);
+        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["project_identity"] = serde_json::to_value(&old).unwrap();
+        fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let paths: Vec<_> = ["index.json", "legacy.json", "legacy.md"]
+        .iter()
+        .map(|name| root.path().join("handoff").join(name))
+        .collect();
+    let before: Vec<_> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
+    assert_eq!(
+        execute(root.path(), json!({"action":"read","task_id":"legacy"})).unwrap_err()["code"],
+        "project_identity_mismatch"
+    );
+    let req = json!({"action":"anchor_identity","expected_index_sha256":format!("{:x}",Sha256::digest(&before[0])),"confirm":true});
+    assert_eq!(
+        execute_from_runner(root.path(), req.clone()).unwrap_err()["code"],
+        "invalid_action"
+    );
+    let mut stale = req.clone();
+    stale["expected_index_sha256"] = "bad".into();
+    assert_eq!(
+        execute(root.path(), stale).unwrap_err()["code"],
+        "revision_conflict"
+    );
+    let mut preview = req.clone();
+    preview["confirm"] = false.into();
+    assert_eq!(execute(root.path(), preview).unwrap()["status"], "reviewed");
+    assert!(!root.path().join("handoff/.volume-anchor.json").exists());
+    assert_eq!(execute(root.path(), req).unwrap()["status"], "anchored");
+    assert_eq!(
+        execute(root.path(), json!({"action":"read","task_id":"legacy"})).unwrap()["status"],
+        "ready"
+    );
+    assert_eq!(
+        before,
+        paths
+            .iter()
+            .map(|p| fs::read(p).unwrap())
+            .collect::<Vec<_>>()
+    );
+    // A copied anchor does not grant continuity to another directory.
+    let other = tempfile::tempdir().unwrap();
+    fs::create_dir(other.path().join("handoff")).unwrap();
+    fs::copy(
+        root.path().join("handoff/.volume-anchor.json"),
+        other.path().join("handoff/.volume-anchor.json"),
+    )
+    .unwrap();
+    assert_eq!(
+        execute(other.path(), json!({"action":"status"})).unwrap_err()["code"],
+        "project_identity_mismatch"
+    );
+    // Even the same path/inode is rejected when the stable volume differs.
+    let path = root.path().join("handoff/.volume-anchor.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["volume_uuid"] = "00000000000000000000000000000000".into();
+    fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(
+        execute(root.path(), json!({"action":"status"})).unwrap_err()["code"],
+        "project_identity_mismatch"
+    );
+}

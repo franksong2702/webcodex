@@ -300,3 +300,24 @@ binaries and machine-specific connection/trust configuration outside Git. Track
 upstream and the operator's own remote separately; a local candidate checkout as
 `origin` is not a remote backup. Publish only portable code/tests/documentation,
 never tokens, private project paths or production snapshots.
+
+### macOS volume identity and legacy checkpoints
+
+New task creation writes `handoff/.volume-anchor.json`. It pins the opened
+volume UUID, canonical directory path and inode to the existing checkpoint
+fingerprint; a remount may change `st_dev` without invalidating the project.
+A copied/replaced directory or another volume still fails closed. Task files,
+archives, unknown results and source bindings retain their original identity.
+
+Legacy records without an anchor are never silently adopted after a device
+change. A local operator who has verified the exact original directory may use
+`webcodex handoff --project <absolute-root> --request-stdin` with
+`{"action":"anchor_identity","expected_index_sha256":"<reviewed SHA-256 of handoff/index.json>","confirm":false}`
+for review, then the same request with `confirm:true`. The confirmed operation
+checks the index digest, canonical path, inode and all referenced task/archive
+records under the existing lock, and atomically creates the anchor without
+rewriting history. It cannot recover a moved/replaced directory, and is not
+exposed through MCP/Runner. Keep a private backup before repairing historical
+metadata. A legacy record has no historical volume UUID; this one-time operator
+confirmation supplies that missing provenance and must not be automated merely
+because an identity check failed. Normal reads never create an anchor.
