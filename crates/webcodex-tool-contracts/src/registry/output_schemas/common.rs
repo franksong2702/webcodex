@@ -1009,13 +1009,14 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                     "complete": schema_type("boolean", "True only when no fixed evidence-gap reason applies."),
                     "reason_codes": {
                         "type": "array",
-                        "maxItems": 9,
+                        "maxItems": 10,
                         "uniqueItems": true,
                         "items": {
                             "type": "string",
                             "enum": [
                                 "attempt_boundary_evicted",
                                 "continuation_unavailable",
+                                "external_observations_changed_during_snapshot",
                                 "guidance_unavailable",
                                 "job_summary_unavailable",
                                 "session_changed_during_snapshot",

@@ -161,6 +161,7 @@ fn brief_for(
         guidance_available,
         existing_suggested_actions: None,
         session_changed_during_snapshot: false,
+        external_observations_changed_during_snapshot: false,
     })
 }
 fn assert_all_objects_strict(schema: &Value, path: &str) {

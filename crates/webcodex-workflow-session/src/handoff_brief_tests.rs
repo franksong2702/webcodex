@@ -309,6 +309,7 @@ fn brief_for_with_external(
         guidance_available,
         existing_suggested_actions: None,
         session_changed_during_snapshot: false,
+        external_observations_changed_during_snapshot: false,
     })
 }
 
@@ -931,6 +932,7 @@ fn handoff_brief_hard_limit_uses_actual_escaped_json_bytes() {
         guidance_available: true,
         existing_suggested_actions: None,
         session_changed_during_snapshot: false,
+        external_observations_changed_during_snapshot: false,
     });
     let bytes = handoff_brief_size(&brief);
     assert_eq!(bytes, serde_json::to_vec(&brief).unwrap().len());

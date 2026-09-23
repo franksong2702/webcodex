@@ -43,6 +43,10 @@ pub struct HandoffBriefInput<'a> {
     pub guidance_available: bool,
     /// Internal caller fence; the numeric revisions are never projected.
     pub session_changed_during_snapshot: bool,
+    /// Separate external-evidence fence. External reports intentionally do not
+    /// mutate the native Session revision, so handoff callers must track this
+    /// plane independently when they project it into the same recovery brief.
+    pub external_observations_changed_during_snapshot: bool,
     /// Optional existing deterministic action projection. Only fixed known
     /// templates are reused; arbitrary strings are never copied into the brief.
     pub existing_suggested_actions: Option<&'a Value>,
@@ -175,6 +179,9 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
     let mut basis_reasons = BTreeSet::new();
     if input.session_changed_during_snapshot {
         basis_reasons.insert("session_changed_during_snapshot");
+    }
+    if input.external_observations_changed_during_snapshot {
+        basis_reasons.insert("external_observations_changed_during_snapshot");
     }
     if !continuation_available {
         basis_reasons.insert("continuation_unavailable");
