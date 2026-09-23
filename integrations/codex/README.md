@@ -145,8 +145,9 @@ acceptance is still required before general rollout.
 Python unit tests use synthetic Hook payloads and controlled senders, including
 uncertain delivery/retry, changed associations, private-file checks, redaction,
 and the read-only consumer's exact identity checks.
-Rust tests cover transactional replay/reopen/conflict/capacity and authenticated
-runtime dispatch. These do **not** establish real Codex Hook lifecycle or ChatGPT
+Rust tests cover transactional replay/reopen/conflict/capacity, authenticated
+runtime dispatch, and the actual `/api/tools/call` non-recording handoff path. These
+do **not** establish real Codex Hook lifecycle or ChatGPT
 browser acceptance of this proposed adapter. The separately deployed downstream
 prototype's acceptance is not acceptance of these new endpoints.
 
