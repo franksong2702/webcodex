@@ -1,9 +1,11 @@
 # Optional local Codex external observations (proposal #631)
 
-This first slice records bounded **external reports** in an explicitly selected
+This integration records bounded **external reports** in an explicitly selected
 WebCodex Workflow Session. It does not install Hooks, change trust, create a
-Session/Goal, execute commands, or migrate a conversation. Goal linkage and a local
-projection of `session_handoff_summary` remain follow-up work.
+Session/Goal, execute commands, or migrate a conversation. The Server now projects
+these claims read-only in `session_handoff_summary`; a local Codex recovery/export
+consumer and Goal linkage remain follow-up work. This does not establish real
+two-sided UI acceptance.
 
 ## Server contract
 
@@ -43,9 +45,11 @@ event, and the explicit ingestion/read calls are deliberately excluded from the
 business Workflow Session event ledger so adapter traffic cannot evict native
 execution evidence. The first adapter also has no durable source sequence: list
 results therefore expose `coverage.complete=false` and do not claim complete capture
-or source execution ordering. Existing `session_handoff_summary` does not yet
-summarize the external reports themselves: call `list_external_observations`
-explicitly. Session lifecycle/authority remain owned by the existing Session store;
+or source execution ordering. `session_handoff_summary` includes the last five
+retained reports in `handoff_brief.external_observations`, with exact source IDs,
+unknown count, truncation and explicit incomplete coverage. Use
+`list_external_observations` to inspect all retained reports (at most 256).
+Session lifecycle/authority remain owned by the existing Session store;
 the SQLite table is only external evidence, not a second task state machine.
 
 ## Optional adapter (macOS / Linux, Python 3.10+)

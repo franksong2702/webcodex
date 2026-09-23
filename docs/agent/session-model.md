@@ -595,7 +595,17 @@ adapter has no durable source sequence, so list results explicitly report incomp
 coverage and must not be interpreted as complete capture or source execution order.
 See [`../../integrations/codex/README.md`](../../integrations/codex/README.md) for
 the optional adapter, capacity/recovery contract and unverified Host boundaries.
-These reports are read separately; `handoff_brief` does not yet integrate them.
+The authorized `session_handoff_summary` handoff brief now includes a bounded
+`external_observations` section, separate from native progress and validation.
+It shows the last five retained reports in server timestamp and identity order,
+with exact adapter/event IDs, tool,
+reported status, and server receipt time, plus total/returned/truncated and
+unknown counts. The section's `provenance` is always `external_report` and its
+`coverage.complete` is always false: receipt ordering cannot prove source
+execution ordering or complete capture. No Session Project, unavailable store,
+or failed read produces `status=unavailable` with null observations and counts,
+never an apparent empty result. The exact Project and Session association comes
+from the surrounding handoff output and `handoff_brief.session.session_id`.
 
 ### Task handoff brief (`handoff_brief`)
 
@@ -608,7 +618,7 @@ brief is not Session replay, does not reconstruct chat or hidden model
 context, and does not decide that implementation work is complete.
 
 The builder consumes only the bounded Session summary, continuation feedback,
-workspace, validation, Job, guidance, exploration, and suggested-action
+workspace, validation, Job, guidance, exploration, external-report, and suggested-action
 snapshots that its caller already obtained. It performs no shell, Git, file,
 search, LSP, Agent, or Runner request; does not refresh activity, consume
 guidance, append a ledger event, or call an LLM; and stores no new Session
@@ -640,6 +650,10 @@ The projection has these stable bounds and semantics:
   are capped at 5. Each bounded evidence list preserves
   `total`/`returned`/`truncated`. Recent files are only continuity hints, not
   complete history.
+- external reports are an independent read-only claim section capped at five
+  identities. A byte-budget reduction updates `returned` and `truncated` as it
+  removes reports; `unknown_count` still counts all retained reports. Store
+  unavailability is local to this section and does not change native closeout.
 - `progress.state` is selected in order: a non-mutable lifecycle is `closed`;
   a workspace conflict, blocking/recovering Job, unresolved validation
   failure, or open risk is `blocked`; workspace changes without a proven

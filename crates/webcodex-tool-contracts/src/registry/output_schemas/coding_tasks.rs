@@ -75,7 +75,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "handoff_brief",
-                handoff_brief_schema("Full-closeout deterministic task handoff for a new window, new Agent, or human receiver; omitted from summary_only. It is a read-only projection over already-obtained Session, continuation, workspace, validation, Job, and guidance evidence; it is not Session replay and never restores hidden model context."),
+                handoff_brief_schema("Full-closeout deterministic task handoff for a new window, new Agent, or human receiver; omitted from summary_only. Its bounded external_report section exposes retained claims and incomplete source coverage without changing native Session, validation, Job, Goal, or completion evidence."),
             ),
             (
                 "review_evidence",

@@ -477,6 +477,10 @@ impl ToolRuntime {
 
         // --- bounded suggested next actions ---
         output["suggested_next_actions"] = json!(handoff_suggested_next_actions(&output));
+        let external_observations = self.handoff_external_observations(
+            &session_id,
+            projection_closeout_session.project.as_deref(),
+        );
         output["handoff_brief"] = build_handoff_brief(HandoffBriefInput {
             session_summary: &projection_closeout_session,
             continuation_feedback: output.get("continuation_feedback").unwrap_or(&Value::Null),
@@ -485,6 +489,7 @@ impl ToolRuntime {
             validation_requested: include_validation,
             validation: Some(&feedback_validation),
             jobs: output.get("jobs"),
+            external_observations: Some(&external_observations),
             guidance_available,
             session_changed_during_snapshot,
             existing_suggested_actions: output.get("suggested_next_actions"),

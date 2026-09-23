@@ -1,6 +1,7 @@
 use super::support::*;
 use crate::tool_runtime::session_context::workflow_session_authority_fingerprint;
 use crate::tool_runtime::{sessions, ToolCall, ToolRuntime};
+use serde_json::json;
 use std::sync::Arc;
 
 fn record(project: &str, session: &str) -> ToolCall {
@@ -183,4 +184,270 @@ async fn external_observations_runtime_scope_replay_unknown_and_readback() {
         .output
         .get("retry_same_event_identity")
         .is_none());
+}
+
+#[tokio::test]
+async fn external_reports_reach_default_and_diagnostic_handoff_without_native_promotion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(crate::db::Database::open(&tmp.path().join("db")).unwrap());
+    let runtime = ToolRuntime::new_for_tests().with_communication_database(db.clone());
+    let auth = auth_context(None, true);
+    let project =
+        register_runner_project_at_path(&runtime, "handoff-external", "p", tmp.path()).await;
+    let mut opts = sessions::SessionCreateOptions::new(
+        Some(project.clone()),
+        None,
+        Default::default(),
+        Default::default(),
+    );
+    opts.owner_authority_fingerprint =
+        Some(workflow_session_authority_fingerprint(Some(&auth)).unwrap());
+    let session = runtime
+        .sessions
+        .start_session_with_options(opts)
+        .unwrap()
+        .session_id;
+    let before = runtime.sessions.summary(&session, None).unwrap();
+    let baseline = runtime
+        .session_handoff_summary(
+            session.clone(),
+            Some(project.clone()),
+            Some(false),
+            Some(false),
+            Some(true),
+            true,
+            Some(20),
+            Some(&auth),
+        )
+        .await;
+    assert!(baseline.success, "{baseline:?}");
+    for (n, exit_code) in [
+        (0, None),
+        (1, Some(0)),
+        (2, Some(9)),
+        (3, None),
+        (4, Some(0)),
+        (5, None),
+        (6, None),
+    ] {
+        db.record_external_observation(
+            &session,
+            &project,
+            webcodex_store::ExternalObservation {
+                adapter_id: "a".repeat(64),
+                event_id: format!("{n:064x}"),
+                tool: "Bash".into(),
+                exit_code,
+                recorded_at: n + 1,
+            },
+        )
+        .unwrap();
+    }
+    let call = |diagnostic| ToolCall::SessionHandoffSummary {
+        session_id: session.clone(),
+        project: Some(project.clone()),
+        include_workspace: Some(false),
+        include_checkpoints: Some(false),
+        include_validation: Some(true),
+        diagnostic,
+        limit: Some(20),
+    };
+    let after_external = runtime
+        .session_handoff_summary(
+            session.clone(),
+            Some(project.clone()),
+            Some(false),
+            Some(false),
+            Some(true),
+            true,
+            Some(20),
+            Some(&auth),
+        )
+        .await;
+    assert!(after_external.success, "{after_external:?}");
+    for pointer in [
+        "/handoff_brief/progress",
+        "/handoff_brief/validation",
+        "/task_outcome",
+    ] {
+        assert_eq!(
+            after_external.output.pointer(pointer),
+            baseline.output.pointer(pointer),
+            "{pointer}"
+        );
+    }
+    let compact = runtime.dispatch_with_auth(call(false), Some(&auth)).await;
+    assert!(compact.success, "{compact:?}");
+    let handoff_spec = crate::tool_runtime::registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "session_handoff_summary")
+        .unwrap();
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+        &json!({"success": true, "output": compact.output.clone()}),
+        &handoff_spec.output_schema,
+    )
+    .unwrap();
+    let reports = &compact.output["handoff_brief"]["external_observations"];
+    assert_eq!(reports["status"], "available");
+    assert_eq!(reports["provenance"], "external_report");
+    assert_eq!(reports["coverage"]["complete"], false);
+    assert_eq!(reports["coverage"]["reason"], "source_sequence_unavailable");
+    assert_eq!(reports["total"], 7);
+    assert_eq!(reports["returned"], 5);
+    assert_eq!(reports["truncated"], true);
+    assert_eq!(reports["unknown_count"], 4);
+    assert_eq!(
+        reports["observations"][0]["event_id"],
+        format!("{:064x}", 2)
+    );
+    assert_eq!(reports["observations"][0]["status"], "reported_failure");
+    assert_eq!(reports["observations"][2]["status"], "reported_success");
+    assert_eq!(
+        reports["observations"][4]["event_id"],
+        format!("{:064x}", 6)
+    );
+    assert_eq!(reports["observations"][4]["status"], "unknown");
+    assert_eq!(compact.output["project"], project);
+    assert_eq!(
+        compact.output["handoff_brief"]["session"]["session_id"],
+        session
+    );
+    assert_ne!(
+        compact.output["handoff_brief"]["validation"]["status"],
+        "passed"
+    );
+    let diagnostic = runtime.dispatch_with_auth(call(true), Some(&auth)).await;
+    assert!(diagnostic.success, "{diagnostic:?}");
+    assert_eq!(
+        diagnostic.output["handoff_brief"]["external_observations"],
+        *reports
+    );
+    // Only normal handoff-tool telemetry enters the native Session ledger.
+    let after = runtime.sessions.summary(&session, None).unwrap();
+    assert_eq!(after.events_total, before.events_total + 4);
+    assert!(after.events[before.events.len()..]
+        .iter()
+        .all(|event| event.tool_name == "session_handoff_summary"));
+
+    let other =
+        register_runner_project_at_path(&runtime, "handoff-external-other", "p", tmp.path()).await;
+    let mut wrong_call = call(false);
+    if let ToolCall::SessionHandoffSummary {
+        project: requested, ..
+    } = &mut wrong_call
+    {
+        *requested = Some(other);
+    }
+    let wrong_project = runtime.dispatch_with_auth(wrong_call, Some(&auth)).await;
+    assert!(!wrong_project.success);
+    assert!(wrong_project.output.get("handoff_brief").is_none());
+    let mut stranger = auth_context(Some("stranger"), false);
+    stranger.scopes = vec!["admin".into()];
+    let denied = runtime
+        .dispatch_with_auth(call(false), Some(&stranger))
+        .await;
+    assert!(!denied.success);
+    assert!(denied.output.get("handoff_brief").is_none());
+}
+
+#[tokio::test]
+async fn external_handoff_read_distinguishes_empty_missing_store_and_failed_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(crate::db::Database::open(&tmp.path().join("db")).unwrap());
+    let with_db = ToolRuntime::new_for_tests().with_communication_database(db.clone());
+    let project = register_runner_project_at_path(&with_db, "handoff-empty", "p", tmp.path()).await;
+    let session = with_db
+        .sessions
+        .start_session(Some(project.clone()), None)
+        .session_id;
+    let handoff =
+        |runtime: &ToolRuntime| runtime.handoff_external_observations(&session, Some(&project));
+    let empty = handoff(&with_db);
+    assert_eq!(empty["status"], "available");
+    assert_eq!(empty["total"], 0);
+    assert_eq!(empty["observations"], json!([]));
+    assert_eq!(empty["coverage"]["complete"], false);
+    let empty_handoff = with_db
+        .session_handoff_summary(
+            session.clone(),
+            Some(project.clone()),
+            Some(false),
+            Some(false),
+            Some(false),
+            true,
+            Some(20),
+            None,
+        )
+        .await;
+    assert!(empty_handoff.success, "{empty_handoff:?}");
+    assert_eq!(
+        empty_handoff.output["handoff_brief"]["external_observations"],
+        empty
+    );
+    let missing_project = with_db.handoff_external_observations(&session, None);
+    assert_eq!(missing_project["status"], "unavailable");
+    assert_eq!(
+        missing_project["reason_code"],
+        "session_project_unavailable"
+    );
+    assert!(missing_project["observations"].is_null());
+    let no_db = ToolRuntime::new_for_tests();
+    let missing_store = handoff(&no_db);
+    assert_eq!(missing_store["reason_code"], "store_unavailable");
+    assert!(missing_store["total"].is_null());
+    let no_db_project =
+        register_runner_project_at_path(&no_db, "handoff-no-db", "p", tmp.path()).await;
+    let no_db_session = no_db
+        .sessions
+        .start_session(Some(no_db_project.clone()), None)
+        .session_id;
+    let no_db_handoff = no_db
+        .session_handoff_summary(
+            no_db_session,
+            Some(no_db_project),
+            Some(false),
+            Some(false),
+            Some(false),
+            false,
+            Some(20),
+            None,
+        )
+        .await;
+    assert!(no_db_handoff.success, "{no_db_handoff:?}");
+    assert_eq!(
+        no_db_handoff.output["handoff_brief"]["external_observations"]["status"],
+        "unavailable"
+    );
+    assert!(
+        no_db_handoff.output["handoff_brief"]["external_observations"]["observations"].is_null()
+    );
+    db.conn_for_tests()
+        .execute_batch("DROP TABLE wc_external_observations")
+        .unwrap();
+    let failed_read = handoff(&with_db);
+    assert_eq!(failed_read["status"], "unavailable");
+    assert_eq!(failed_read["reason_code"], "store_unavailable");
+    assert_eq!(failed_read["coverage"]["complete"], false);
+    assert!(failed_read["observations"].is_null());
+    let failed_handoff = with_db
+        .session_handoff_summary(
+            session,
+            Some(project),
+            Some(false),
+            Some(false),
+            Some(false),
+            true,
+            Some(20),
+            None,
+        )
+        .await;
+    assert!(failed_handoff.success, "{failed_handoff:?}");
+    assert_eq!(
+        failed_handoff.output["handoff_brief"]["external_observations"],
+        failed_read
+    );
+    assert_eq!(
+        failed_handoff.output["task_outcome"],
+        empty_handoff.output["task_outcome"]
+    );
 }

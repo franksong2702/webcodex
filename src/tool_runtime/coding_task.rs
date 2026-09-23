@@ -1755,6 +1755,19 @@ impl ToolRuntime {
             })
         };
 
+        // Reuse the handoff's exact read when present. An omitted or failed
+        // handoff still gets a single local report read for its own brief.
+        let external_observations = handoff
+            .pointer("/handoff_brief/external_observations")
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| {
+                self.handoff_external_observations(
+                    &session_id,
+                    projection_closeout_session_summary.project.as_deref(),
+                )
+            });
+
         let mut output = json!({
             "project": project,
             "resolved_project": resolved_project_payload(&resolved),
@@ -1793,6 +1806,7 @@ impl ToolRuntime {
             validation_requested: include_validation_summary,
             validation: output.get("validation"),
             jobs: output.get("jobs"),
+            external_observations: Some(&external_observations),
             guidance_available,
             existing_suggested_actions: output.get("suggested_next_actions"),
             session_changed_during_snapshot: false,

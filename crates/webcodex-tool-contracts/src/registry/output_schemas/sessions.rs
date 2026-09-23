@@ -6,45 +6,12 @@ use webcodex_core::workflow_session_contract::{
 
 use super::common::{
     array_schema, cargo_test_count_assertion_schema, continuation_feedback_schema,
-    evidence_history_schema, evidence_integrity_schema, handoff_brief_schema,
-    job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_summary_schema,
-    schema_type, session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
-    session_mode_schema, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
+    evidence_history_schema, evidence_integrity_schema, external_observation_schema,
+    handoff_brief_schema, job_lifecycle_summary_schema, nullable_schema, open_object_schema,
+    permission_summary_schema, schema_type, session_execution_context_schema,
+    session_guards_schema, session_lifecycle_schema, session_mode_schema, task_outcome_schema,
+    validation_delta_schema, wrapped_output_schema,
 };
-
-fn external_observation_schema(description: &str) -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "description": description,
-        "properties": {
-            "adapter_id": {
-                "type": "string",
-                "pattern": "^[0-9a-f]{64}$",
-                "maxLength": 64
-            },
-            "event_id": {
-                "type": "string",
-                "pattern": "^[0-9a-f]{64}$",
-                "maxLength": 64
-            },
-            "tool": {
-                "type": "string",
-                "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
-                "maxLength": 64
-            },
-            "exit_code": {
-                "anyOf": [{"type": "integer"}, {"type": "null"}]
-            },
-            "recorded_at": {"type": "integer"},
-            "status": {
-                "type": "string",
-                "enum": ["unknown", "reported_success", "reported_failure"]
-            }
-        },
-        "required": ["adapter_id", "event_id", "tool", "exit_code", "recorded_at", "status"]
-    })
-}
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
@@ -730,7 +697,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "handoff_brief",
-                handoff_brief_schema("Compact deterministic task handoff for a new window, new Agent, or human receiver. It is a read-only projection over already-obtained Session, continuation, workspace, validation, Job, and guidance evidence; it is not Session replay and never restores hidden model context."),
+                handoff_brief_schema("Compact deterministic task handoff for a new window, new Agent, or human receiver. It includes a bounded read-only external_report section with explicit incomplete capture coverage, separate from native Session, validation, and Job evidence; it is not Session replay and never restores hidden model context."),
             ),
         ])),
         _ => None,

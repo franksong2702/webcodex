@@ -4,6 +4,16 @@ use crate::auth::AuthContext;
 use serde_json::{json, Value};
 use webcodex_store::{ExternalObservation, ExternalObservationError};
 
+const MAX_HANDOFF_EXTERNAL_OBSERVATIONS: usize = 5;
+
+fn external_observation_coverage(reason: &str) -> Value {
+    json!({
+        "complete": false,
+        "reason": reason,
+        "ordering": "server_recorded_at_then_identity",
+    })
+}
+
 fn project_observation(value: ExternalObservation) -> Value {
     let status = match value.exit_code {
         Some(0) => "reported_success",
@@ -16,6 +26,61 @@ fn project_observation(value: ExternalObservation) -> Value {
 }
 
 impl ToolRuntime {
+    /// Read the exact authorized Session Project's retained external reports
+    /// for a handoff. This is a separate, bounded claim projection: it never
+    /// materializes native Session events or changes closeout decisions.
+    pub(super) fn handoff_external_observations(
+        &self,
+        session_id: &str,
+        session_project: Option<&str>,
+    ) -> Value {
+        let unavailable = |reason_code: &str| {
+            json!({
+                "status": "unavailable",
+                "reason_code": reason_code,
+                "provenance": "external_report",
+                "coverage": external_observation_coverage("read_unavailable"),
+                "total": null,
+                "returned": null,
+                "truncated": null,
+                "unknown_count": null,
+                "observations": null,
+            })
+        };
+        let Some(project) = session_project else {
+            return unavailable("session_project_unavailable");
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return unavailable("store_unavailable");
+        };
+        let Ok(rows) = db.list_external_observations(session_id, project) else {
+            return unavailable("store_unavailable");
+        };
+        let total = rows.len();
+        let unknown_count = rows.iter().filter(|row| row.exit_code.is_none()).count();
+        // The store sorts by server timestamp and identity, not source order.
+        // Keep the last few in that order while retaining the whole count.
+        let mut observations = rows
+            .into_iter()
+            .rev()
+            .take(MAX_HANDOFF_EXTERNAL_OBSERVATIONS)
+            .map(project_observation)
+            .collect::<Vec<_>>();
+        observations.reverse();
+        let returned = observations.len();
+        json!({
+            "status": "available",
+            "reason_code": null,
+            "provenance": "external_report",
+            "coverage": external_observation_coverage("source_sequence_unavailable"),
+            "total": total,
+            "returned": returned,
+            "truncated": returned < total,
+            "unknown_count": unknown_count,
+            "observations": observations,
+        })
+    }
+
     pub(crate) async fn external_observation_tool(
         &self,
         project: String,
@@ -86,11 +151,7 @@ impl ToolRuntime {
         } else {
             db.list_external_observations(&session_id, &project).map(|rows| json!({
                 "session_id":session_id, "project":project, "provenance":"external_report",
-                "coverage": {
-                    "complete": false,
-                    "reason": "source_sequence_unavailable",
-                    "ordering": "server_recorded_at_then_identity",
-                },
+                "coverage": external_observation_coverage("source_sequence_unavailable"),
                 "observations": rows.into_iter().map(project_observation).collect::<Vec<_>>(),
             }))
         };
