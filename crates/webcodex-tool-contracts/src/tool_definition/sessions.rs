@@ -10,25 +10,36 @@ use crate::metadata::{
 };
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
-    requires_explicit_business_session(model_spec(
+    requires_explicit_business_session(
         def(
             "record_external_observation",
             super::ToolAuditPolicy::typed_fields(&[
                 super::ToolAuditResultField::value("session_id"),
                 super::ToolAuditResultField::value("error_kind"),
             ]),
-            ModelVisible, TOOL_CATEGORY_SESSION, None, TOOL_PROVIDER_CONTROL,
+            ModelHidden,
+            TOOL_CATEGORY_SESSION,
+            None,
+            TOOL_PROVIDER_CONTROL,
             super::ToolSemanticContract {
                 effect: super::ToolEffect::Mutate,
                 risk: super::ToolRisk::SessionCollaborate,
                 approval: super::ToolApprovalPolicy::None,
                 idempotency: super::ToolIdempotency::FencedReplay,
             },
-            Some(SESSION_COLLABORATE), true, NoPath, false, false,
-            super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
-        ).with_gpt_action_description("Record an untrusted external report. Exact Session/Project required. Reuse event identity after uncertain acknowledgement; never rerun work. This is not native execution or validation evidence."),
-        "Record one bounded untrusted external tool report in an exact Session/Project. Replay the same adapter/event IDs to reconcile an uncertain recording response; changed payloads conflict. This never executes work or proves native Job/validation success. Missing exit_code remains unknown. Capacity errors require reconciliation, not a new event ID.",
-    )),
+            Some(SESSION_COLLABORATE),
+            true,
+            NoPath,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE
+                .lifecycle(super::ToolSessionLifecycleEffect::Mutation),
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        ),
+    ),
 
     requires_explicit_business_session(model_spec(
         def(
@@ -46,7 +57,12 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             },
             Some(RUNTIME_READ), true, NoPath, false, false,
             super::ToolSessionEvidencePolicy::NONE,
-        ).with_gpt_action_description("Read retained external reports for an exact Session/Project. These are untrusted adapter claims, not native execution or validation evidence."),
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        )
+        .with_gpt_action_description("Read retained external reports for an exact Session/Project. These are untrusted adapter claims, not native execution or validation evidence."),
         "Read all retained external reports for an exact Session/Project (at most 256). Reports are untrusted adapter claims, separate from native Job and validation evidence. They never establish task completion or authorize replaying work.",
     )),
 

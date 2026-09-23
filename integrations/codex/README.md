@@ -13,6 +13,12 @@ projection of `session_handoff_summary` remain follow-up work.
 - `list_external_observations(project, session_id)`: authorized read of the same
   reports, available through normal MCP tool discovery/gateway and REST.
 
+The write tool is intentionally adapter/API ingress and is hidden from the model
+tool surface; `list_external_observations` remains model-visible for continuity
+recovery. A model therefore cannot manufacture an external report through ordinary
+MCP discovery while an authenticated local adapter can still submit one through the
+supported Runtime API.
+
 Both identities are required, not inferred from the connection, directory, window
 or credentials. `adapter_id` and `event_id` are lowercase SHA-256 strings; they are
 correlation keys, not authenticated provenance or authorization tokens. Any authorized
@@ -31,10 +37,13 @@ reconcile by submitting the **same** identity/payload, never rerunning work.
 The prototype admits at most 256 observations per Session and 65,536 total. It
 fails closed at capacity; it does not evict replay keys or silently claim full
 history. There is no automatic garbage collection yet. This conservative capacity
-policy and the final API shape need maintainer review before broad rollout. Server
-reports are not appended as native tool execution events, so existing
-`session_handoff_summary` does not yet summarize them: call
-`list_external_observations` explicitly. Session lifecycle/authority remain owned
+policy and the final API shape need maintainer review before broad rollout. The
+reported local operation is never represented as a native WebCodex tool/Job/validation
+event. The explicit WebCodex ingestion/read calls may retain ordinary bookkeeping
+events, but both are non-meaningful support interactions and carry no native
+execution/validation evidence. Existing `session_handoff_summary` therefore does not
+yet summarize the external reports themselves: call `list_external_observations`
+explicitly. Session lifecycle/authority remain owned
 by the existing Session store; the SQLite table is only external evidence, not a
 second task state machine.
 

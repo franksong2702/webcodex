@@ -2003,18 +2003,44 @@ fn external_observation_contract_uses_explicit_identities_and_no_raw_payload() {
     ));
     value["command"] = json!("must not be accepted");
     assert!(ToolCall::from_tool_name("record_external_observation", value).is_err());
+    assert!(!crate::is_model_visible_tool_name(
+        "record_external_observation"
+    ));
+    assert!(crate::is_model_visible_tool_name(
+        "list_external_observations"
+    ));
+    assert!(registered_tool_specs()
+        .into_iter()
+        .all(|spec| spec.name != "record_external_observation"));
+
     for name in ["record_external_observation", "list_external_observations"] {
-        let spec = registered_tool_specs()
-            .into_iter()
-            .find(|s| s.name == name)
-            .unwrap();
-        assert!(spec.input_schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("session_id")));
-        assert!(spec.input_schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("project")));
+        let activity = crate::runtime_tool_activity_semantics(name);
+        assert_eq!(activity.presentation.as_str(), "support");
+        assert!(!activity.interaction.is_meaningful());
     }
+
+    let list_spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "list_external_observations")
+        .unwrap();
+    for field in ["session_id", "project"] {
+        assert!(list_spec.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(field)));
+    }
+
+    let record_schema = crate::registry::output_schema_for_tool("record_external_observation");
+    let record_output = &record_schema["properties"]["output"]["properties"];
+    let observation = &record_output["observation"];
+    assert_eq!(observation["additionalProperties"], false);
+    assert_eq!(
+        observation["properties"]["status"]["enum"],
+        json!(["unknown", "reported_success", "reported_failure"])
+    );
+
+    let list_output = &list_spec.output_schema["properties"]["output"]["properties"];
+    let observations = &list_output["observations"];
+    assert_eq!(observations["maxItems"], 256);
+    assert_eq!(observations["items"]["additionalProperties"], false);
 }

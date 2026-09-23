@@ -1,5 +1,5 @@
 //! External reports never enter native execution/validation projections.
-use super::{ToolResult, ToolRuntime};
+use super::{RecoveryKind, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use serde_json::{json, Value};
 use webcodex_store::{ExternalObservation, ExternalObservationError};
@@ -23,7 +23,8 @@ impl ToolRuntime {
         input: Option<ExternalObservation>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let name = if input.is_some() {
+        let is_record = input.is_some();
+        let name = if is_record {
             "record_external_observation"
         } else {
             "list_external_observations"
@@ -53,7 +54,26 @@ impl ToolRuntime {
             );
         }
         let Some(db) = self.communication_db.as_ref() else {
-            return ToolResult::err("external_observation_store_unavailable");
+            return if is_record {
+                ToolResult::err_with_output(
+                    "external_observation_store_unavailable",
+                    json!({
+                        "error_kind": "external_observation_store_unavailable",
+                        "state_changed": false,
+                        "retry_same_event_identity": true,
+                    }),
+                )
+                .with_recovery(RecoveryKind::RetrySame)
+            } else {
+                ToolResult::err_with_output(
+                    "external_observation_store_unavailable",
+                    json!({
+                        "error_kind": "external_observation_store_unavailable",
+                        "state_changed": false,
+                    }),
+                )
+                .with_recovery(RecoveryKind::Reobserve)
+            };
         };
         let result = if let Some(input) = input {
             db.record_external_observation(&session_id, &project, input)
@@ -71,21 +91,56 @@ impl ToolRuntime {
         };
         match result {
             Ok(output) => ToolResult::ok(output),
-            Err(error) => {
-                let code = match error {
-                    ExternalObservationError::InvalidInput => "invalid_external_observation",
-                    ExternalObservationError::Conflict => "external_observation_conflict",
-                    ExternalObservationError::Capacity => "external_observation_capacity",
-                    ExternalObservationError::Storage => "external_observation_storage_unavailable",
-                };
-                // A commit failure may have an uncertain outcome. Do not claim
-                // state_changed=false or suggest a fresh identity/business retry.
+            Err(ExternalObservationError::InvalidInput) => ToolResult::err_with_output(
+                "invalid_external_observation",
+                json!({
+                    "error_kind": "invalid_external_observation",
+                    "state_changed": false,
+                }),
+            )
+            .with_recovery(RecoveryKind::FixInput),
+            Err(ExternalObservationError::Conflict) => ToolResult::err_with_output(
+                "external_observation_conflict",
+                json!({
+                    "error_kind": "external_observation_conflict",
+                    "failure_kind": "conflict",
+                    "state_changed": false,
+                }),
+            )
+            .with_recovery(RecoveryKind::FixInput),
+            Err(ExternalObservationError::Capacity) => ToolResult::err_with_output(
+                "external_observation_capacity",
+                json!({
+                    "error_kind": "external_observation_capacity",
+                    "state_changed": false,
+                    "recovery": "Retained external-observation capacity is full; do not mint a new event identity to bypass the bound.",
+                }),
+            )
+            .with_recovery(RecoveryKind::UserAction),
+            Err(ExternalObservationError::Storage) if is_record => {
+                // SQLite commit failure may mean the exact keyed report committed
+                // but its acknowledgement was lost. The only safe retry is the
+                // same Session + adapter_id + event_id + canonical payload.
                 ToolResult::err_with_output(
-                    code,
-                    json!({"error_kind":code,
-                    "recovery":"Reconcile using the same Session, adapter and event identity; never replay the business operation."}),
+                    "external_observation_storage_uncertain",
+                    json!({
+                        "error_kind": "external_observation_storage_uncertain",
+                        "failure_kind": "outcome_unknown",
+                        "state_changed": Value::Null,
+                        "retry_same_event_identity": true,
+                        "recovery": "Retry the same Session, adapter_id, event_id and payload; never replay the observed business operation.",
+                    }),
                 )
+                .with_recovery(RecoveryKind::RetrySame)
             }
+            Err(ExternalObservationError::Storage) => ToolResult::err_with_output(
+                "external_observation_store_unavailable",
+                json!({
+                    "error_kind": "external_observation_store_unavailable",
+                    "state_changed": false,
+                }),
+            )
+            .with_recovery(RecoveryKind::Reobserve),
         }
     }
 }

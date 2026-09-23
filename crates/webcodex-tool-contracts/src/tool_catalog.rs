@@ -265,7 +265,6 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "complete_session_message",
             "session_discussion_summary",
             "session_handoff_summary",
-            "record_external_observation",
             "list_external_observations",
             #[cfg(feature = "workspace-checkpoints")]
             "workspace_checkpoint_create",

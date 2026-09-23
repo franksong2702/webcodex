@@ -64,6 +64,43 @@ async fn external_observations_runtime_scope_replay_unknown_and_readback() {
     let denied = runtime.dispatch_with_auth(conflict, Some(&auth)).await;
     assert!(!denied.success);
     assert_eq!(denied.output["error_kind"], "external_observation_conflict");
+    assert_eq!(denied.output["failure_kind"], "conflict");
+    assert_eq!(denied.output["state_changed"], false);
+    assert_eq!(denied.output["recovery_kind"], "fix_input");
+
+    db.conn_for_tests()
+        .execute_batch(
+            "CREATE TRIGGER fail_external_observation BEFORE INSERT ON wc_external_observations              BEGIN SELECT RAISE(ABORT,'injected'); END;",
+        )
+        .unwrap();
+    let mut uncertain_call = record(&project, &session);
+    if let ToolCall::RecordExternalObservation { event_id, .. } = &mut uncertain_call {
+        *event_id = "c".repeat(64);
+    }
+    let uncertain = runtime
+        .dispatch_with_auth(uncertain_call, Some(&auth))
+        .await;
+    assert!(!uncertain.success);
+    assert_eq!(
+        uncertain.output["error_kind"],
+        "external_observation_storage_uncertain"
+    );
+    assert_eq!(uncertain.output["failure_kind"], "outcome_unknown");
+    assert!(uncertain.output["state_changed"].is_null());
+    assert_eq!(uncertain.output["recovery_kind"], "retry_same");
+    assert_eq!(uncertain.output["retry_same_event_identity"], true);
+    db.conn_for_tests()
+        .execute_batch("DROP TRIGGER fail_external_observation")
+        .unwrap();
+
+    let mut retry_same = record(&project, &session);
+    if let ToolCall::RecordExternalObservation { event_id, .. } = &mut retry_same {
+        *event_id = "c".repeat(64);
+    }
+    let recovered = runtime.dispatch_with_auth(retry_same, Some(&auth)).await;
+    assert!(recovered.success, "{recovered:?}");
+    assert_eq!(recovered.output["inserted"], true);
+
     let other = register_runner_project_at_path(&runtime, "external-other", "p", tmp.path()).await;
     assert!(
         !runtime
@@ -91,9 +128,9 @@ async fn external_observations_runtime_scope_replay_unknown_and_readback() {
         db.list_external_observations(&session, &project)
             .unwrap()
             .len(),
-        1
+        2
     );
-    // Neither accepting nor reading this report creates a native Job receipt.
+    // Neither accepting nor reading these reports creates a native Job receipt.
     assert!(db
         .load_job_receipts(chrono::Utc::now().timestamp())
         .unwrap()
@@ -113,4 +150,27 @@ async fn external_observations_runtime_scope_replay_unknown_and_readback() {
             .await
             .success
     );
+    db.conn_for_tests()
+        .execute_batch("DROP TABLE wc_external_observations")
+        .unwrap();
+    let list_failure = runtime
+        .dispatch_with_auth(
+            ToolCall::ListExternalObservations {
+                project: project.clone(),
+                session_id: session.clone(),
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(!list_failure.success);
+    assert_eq!(
+        list_failure.output["error_kind"],
+        "external_observation_store_unavailable"
+    );
+    assert_eq!(list_failure.output["state_changed"], false);
+    assert_eq!(list_failure.output["recovery_kind"], "reobserve");
+    assert!(list_failure
+        .output
+        .get("retry_same_event_identity")
+        .is_none());
 }
