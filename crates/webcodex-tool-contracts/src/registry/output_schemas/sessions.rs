@@ -59,11 +59,22 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("session_id", schema_type("string", "Exact Workflow Session.")),
             ("project", schema_type("string", "Exact authorized Project.")),
             ("provenance", schema_type("string", "Always external_report; not native execution evidence.")),
+            ("coverage", json!({
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Capture/ordering truth for this external-report projection. The first adapter has no durable source sequence, so completeness cannot be proven.",
+                "properties": {
+                    "complete": {"type": "boolean", "const": false},
+                    "reason": {"type": "string", "enum": ["source_sequence_unavailable"]},
+                    "ordering": {"type": "string", "enum": ["server_recorded_at_then_identity"]}
+                },
+                "required": ["complete", "reason", "ordering"]
+            })),
             ("observations", json!({
                 "type": "array",
                 "maxItems": 256,
                 "items": external_observation_schema("Untrusted external report."),
-                "description": "At most 256 retained reports."
+                "description": "At most 256 retained reports. Ordering is server recorded-at plus identity, not proven source execution order."
             })),
         ])),
         "start_session" => Some(wrapped_output_schema(vec![

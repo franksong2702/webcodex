@@ -70,4 +70,6 @@ async fn roundtrip() {
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0]["event_id"], event["event_id"]);
     assert_eq!(reports[0]["status"], "unknown");
+    assert_eq!(output["coverage"]["complete"], false);
+    assert_eq!(output["coverage"]["reason"], "source_sequence_unavailable");
 }

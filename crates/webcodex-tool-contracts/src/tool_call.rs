@@ -5519,8 +5519,11 @@ impl ToolCall {
 
     pub fn session_id(&self) -> Option<&str> {
         match self {
-            Self::RecordExternalObservation { session_id, .. }
-            | Self::ListExternalObservations { session_id, .. } => Some(session_id),
+            // External-observation ingress/read carries an exact business Session
+            // that is independently re-authorized by the runtime method. Keep it
+            // out of this generic recorder projection so adapter traffic cannot
+            // become native Session evidence or consume the bounded event tail.
+            Self::RecordExternalObservation { .. } | Self::ListExternalObservations { .. } => None,
             #[cfg(feature = "experimental-code-mode")]
             Self::CodeModeExec { session_id, .. }
             | Self::CodeModeExecEffectful { session_id, .. }

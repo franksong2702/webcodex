@@ -86,6 +86,11 @@ impl ToolRuntime {
         } else {
             db.list_external_observations(&session_id, &project).map(|rows| json!({
                 "session_id":session_id, "project":project, "provenance":"external_report",
+                "coverage": {
+                    "complete": false,
+                    "reason": "source_sequence_unavailable",
+                    "ordering": "server_recorded_at_then_identity",
+                },
                 "observations": rows.into_iter().map(project_observation).collect::<Vec<_>>(),
             }))
         };

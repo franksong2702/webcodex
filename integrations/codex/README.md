@@ -39,13 +39,14 @@ fails closed at capacity; it does not evict replay keys or silently claim full
 history. There is no automatic garbage collection yet. This conservative capacity
 policy and the final API shape need maintainer review before broad rollout. The
 reported local operation is never represented as a native WebCodex tool/Job/validation
-event. The explicit WebCodex ingestion/read calls may retain ordinary bookkeeping
-events, but both are non-meaningful support interactions and carry no native
-execution/validation evidence. Existing `session_handoff_summary` therefore does not
-yet summarize the external reports themselves: call `list_external_observations`
-explicitly. Session lifecycle/authority remain owned
-by the existing Session store; the SQLite table is only external evidence, not a
-second task state machine.
+event, and the explicit ingestion/read calls are deliberately excluded from the
+business Workflow Session event ledger so adapter traffic cannot evict native
+execution evidence. The first adapter also has no durable source sequence: list
+results therefore expose `coverage.complete=false` and do not claim complete capture
+or source execution ordering. Existing `session_handoff_summary` does not yet
+summarize the external reports themselves: call `list_external_observations`
+explicitly. Session lifecycle/authority remain owned by the existing Session store;
+the SQLite table is only external evidence, not a second task state machine.
 
 ## Optional adapter (macOS / Linux, Python 3.10+)
 

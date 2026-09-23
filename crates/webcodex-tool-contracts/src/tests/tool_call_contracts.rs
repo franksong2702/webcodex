@@ -1993,7 +1993,7 @@ fn external_observation_contract_uses_explicit_identities_and_no_raw_payload() {
         "adapter_id":"a".repeat(64),"event_id":"b".repeat(64),"observed_tool":"Bash"});
     let call = ToolCall::from_tool_name("record_external_observation", value.clone()).unwrap();
     assert_eq!(call.project(), Some("agent:r:p"));
-    assert_eq!(call.session_id(), value["session_id"].as_str());
+    assert_eq!(call.session_id(), None);
     assert!(matches!(
         call,
         ToolCall::RecordExternalObservation {
@@ -2043,4 +2043,11 @@ fn external_observation_contract_uses_explicit_identities_and_no_raw_payload() {
     let observations = &list_output["observations"];
     assert_eq!(observations["maxItems"], 256);
     assert_eq!(observations["items"]["additionalProperties"], false);
+    let coverage = &list_output["coverage"];
+    assert_eq!(coverage["additionalProperties"], false);
+    assert_eq!(coverage["properties"]["complete"]["const"], false);
+    assert_eq!(
+        coverage["properties"]["reason"]["enum"],
+        json!(["source_sequence_unavailable"])
+    );
 }

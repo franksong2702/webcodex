@@ -62,8 +62,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolActivityPresentation::Support,
             super::ToolActivityInteraction::NonMeaningful,
         )
-        .with_gpt_action_description("Read retained external reports for an exact Session/Project. These are untrusted adapter claims, not native execution or validation evidence."),
-        "Read all retained external reports for an exact Session/Project (at most 256). Reports are untrusted adapter claims, separate from native Job and validation evidence. They never establish task completion or authorize replaying work.",
+        .with_gpt_action_description("Read retained external reports for an exact Session/Project. These are untrusted adapter claims, not native execution or validation evidence; current capture completeness and source order are unproven."),
+        "Read all retained external reports for an exact Session/Project (at most 256). Reports are untrusted adapter claims, separate from native Job and validation evidence. They never establish task completion or authorize replaying work. coverage remains incomplete until a durable source sequence can prove gaps/order.",
     )),
 
     def(

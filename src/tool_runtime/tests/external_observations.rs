@@ -34,6 +34,7 @@ async fn external_observations_runtime_scope_replay_unknown_and_readback() {
         .start_session_with_options(opts)
         .unwrap()
         .session_id;
+    let before_external = runtime.sessions.summary(&session, None).unwrap();
     let result = runtime
         .dispatch_with_auth(record(&project, &session), Some(&auth))
         .await;
@@ -57,6 +58,15 @@ async fn external_observations_runtime_scope_replay_unknown_and_readback() {
         .await;
     assert!(read.success, "{:?}", read);
     assert_eq!(read.output["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(read.output["coverage"]["complete"], false);
+    assert_eq!(
+        read.output["coverage"]["reason"],
+        "source_sequence_unavailable"
+    );
+    let after_external = runtime.sessions.summary(&session, None).unwrap();
+    assert_eq!(after_external.events_total, before_external.events_total);
+    assert_eq!(after_external.events.len(), before_external.events.len());
+    assert_eq!(after_external.updated_at, before_external.updated_at);
     let mut conflict = record(&project, &session);
     if let ToolCall::RecordExternalObservation { exit_code, .. } = &mut conflict {
         *exit_code = Some(0);
