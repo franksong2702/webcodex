@@ -1807,6 +1807,15 @@ pub enum ToolCall {
         limit: Option<usize>,
     },
 
+    /// Adapter/API-only exact recovery read. Uses the canonical handoff projection
+    /// without exposing the business Session through generic recorder semantics.
+    SessionHandoffState {
+        /// Required exact runtime Project; must match the authorized Session Project.
+        project: String,
+        /// Required exact business Workflow Session id.
+        session_id: String,
+    },
+
     /// Create a bounded last-known-good workspace checkpoint outside the
     /// project worktree.
     #[cfg(feature = "workspace-checkpoints")]
@@ -5354,6 +5363,7 @@ impl ToolCall {
             Self::CompleteSessionMessage { .. } => "complete_session_message",
             Self::SessionDiscussionSummary { .. } => "session_discussion_summary",
             Self::SessionHandoffSummary { .. } => "session_handoff_summary",
+            Self::SessionHandoffState { .. } => "session_handoff_state",
             #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointCreate { .. } => "workspace_checkpoint_create",
             #[cfg(feature = "workspace-checkpoints")]
@@ -5597,7 +5607,9 @@ impl ToolCall {
             // App-only presentation reads intentionally do not expose their business
             // Session through this generic recorder projection: each re-authorizes
             // and reads the exact target inside its runtime method.
-            Self::WorkResultState { .. } | Self::ChangesFileDiff { .. } => None,
+            Self::WorkResultState { .. }
+            | Self::ChangesFileDiff { .. }
+            | Self::SessionHandoffState { .. } => None,
             Self::ImportConversationFilesToProject { session_id, .. } => session_id.as_deref(),
             Self::CallHierarchy { session_id, .. } => session_id.as_deref(),
             Self::WorkOnProject { session_id, .. } => session_id.as_deref(),
@@ -5750,6 +5762,7 @@ impl ToolCall {
             Self::UpdateSessionContext { project, .. }
             | Self::ValidationSummary { project, .. } => Some(project.as_str()),
             Self::SessionHandoffSummary { project, .. } => project.as_deref(),
+            Self::SessionHandoffState { project, .. } => Some(project.as_str()),
             _ => None,
         }
     }

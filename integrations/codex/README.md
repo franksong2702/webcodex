@@ -117,15 +117,22 @@ From the configured project directory, run:
 python3 /absolute/path/read_handoff.py --config /private/operator/observation.json
 ```
 
-This uses the same private operator configuration and calls only
-`session_handoff_summary` for its exact Project and Workflow Session. It rejects
-a different current project, response identity, or missing evidence basis. The
-JSON output retains the bounded `handoff_brief`, including incomplete basis,
-unknown reports and incomplete source coverage. A successful read means only
-that the brief was obtained; inspect current project rules, files, Git status,
-Jobs and unknown operations before continuing. The command does not select a
-Session by directory or recency, bind the new local conversation, mark work
-complete, replay an operation, install a Hook, or write a handoff file.
+This uses the same private operator configuration and calls the hidden
+`session_handoff_state` API ingress for its exact Project and Workflow Session.
+That ingress reuses the canonical `session_handoff_summary` projection, but it is
+non-meaningful adapter traffic and deliberately does not expose its business
+Session through generic recorder semantics. It therefore does not append Workflow
+Session tool-call telemetry or refresh Goal liveness. Standard request/audit
+telemetry may still be retained outside the Workflow Session.
+
+The reader rejects a different current project, response identity, missing evidence
+basis, a missing/invalid external-report section, or a nondeterministic/LLM summary.
+The JSON output retains the bounded `handoff_brief`, including incomplete basis,
+unknown reports and incomplete source coverage. A successful read means only that
+the brief was obtained; inspect current project rules, files, Git status, Jobs and
+unknown operations before continuing. The command does not select a Session by
+directory or recency, bind the new local conversation, mark work complete, replay
+an operation, install a Hook, or write a handoff file.
 
 This is a deliberate recovery command, not automatic SessionStart injection.
 It requires an already selected Workflow Session and the normal authorized

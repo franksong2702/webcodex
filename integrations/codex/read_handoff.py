@@ -22,7 +22,7 @@ def read_handoff(config, timeout=6, current_dir=None):
     request = urllib.request.Request(
         config["server_url"].rstrip("/") + "/api/tools/call",
         data=json.dumps({
-            "tool": "session_handoff_summary",
+            "tool": "session_handoff_state",
             "params": {
                 "project": config["project"],
                 "session_id": config["workflow_session_id"],
@@ -52,6 +52,15 @@ def read_handoff(config, timeout=6, current_dir=None):
     if (not isinstance(brief.get("basis"), dict)
             or not isinstance(brief["basis"].get("complete"), bool)):
         raise AdapterError("handoff_basis_missing")
+    external = brief.get("external_observations")
+    coverage = external.get("coverage") if isinstance(external, dict) else None
+    if (not isinstance(external, dict)
+            or external.get("provenance") != "external_report"
+            or not isinstance(coverage, dict)
+            or coverage.get("complete") is not False):
+        raise AdapterError("handoff_external_observations_missing")
+    if brief.get("deterministic") is not True or brief.get("llm_summary") is not False:
+        raise AdapterError("handoff_contract_invalid")
     return {
         "status": "read",
         "project": output["project"],

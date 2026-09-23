@@ -1022,6 +1022,23 @@ fn tool_call_project_accessor_covers_project_tool_specs() {
     )
     .unwrap();
     assert_eq!(handoff.project(), Some("agent:oe:private-drop"));
+
+    // Adapter-only handoff state keeps its exact business target but never
+    // exposes that Session through the generic recorder projection.
+    let handoff_state = ToolCall::from_tool_name(
+        "session_handoff_state",
+        json!({"session_id": "wc_sess_x", "project": "agent:oe:private-drop"}),
+    )
+    .unwrap();
+    assert_eq!(handoff_state.project(), Some("agent:oe:private-drop"));
+    assert_eq!(handoff_state.session_id(), None);
+    assert!(is_model_hidden_tool_name("session_handoff_state"));
+    assert!(runtime_tool_requires_explicit_business_session(
+        "session_handoff_state"
+    ));
+    let activity = runtime_tool_activity_semantics("session_handoff_state");
+    assert_eq!(activity.presentation.as_str(), "support");
+    assert!(!activity.interaction.is_meaningful());
 }
 
 #[test]

@@ -31,6 +31,22 @@ impl ToolRuntime {
                 )
                 .await
             }
+            ToolCall::SessionHandoffState {
+                project,
+                session_id,
+            } => {
+                self.session_handoff_summary(
+                    session_id,
+                    Some(project),
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    auth,
+                )
+                .await
+            }
             _ => unreachable!("non-handoff tool routed to handoff dispatcher"),
         }
     }

@@ -5632,6 +5632,13 @@ impl ToolCallAuditProjection for ToolCall {
                 "diagnostic": diagnostic,
                 "limit": limit,
             }),
+            Self::SessionHandoffState {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+            }),
             Self::StartSession {
                 project,
                 title,
