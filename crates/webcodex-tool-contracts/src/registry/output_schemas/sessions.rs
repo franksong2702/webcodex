@@ -6,14 +6,44 @@ use webcodex_core::workflow_session_contract::{
 
 use super::common::{
     array_schema, cargo_test_count_assertion_schema, continuation_feedback_schema,
-    evidence_history_schema, evidence_integrity_schema, handoff_brief_schema,
-    job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_summary_schema,
-    schema_type, session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
-    session_mode_schema, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
+    evidence_history_schema, evidence_integrity_schema, external_observation_schema,
+    handoff_brief_schema, job_lifecycle_summary_schema, nullable_schema, open_object_schema,
+    permission_summary_schema, schema_type, session_execution_context_schema,
+    session_guards_schema, session_lifecycle_schema, session_mode_schema, task_outcome_schema,
+    validation_delta_schema, wrapped_output_schema,
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "record_external_observation" => Some(wrapped_output_schema(vec![
+            ("session_id", schema_type("string", "Exact Workflow Session.")),
+            ("project", schema_type("string", "Exact authorized Project.")),
+            ("provenance", schema_type("string", "Always external_report; not native execution evidence.")),
+            ("inserted", schema_type("boolean", "False for an identical retained replay.")),
+            ("observation", external_observation_schema("Bounded external claim; missing exit_code produces unknown.")),
+        ])),
+        "list_external_observations" => Some(wrapped_output_schema(vec![
+            ("session_id", schema_type("string", "Exact Workflow Session.")),
+            ("project", schema_type("string", "Exact authorized Project.")),
+            ("provenance", schema_type("string", "Always external_report; not native execution evidence.")),
+            ("coverage", json!({
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Capture/ordering truth for this external-report projection. The first adapter has no durable source sequence, so completeness cannot be proven.",
+                "properties": {
+                    "complete": {"type": "boolean", "const": false},
+                    "reason": {"type": "string", "enum": ["source_sequence_unavailable"]},
+                    "ordering": {"type": "string", "enum": ["server_recorded_at_then_identity"]}
+                },
+                "required": ["complete", "reason", "ordering"]
+            })),
+            ("observations", json!({
+                "type": "array",
+                "maxItems": 256,
+                "items": external_observation_schema("Untrusted external report."),
+                "description": "At most 256 retained reports. Ordering is server recorded-at plus identity, not proven source execution order."
+            })),
+        ])),
         "start_session" => Some(wrapped_output_schema(vec![
             (
                 "success",
@@ -252,11 +282,11 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         "validation_summary" => Some(validation_summary_tool_output_schema()),
         "present_work_result" | "work_result_state" => Some(wrapped_output_schema(vec![(
             "work_result",
-            open_object_schema("Bounded Work Result for one exact project-scoped Workflow Session. Initial presentation may include frozen final_changes; explicit state reads return only live workspace, validation, and review domains."),
+            open_object_schema("Bounded Work Result for one exact project-scoped Workflow Session. Presentation and explicit App state reads expose live workspace, validation, review, and Session activity; after a non-blocking current-attempt finish_coding_task closeout they may also expose the retained sealed final_changes snapshot."),
         )])),
         "changes_file_diff" => Some(wrapped_output_schema(vec![(
             "changes_file_diff",
-            open_object_schema("Bounded lazy unified diff for one advertised path in the initial Work Result frozen snapshot."),
+            open_object_schema("Bounded lazy unified diff for one advertised path in the Work Result sealed final snapshot."),
         )])),
         "post_session_message" => Some(wrapped_output_schema(vec![
             ("success", schema_type("boolean", "Always true on success.")),
@@ -266,9 +296,11 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "message_id",
-                schema_type("string", "Created wc_msg_* message id."),
+                schema_type("string", "Created or replayed wc_msg_* message id."),
             ),
             ("message", open_object_schema("Created session message.")),
+            ("replayed", schema_type("boolean", "True for an exact delivery_key retry that returned the original message.")),
+            ("state_changed", schema_type("boolean", "True only when this call created the message.")),
         ])),
         "post_peer_message" => Some(wrapped_output_schema(vec![
             ("success", schema_type("boolean", "Always true on success.")),
@@ -276,6 +308,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("sender_peer_id", schema_type("string", "Principal-scoped sender window identity.")),
             ("recipient_peer_id", schema_type("string", "Principal-scoped recipient window identity.")),
             ("requires_ack", schema_type("boolean", "Whether omission of the request-scoped ACK causes re-projection.")),
+            ("replayed", schema_type("boolean", "True for an exact delivery_key retry that returned the original message.")),
+            ("state_changed", schema_type("boolean", "True only when this call created the message.")),
         ])),
         "list_session_messages" => Some(wrapped_output_schema(vec![
             ("success", schema_type("boolean", "Always true on success.")),
@@ -663,7 +697,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "handoff_brief",
-                handoff_brief_schema("Compact deterministic task handoff for a new window, new Agent, or human receiver. It is a read-only projection over already-obtained Session, continuation, workspace, validation, Job, and guidance evidence; it is not Session replay and never restores hidden model context."),
+                handoff_brief_schema("Compact deterministic task handoff for a new window, new Agent, or human receiver. It includes a bounded read-only external_report section with explicit incomplete capture coverage, separate from native Session, validation, and Job evidence; it is not Session replay and never restores hidden model context."),
             ),
         ])),
         _ => None,

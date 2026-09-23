@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { GoalWorkbench } from "../src/runtime-v2/components/GoalWorkbench.js";
+import { UiProvider } from "../src/ui/UiProvider.js";
 import type { RuntimeV2Client } from "../src/runtime-v2/api/client.js";
 
 const goalId = "wc_goal_1234567890abcdef";
@@ -74,7 +75,7 @@ describe("Goal Workbench", () => {
     const onOpenAgent = vi.fn();
     const onOpenWindow = vi.fn();
     render(
-      <GoalWorkbench
+      <UiProvider><GoalWorkbench
         client={client()}
         language="en"
         projects={[{ id: "agent:special:webcodex", client_id: "special", name: "WebCodex", path: "/root/git/webcodex", connected: true }]}
@@ -84,12 +85,16 @@ describe("Goal Workbench", () => {
         onOpenAgent={onOpenAgent}
         onOpenWindow={onOpenWindow}
         onUnauthorized={vi.fn()}
-      />,
+      /></UiProvider>,
     );
 
     expect(await screen.findByRole("heading", { name: "Runtime V2 Goal Workbench" })).toBeTruthy();
     expect(screen.getByText("2 / 5 steps completed")).toBeTruthy();
     expect(screen.getByTestId("goal-step-implement").textContent).toContain("Implement read-only Goal Workbench");
+    expect(screen.getByTestId("goal-step-survey").hasAttribute("data-completed")).toBe(true);
+    expect(screen.getByTestId("goal-step-implement").hasAttribute("data-progress")).toBe(true);
+    expect(screen.getByTestId("goal-step-validate").hasAttribute("data-progress")).toBe(false);
+    expect(screen.getByTestId("goal-step-survey").querySelector(".mantine-Stepper-stepCompletedIcon svg")).toBeTruthy();
     expect(screen.getAllByText("Goal Controller").length).toBeGreaterThan(0);
     expect(screen.getByText("ALL 1 / 2")).toBeTruthy();
     expect(screen.getByText("Goal implementation Session")).toBeTruthy();
@@ -102,13 +107,13 @@ describe("Goal Workbench", () => {
     expect(onOpenAgent).toHaveBeenCalledWith(controllerId);
     fireEvent.click(screen.getByText(/Window aaaaaaaaaa/));
     expect(onOpenWindow).toHaveBeenCalledWith(windowKey);
-    fireEvent.click(screen.getByRole("tab", { name: /Sessions/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Sessions/ }));
     expect(onSurfaceChange).toHaveBeenCalledWith("sessions");
   });
 
   it("keeps Goal list and detail read-only", async () => {
     const rendered = render(
-      <GoalWorkbench
+      <UiProvider><GoalWorkbench
         client={client()}
         language="en"
         projects={[]}
@@ -118,7 +123,7 @@ describe("Goal Workbench", () => {
         onOpenAgent={vi.fn()}
         onOpenWindow={vi.fn()}
         onUnauthorized={vi.fn()}
-      />,
+      /></UiProvider>,
     );
     await screen.findByRole("heading", { name: "Runtime V2 Goal Workbench" });
     expect(rendered.container.querySelector("input[aria-label='Search Goals']")).toBeTruthy();

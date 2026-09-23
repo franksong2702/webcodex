@@ -1801,6 +1801,83 @@ async fn apply_text_edits_empty_batch_proves_preflight_no_effect_without_fake_in
 }
 
 #[tokio::test]
+async fn apply_text_edits_duplicate_anchor_advisory_survives_runner_projection() {
+    for dry_run in [true, false] {
+        let runtime = runtime_with_agent_project("ate-advisory");
+        register_agent(
+            &runtime,
+            "ate-advisory",
+            None,
+            RunnerCapabilities {
+                file_write: true,
+                apply_text_edit_local_guard_without_sha: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let project = agent_test_project_id("ate-advisory");
+        let revision =
+            seed_read_revision(&runtime, &project, "EDIT_PROBE.txt", &"a".repeat(64)).await;
+        let mut change = edit_change(
+            "EDIT_PROBE.txt",
+            "unused",
+            vec![text_edit(
+                ApplyTextEditKind::InsertBefore,
+                None,
+                Some("anchor"),
+                Some("anchor"),
+            )],
+        );
+        change.expected_read_revision = Some(revision);
+        let runtime_for_task = runtime.clone();
+        let task = tokio::spawn(async move {
+            runtime_for_task
+                .apply_text_edits(project, vec![change], Some(dry_run))
+                .await
+        });
+        let req = wait_for_patch_agent_request(&runtime, "ate-advisory").await;
+        let warning = "Inserted text already contains the full anchor at the insertion boundary; the original anchor remains.";
+        runtime
+            .runner_registry
+            .complete(RunnerResultRequest {
+                client_id: "ate-advisory".to_string(),
+                runner_instance_id: "inst".to_string(),
+                request_id: req.request_id,
+                exit_code: Some(0),
+                stdout: Some(
+                    serde_json::json!({
+                        "dry_run": dry_run, "applied_count": 1,
+                        "changed": !dry_run, "state_changed": !dry_run,
+                        "execution_state": "completed", "would_change": true,
+                        "files": [{
+                            "index": 0, "kind": "edit", "path": "EDIT_PROBE.txt", "to_path": null,
+                            "old_sha256": "a".repeat(64), "new_sha256": "b".repeat(64),
+                            "changed": !dry_run, "would_change": true,
+                            "edits": [{"index": 0, "kind": "insert_before", "old_start_line": 1,
+                                "old_end_line": 1, "new_line_count": 1, "warning": warning}]
+                        }],
+                        "changed_paths": if dry_run { vec![] } else { vec!["EDIT_PROBE.txt"] }
+                    })
+                    .to_string(),
+                ),
+                stderr: Some(String::new()),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration_ms: Some(1),
+                error: None,
+            })
+            .await
+            .unwrap();
+        let result = task.await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.output["files"][0]["edits"][0]["warning"], warning);
+        assert_eq!(result.output["changed"], !dry_run);
+        assert_eq!(result.output["state_changed"], !dry_run);
+        assert_eq!(result.output["execution_state"], "completed");
+    }
+}
+
+#[tokio::test]
 async fn apply_text_edits_dry_run_does_not_write() {
     let runtime = runtime_with_agent_project("ate-dry");
     register_agent(

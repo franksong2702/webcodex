@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { webResponse, desktopState } from './fixtures.mjs';
+import { webResponse, desktopState, adminDashboard } from './fixtures.mjs';
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(directory, '../..');
 
@@ -20,6 +20,7 @@ export async function startFixtureServer() {
       if (url.pathname === '/__fixture/desktop-state') return send(200, desktopState(url.searchParams.get('state') === 'disconnected'));
       if (url.pathname === '/__fixture/requests') return send(200, requests);
       if (url.pathname === '/__fixture/health') return send(200, { fixture: true, pid: process.pid });
+      if (url.pathname === '/api/admin/dashboard' && req.method === 'POST') return send(200, adminDashboard);
       if (url.pathname.startsWith('/api/runtime-console/')) {
         let body = '';
         for await (const chunk of req) { body += chunk; if (body.length > 65536) return send(413, { error: 'Fixture request bound' }); }
@@ -28,11 +29,13 @@ export async function startFixtureServer() {
         if (route === 'workflow-session-observe' && payload.observation_token) await new Promise(resolve => setTimeout(resolve, 1000));
         return send(200, webResponse(route, payload));
       }
-      if (url.pathname === '/') return send(200, '<!doctype html><title>Isolated UI fixtures</title><h1>Fixture only — no native backend</h1><a href="/runtime/">WebUI</a> · <a href="/desktop/">Desktop renderer</a>', 'text/html');
+      if (url.pathname === '/') return send(200, '<!doctype html><title>Isolated UI fixtures</title><h1>Fixture only — no native backend</h1><a href="/runtime/">WebUI</a> · <a href="/desktop/">Desktop renderer</a> · <a href="/admin/">Admin</a>', 'text/html');
       if (url.pathname === '/desktop-shim.js') return send(200, fs.readFileSync(path.join(directory, 'desktop-shim.js')), 'text/javascript');
       const desktop = url.pathname.startsWith('/desktop/') || url.pathname.startsWith('/assets/');
-      let relative = desktop ? (url.pathname.replace(/^\/desktop\//, '') || 'index.html') : url.pathname.replace(/^\/runtime\/?/, '');
-      if (!desktop) relative = ({ '': 'runtime.html', 'app.js': 'runtime.js', 'styles.css': 'runtime.css' })[relative] || relative;
+      const admin = url.pathname.startsWith('/admin/');
+      let relative = desktop ? (url.pathname.replace(/^\/desktop\//, '') || 'index.html') : admin ? url.pathname.replace(/^\/admin\/?/, '') : url.pathname.replace(/^\/runtime\/?/, '');
+      if (admin) relative = ({ '': 'admin.html', 'app.js': 'admin.js', 'styles.css': 'admin.css' })[relative] || relative;
+      else if (!desktop) relative = ({ '': 'runtime.html', 'app.js': 'app.js', 'styles.css': 'styles.css' })[relative] || relative;
       if (relative.startsWith('/assets/')) relative = relative.slice(1);
       const base = path.join(root, desktop ? 'apps/desktop/dist' : 'frontend/dist');
       const file = path.resolve(base, relative);

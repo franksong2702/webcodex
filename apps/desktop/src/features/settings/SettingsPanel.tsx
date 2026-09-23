@@ -7,6 +7,8 @@ import { useProduct } from "../../i18n/product";
 import type { RunnerSettings } from "../../models/topology";
 import { ComputerPermissions } from "./ComputerPermissions";
 import { PowerShellInstallGuidance } from "./PowerShellInstallGuidance";
+import { APPEARANCES, useAppearance } from "../../hooks/useAppearance";
+import { AccentPicker } from "../../components/AccentPicker";
 
 export function SettingsPanel({
   state,
@@ -20,6 +22,7 @@ export function SettingsPanel({
   onStopRuntime?: () => void;
 }) {
   const { locale, setLocale, t } = useLocale();
+  const { appearance, setAppearance, accent, setAccent } = useAppearance();
   const p = useProduct();
   const [runnerSettings, setRunnerSettings] = useState<RunnerSettings | null>(null);
   const [restartingRunner, setRestartingRunner] = useState(false);
@@ -77,6 +80,8 @@ export function SettingsPanel({
       <section className="settings-section" aria-labelledby="settings-general-title">
         <h2 id="settings-general-title">{p("general")}</h2>
         <div className="setting-row"><label htmlFor="desktop-settings-locale">{t("locale.label")}</label><select id="desktop-settings-locale" value={locale} onChange={event => setLocale(event.target.value as typeof locale)} data-webcodex-control="locale">{LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.label}</option>)}</select></div>
+        <div className="setting-row"><label htmlFor="desktop-settings-appearance">{t("appearance.label")}</label><select id="desktop-settings-appearance" value={appearance} onChange={event => setAppearance(event.target.value as typeof appearance)} data-webcodex-control="appearance">{APPEARANCES.map(value => <option key={value} value={value}>{t(`appearance.${value}`)}</option>)}</select></div>
+        <div className="setting-row"><span>{t("accent.label")}</span><AccentPicker color={accent} onChange={setAccent} /></div>
         <div className="setting-row"><label htmlFor="desktop-launch-at-login">{t("settings.launchAtLogin")}</label><input id="desktop-launch-at-login" type="checkbox" checked={launchAtLogin ?? false} onChange={event => void updateLaunchAtLogin(event.target.checked)} disabled={launchAtLogin === null || savingLaunchAtLogin} data-webcodex-control="launch-at-login" /></div>
         {launchAtLoginError && <SettingsError error={launchAtLoginError} />}
         <div className="setting-row"><span>{p("background")}</span><span className="setting-value">{p("keepRunning")}</span></div>
@@ -125,4 +130,3 @@ function SettingsError({ error }: { error: DesktopError }) {
     </div>
   );
 }
-

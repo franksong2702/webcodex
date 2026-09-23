@@ -173,6 +173,8 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "provider_id" => json!("codex"),
         "run_id" => json!("wc_agent_run_sample_1234"),
         "shell_id" => json!("wc_shell_123"),
+        "adapter_id" | "event_id" => json!("a".repeat(64)),
+        "observed_tool" => json!("Bash"),
         "session_id" => json!(format!("wc_sess_{}", "1".repeat(32))),
         "checkpoint_id" => json!("wc_ckpt_1234"),
         "confirm" => json!(true),

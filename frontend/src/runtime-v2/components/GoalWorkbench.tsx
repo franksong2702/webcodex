@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowRight,
   ArrowUpRight,
   Bot,
   Check,
@@ -14,14 +15,18 @@ import {
   TerminalSquare,
   Users,
 } from "lucide-react";
+import { Progress, SegmentedControl, Stepper, TextInput } from "@mantine/core";
+import { motion } from "motion/react";
 import { useMemo, useState } from "react";
 import type { RuntimeLanguage } from "../../runtime_i18n.js";
 import { translate } from "../../runtime_i18n.js";
 import type { RuntimeV2Client } from "../api/client.js";
 import { absoluteTime, projectDisplayName, relativeTime, shortId } from "../model/format.js";
-import type { GoalDetailResponse, GoalListItem, GoalStep, GoalTask, GoalWait } from "../model/goals.js";
+import type { GoalDetailResponse, GoalListItem, GoalTask, GoalWait } from "../model/goals.js";
 import type { ProjectRow } from "../model/types.js";
+import { ProjectPicker } from "../../ui/ProjectPicker.js";
 import { useGoalWorkspace } from "../state/useGoalWorkspace.js";
+import { IconButton } from "./ui/IconButton.js";
 import type { SessionLocation } from "../state/useSessionWorkspace.js";
 
 export type WorkSurface = "goals" | "sessions";
@@ -37,16 +42,6 @@ type Props = {
   onOpenWindow: (windowKey: string) => void;
   onUnauthorized: () => void;
 };
-
-const STEP_GLYPH: Record<string, string> = {
-  completed: "✓",
-  in_progress: "→",
-  pending: "·",
-};
-
-function stepClass(step: GoalStep): string {
-  return step.status === "completed" ? "completed" : step.status === "in_progress" ? "current" : "pending";
-}
 
 function lifecycleClass(lifecycle: string): string {
   return lifecycle === "active" ? "active" : lifecycle === "completed" ? "completed" : "cancelled";
@@ -74,16 +69,20 @@ function WorkSurfaceSwitch({
   language: RuntimeLanguage;
 }) {
   const t = (value: string) => translate(value, language);
-  return (
-    <div className="work-surface-switch" role="tablist" aria-label={t("Work level")}>
-      <button type="button" role="tab" aria-selected={surface === "goals"} className={surface === "goals" ? "active" : ""} onClick={() => onSurfaceChange("goals")}>
-        <Flag size={13} /> {t("Goals")}
-      </button>
-      <button type="button" role="tab" aria-selected={surface === "sessions"} className={surface === "sessions" ? "active" : ""} onClick={() => onSurfaceChange("sessions")}>
-        <Activity size={13} /> {t("Sessions")}
-      </button>
-    </div>
-  );
+  return <SegmentedControl<WorkSurface>
+    className="work-surface-control"
+    aria-label={t("Work level")}
+    value={surface}
+    onChange={onSurfaceChange}
+    data={[
+      { value: "goals", label: <span className="work-surface-label"><Flag size={13} />{t("Goals")}</span> },
+      { value: "sessions", label: <span className="work-surface-label"><Activity size={13} />{t("Sessions")}</span> },
+    ]}
+    fullWidth
+    size="xs"
+    radius="md"
+    withItemsBorders={false}
+  />;
 }
 
 export { WorkSurfaceSwitch };
@@ -131,6 +130,7 @@ export function GoalWorkbench({
       onClick={() => state.selectGoal(goal.goal_id)}
       key={goal.goal_id}
     >
+      {state.selectedGoalId === goal.goal_id && <motion.span className="ui-selection-rail" layoutId="runtime-goal-rail" aria-hidden="true" />}
       <span className={"goal-list-icon " + lifecycleClass(goal.lifecycle)}><Flag size={14} /></span>
       <span className="goal-list-copy">
         <strong>{goal.title}</strong>
@@ -154,15 +154,14 @@ export function GoalWorkbench({
       <aside className="work-list-panel goal-list-panel">
         <div className="work-list-header goal-list-header">
           <div><span className="eyebrow">{t("Durable work")}</span><h1>{t("Work")}</h1></div>
-          <button className="icon-button" type="button" onClick={state.refresh} aria-label={t("Refresh")}><RefreshCw size={14} /></button>
+          <IconButton label={t("Refresh")} onClick={state.refresh}><RefreshCw size={16} /></IconButton>
           <WorkSurfaceSwitch surface={surface} onSurfaceChange={onSurfaceChange} language={language} />
         </div>
         <div className="goal-list-filters">
-          <label><Search size={14} /><input aria-label={t("Search Goals")} value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t("Search Goals…")} /></label>
-          <select aria-label={t("Filter Goals by Project")} value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)}>
-            <option value="">{t("All Projects")}</option>
-            {projects.map((project) => <option value={project.id} key={project.id}>{projectDisplayName(project.name, project.id)}</option>)}
-          </select>
+          <TextInput type="search" aria-label={t("Search Goals")} leftSection={<Search size={14} />}
+            value={search} onChange={(event) => setSearch(event.currentTarget.value)} placeholder={t("Search Goals…")} />
+          <ProjectPicker label={t("Filter Goals by Project")} allLabel={t("All Projects")} emptyLabel={t("No matching projects")} searchLabel={t("Search projects")}
+            value={projectFilter} onChange={setProjectFilter} options={projects.map((project) => ({ value: project.id, label: projectDisplayName(project.name, project.id), detail: project.path }))} />
         </div>
         <div className="work-list-scroll goal-list-scroll">
           {state.truncated && <div className="inventory-note">{t("Goal inventory is bounded by the durable store.")}</div>}
@@ -174,7 +173,7 @@ export function GoalWorkbench({
         </div>
       </aside>
 
-      <main className="goal-main">
+      <main className="goal-main ui-workbench-surface">
         {detail ? (
           <GoalDetail
             detail={detail}
@@ -188,13 +187,12 @@ export function GoalWorkbench({
           <div className="empty-work">
             <Flag size={23} />
             <h2>{state.detailAvailability === "loading" ? t("Loading Goal…") : t("Select a Goal")}</h2>
-            <p>{t("Goals are durable work truth above Sessions, workers, waits and Window evidence.")}</p>
           </div>
         )}
       </main>
 
       <aside className="inspector goal-inspector">
-        <div className="inspector-header"><div><span className="eyebrow">{t("Goal context")}</span><strong>{detail?.goal.summary.title || t("No Goal selected")}</strong></div></div>
+        <div className="inspector-header"><div><strong>{t("Goal context")}</strong></div></div>
         <div className="inspector-content">
           {detail && <GoalInspector detail={detail} controller={controller} language={language} onOpenAgent={onOpenAgent} />}
         </div>
@@ -220,6 +218,8 @@ function GoalDetail({
 }) {
   const t = (value: string) => translate(value, language);
   const plan = detail.goal_plan;
+  const firstUnfinishedStep = plan.steps.findIndex((step) => step.status !== "completed");
+  const activeStep = firstUnfinishedStep === -1 ? plan.steps.length : firstUnfinishedStep;
   const continuity = plan.continuity;
   const activity = plan.activity;
   return (
@@ -242,19 +242,26 @@ function GoalDetail({
               <div><strong>{t("Plan")}</strong><small>{plan.completed_step_count} / {plan.total_step_count} {t("steps completed")}</small></div>
               <strong>{plan.total_step_count ? Math.round(plan.completed_step_count / plan.total_step_count * 100) : 0}%</strong>
             </div>
-            <div className="goal-progress-track"><span style={{ width: `${plan.total_step_count ? plan.completed_step_count / plan.total_step_count * 100 : 0}%` }} /></div>
-            <div className="goal-step-list">
+            <Progress className="goal-plan-progress" aria-label={t("Plan")}
+              value={plan.total_step_count ? plan.completed_step_count / plan.total_step_count * 100 : 0}
+              size={4} radius="xl" transitionDuration={200} />
+            <Stepper className="goal-plan-stepper" orientation="vertical" active={activeStep}
+              iconSize={30} size="sm" allowNextStepsSelect={false}
+              completedIcon={<Check size={16} strokeWidth={2} aria-hidden="true" />}
+              progressIcon={<ArrowRight size={16} strokeWidth={2} aria-hidden="true" />}>
               {plan.steps.map((step, index) => (
-                <div className={"goal-step " + stepClass(step)} key={step.id} data-testid={"goal-step-" + step.id}>
-                  <span>{STEP_GLYPH[step.status] || index + 1}</span>
-                  <div><strong>{step.title}</strong><small>{step.id} · {t(step.status)}</small></div>
-                </div>
+                <Stepper.Step key={step.id} data-testid={"goal-step-" + step.id}
+                  data-goal-status={step.status}
+                  color={step.status === "completed" ? "var(--ui-success)" : "var(--ui-accent)"}
+                  icon={index + 1} progressIcon={step.status === "in_progress" ? <ArrowRight size={16} strokeWidth={2} aria-hidden="true" /> : index + 1}
+                  label={step.title} description={`${step.id} · ${t(step.status)}`}
+                  aria-disabled="true" />
               ))}
-            </div>
+            </Stepper>
             {plan.progress_summary && <p className="goal-progress-summary">{plan.progress_summary}</p>}
           </section>
 
-          <div className="goal-status-grid">
+          <div className="goal-status-grid" aria-label={t("Goal activity")}>
             <section className="goal-status-card">
               <div className="goal-section-title"><Bot size={16} /><strong>{t("Controller")}</strong></div>
               {controller ? (
@@ -282,7 +289,7 @@ function GoalDetail({
             </section>
           </div>
 
-          <GoalSection title="Sessions" icon={<Activity size={16} />} count={detail.sessions.length}>
+          <GoalSection title={t("Sessions")} icon={<Activity size={16} />} count={detail.sessions.length}>
             <div className="goal-resource-list">
               {detail.sessions.map((session) => (
                 <button className="goal-resource-row" type="button" key={session.session_id} onClick={() => onOpenSession({ projectId: session.project_id, projectName: session.project_name || session.project_id, runner: session.client_id, sessionId: session.session_id })}>
@@ -296,22 +303,20 @@ function GoalDetail({
             </div>
           </GoalSection>
 
-          <GoalSection title="Workers" icon={<Users size={16} />} count={detail.tasks.length}>
+          {!!detail.tasks.length && <GoalSection title={t("Workers")} icon={<Users size={16} />} count={detail.tasks.length}>
             <div className="goal-resource-list">
               {detail.tasks.map((task) => <GoalTaskRow key={task.summary.task_id} task={task} language={language} onOpenAgent={onOpenAgent} />)}
-              {!detail.tasks.length && <div className="empty-inline">{t("No correlated AgentTasks")}</div>}
             </div>
-          </GoalSection>
+          </GoalSection>}
 
-          <GoalSection title="Join / fan-in" icon={<GitMerge size={16} />} count={detail.waits.length}>
+          {(detail.waits.length > 0 || detail.waits_truncated) && <GoalSection title={t("Join / fan-in")} icon={<GitMerge size={16} />} count={detail.waits.length}>
             <div className="goal-wait-list">
               {detail.waits.map((wait) => <GoalWaitRow key={wait.wait_id} wait={wait} language={language} />)}
-              {!detail.waits.length && <div className="empty-inline">{t("No Goal-scoped AgentWait")}</div>}
               {detail.waits_truncated && <div className="inventory-note">{t("Goal Wait inventory is bounded.")}</div>}
             </div>
-          </GoalSection>
+          </GoalSection>}
 
-          <GoalSection title="Windows" icon={<Monitor size={16} />} count={detail.windows.length}>
+          {!!detail.windows.length && <GoalSection title={t("Windows")} icon={<Monitor size={16} />} count={detail.windows.length}>
             <div className="goal-resource-list">
               {detail.windows.map((window) => (
                 <button className="goal-resource-row" type="button" key={window.client_window_key} onClick={() => onOpenWindow(window.client_window_key)}>
@@ -321,9 +326,8 @@ function GoalDetail({
                   <time>{absoluteTime(window.last_meaningful_activity_at_ms || window.last_seen_at_ms)}</time><ArrowUpRight size={14} />
                 </button>
               ))}
-              {!detail.windows.length && <div className="empty-inline">{t("No linked Window evidence")}</div>}
             </div>
-          </GoalSection>
+          </GoalSection>}
         </div>
       </div>
     </>
@@ -363,7 +367,9 @@ function GoalWaitRow({ wait, language }: { wait: GoalWait; language: RuntimeLang
     <details className="goal-wait-row">
       <summary><GitMerge size={15} /><span><strong>{waitLabel(wait)}</strong><small>{shortId(wait.wait_id)} · {t(wait.state)}</small></span><span className="goal-resource-state">{t(wait.mode)}</span></summary>
       <div className="goal-wait-detail">
-        <div className="goal-join-progress"><span style={{ width: `${wait.source_count ? Math.min(100, wait.match_count / wait.source_count * 100) : 0}%` }} /></div>
+        <Progress aria-label={t("Join / fan-in")}
+          value={wait.source_count ? Math.min(100, wait.match_count / wait.source_count * 100) : 0}
+          size={4} radius="xl" transitionDuration={200} />
         {wait.sources.map((source) => {
           const match = wait.matches.find((entry) => entry.task_id === source.task_id);
           return <div className="goal-wait-source" key={source.task_id}><span>{match ? <Check size={13} /> : <CircleDot size={13} />}</span><code>{shortId(source.task_id)}</code><small>{match ? t(match.terminal_task_state) : t("Waiting")}</small></div>;
@@ -379,7 +385,7 @@ function GoalInspector({ detail, controller, language, onOpenAgent }: { detail: 
   const plan = detail.goal_plan;
   return (
     <>
-      <section className="context-hero goal-context-hero"><div className="context-kicker"><Flag size={13} /> {t(plan.lifecycle)}</div><strong>{goal.summary.title}</strong><p>{goal.objective}</p></section>
+      {goal.objective && <p className="goal-context-objective">{goal.objective}</p>}
       <section className="inspector-section"><h3>{t("Goal identity")}</h3><div className="fact-list"><div><span>{t("Goal")}</span><strong><code>{goal.summary.goal_id}</code></strong></div><div><span>{t("Revision")}</span><strong>{plan.revision}</strong></div><div><span>{t("Checkpoint")}</span><strong>{absoluteTime(plan.checkpoint_at_unix_ms || undefined)}</strong></div><div><span>{t("Updated")}</span><strong>{absoluteTime(plan.updated_at_unix_ms)}</strong></div></div></section>
       <section className="inspector-section"><h3>{t("Projects")}</h3><div className="goal-inspector-list">{detail.projects.map((project) => <div key={project.id}><strong>{projectDisplayName(project.name, project.id)}</strong><small>{project.path || project.id}</small></div>)}{!detail.projects.length && <div className="empty-inline">{t("No authorized Project correlation")}</div>}</div></section>
       <section className="inspector-section"><h3>{t("Completion conditions")}</h3><ol className="goal-condition-list">{goal.plan.completion_conditions.map((condition, index) => <li key={index}>{condition}</li>)}</ol></section>

@@ -39,6 +39,20 @@ class PathRiskFixtureTests(unittest.TestCase):
         self.assertEqual(result["needs_windows"], "false")
         self.assertEqual(result["needs_macos"], "false")
 
+    def test_shared_frontend_source_and_dependencies_also_check_desktop(self) -> None:
+        for path in (
+            "frontend/src/ui/ProjectPicker.tsx",
+            "frontend/src/ui/foundation.css",
+            "frontend/package.json",
+            "frontend/package-lock.json",
+        ):
+            with self.subTest(path=path):
+                result = classify(path)
+                self.assertEqual(result["needs_frontend"], "true")
+                self.assertEqual(result["needs_desktop_frontend"], "true")
+                self.assertEqual(result["needs_windows"], "false")
+                self.assertEqual(result["needs_macos"], "false")
+
     def test_desktop_frontend_isolated_from_main_frontend_and_native(self) -> None:
         result = classify("apps/desktop/src/main.tsx")
         self.assertEqual(result["needs_frontend"], "false")

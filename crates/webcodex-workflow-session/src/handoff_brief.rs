@@ -34,12 +34,19 @@ pub struct HandoffBriefInput<'a> {
     pub validation_requested: bool,
     pub validation: Option<&'a Value>,
     pub jobs: Option<&'a Value>,
+    /// Read-only retained external reports for this exact Session Project.
+    /// They remain separate from native progress, validation, and closeout.
+    pub external_observations: Option<&'a Value>,
     /// The Workflow Session summary carries exact open-message counts. This
     /// flag lets callers report a stable gap if that guidance snapshot was not
     /// available instead of silently treating it as empty.
     pub guidance_available: bool,
     /// Internal caller fence; the numeric revisions are never projected.
     pub session_changed_during_snapshot: bool,
+    /// Separate external-evidence fence. External reports intentionally do not
+    /// mutate the native Session revision, so handoff callers must track this
+    /// plane independently when they project it into the same recovery brief.
+    pub external_observations_changed_during_snapshot: bool,
     /// Optional existing deterministic action projection. Only fixed known
     /// templates are reused; arbitrary strings are never copied into the brief.
     pub existing_suggested_actions: Option<&'a Value>,
@@ -93,6 +100,23 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
     let workspace = project_workspace(input.workspace_requested, input.workspace);
     let mut validation = project_validation(input.validation_requested, input.validation);
     let jobs = project_jobs(input.jobs);
+    let external_observations = input.external_observations.cloned().unwrap_or_else(|| {
+        json!({
+            "status": "unavailable",
+            "reason_code": "projection_unavailable",
+            "provenance": "external_report",
+            "coverage": {
+                "complete": false,
+                "reason": "read_unavailable",
+                "ordering": "server_recorded_at_then_identity",
+            },
+            "total": null,
+            "returned": null,
+            "truncated": null,
+            "unknown_count": null,
+            "observations": null,
+        })
+    });
 
     let changes = bounded_path_list(
         attempt.and_then(|value| value.pointer("/changes/changed_paths")),
@@ -155,6 +179,9 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
     let mut basis_reasons = BTreeSet::new();
     if input.session_changed_during_snapshot {
         basis_reasons.insert("session_changed_during_snapshot");
+    }
+    if input.external_observations_changed_during_snapshot {
+        basis_reasons.insert("external_observations_changed_during_snapshot");
     }
     if !continuation_available {
         basis_reasons.insert("continuation_unavailable");
@@ -232,6 +259,7 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
             "recent_files": recent_files,
         },
         "validation": validation.value,
+        "external_observations": external_observations,
         "attention": {
             "workspace_conflict": workspace.conflicted,
             "active_jobs": jobs.active,
@@ -779,6 +807,11 @@ fn push_unique(actions: &mut Vec<String>, action: &str) {
 }
 
 fn enforce_hard_limit(brief: &mut Value) {
+    // External claims are lower priority than native task/validation context.
+    // Retain the newest report when the byte budget can hold only one.
+    while handoff_brief_size(brief) >= HANDOFF_BRIEF_HARD_MAX_BYTES
+        && pop_external_observation(brief)
+    {}
     for pointer in [
         "/progress/recent_files",
         "/progress/changes",
@@ -799,6 +832,29 @@ fn enforce_hard_limit(brief: &mut Value) {
         handoff_brief_size(brief) < HANDOFF_BRIEF_HARD_MAX_BYTES,
         "handoff brief hard-limit reduction must retain a bounded core"
     );
+}
+
+fn pop_external_observation(brief: &mut Value) -> bool {
+    let Some(section) = brief
+        .pointer_mut("/external_observations")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let Some(observations) = section
+        .get_mut("observations")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    if observations.is_empty() {
+        return false;
+    }
+    observations.remove(0);
+    let returned = observations.len();
+    section.insert("returned".to_string(), json!(returned));
+    section.insert("truncated".to_string(), json!(true));
+    true
 }
 
 fn pop_list_item(brief: &mut Value, pointer: &str) -> bool {

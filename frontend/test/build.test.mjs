@@ -26,25 +26,22 @@ async function assertFile(directory, name) {
   assert.equal((await stat(resolve(directory, name))).isFile(), true, name);
 }
 
-test("Admin build is independent from the retired Runtime classic bundle", async () => {
+test("Admin React build emits the three fixed Server assets", async () => {
   const output = await mkdtemp(resolve(tmpdir(), "webcodex-admin-build-"));
   try {
     await exec(process.execPath, [adminBuild, "--out-dir", output]);
     const files = (await readdir(output)).sort();
-    assert.deepEqual(files, [
-      "admin.css",
-      "admin.html",
-      "admin.js",
-      "admin_controller.js",
-      "admin_mutation_controller.js",
-      "admin_mutation_view.js",
-      "admin_view.js",
-    ]);
+    assert.deepEqual(files, ["admin.css", "admin.html", "admin.js"]);
+    const adminHtml = await readFile(resolve(output, "admin.html"), "utf8");
+    assert.match(adminHtml, /id="root"/);
+    assert.match(adminHtml, /\/admin\/app\.js/);
+    assert.match(adminHtml, /\/admin\/styles\.css/);
     const admin = await readFile(resolve(output, "admin.js"), "utf8");
     await exec(process.execPath, ["--check", resolve(output, "admin.js")]);
-    assert.equal(/localStorage|sessionStorage|document\.cookie/.test(admin), false);
-    assert.equal(/innerHTML/.test(admin), false);
-    assert.match(admin, /textContent/);
+    assert.match(admin, /\/api\/admin\//);
+    assert.match(admin, /Administrator access/);
+    assert.equal(/document\.cookie/.test(admin), false);
+    await exec(process.execPath, [adminBuild, "--out-dir", output, "--check"]);
   } finally {
     await rm(output, { recursive: true, force: true });
   }

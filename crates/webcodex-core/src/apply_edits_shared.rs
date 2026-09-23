@@ -99,6 +99,11 @@ impl ApplyTextEditKind {
     }
 }
 
+/// Canonical model-facing advisory for the narrow duplicate-anchor insertion case.
+/// The Runner may report this evidence, but the Server projects only this exact text.
+pub const APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING: &str =
+    "Inserted text already contains the full anchor at the insertion boundary; the original anchor remains.";
+
 /// Optional source-line safety fence for one exact edit. Lines are 1-based and
 /// inclusive against the canonicalized original file content for the batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -138,6 +143,12 @@ pub struct ApplyTextEditInput {
     #[schemars(length(min = 1, max = 524288))]
     #[serde(default)]
     pub old_text: Option<String>,
+    /// Insertions preserve this text and the original anchor. On supporting
+    /// Runners, dry-run and successful results include files[].edits[].warning
+    /// when this text ends with the full anchor_text for insert_before or starts
+    /// with it for insert_after, after existing LF/CRLF canonicalization of both.
+    /// An anchor only in the middle does not warn; no other whitespace or fuzzy
+    /// comparison applies. The advisory never changes text, success, or change flags.
     #[schemars(length(max = 524288))]
     #[serde(default)]
     pub new_text: Option<String>,

@@ -224,6 +224,12 @@ impl ToolRuntime {
             .sessions
             .summary(&session_id, Some(HANDOFF_CLOSEOUT_SESSION_EVENT_LIMIT))
             .unwrap_or_else(|| summary.clone());
+        // External observations live in an intentionally separate evidence plane,
+        // so capture their own bounded snapshot inside the handoff window. The
+        // final comparison below detects accepted reports that arrive while the
+        // remaining workspace/Job/validation snapshots are assembled.
+        let external_observations =
+            self.handoff_external_observations(&session_id, summary.project.as_deref());
 
         // --- message board state ---
         let (discussion, guidance_available) =
@@ -464,6 +470,11 @@ impl ToolRuntime {
             output["validation"] = reconciliation.validation;
         }
 
+        let external_observations_changed_during_snapshot = external_observations
+            != self.handoff_external_observations(
+                &session_id,
+                projection_closeout_session.project.as_deref(),
+            );
         let session_changed_during_snapshot = observed_revision.is_none()
             || observed_revision != self.sessions.handoff_revision(&session_id);
         if session_changed_during_snapshot {
@@ -485,8 +496,10 @@ impl ToolRuntime {
             validation_requested: include_validation,
             validation: Some(&feedback_validation),
             jobs: output.get("jobs"),
+            external_observations: Some(&external_observations),
             guidance_available,
             session_changed_during_snapshot,
+            external_observations_changed_during_snapshot,
             existing_suggested_actions: output.get("suggested_next_actions"),
         });
 

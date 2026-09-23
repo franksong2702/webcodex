@@ -1742,6 +1742,64 @@ fn observe_jobs_wake_policy_defaults_and_validates() {
     }
 }
 
+#[test]
+fn observe_jobs_compact_ref_selector_is_additive_and_unambiguous() {
+    let raw = ToolCall::from_tool_name(
+        "observe_jobs",
+        json!({
+            "items": [{
+                "job_id": "wc_job_example",
+                "after_observation_token": "wj3_example"
+            }],
+            "summary_only": true
+        }),
+    )
+    .expect("classic observe_jobs path must remain supported");
+    assert!(matches!(
+        raw,
+        ToolCall::ObserveJobs {
+            summary_only: true,
+            ..
+        }
+    ));
+
+    let compact = ToolCall::from_tool_name(
+        "observe_jobs",
+        json!({"items": [{"observation_ref": "~j12"}]}),
+    )
+    .expect("compact observation_ref path must parse");
+    let ToolCall::ObserveJobs { items, .. } = compact else {
+        panic!("expected observe_jobs");
+    };
+    assert_eq!(items.len(), 1);
+    assert!(items[0].job_id.is_empty());
+    assert_eq!(items[0].observation_ref.as_deref(), Some("~j12"));
+    assert!(items[0].after_observation_token.is_none());
+
+    for invalid in [
+        json!({"items": [{}]}),
+        json!({"items": [{"job_id": "job", "observation_ref": "~j1"}]}),
+        json!({"items": [{"observation_ref": "~j1", "after_observation_token": "wj3_x"}]}),
+        json!({"items": [{"observation_ref": "j1"}]}),
+        json!({"items": [{"observation_ref": "~j2"}, {"observation_ref": "~j2"}]}),
+    ] {
+        assert!(
+            ToolCall::from_tool_name("observe_jobs", invalid).is_err(),
+            "ambiguous/invalid compact selector must fail closed"
+        );
+    }
+
+    let schema = crate::input_schema_for_tool("observe_jobs");
+    let branches = schema["properties"]["items"]["items"]["oneOf"]
+        .as_array()
+        .expect("observe_jobs item schema must expose selector oneOf");
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches[0]["required"], json!(["job_id"]));
+    assert_eq!(branches[1]["required"], json!(["observation_ref"]));
+    assert_eq!(branches[0]["additionalProperties"], false);
+    assert_eq!(branches[1]["additionalProperties"], false);
+}
+
 #[cfg(feature = "experimental-code-mode")]
 #[test]
 fn code_mode_exec_parses_outer_authority() {
@@ -1970,4 +2028,69 @@ fn project_handoff_typed_contract_preserves_identity_and_rejects_forged_receipts
             .unwrap();
         assert_eq!(spec.input_schema, input_schema_for_tool(name));
     }
+}
+
+#[test]
+fn external_observation_contract_uses_explicit_identities_and_no_raw_payload() {
+    let mut value = json!({"project":"agent:r:p", "session_id":format!("wc_sess_{}","1".repeat(32)),
+        "adapter_id":"a".repeat(64),"event_id":"b".repeat(64),"observed_tool":"Bash"});
+    let call = ToolCall::from_tool_name("record_external_observation", value.clone()).unwrap();
+    assert_eq!(call.project(), Some("agent:r:p"));
+    assert_eq!(call.session_id(), None);
+    assert!(matches!(
+        call,
+        ToolCall::RecordExternalObservation {
+            exit_code: None,
+            ..
+        }
+    ));
+    value["command"] = json!("must not be accepted");
+    assert!(ToolCall::from_tool_name("record_external_observation", value).is_err());
+    assert!(!crate::is_model_visible_tool_name(
+        "record_external_observation"
+    ));
+    assert!(crate::is_model_visible_tool_name(
+        "list_external_observations"
+    ));
+    assert!(registered_tool_specs()
+        .into_iter()
+        .all(|spec| spec.name != "record_external_observation"));
+
+    for name in ["record_external_observation", "list_external_observations"] {
+        let activity = crate::runtime_tool_activity_semantics(name);
+        assert_eq!(activity.presentation.as_str(), "support");
+        assert!(!activity.interaction.is_meaningful());
+    }
+
+    let list_spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "list_external_observations")
+        .unwrap();
+    for field in ["session_id", "project"] {
+        assert!(list_spec.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(field)));
+    }
+
+    let record_schema = crate::registry::output_schema_for_tool("record_external_observation");
+    let record_output = &record_schema["properties"]["output"]["properties"];
+    let observation = &record_output["observation"];
+    assert_eq!(observation["additionalProperties"], false);
+    assert_eq!(
+        observation["properties"]["status"]["enum"],
+        json!(["unknown", "reported_success", "reported_failure"])
+    );
+
+    let list_output = &list_spec.output_schema["properties"]["output"]["properties"];
+    let observations = &list_output["observations"];
+    assert_eq!(observations["maxItems"], 256);
+    assert_eq!(observations["items"]["additionalProperties"], false);
+    let coverage = &list_output["coverage"];
+    assert_eq!(coverage["additionalProperties"], false);
+    assert_eq!(coverage["properties"]["complete"]["const"], false);
+    assert_eq!(
+        coverage["properties"]["reason"]["enum"],
+        json!(["source_sequence_unavailable"])
+    );
 }

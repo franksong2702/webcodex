@@ -26,7 +26,14 @@ const MAX_OBSERVE_JOBS_ERROR_CHARS: usize = 512;
 struct ObservedJob {
     index: usize,
     job_id: String,
+    observation_ref: Option<String>,
     result: ToolResult,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedObserveJobsItem {
+    index: usize,
+    item: ObserveJobsItem,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +117,9 @@ fn bounded_error(error: Option<&str>) -> String {
 
 fn observation_error_kind(result: &ToolResult) -> &'static str {
     let error = result.error.as_deref().unwrap_or_default();
-    if error.contains("after_observation_token") {
+    if error.starts_with("unknown observation_ref:") {
+        "unknown_observation_ref"
+    } else if error.contains("after_observation_token") {
         "invalid_observation_token"
     } else if error.starts_with("unknown job:") {
         "unknown_job"
@@ -123,7 +132,9 @@ fn observation_error_kind(result: &ToolResult) -> &'static str {
 
 fn observation_recovery(error_kind: &str) -> RecoveryKind {
     match error_kind {
-        "invalid_observation_token" | "output_budget_exceeded" => RecoveryKind::FixInput,
+        "invalid_observation_token" | "unknown_observation_ref" | "output_budget_exceeded" => {
+            RecoveryKind::FixInput
+        }
         "unknown_job" => RecoveryKind::Reobserve,
         _ => RecoveryKind::NoAction,
     }
@@ -227,7 +238,8 @@ pub(crate) fn summarize_observe_jobs_result(
         else {
             continue;
         };
-        if item["job_id"].as_str() != Some(original.job_id.as_str()) {
+        if !original.job_id.is_empty() && item["job_id"].as_str() != Some(original.job_id.as_str())
+        {
             continue;
         }
         let output = &item["output"];
@@ -285,25 +297,36 @@ fn batch_item(observed: ObservedJob) -> Value {
             output.remove("waited_ms");
             output.remove("continuation_semantics");
         }
-        json!({
+        let mut item = json!({
             "index": observed.index,
             "job_id": observed.job_id,
             "success": true,
             "output": output,
             "error_kind": null,
             "error": null,
-        })
+        });
+        if let Some(observation_ref) = observed.observation_ref {
+            item["observation_ref"] = json!(observation_ref);
+        }
+        item
     } else {
         let error_kind = observation_error_kind(&observed.result);
         let recovery_kind = observation_recovery(error_kind);
         let mut item = json!({
             "index": observed.index,
-            "job_id": observed.job_id,
             "success": false,
             "output": null,
             "error_kind": error_kind,
             "error": bounded_error(observed.result.error.as_deref()),
         });
+        item["job_id"] = if observed.job_id.is_empty() {
+            Value::Null
+        } else {
+            json!(observed.job_id)
+        };
+        if let Some(observation_ref) = observed.observation_ref {
+            item["observation_ref"] = json!(observation_ref);
+        }
         if error_kind == "unknown_job" {
             item["suggested_call"] = SuggestedToolCall::new("list_jobs", json!({})).to_value();
         } else {
@@ -373,6 +396,9 @@ fn batch_output(
 }
 
 fn observe_jobs_item_argument_value(item: &ObserveJobsItem) -> Value {
+    if let Some(observation_ref) = item.observation_ref.as_deref() {
+        return json!({"observation_ref": observation_ref});
+    }
     let mut value = json!({"job_id": item.job_id});
     if let Some(token) = item.after_observation_token.as_deref() {
         value["after_observation_token"] = json!(token);
@@ -565,6 +591,9 @@ fn sparse_success_item(item: &Value) -> Option<Value> {
     sparse.insert("changed".to_string(), json!(changed));
     sparse.insert("log_delta_status".to_string(), json!(log_delta_status));
     sparse.insert("observation_token".to_string(), json!(observation_token));
+    if let Some(observation_ref) = item.get("observation_ref").and_then(Value::as_str) {
+        sparse.insert("observation_ref".to_string(), json!(observation_ref));
+    }
 
     for key in [
         "exit_code",
@@ -766,11 +795,16 @@ impl ToolRuntime {
         tail_lines: usize,
         wait_secs: Option<u64>,
     ) -> Result<(), String> {
-        if !(1..=MAX_OBSERVE_JOBS_ITEMS).contains(&items.len()) {
-            return Err("observe_jobs requires between 1 and 8 items".into());
+        if items.len() > MAX_OBSERVE_JOBS_ITEMS {
+            return Err("observe_jobs accepts at most 8 resolved items".into());
         }
-        if items.iter().any(|item| item.job_id.trim().is_empty()) {
-            return Err("observe_jobs requires every item to have a non-empty job_id".into());
+        if items
+            .iter()
+            .any(|item| item.job_id.trim().is_empty() || item.observation_ref.is_some())
+        {
+            return Err(
+                "observe_jobs requires every resolved item to have only a non-empty job_id".into(),
+            );
         }
         if let Some(item) = items.iter().find(|item| {
             item.after_observation_token.as_ref().is_some_and(|token| {
@@ -803,12 +837,13 @@ impl ToolRuntime {
 
     async fn observe_jobs_pass(
         &self,
-        items: &[ObserveJobsItem],
+        items: &[ResolvedObserveJobsItem],
         tail_lines: usize,
         auth: Option<&AuthContext>,
     ) -> Vec<ObservedJob> {
-        let mut observed: Vec<ObservedJob> = stream::iter(items.iter().cloned().enumerate().map(
-            |(index, item)| async move {
+        let mut observed: Vec<ObservedJob> =
+            stream::iter(items.iter().cloned().map(|resolved| async move {
+                let item = resolved.item;
                 let result = self
                     .job_log_for_auth(
                         item.job_id.clone(),
@@ -820,22 +855,22 @@ impl ToolRuntime {
                     )
                     .await;
                 ObservedJob {
-                    index,
+                    index: resolved.index,
                     job_id: item.job_id,
+                    observation_ref: None,
                     result,
                 }
-            },
-        ))
-        .buffer_unordered(MAX_OBSERVE_JOBS_ITEMS)
-        .collect()
-        .await;
+            }))
+            .buffer_unordered(MAX_OBSERVE_JOBS_ITEMS)
+            .collect()
+            .await;
         observed.sort_by_key(|item| item.index);
         observed
     }
 
     async fn wait_for_observed_jobs(
         &self,
-        items: &[ObserveJobsItem],
+        items: &[ResolvedObserveJobsItem],
         auth: Option<&AuthContext>,
         wait_secs: u64,
         wake_on: ObserveJobsWakeOn,
@@ -844,7 +879,8 @@ impl ToolRuntime {
         // Each Job keeps its own waiter across other Jobs' updates. The
         // canonical Notify + revision recheck covers updates both before and
         // during wait registration; no polling heartbeat is needed here.
-        let mut waits = stream::iter(items.iter().cloned().map(|mut item| async move {
+        let mut waits = stream::iter(items.iter().cloned().map(|resolved| async move {
+            let mut item = resolved.item;
             loop {
                 if Instant::now() >= deadline {
                     return Ok::<WakeReason, String>(WakeReason::Timeout);
@@ -917,15 +953,89 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         let (tail_lines, wait_secs) = normalize_observe_jobs_preferences(tail_lines, wait_secs);
-        if let Err(error) = Self::validate_observe_jobs_input(&items, tail_lines, wait_secs) {
-            return ToolResult::err(error);
+        if !(1..=MAX_OBSERVE_JOBS_ITEMS).contains(&items.len()) {
+            return ToolResult::err("observe_jobs requires between 1 and 8 items");
+        }
+        if tail_lines == 0 {
+            return ToolResult::err("observe_jobs tail_lines must be at least 1");
+        }
+        if wait_secs == Some(0) {
+            return ToolResult::err("observe_jobs wait_secs must be at least 1");
         }
 
         let requested_count = items.len();
-        let initial = self.observe_jobs_pass(&items, tail_lines, auth).await;
-        let missing_baseline = items
+        let original_items = items.clone();
+        let has_ref_selector = items.iter().any(|item| item.observation_ref.is_some());
+        let principal_key =
+            match crate::tool_runtime::session_context::runtime_observation_principal(auth) {
+                Ok((kind, id)) => Some(format!("{kind}:{id}")),
+                Err(error) if has_ref_selector => return ToolResult::err(error),
+                Err(_) => None,
+            };
+
+        let mut resolved = Vec::with_capacity(items.len());
+        let mut unresolved_refs = Vec::new();
+        for (index, item) in items.into_iter().enumerate() {
+            if let Some(observation_ref) = item.observation_ref.as_deref() {
+                let Some(principal_key) = principal_key.as_deref() else {
+                    return ToolResult::err(
+                        "runtime_observation_unavailable: observation_ref requires a stable principal",
+                    );
+                };
+                match self
+                    .observation_ref_registry
+                    .resolve(principal_key, observation_ref)
+                {
+                    Some((job_id, token)) => resolved.push(ResolvedObserveJobsItem {
+                        index,
+                        item: ObserveJobsItem::resolved(
+                            job_id,
+                            Some(token).filter(|token| !token.is_empty()),
+                        ),
+                    }),
+                    None => unresolved_refs.push((index, observation_ref.to_string())),
+                }
+            } else {
+                if item.job_id.trim().is_empty() {
+                    return ToolResult::err(
+                        "observe_jobs requires each item to supply job_id or observation_ref",
+                    );
+                }
+                resolved.push(ResolvedObserveJobsItem { index, item });
+            }
+        }
+
+        let canonical_items = resolved
             .iter()
-            .any(|item| item.after_observation_token.is_none());
+            .map(|resolved| resolved.item.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            Self::validate_observe_jobs_input(&canonical_items, tail_lines, wait_secs)
+        {
+            return ToolResult::err(error);
+        }
+
+        let unresolved_observations = || {
+            unresolved_refs
+                .iter()
+                .map(|(index, observation_ref)| ObservedJob {
+                    index: *index,
+                    job_id: String::new(),
+                    observation_ref: Some(observation_ref.clone()),
+                    result: ToolResult::err(format!(
+                        "unknown observation_ref: {observation_ref}; use the retained raw job_id + observation_token pair"
+                    )),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut initial = self.observe_jobs_pass(&resolved, tail_lines, auth).await;
+        initial.extend(unresolved_observations());
+        initial.sort_by_key(|item| item.index);
+
+        let missing_baseline = resolved
+            .iter()
+            .any(|resolved| resolved.item.after_observation_token.is_none());
         let immediate_reason =
             if wake_on == ObserveJobsWakeOn::AllTerminal && observed_has_error(&initial) {
                 Some(WakeReason::ItemError)
@@ -946,14 +1056,18 @@ impl ToolRuntime {
         } else {
             let wait_secs = wait_secs.expect("shared wait requires validated wait_secs");
             let wait_started = Instant::now();
-            let pending: Vec<_> = items
+            let pending: Vec<_> = resolved
                 .iter()
-                .zip(&initial)
-                .filter(|(_, observed)| {
+                .filter(|resolved| {
                     wake_on != ObserveJobsWakeOn::AllTerminal
-                        || observed.result.output["terminal"].as_bool() != Some(true)
+                        || initial
+                            .iter()
+                            .find(|observed| observed.index == resolved.index)
+                            .is_none_or(|observed| {
+                                observed.result.output["terminal"].as_bool() != Some(true)
+                            })
                 })
-                .map(|(item, _)| item.clone())
+                .cloned()
                 .collect();
             let wait_reason = match self
                 .wait_for_observed_jobs(
@@ -969,15 +1083,40 @@ impl ToolRuntime {
                 Err(error) => return ToolResult::err(error),
             };
             let waited_ms = wait_started.elapsed().as_millis() as u64;
-            let refreshed = self.observe_jobs_pass(&items, tail_lines, auth).await;
+            let mut refreshed = self.observe_jobs_pass(&resolved, tail_lines, auth).await;
+            refreshed.extend(unresolved_observations());
+            refreshed.sort_by_key(|item| item.index);
             let final_reason = final_wake_reason(&refreshed, wake_on, wait_reason);
             (refreshed, final_reason, waited_ms)
         };
 
-        let completed = observed.into_iter().map(batch_item).collect();
+        let mut completed = observed.into_iter().map(batch_item).collect::<Vec<_>>();
+        if let Some(principal_key) = principal_key.as_deref() {
+            for item in &mut completed {
+                if item["success"] != true {
+                    continue;
+                }
+                let Some(job_id) = item.get("job_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(token) = item
+                    .get("output")
+                    .and_then(|output| output.get("observation_token"))
+                    .and_then(Value::as_str)
+                    .filter(|token| !token.is_empty())
+                else {
+                    continue;
+                };
+                let observation_ref =
+                    self.observation_ref_registry
+                        .mint(principal_key, job_id, token);
+                item["observation_ref"] = json!(observation_ref);
+            }
+        }
+
         match apply_output_budget(requested_count, completed, wake_reason, waited_ms) {
             Ok(mut output) => {
-                add_actionable_batch_continuation(&mut output, &items, tail_lines);
+                add_actionable_batch_continuation(&mut output, &original_items, tail_lines);
                 ToolResult::ok(output)
             }
             Err(error) => ToolResult::err(error),
@@ -994,6 +1133,7 @@ mod tests {
         let completed = vec![ObservedJob {
             index: 0,
             job_id: "job".into(),
+            observation_ref: None,
             result: ToolResult::ok(json!({"terminal":true,"changed":true})),
         }];
         assert_eq!(
@@ -1050,6 +1190,7 @@ mod tests {
         let missing = batch_item(ObservedJob {
             index: 0,
             job_id: "job-missing".to_string(),
+            observation_ref: None,
             result: ToolResult::err("unknown job: job-missing"),
         });
         assert_eq!(missing["error_kind"], "unknown_job");
@@ -1082,6 +1223,7 @@ mod tests {
         let invalid_token = batch_item(ObservedJob {
             index: 1,
             job_id: "job-token".to_string(),
+            observation_ref: None,
             result: ToolResult::err("invalid after_observation_token"),
         });
         assert_eq!(invalid_token["recovery_kind"], "fix_input");
@@ -1091,6 +1233,7 @@ mod tests {
         let success = batch_item(ObservedJob {
             index: 2,
             job_id: "job-ok".to_string(),
+            observation_ref: None,
             result: ToolResult::ok(json!({"changed": false})),
         });
         assert!(success.get("recovery_kind").is_none());
@@ -1104,14 +1247,17 @@ mod tests {
             ObserveJobsItem {
                 job_id: "job-0".to_string(),
                 after_observation_token: Some("token-0".to_string()),
+                observation_ref: None,
             },
             ObserveJobsItem {
                 job_id: "job-1".to_string(),
                 after_observation_token: None,
+                observation_ref: None,
             },
             ObserveJobsItem {
                 job_id: "job-2".to_string(),
                 after_observation_token: Some("token-2".to_string()),
+                observation_ref: None,
             },
         ];
         let mut output = json!({

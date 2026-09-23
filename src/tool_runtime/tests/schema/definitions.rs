@@ -92,6 +92,7 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
         "goal_plan_sync",
         "work_result_state",
         "changes_file_diff",
+        "record_external_observation",
         "agent_continuation_bind",
         "agent_continuation_recover_endpoint",
         "agent_continuation_state",

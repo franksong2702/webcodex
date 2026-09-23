@@ -212,6 +212,7 @@ fn unwrap_adaptive_runtime_gateway_arguments(
             crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
             crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD,
+            crate::tool_runtime::control_sidecar::CONTROL_FIELD,
         ]);
     }
     for (key, value) in outer {
@@ -401,16 +402,20 @@ fn mcp_context_projection_output_schema() -> Value {
     })
 }
 
-fn add_context_projection_to_output_shape(schema: &mut Value, projection_schema: &Value) {
+fn add_wrapper_projection_to_output_shape(
+    schema: &mut Value,
+    field: &str,
+    projection_schema: &Value,
+) {
     if schema.get("type").and_then(Value::as_str) == Some("object") {
         if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            properties.insert("context_projection".to_string(), projection_schema.clone());
+            properties.insert(field.to_string(), projection_schema.clone());
         }
     }
     for keyword in ["anyOf", "oneOf", "allOf"] {
         if let Some(branches) = schema.get_mut(keyword).and_then(Value::as_array_mut) {
             for branch in branches {
-                add_context_projection_to_output_shape(branch, projection_schema);
+                add_wrapper_projection_to_output_shape(branch, field, projection_schema);
             }
         }
     }
@@ -422,7 +427,7 @@ fn add_stateless_context_projection_output_schema(tool: &mut Value) {
     };
     let projection_schema = mcp_context_projection_output_schema();
     if let Some(output) = output_schema.pointer_mut("/properties/output") {
-        add_context_projection_to_output_shape(output, &projection_schema);
+        add_wrapper_projection_to_output_shape(output, "context_projection", &projection_schema);
     }
     if let Some(conditions) = output_schema.get_mut("allOf").and_then(Value::as_array_mut) {
         for condition in conditions {
@@ -430,7 +435,11 @@ fn add_stateless_context_projection_output_schema(tool: &mut Value) {
                 if let Some(output) =
                     condition.pointer_mut(&format!("/{branch_name}/properties/output"))
                 {
-                    add_context_projection_to_output_shape(output, &projection_schema);
+                    add_wrapper_projection_to_output_shape(
+                        output,
+                        "context_projection",
+                        &projection_schema,
+                    );
                 }
             }
         }
@@ -445,8 +454,81 @@ fn stateless_collaboration_ack_schema() -> Value {
             "type": "string",
             "pattern": "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
         },
-        "description": "Proves the current model context still retains the listed ACK-required collaboration messages. For Session messages the id must belong to the explicit recording Session; Peer messages may target the current principal-bound ClientWindow without a recorder. Repeat while retained. If later omitted, unresolved Session messages or retained Peer messages may be surfaced again. ACK neither resolves messages nor grants authority or gates execution."
+        "description": "Proves the current model context still retains the listed ACK-required collaboration messages. Session ACK uses the explicit recorder when present, otherwise an authorized same-Window active Session affinity for the resolved Project; Peer ACK targets the current principal-bound ClientWindow. Repeat while retained. ACK neither resolves messages nor grants authority or gates execution."
     })
+}
+
+fn stateless_session_attention_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Bounded open ACK-required messages from one exact authorized Workflow Session. Window affinity may select this delivery scope only when no explicit recorder was supplied; it never records the main call or supplies business authority.",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+            },
+            "source": {
+                "type": "string",
+                "enum": ["recording_session", "business_session", "window_affinity"]
+            },
+            "requires_ack": {"type": "boolean"},
+            "messages": {
+                "type": "array",
+                "maxItems": crate::tool_runtime::SESSION_ATTENTION_MAX_MESSAGES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "message_id": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "priority": {"type": "string"},
+                        "created_at": {"type": "integer"},
+                        "message": {"type": "string"},
+                        "message_truncated": {"type": "boolean"}
+                    },
+                    "required": ["message_id", "kind", "priority", "created_at", "message", "message_truncated"]
+                }
+            },
+            "omitted_count": {"type": "integer", "minimum": 0},
+            "truncated": {"type": "boolean"},
+            "ack": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "accepted_count": {"type": "integer", "minimum": 0},
+                    "ignored_count": {"type": "integer", "minimum": 0}
+                },
+                "required": ["accepted_count", "ignored_count"]
+            }
+        },
+        "required": ["session_id", "source", "requires_ack", "messages", "omitted_count", "truncated", "ack"]
+    })
+}
+
+fn add_stateless_session_attention_output_schema(tool: &mut Value) {
+    let Some(output_schema) = tool.get_mut("outputSchema") else {
+        return;
+    };
+    let projection = stateless_session_attention_output_schema();
+    if let Some(output) = output_schema.pointer_mut("/properties/output") {
+        add_wrapper_projection_to_output_shape(output, "session_attention", &projection);
+    }
+    if let Some(conditions) = output_schema.get_mut("allOf").and_then(Value::as_array_mut) {
+        for condition in conditions {
+            for branch_name in ["then", "else"] {
+                if let Some(output) =
+                    condition.pointer_mut(&format!("/{branch_name}/properties/output"))
+                {
+                    add_wrapper_projection_to_output_shape(
+                        output,
+                        "session_attention",
+                        &projection,
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn insert_stateless_collaboration_ack_property(properties: &mut serde_json::Map<String, Value>) {
@@ -461,7 +543,8 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
         return;
     };
     for tool in tools {
-        let tool_name = tool.get("name").and_then(Value::as_str);
+        let tool_name_owned = tool.get("name").and_then(Value::as_str).map(str::to_string);
+        let tool_name = tool_name_owned.as_deref();
         if matches!(
             tool_name,
             Some("goal_plan_sync" | "work_result_state" | "changes_file_diff")
@@ -480,7 +563,7 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
             json!({
                 "type": "string",
                 "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
-                "description": "Optional explicit Workflow Session used only to record this call and trusted collaboration provenance. Separate from any tool business Session input; grants no authority; removed before concrete parsing."
+                "description": "Optional explicit recorder provenance for one exact Workflow Session. Never execution authority or a business Session target. When omitted, authorized same-Window affinity may still deliver and ACK Session collaboration without recording this call."
             }),
         );
         insert_stateless_collaboration_ack_property(properties);
@@ -519,7 +602,35 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
                     "description": format!("Request bounded context material after this tool's main effect/observation; keys are open-ended and currently include {}. This sidecar grants no authority and cannot make requested guidance a retroactive precondition of the current effect. Recover missing project or Memory guidance on a read/observation call before any later dependent mutation.", crate::tool_runtime::context_projection::context_material_keys_csv())
                 }),
             );
+        if let Some(name) = tool_name.filter(|name| {
+            *name == "call_runtime_tool"
+                || crate::tool_runtime::control_sidecar::supports_control_sidecars(name)
+        }) {
+            properties.insert(
+                crate::tool_runtime::control_sidecar::CONTROL_FIELD.to_string(),
+                crate::tool_runtime::control_sidecar::input_schema(name),
+            );
+            let projection = crate::tool_runtime::control_sidecar::output_schema();
+            if let Some(output) = tool.pointer_mut("/outputSchema/properties/output") {
+                add_wrapper_projection_to_output_shape(output, "control", &projection);
+            }
+            if let Some(conditions) = tool
+                .pointer_mut("/outputSchema/allOf")
+                .and_then(Value::as_array_mut)
+            {
+                for condition in conditions {
+                    for branch in ["then", "else"] {
+                        if let Some(output) =
+                            condition.pointer_mut(&format!("/{branch}/properties/output"))
+                        {
+                            add_wrapper_projection_to_output_shape(output, "control", &projection);
+                        }
+                    }
+                }
+            }
+        }
         add_stateless_context_projection_output_schema(tool);
+        add_stateless_session_attention_output_schema(tool);
     }
 }
 
@@ -1568,6 +1679,22 @@ pub(super) async fn handle_call(
     } else {
         Vec::new()
     };
+    // Strip private control payloads before tracing, canonical argument parsing,
+    // specialized dispatch, and audit. Legacy/hidden adapters reject explicitly.
+    let control = match crate::tool_runtime::control_sidecar::strip_control_sidecars(
+        &mut params.arguments,
+        &params.name,
+        stateless_2026,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            if let Some(lc) = lifecycle.as_deref() {
+                lc.dispatch_failed("invalid_arguments");
+                lc.dispatch_finished(false, Some(false), "invalid_arguments");
+            }
+            return McpOutcome::BadRequest(rpc_error(id, -32602, message));
+        }
+    };
     if let Some(lc) = lifecycle.as_deref() {
         lc.capture_payload_lazy("raw_arguments", || {
             if params.name == crate::plugin_gateway::PLUGIN_TOOL_NAME {
@@ -2102,11 +2229,13 @@ pub(super) async fn handle_call(
                 host_file_import_trust,
             },
             ToolInvocationMetadata {
+                control,
                 ack_session_message_ids,
                 session_message_resolution,
                 context_request,
             },
             ToolProtocolCapabilities {
+                control_sidecars: stateless_2026,
                 context_sidecar: context_sidecar_capable,
                 skill_runtime: skill_runtime_capable,
                 skill_management: skill_management_capable,

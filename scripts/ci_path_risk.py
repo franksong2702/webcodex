@@ -159,6 +159,13 @@ def _is_main_frontend(path: str) -> bool:
     return path.startswith("frontend/")
 
 
+def _is_desktop_shared_frontend(path: str) -> bool:
+    return path.startswith("frontend/src/ui/") or path in {
+        "frontend/package.json",
+        "frontend/package-lock.json",
+    }
+
+
 def _is_desktop_frontend(path: str) -> bool:
     return path.startswith("apps/desktop/src/") or path in {
         "apps/desktop/index.html",
@@ -224,6 +231,9 @@ def _classify_path(risk: Risk, path: str) -> None:
     if _is_main_frontend(path):
         risk.needs_frontend = True
         risk.categories.add("frontend")
+        if _is_desktop_shared_frontend(path):
+            risk.needs_desktop_frontend = True
+            risk.categories.add("desktop-shared-ui")
         return
     if _is_desktop_frontend(path):
         risk.needs_desktop_frontend = True

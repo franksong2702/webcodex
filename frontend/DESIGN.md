@@ -1,5 +1,11 @@
 # WebCodex Runtime WebUI v2
 
+## Visual language across renderers
+
+Runtime WebUI, Desktop and Admin share a restrained glass visual language while keeping their independent bundles. Semantic canvas, solid surface, glass, text, border, status, radius and shadow values have light and dark variants. System appearance is the default; the chosen appearance is stored only as a non-secret local preference. Main reading surfaces, logs, tables and form fields remain opaque. Blur is limited to navigation, composer chrome and dialogs, with opaque fallbacks for unsupported or reduced-transparency environments. Reduced motion and visible keyboard focus apply in all three renderers.
+
+Runtime keeps Work, Projects and Runtime as its primary destinations. Desktop groups its six existing destinations as Work and Configure without changing their IDs or shortcuts. Admin provides section navigation for Overview, Devices / Agents, Projects and Diagnostics; its wide data tables scroll inside labelled regions on narrow screens. Visual changes do not alter backend authority, credential handling or mutation behavior.
+
 Runtime WebUI is the remote WebCodex workbench. It is not the Desktop surface and it is not a browser for backend domain tables. Desktop owns local lifecycle, secure connections, permissions, Skills/Plugins/MCP installation and machine-local settings. Runtime WebUI answers what work is happening, where it is happening, what needs attention, and what evidence supports that state.
 
 ## Primary information architecture

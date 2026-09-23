@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MantineProvider } from "@mantine/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceProvider } from "./workspace/WorkspaceContext";
 import { LocaleProvider } from "../i18n/locale";
@@ -10,7 +11,7 @@ import { TunnelConfigDiagnostics } from "./connection/TunnelConfigDiagnostics";
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
 
-const api = vi.hoisted(() => ({ runnerSettings: vi.fn(), updateRunnerSettings: vi.fn(), restartOwnedRunner: vi.fn(), addRunnerPlugin: vi.fn(), computerPermissions: vi.fn(), requestComputerPermission: vi.fn(), updateTunnelConfig: vi.fn(), getState: vi.fn() }));
+const api = vi.hoisted(() => ({ runnerCapabilityAuthorization: vi.fn(), authorizeRunnerCapabilities: vi.fn(), sshResources: vi.fn(), runnerSettings: vi.fn(), updateRunnerSettings: vi.fn(), restartOwnedRunner: vi.fn(), addRunnerPlugin: vi.fn(), computerPermissions: vi.fn(), requestComputerPermission: vi.fn(), updateTunnelConfig: vi.fn(), getState: vi.fn() }));
 vi.mock("../lib/desktop-api", () => ({ desktopApi: api }));
 const state: DesktopState = {
   project: { path: "/fixture/alpha", allowed_root: "/fixture/alpha", is_git_repository: false, runtime_project_id: "agent:fixture-runner:alpha" },
@@ -23,7 +24,7 @@ const state: DesktopState = {
 const target = { config_path: "/fixture/runner.toml", client_id: "fixture-runner", server_url: "http://127.0.0.1:1" };
 let settings: RunnerSettings;
 const onState = vi.fn();
-const wrap = (element: React.ReactNode) => <LocaleProvider><WorkspaceProvider state={state}>{element}</WorkspaceProvider></LocaleProvider>;
+const wrap = (element: React.ReactNode) => <MantineProvider><LocaleProvider><WorkspaceProvider state={state}>{element}</WorkspaceProvider></LocaleProvider></MantineProvider>;
 
 beforeEach(() => {
   vi.clearAllMocks(); localStorage.clear(); localStorage.setItem("webcodex.desktop.locale", "en-US");
@@ -34,6 +35,9 @@ beforeEach(() => {
   });
   settings = { target, paths: { instruction_files: ["/fixture/global.md"], skill_roots: ["/fixture/skills"] }, plugin_ids: ["existing"], can_restart: true };
   api.runnerSettings.mockImplementation(async () => structuredClone(settings));
+  api.runnerCapabilityAuthorization.mockResolvedValue({ target, can_authorize: true, coding_agents: true, ssh_resources: true });
+  api.authorizeRunnerCapabilities.mockResolvedValue({ target, can_authorize: true, coding_agents: true, ssh_resources: true });
+  api.sshResources.mockResolvedValue({ runner: target.client_id, available: true, observation_id: "observed", resources: [], error_kind: null });
   api.updateRunnerSettings.mockImplementation(async (_target, _expected, paths) => { settings.paths = paths; return state; });
   api.addRunnerPlugin.mockImplementation(async (_target, provider) => { settings.plugin_ids.push(provider.id); return state; });
   api.restartOwnedRunner.mockResolvedValue(state); api.getState.mockResolvedValue(state); api.updateTunnelConfig.mockResolvedValue(state);
@@ -66,6 +70,7 @@ describe("workspace configuration boundaries", () => {
 
   it("saves exact-target instruction and Skill paths and fences Runner restart", async () => {
     render(wrap(<ExtensionsPanel state={state} onState={onState} />));
+    fireEvent.click(screen.getByRole("tab", { name: "Instructions" }));
     fireEvent.click(await screen.findByRole("button", { name: "Manage" }));
     const input = await screen.findByLabelText("Global instruction files");
     fireEvent.change(input, { target: { value: "/fixture/new.md" } });
@@ -119,4 +124,24 @@ describe("workspace configuration boundaries", () => {
     expect(screen.getByRole("button", { name: "Grant Permission · Screen Recording" })).toBeEnabled();
     expect(api.requestComputerPermission).not.toHaveBeenCalled();
   });
+});
+
+
+it("preserves capability-first tabs and Coding-only authorization after the shared UI merge", async () => {
+  api.runnerCapabilityAuthorization.mockResolvedValue({ target, can_authorize: true, coding_agents: false, ssh_resources: false });
+  render(wrap(<ExtensionsPanel state={state} onState={onState} />));
+  expect(screen.getAllByRole("tab").map(tab => tab.textContent)).toEqual(["Coding Agents", "SSH Resources", "MCP Providers", "Skills", "Instructions"]);
+  expect(screen.getByRole("tab", { name: "Coding Agents" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.queryByRole("button", { name: /^Projects:/ })).not.toBeInTheDocument();
+  fireEvent.click(await screen.findByRole("button", { name: "Authorize Runner Capabilities" }));
+  expect(api.authorizeRunnerCapabilities).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Confirm Authorize Runner Capabilities" }));
+  await waitFor(() => expect(api.authorizeRunnerCapabilities).toHaveBeenCalledExactlyOnceWith(target));
+  expect(api.sshResources).not.toHaveBeenCalled();
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  fireEvent.click(screen.getByRole("tab", { name: "SSH Resources" }));
+  await waitFor(() => expect(api.sshResources).toHaveBeenCalled());
+  expect(screen.queryByRole("button", { name: /^Projects:/ })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("tab", { name: "Instructions" }));
+  await screen.findByRole("button", { name: /^Projects:/ });
 });

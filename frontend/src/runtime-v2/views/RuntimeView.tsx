@@ -18,6 +18,7 @@ import { absoluteTime, durationText, projectDisplayName, relativeTime, shortId }
 import type { Availability, ProjectRow, RuntimeOverview } from "../model/types.js";
 import { useAgentInventory } from "../state/useAgentInventory.js";
 import { AgentsPanel } from "../components/AgentsPanel.js";
+import { PageHeader } from "../components/ui/PageHeader.js";
 import { useLinkedSessionWindowCounts } from "../state/useLinkedSessionWindowCounts.js";
 import type { SessionLocation } from "../state/useSessionWorkspace.js";
 import { useWindowWorkspace } from "../state/useWindowWorkspace.js";
@@ -97,18 +98,11 @@ export function RuntimeView({
     projectId ? projects.find((project) => project.id === projectId) : undefined;
 
   return (
-    <main className="page runtime-page">
-      <header className="page-heading runtime-heading">
-        <div>
-          <span className="eyebrow">{t("System evidence")}</span>
-          <h1>{t("Runtime")}</h1>
-          <p>{t("Infrastructure, Window observation and low-level evidence stay below task-oriented Work.")}</p>
-        </div>
-        <span className="quiet-pill">
+    <main className="page runtime-page ui-workbench-surface">
+      <PageHeader title={t("Runtime")} className="runtime-heading" actions={<span className="quiet-pill">
           <span className={"status-dot " + overviewStatus.className} />
           {t(overviewStatus.label)}
-        </span>
-      </header>
+        </span>} />
 
       <div className="runtime-tabs" role="tablist">
         <button className={mode === "overview" ? "active" : ""} role="tab" aria-selected={mode === "overview"} onClick={() => setMode("overview")}>
@@ -149,7 +143,7 @@ export function RuntimeView({
 
           <section className="runtime-section">
             <div className="section-heading">
-              <div><h2>{t("Runner fleet")}</h2><p>{t("Execution capacity and source/build alignment.")}</p></div>
+              <div><h2>{t("Runner fleet")}</h2></div>
             </div>
             {overview?.runners.map((runner) => (
               <div className="runtime-row" key={runner.client_id}>
@@ -175,7 +169,7 @@ export function RuntimeView({
 
           <section className="runtime-section">
             <div className="section-heading">
-              <div><h2>{t("Meaningful runtime status")}</h2><p>{t("Only evidence available from the current Runtime projection is shown.")}</p></div>
+              <div><h2>{t("Meaningful runtime status")}</h2></div>
               <button className="text-button" type="button" onClick={() => setMode("windows")}>
                 {t("Open Window activity")} <ArrowUpRight size={13} />
               </button>

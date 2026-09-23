@@ -648,6 +648,40 @@ fn apply_text_edits_sha256(value: Option<&Value>) -> bool {
         .is_some_and(crate::apply_edits_shared::is_lowercase_hex_sha256)
 }
 
+fn sanitize_apply_text_edit_advisories(output: &mut Value, changes: &[ApplyFileChangeInput]) {
+    let Some(files) = output.get_mut("files").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (file, change) in files.iter_mut().zip(changes) {
+        let Some(summaries) = file.get_mut("edits").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for summary in summaries {
+            let Some(summary) = summary.as_object_mut() else {
+                continue;
+            };
+            let requested_edit = summary
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .and_then(|index| change.edits.get(index));
+            let preserve_warning = requested_edit.is_some_and(|edit| {
+                change.kind == ApplyFileChangeKind::Edit
+                    && matches!(
+                        edit.kind,
+                        ApplyTextEditKind::InsertBefore | ApplyTextEditKind::InsertAfter
+                    )
+                    && summary.get("kind").and_then(Value::as_str) == Some(edit.kind.as_str())
+                    && summary.get("warning").and_then(Value::as_str)
+                        == Some(crate::apply_edits_shared::APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING)
+            });
+            if !preserve_warning {
+                summary.remove("warning");
+            }
+        }
+    }
+}
+
 fn validate_apply_text_edits_success_metadata(
     output: &Value,
     changes: &[ApplyFileChangeInput],
@@ -1896,7 +1930,7 @@ fn apply_text_edits_agent_stdout_result(
     project: &str,
     changes: &[ApplyFileChangeInput],
 ) -> ToolResult {
-    let result = sanitize_apply_text_edits_model_recovery(
+    let mut result = sanitize_apply_text_edits_model_recovery(
         transactional_edit_agent_stdout_result(
             "apply_text_edits",
             stdout,
@@ -1910,6 +1944,7 @@ fn apply_text_edits_agent_stdout_result(
         return result;
     }
     if validate_apply_text_edits_success_metadata(&result.output, changes, expected_dry_run) {
+        sanitize_apply_text_edit_advisories(&mut result.output, changes);
         return result;
     }
     structured_edit_outcome_unknown_result(
@@ -4310,6 +4345,80 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.output["execution_state"], "outcome_unknown");
         assert!(result.output.get("files").is_none());
+    }
+
+    #[test]
+    fn apply_text_edits_success_sanitizes_duplicate_anchor_advisory_text() {
+        let change = ApplyFileChangeInput {
+            kind: ApplyFileChangeKind::Edit,
+            path: "file.txt".to_string(),
+            to_path: None,
+            content: None,
+            edits: vec![ApplyTextEditInput {
+                kind: ApplyTextEditKind::InsertBefore,
+                old_text: None,
+                new_text: Some("anchor".to_string()),
+                anchor_text: Some("anchor".to_string()),
+                occurrence: None,
+                line_scope: None,
+            }],
+            expected_read_revision: None,
+        };
+        let payload = |warning: &str, kind: &str| {
+            json!({
+                "dry_run": true,
+                "applied_count": 1,
+                "changed": false,
+                "would_change": true,
+                "files": [{
+                    "index": 0,
+                    "kind": "edit",
+                    "path": "file.txt",
+                    "to_path": null,
+                    "old_sha256": "a".repeat(64),
+                    "new_sha256": "b".repeat(64),
+                    "changed": false,
+                    "would_change": true,
+                    "edits": [{
+                        "index": 0,
+                        "kind": kind,
+                        "old_start_line": 1,
+                        "old_end_line": 1,
+                        "new_line_count": 1,
+                        "warning": warning,
+                    }]
+                }],
+                "changed_paths": []
+            })
+        };
+        let canonical = crate::apply_edits_shared::APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING;
+        let result = apply_text_edits_agent_stdout_result(
+            &payload(canonical, "insert_before").to_string(),
+            1,
+            true,
+            "agent:test:demo",
+            std::slice::from_ref(&change),
+        );
+        assert!(result.success);
+        assert_eq!(result.output["files"][0]["edits"][0]["warning"], canonical);
+
+        for payload in [
+            payload("PRIVATE_RUNNER_TEXT", "insert_before"),
+            payload(canonical, "replace_exact"),
+        ] {
+            let result = apply_text_edits_agent_stdout_result(
+                &payload.to_string(),
+                1,
+                true,
+                "agent:test:demo",
+                std::slice::from_ref(&change),
+            );
+            assert!(result.success);
+            assert!(result.output["files"][0]["edits"][0]
+                .get("warning")
+                .is_none());
+            assert!(!result.output.to_string().contains("PRIVATE_RUNNER_TEXT"));
+        }
     }
 
     #[test]

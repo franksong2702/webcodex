@@ -42,9 +42,11 @@ Tauri 包，但它不是完整可运行的 WebCodex Desktop 分发包。
 - WebCodex 源码 checkout；
 - 足够的磁盘空间保存 root Rust build 与独立的 Desktop Tauri build。
 
-每次新 checkout 或 Desktop dependency 更新后先安装：
+每次新 checkout 或 Desktop dependency 更新后先安装两套 JavaScript 依赖。Desktop
+会直接使用 `frontend/src/ui` 的共享组件，因此类型检查和构建也需要 frontend 的依赖：
 
 ```bash
+npm ci --prefix frontend
 npm ci --prefix apps/desktop
 ```
 

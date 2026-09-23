@@ -1,11 +1,15 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render as testingRender, screen, waitFor, within } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeV2Client } from "../src/runtime-v2/api/client.js";
 import { workItemFromRecent } from "../src/runtime-v2/model/work.js";
 import { ProjectsView } from "../src/runtime-v2/views/ProjectsView.js";
 import { RuntimeView } from "../src/runtime-v2/views/RuntimeView.js";
 import { WorkView } from "../src/runtime-v2/views/WorkView.js";
+import { UiProvider } from "../src/ui/UiProvider.js";
 import { recentSession, runtimeOverview, sessionDetail, sessionItem, windowDetail } from "./fixtures.js";
+
+const render = (ui: ReactElement) => testingRender(<UiProvider>{ui}</UiProvider>);
 
 function fakeClient(handler: (path: string, payload: any) => any): RuntimeV2Client {
   return {
@@ -108,10 +112,10 @@ describe("Project / Session / Window relationships", () => {
       <ProjectsView client={client} language="en" runners={overview.runners} onOpenSession={vi.fn()} onUnauthorized={vi.fn()} />,
     );
     fireEvent.click(await screen.findByRole("button", { name: "Add Project" }));
-    fireEvent.change(screen.getByPlaceholderText("Absolute folder path on the selected Runner"), {
+    fireEvent.change(await screen.findByPlaceholderText("Absolute folder path on the selected Runner"), {
       target: { value: "/root/git/new-project" },
     });
-    fireEvent.click(screen.getAllByRole("button", { name: "Add Project" }).at(-1)!);
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add Project" }));
     await screen.findByText("The result could not be confirmed. Refresh Projects before trying again.");
     expect(handler.mock.calls.filter(([path]) => path === "/api/projects/resolve-or-register")).toHaveLength(1);
   });

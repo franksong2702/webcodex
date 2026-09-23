@@ -1,8 +1,12 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render as testingRender, screen, waitFor } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RUNTIME_CREDENTIAL_SESSION_KEY } from "../src/runtime_storage.js";
 import { App } from "../src/runtime-v2/App.js";
+import { UiProvider } from "../src/ui/UiProvider.js";
 import { runtimeOverview, sessionDetail, sessionItem, windowDetail } from "./fixtures.js";
+
+const render = (ui: ReactElement) => testingRender(<UiProvider>{ui}</UiProvider>);
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -82,8 +86,8 @@ describe("Runtime v2 navigation", () => {
     expect(primary.textContent).toContain("Runtime");
     expect(primary.textContent).not.toContain("Workflow Sessions");
     expect(primary.textContent).not.toContain("Window Activity");
-    expect(screen.getByRole("tab", { name: /Goals/ }).getAttribute("aria-selected")).toBe("true");
-    expect(screen.getByRole("tab", { name: /Sessions/ })).toBeTruthy();
+    expect((screen.getByRole("radio", { name: /Goals/ }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByRole("radio", { name: /Sessions/ })).toBeTruthy();
 
     fireEvent.click(screen.getAllByRole("button", { name: /Projects/ })[0]);
     expect(await screen.findByRole("heading", { name: "Projects" })).toBeTruthy();
@@ -111,10 +115,10 @@ describe("Runtime v2 navigation", () => {
     installFetch(() => pendingLocate);
     render(<App />);
     expect(await screen.findByRole("heading", { name: "Runtime V2 Goal Workbench" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("tab", { name: /Sessions/ }));
+    fireEvent.click(screen.getByRole("radio", { name: /Sessions/ }));
 
     const exact = "wc_sess_abcdef0123456789";
-    const search = screen.getByRole("textbox", { name: "Search Sessions" });
+    const search = screen.getByRole("searchbox", { name: "Search Sessions" });
     fireEvent.change(search, { target: { value: exact } });
     fireEvent.keyDown(search, { key: "Enter" });
     await waitFor(() => expect((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.some(([url]) => String(url).endsWith("/api/runtime-console/workflow-session-locate"))).toBe(true));

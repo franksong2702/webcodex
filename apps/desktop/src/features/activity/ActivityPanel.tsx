@@ -8,6 +8,8 @@ import { observationTime } from "../workspace/WorkspaceStatus";
 import { SystemActivity } from "./SystemActivity";
 import { WorkflowSessionDetail, activityTitle, sessionLifecycle, SessionAttention } from "./WorkflowSessionDetail";
 import { WindowActivityDetail } from "./WindowActivityDetail";
+import { ProjectPicker } from "../../../../../frontend/src/ui/ProjectPicker";
+import { WorkspaceEmptyState } from "../../components/WorkspaceEmptyState";
 
 type View = "windows" | "sessions" | "system";
 const VIEWS: View[] = ["windows", "sessions", "system"];
@@ -41,25 +43,25 @@ export function ActivityPanel({ activity }: { activity: ActivityEntry[] }) {
         setView(VIEWS[index]); document.getElementById(`activity-tab-${VIEWS[index]}`)?.focus();
       }}>{p(item)}</button>)}
     </div>
-    {view !== "system" && <div className="activity-project-filter"><label htmlFor="activity-project">{p("projects")}</label><select id="activity-project" value={filter} onChange={event => setFilter(event.target.value)}><option value="">{p("allProjects")}</option>{workspace.projects.filter(project => project.id).map(project => <option key={project.id} value={project.id}>{projectName(project)}</option>)}</select></div>}
-    <section role="tabpanel" id={`activity-view-${view}`} aria-labelledby={`activity-tab-${view}`}>
+    {view !== "system" && <div className="activity-project-filter"><span className="filter-label">{p("projects")}</span><ProjectPicker label={p("projects")} allLabel={p("allProjects")} emptyLabel={p("noMatches")} searchLabel={p("search")} value={filter} onChange={setFilter} options={workspace.projects.filter(project => project.id).map(project => ({ value: project.id, label: projectName(project), detail: project.path }))} /></div>}
+    <section className="activity-workbench-surface ui-workbench-surface" role="tabpanel" id={`activity-view-${view}`} aria-labelledby={`activity-tab-${view}`}>
       {view === "windows" && <>
         {workspace.windowsError && <p role="alert" className="workspace-notice">{p("loadError")}</p>}
-        {windows.map(row => <button type="button" className="workspace-window-row" key={row.client_window_key} onClick={() => workspace.setSelection({ kind: "window", id: row.client_window_key })}>
-          <span className="project-avatar" aria-hidden="true">W</span><span className="project-row-main"><strong>{p("windows")} · {row.client_window_key.slice(-12)}</strong><span>{projectLabel(row.last_project)}</span><small>{row.linked_session_count} {p("associatedSessions")}</small></span>
+        {windows.map(row => <button type="button" className="workspace-window-row ui-entity-row" key={row.client_window_key} onClick={() => workspace.setSelection({ kind: "window", id: row.client_window_key })}>
+          <span className="project-avatar" aria-hidden="true"><svg viewBox="0 0 20 20" fill="none"><rect x="2.5" y="3" width="15" height="11" rx="2"/><path d="M7 17h6m-3-3v3"/></svg></span><span className="project-row-main"><strong>{p("windows")} · {row.client_window_key.slice(-12)}</strong><span>{projectLabel(row.last_project)}</span><small>{row.linked_session_count} {p("associatedSessions")}</small></span>
           <span className="window-row-state"><span className={`workspace-badge ${row.active_count ? "working" : ""}`}>{p(row.active_count ? "inProgress" : "observed")}</span><time>{observationTime(row.last_meaningful_activity_at_ms || row.last_seen_at_ms, locale)}</time></span>
         </button>)}
-        {!windows.length && <p className="workspace-empty">{p(workspace.loading ? "loading" : "noWindows")}</p>}
+        {!windows.length && (workspace.loading ? <p className="workspace-empty">{p("loading")}</p> : <WorkspaceEmptyState kind="activity" message={p("noWindows")} />)}
       </>}
       {view === "sessions" && <>
         {(failed || workspace.error) && <p role="alert" className="workspace-notice">{p("loadError")}</p>}
-        {sessions.map(session => <button type="button" className="workspace-session-row" key={`${session.project_id}:${session.session_id}`} onClick={() => session.project_id && workspace.setSelection({ kind: "session", project: session.project_id, id: session.session_id })}>
+        {sessions.map(session => <button type="button" className="workspace-session-row ui-entity-row" key={`${session.project_id}:${session.session_id}`} onClick={() => session.project_id && workspace.setSelection({ kind: "session", project: session.project_id, id: session.session_id })}>
           <span className="session-row-heading"><strong>{sessionTitle(session.title)}</strong><span className="workspace-badge">{sessionLifecycle(session.lifecycle, p)}</span></span>
           <span className="session-row-project">{session.project_name || projectLabel(session.project_id)} · {observationTime(session.updated_at * 1000, locale)}</span>
           <span className="session-row-task">{activityTitle(session.current_activity || session.last_activity, p)}</span>
           <SessionAttention session={session} />
         </button>)}
-        {!sessions.length && <p className="workspace-empty">{p(loading || workspace.loading ? "loading" : "noSessions")}</p>}
+        {!sessions.length && (loading || workspace.loading ? <p className="workspace-empty">{p("loading")}</p> : <WorkspaceEmptyState kind="activity" message={p("noSessions")} />)}
         {(filter ? projectSessions?.truncated : workspace.runner?.recent_sessions?.scan_truncated || workspace.runner?.recent_sessions?.truncated) && <p className="workspace-notice">{p("partial")}</p>}
       </>}
       {view === "system" && <SystemActivity activity={activity} />}

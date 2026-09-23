@@ -10,6 +10,62 @@ use crate::metadata::{
 };
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
+    requires_explicit_business_session(
+        def(
+            "record_external_observation",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelHidden,
+            TOOL_CATEGORY_SESSION,
+            None,
+            TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Mutate,
+                risk: super::ToolRisk::SessionCollaborate,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::FencedReplay,
+            },
+            Some(SESSION_COLLABORATE),
+            true,
+            NoPath,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE
+                .lifecycle(super::ToolSessionLifecycleEffect::Mutation),
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        ),
+    ),
+
+    requires_explicit_business_session(model_spec(
+        def(
+            "list_external_observations",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelVisible, TOOL_CATEGORY_SESSION, None, TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ), true, NoPath, false, false,
+            super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        )
+        .with_gpt_action_description("Read retained external reports for an exact Session/Project. These are untrusted adapter claims, not native execution or validation evidence; current capture completeness and source order are unproven."),
+        "Read all retained external reports for an exact Session/Project (at most 256). Reports are untrusted adapter claims, separate from native Job and validation evidence. They never establish task completion or authorize replaying work. coverage remains incomplete until a durable source sequence can prove gaps/order.",
+    )),
+
     def(
         "start_session",
         super::ToolAuditPolicy::TYPED_CANONICAL,
@@ -116,7 +172,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolActivityPresentation::Transport,
                 super::ToolActivityInteraction::NonMeaningful,
             ),
-            "Present one exact coding Workflow Session as a persistent read-only WebCodex Progress MCP App card when a long-running task benefits from visible progress. Requires explicit project + session_id, creates no work, runs no validation/review, changes no Session lifecycle, and grants no authority. Call at most once per long-running Session: the mounted App performs bounded app-only live reads of Session activity, workspace, validation, and review, so model-visible polling calls are unnecessary for presentation. Eligible frozen final changes remain available for lazy in-card diff reads. Presentation is UX only, never a correctness requirement; repeated explicit presentation may create another Host card.",
+            "Present one exact coding Workflow Session as a persistent read-only WebCodex Progress MCP App card. For substantial coding, call at most once after the Session becomes materially stateful so the user can watch bounded app-only live reads of Session activity, workspace, validation, and review without model-visible polling. Tiny/read-only work does not need a card. A non-blocking finish_coding_task closeout seals eligible final changes in the presentation cache; the mounted card then discovers that immutable snapshot on App refresh for lazy in-card diff reads. If no card exists, closeout may suggest one presentation. Requires explicit project + session_id, creates no work, runs no validation/review, changes no Session lifecycle, and grants no authority. Presentation is UX only, never a correctness requirement; repeated explicit presentation may create another Host card.",
         ))
         .with_gpt_action_unsupported(),
         155,
@@ -311,7 +367,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
         ),
-        "Post a bounded collaboration message (todo, question, progress, guidance, risk, or decision). Any message may request request-scoped ACK; ACK proves only current model-context retention and neither resolves nor gates work. Use complete_session_message to atomically answer and resolve a finished todo.",
+        "Post a bounded collaboration message (todo, question, progress, guidance, risk, or decision). Optional delivery_key provides bounded restart-safe sender-scoped replay while the keyed message metadata remains retained; exact retries return the original message and conflicting retained key reuse fails closed. Any message may request request-scoped ACK; ACK proves only current model-context retention and neither resolves nor gates work. Use complete_session_message to atomically answer and resolve a finished todo.",
     )),
     model_spec(
         def(
@@ -340,7 +396,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Send a bounded message to a principal-scoped peer window discovered through peer_awareness. Routing does not require Project equality, so a Project/worktree change alone does not invalidate the retained route; it grants no access to the recipient's Project, Workflow Session, files, or assignment authority. Ordinary messages are projected once; requires_ack messages repeat while retained whenever the recipient omits the request-scoped ACK.",
+        "Send a bounded message to a principal-scoped peer window discovered through peer_awareness. Optional delivery_key provides bounded restart-safe principal-and-sender-Window replay while the keyed peer message remains retained; exact retries return the original message and conflicting retained key reuse fails closed. Routing does not require Project equality, so a Project/worktree change alone does not invalidate the retained route; it grants no access to the recipient's Project, Workflow Session, files, or assignment authority. Ordinary messages are projected once; requires_ack messages repeat while retained whenever the recipient omits the request-scoped ACK.",
     ),
     requires_explicit_business_session(model_spec(
         def(
@@ -565,7 +621,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolActivityPresentation::Support,
             super::ToolActivityInteraction::Meaningful,
         ),
-            "Explicit read-only recovery for genuinely missing task context or an explicit handoff; requires the exact session_id. Do not use as routine progress/status polling or to establish a Session baseline when current context is coherent. Defaults to identity plus deterministic handoff_brief, hard-bounded at 8 KiB: task instructions, workspace, progress, validation, jobs, collaboration attention, next actions and basis completeness. Omitted project uses the authorized Session Project. diagnostic=true adds detailed ledger and closeout evidence. A concurrent Session change marks the basis incomplete; re-observe before dependent work. No checkpoint allocation, ACK token, or authority grant.",
+            "Explicit read-only recovery for genuinely missing task context or an explicit handoff; requires the exact session_id. Do not use as routine progress/status polling or to establish a Session baseline when current context is coherent. Defaults to identity plus deterministic handoff_brief, hard-bounded at 8 KiB: task instructions, workspace, progress, validation, jobs, collaboration attention, bounded external reports, next actions and basis completeness. External reports retain exact source IDs and unknown outcomes, with incomplete capture coverage; they are not native execution or validation. Omitted project uses the authorized Session Project. diagnostic=true adds detailed ledger and closeout evidence. A concurrent Session change marks the basis incomplete; re-observe before dependent work. No checkpoint allocation, ACK token, or authority grant.",
         ).with_gpt_action_description("Recover missing task context or perform an explicit handoff for an exact session_id. Do not use for routine progress/status polling or to establish a baseline. Returns a bounded handoff_brief; diagnostic=true adds detailed evidence. Check basis completeness before dependent work. Read-only.")),
         16,
     ),

@@ -502,6 +502,7 @@ fn edit_plan(
         .map_err(|error| EditPlanError::plain(0, "edit", error))?;
     let original = canonical_original.as_ref();
     let mut ops: Vec<(usize, usize, String, usize)> = Vec::with_capacity(edits.len());
+    let mut duplicate_anchors = vec![false; edits.len()];
     for (index, edit) in edits.iter().enumerate() {
         let kind = &edit.kind;
         if edit.occurrence == Some(0) {
@@ -651,6 +652,13 @@ fn edit_plan(
             ApplyTextEditKind::InsertAfter => (end, end),
             _ => (start, end),
         };
+        // Compare only the insertion boundary after the existing line-ending
+        // canonicalization. Advisory evidence must never alter the edit bytes.
+        duplicate_anchors[index] = match kind {
+            ApplyTextEditKind::InsertBefore => replacement.ends_with(needle),
+            ApplyTextEditKind::InsertAfter => replacement.starts_with(needle),
+            _ => false,
+        };
         ops.push((range_start, range_end, replacement, index));
     }
     ops.sort_by_key(|&(start, end, _, index)| (start, end, index));
@@ -675,13 +683,19 @@ fn edit_plan(
         replacement.push_str(text);
         cursor = end;
         let source_range = resolved_edit_source_range(original, start, end, index);
-        summaries.push(serde_json::json!({
+        let mut summary = serde_json::json!({
             "index": index,
             "kind": edits[index].kind.as_str(),
             "old_start_line": source_range.start_line,
             "old_end_line": source_range.end_line,
             "new_line_count": if text.is_empty() { 0 } else { text.lines().count() },
-        }));
+        });
+        if duplicate_anchors[index] {
+            summary["warning"] = serde_json::json!(
+                webcodex_core::apply_edits_shared::APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING
+            );
+        }
+        summaries.push(summary);
     }
     replacement.push_str(&original[cursor..]);
     let replacement = restore_apply_text_line_endings(replacement, line_ending);

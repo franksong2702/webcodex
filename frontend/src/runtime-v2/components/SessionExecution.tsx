@@ -133,6 +133,7 @@ export function SessionExecution({ item, location, session, language }: Props) {
               )}
             </section>
 
+            <div className="workflow-support">
             {item.runningJobs > 0 && (
               <section className="active-command">
                 <div className="active-command-head">
@@ -176,6 +177,7 @@ export function SessionExecution({ item, location, session, language }: Props) {
             {session.detail?.window_activity_after_last_session_record_truncated && (
               <div className="inventory-note wide">{t("Window activity reached the server history bound; older Window evidence may be omitted.")}</div>
             )}
+            </div>
 
             {item.reportedProgress?.text && (
               <article className="agent-working-note">

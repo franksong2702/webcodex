@@ -1,8 +1,18 @@
-# WebCodex
+<p align="right"><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a></p>
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+<p align="center"><img src="docs/assets/brand/webcodex-app-icon.png" alt="WebCodex" width="96" height="96"></p>
 
-**WebCodex lets ChatGPT, Claude, and other AI agents work directly with code and developer tools on your own machines.**
+<h1 align="center">WebCodex</h1>
+
+<p align="center"><strong>Give cloud AI agents a real development environment on your own machines.</strong></p>
+<p align="center">Connect ChatGPT, Claude, and other MCP clients to the repositories, Git checkout, and tools you already use.</p>
+<p align="center"><a href="#just-trying-it-for-a-few-minutes-temporary-share">Quick Trial</a> · <a href="#download-a-release">Downloads</a> · <a href="docs/PERSONAL_SETUP.md">Full Setup</a> · <a href="#documentation">Documentation</a> · <a href="SECURITY.md">Security</a></p>
+
+<p align="center">
+  <a href="docs/MCP.md"><img src="https://img.shields.io/badge/protocol-MCP-2563EB?labelColor=1E40AF&amp;style=flat-square" alt="MCP protocol"></a>
+  <a href="docs/QUICK_START.md#prerequisites"><img src="https://img.shields.io/badge/Node.js-18%2B-0D9488?labelColor=0F766E&amp;style=flat-square" alt="Node.js 18 or newer"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-2563EB?labelColor=1E40AF&amp;style=flat-square" alt="Apache 2.0 license"></a>
+</p>
 
 Ask your assistant to inspect a repository, modify code, run tests, use Git, or investigate a failure. Your repository stays on the machine where it already lives; you do not need to move the project into a hosted workspace just to use an AI coding agent.
 
@@ -14,12 +24,6 @@ Ask your assistant to inspect a repository, modify code, run tests, use Git, or 
 
 ## Start using WebCodex
 
-### Everyday development: full WebCodex (recommended)
-
-If you want ChatGPT to keep using your real development environment, start with a **regular Server + Runner**. This is the full development experience: durable access to multiple projects plus project exploration, editing, Git, commands, tests, long-running work, and code navigation. Public HTTPS, Cloudflare Tunnel, and OpenAI Secure MCP Tunnel are only ways for ChatGPT to reach the Server; they do not switch you into a different restricted experience.
-
-For Windows or macOS, the recommended first path is **WebCodex Desktop + the official OpenAI Secure Tunnel**. Follow the [Desktop installation guide](docs/desktop-install.md). For CLI, an existing Server, self-hosting, or advanced setup, use the [Full Setup guide](docs/PERSONAL_SETUP.md).
-
 ### Just trying it for a few minutes: temporary share
 
 To quickly see whether WebCodex fits your workflow, run this inside one repository:
@@ -30,6 +34,27 @@ npx --yes @yyjeqhc/webcodex share
 ```
 
 `share` starts a temporary, single-project instance of the ordinary WebCodex Adaptive Runtime and prints the ChatGPT connection values. Its temporary Project Credential limits access to that ProjectGrant; the endpoint and credential stop working when the command exits. It is intended for trials and short-lived sharing, not as the default full daily setup. See the [Quick Trial](docs/QUICK_START.md) for the exact steps.
+
+### Everyday development: full WebCodex (recommended)
+
+If you want ChatGPT to keep using your real development environment, start with a **regular Server + Runner**. This is the full development experience: durable access to multiple projects plus project exploration, editing, Git, commands, tests, long-running work, and code navigation. Public HTTPS, Cloudflare Tunnel, and OpenAI Secure MCP Tunnel are only ways for ChatGPT to reach the Server; they do not switch you into a different restricted experience.
+
+For Windows or macOS, the recommended first path is **WebCodex Desktop + the official OpenAI Secure Tunnel**. Follow the [Desktop installation guide](docs/desktop-install.md). For CLI, an existing Server, self-hosting, or advanced setup, use the [Full Setup guide](docs/PERSONAL_SETUP.md).
+
+### Download a release
+
+The links below are for the **official upstream v0.4.1 release**. Choose a Desktop installer for ordinary Windows/macOS use, or a native CLI archive for Server/Runner workflows. [View the release and checksums](https://github.com/yyjeqhc/webcodex/releases/tag/v0.4.1).
+
+| Platform | Desktop | CLI / Server / Runner |
+| --- | --- | --- |
+| Windows x64 | [Installer](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-desktop-v0.4.1-win32-x64-setup.exe) | [Archive](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-v0.4.1-win32-x64.tar.gz) |
+| Windows arm64 | — | [Archive](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-v0.4.1-win32-arm64.tar.gz) |
+| macOS Apple Silicon | [DMG](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-desktop-v0.4.1-darwin-arm64.dmg) | [Archive](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-v0.4.1-darwin-arm64.tar.gz) |
+| macOS Intel | [DMG](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-desktop-v0.4.1-darwin-x64.dmg) | [Archive](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-v0.4.1-darwin-x64.tar.gz) |
+| Linux x64 | — | [Archive](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-v0.4.1-linux-x64.tar.gz) |
+| Linux arm64 | — | [Archive](https://github.com/yyjeqhc/webcodex/releases/download/v0.4.1/webcodex-v0.4.1-linux-arm64.tar.gz) |
+
+The npm installation path remains `npm install -g @yyjeqhc/webcodex` (Node.js 18+).
 
 ## What can it do?
 
@@ -67,9 +92,18 @@ For the internal Server/Runner architecture, protocol surfaces, and authority bo
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/image?repos=yyjeqhc/webcodex&type=Date)](https://www.star-history.com/yyjeqhc/webcodex)
+This chart tracks the upstream [yyjeqhc/webcodex](https://github.com/yyjeqhc/webcodex) repository.
+
+<a href="https://www.star-history.com/yyjeqhc/webcodex">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=yyjeqhc/webcodex&amp;type=Date&amp;theme=dark">
+    <img alt="Star history of yyjeqhc/webcodex" src="https://api.star-history.com/svg?repos=yyjeqhc/webcodex&amp;type=Date">
+  </picture>
+</a>
 
 ## Platforms
+
+The platform capabilities below describe the official upstream release linked above.
 
 - **Linux x64/arm64** — local `share`, Server, and Runner workflows.
 - **macOS x64/arm64** — Desktop local Server + Runner, OpenAI Secure Tunnel, local `share`, and standalone Runner workflows.
@@ -101,7 +135,7 @@ Those are follow-up operating concerns, not concepts a first-time user should ha
 
 ## Security
 
-WebCodex can read and modify files and execute commands inside configured project boundaries. Use version control, keep credentials out of prompts/logs/Git, and register only project roots the assistant should access. Read [SECURITY.md](SECURITY.md) for the complete model.
+WebCodex can read and modify files and execute commands inside configured project boundaries. Use version control, keep credentials out of prompts/logs/Git, and register only project roots the assistant should access. Tool results, including requested file excerpts, may be returned to the AI client. Read [SECURITY.md](SECURITY.md) for the complete model.
 
 ## Build from source
 

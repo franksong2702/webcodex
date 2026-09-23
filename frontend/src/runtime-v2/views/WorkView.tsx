@@ -139,7 +139,7 @@ export function WorkView({
       />
 
       {sessionDenied ? (
-        <main className="session-main">
+        <main className="session-main ui-workbench-surface">
           <div className="empty-work">
             <CircleDot size={22} />
             <h2>{t("Session unavailable")}</h2>
@@ -149,7 +149,7 @@ export function WorkView({
       ) : selectedItem && selected ? (
         <SessionExecution item={selectedItem} location={selected} session={session} language={language} />
       ) : (
-        <main className="session-main">
+        <main className="session-main ui-workbench-surface">
           <div className="empty-work">
             <CircleDot size={22} />
             <h2>{t("Select a work Session")}</h2>

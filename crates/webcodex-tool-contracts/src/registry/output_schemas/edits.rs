@@ -207,6 +207,19 @@ fn apply_patch_file_summary_schema() -> Value {
     })
 }
 
+fn apply_text_edit_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "warning": {
+                "type": "string",
+                "enum": [webcodex_core::apply_edits_shared::APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING],
+                "description": "Optional non-blocking duplicate-anchor advisory. The Server preserves only this canonical fixed text when it maps to the original insert edit."
+            }
+        }
+    })
+}
+
 fn apply_text_edits_file_summary_schema() -> Value {
     json!({
         "type": "array",
@@ -232,8 +245,8 @@ fn apply_text_edits_file_summary_schema() -> Value {
                 "edits": {
                     "type": "array",
                     "maxItems": webcodex_core::apply_edits_shared::MAX_APPLY_TEXT_EDITS,
-                    "items": {"type": "object"},
-                    "description": "Bounded source-free per-edit summaries reported by the Runner."
+                    "items": apply_text_edit_summary_schema(),
+                    "description": "Bounded source-free per-edit summaries. The optional duplicate-anchor warning is Server-sanitized to one fixed non-blocking advisory; existing structural metadata remains additive."
                 }
             },
             "required": [

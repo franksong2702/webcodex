@@ -723,6 +723,23 @@ pub fn continuation_feedback_schema(description: &str) -> Value {
     })
 }
 
+pub(super) fn external_observation_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": description,
+        "properties": {
+            "adapter_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+            "event_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+            "tool": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "maxLength": 64},
+            "exit_code": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            "recorded_at": {"type": "integer"},
+            "status": {"type": "string", "enum": ["unknown", "reported_success", "reported_failure"]}
+        },
+        "required": ["adapter_id", "event_id", "tool", "exit_code", "recorded_at", "status"]
+    })
+}
+
 /// Strict compact handoff projection shared by `session_handoff_summary` and
 /// `finish_coding_task`.
 pub fn handoff_brief_schema(description: &str) -> Value {
@@ -794,6 +811,39 @@ pub fn handoff_brief_schema(description: &str) -> Value {
             "minimum": 0
         }))
     };
+    let external_observations = json!({
+        "type": "object",
+        "description": "Retained external claims for the exact output project and handoff Session. These reports never become native execution, validation, Goal, or completion evidence. Last five by server timestamp then identity; source order and capture completeness are unproven.",
+        "additionalProperties": false,
+        "properties": {
+            "status": {"type": "string", "enum": ["available", "unavailable"]},
+            "reason_code": nullable_with(json!({
+                "type": "string",
+                "enum": ["session_project_unavailable", "store_unavailable", "projection_unavailable"]
+            })),
+            "provenance": {"type": "string", "const": "external_report"},
+            "coverage": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "complete": {"type": "boolean", "const": false},
+                    "reason": {"type": "string", "enum": ["source_sequence_unavailable", "read_unavailable"]},
+                    "ordering": {"type": "string", "const": "server_recorded_at_then_identity"}
+                },
+                "required": ["complete", "reason", "ordering"]
+            },
+            "total": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 256})),
+            "returned": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 5})),
+            "truncated": nullable_bool(),
+            "unknown_count": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 256})),
+            "observations": nullable_with(json!({
+                "type": "array",
+                "maxItems": 5,
+                "items": external_observation_schema("Untrusted external report with exact adapter and event identity.")
+            }))
+        },
+        "required": ["status", "reason_code", "provenance", "coverage", "total", "returned", "truncated", "unknown_count", "observations"]
+    });
 
     json!({
         "type": "object",
@@ -920,6 +970,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                 },
                 "required": ["status", "open_failures", "reason_code"]
             },
+            "external_observations": external_observations,
             "attention": {
                 "type": "object",
                 "description": "Proven workspace, Job, and open guidance counts. Null means the corresponding evidence was unavailable.",
@@ -959,13 +1010,14 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                     "complete": schema_type("boolean", "True only when no fixed evidence-gap reason applies."),
                     "reason_codes": {
                         "type": "array",
-                        "maxItems": 9,
+                        "maxItems": 10,
                         "uniqueItems": true,
                         "items": {
                             "type": "string",
                             "enum": [
                                 "attempt_boundary_evicted",
                                 "continuation_unavailable",
+                                "external_observations_changed_during_snapshot",
                                 "guidance_unavailable",
                                 "job_summary_unavailable",
                                 "session_changed_during_snapshot",
@@ -990,7 +1042,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
         },
         "required": [
             "version", "session", "task", "workspace", "progress",
-            "validation", "attention", "next_actions", "basis",
+            "validation", "external_observations", "attention", "next_actions", "basis",
             "deterministic", "llm_summary"
         ]
     })

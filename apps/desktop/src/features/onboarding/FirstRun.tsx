@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { FolderOpen, Globe2, Share2 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { desktopApi, type QuickShareProvider } from "../../lib/desktop-api";
 import { useLocale } from "../../i18n/locale";
@@ -130,14 +131,17 @@ export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }
         <div className="entry-grid">
           <button className="entry-card recommended" onClick={() => setMode("local")} data-webcodex-action="choose-local-setup">
             <span className="entry-badge">{t("first.recommended")}</span>
+            <span className="entry-icon" aria-hidden="true"><FolderOpen /></span>
             <strong>{t("first.localTitle")}</strong>
             <span>{t("first.localDescription")}</span>
           </button>
           <button className="entry-card" onClick={() => setMode("remote")} data-webcodex-action="choose-remote-setup">
+            <span className="entry-icon" aria-hidden="true"><Globe2 /></span>
             <strong>{t("first.remoteTitle")}</strong>
             <span>{t("first.remoteDescription")}</span>
           </button>
           <button className="entry-card" onClick={() => setMode("share")} data-webcodex-action="choose-quick-share-setup">
+            <span className="entry-icon" aria-hidden="true"><Share2 /></span>
             <strong>{t("first.shareTitle")}</strong>
             <span>{t("first.shareDescription")}</span>
           </button>

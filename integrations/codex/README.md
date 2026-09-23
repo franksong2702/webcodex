@@ -4,6 +4,10 @@ This adapter connects Codex hooks to the same checkpoint implementation used by
 WebCodex's Runner. It does not install hooks, migrate chat transcripts, launch a
 model, modify permission decisions, or commit/push project files.
 
+The optional upstream Workflow Session report adapter has a separate evidence
+model and is documented in [workflow-session-observations.md](workflow-session-observations.md).
+It does not replace the project-local checkpoint or its universal Hooks.
+
 ## Activation: one trusted entry for all projects
 
 Generate `generate_config.py --universal --binary /absolute/webcodex` and review

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { MantineProvider } from "@mantine/core";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LocaleProvider } from "../i18n/locale";
@@ -29,7 +30,7 @@ function state(): DesktopState {
 }
 function Harness({ mode, initial = state() }: { mode: "connections" | "mcp"; initial?: DesktopState }) {
   const [snapshot, setSnapshot] = useState(initial);
-  return <LocaleProvider>{mode === "connections" ? <ConnectionPanel state={snapshot} onState={setSnapshot} /> : <McpProvidersPanel state={snapshot} onState={setSnapshot} settings={settings} onRestarted={() => undefined} />}</LocaleProvider>;
+  return <MantineProvider><LocaleProvider>{mode === "connections" ? <ConnectionPanel state={snapshot} onState={setSnapshot} /> : <McpProvidersPanel state={snapshot} onState={setSnapshot} settings={settings} onRestarted={() => undefined} />}</LocaleProvider></MantineProvider>;
 }
 beforeEach(() => {
   vi.resetAllMocks(); localStorage.setItem("webcodex.desktop.locale", "en-US");

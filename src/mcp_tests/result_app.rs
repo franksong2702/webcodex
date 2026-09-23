@@ -165,12 +165,13 @@ async fn result_app_descriptor_and_resource_exposure_require_ui_operator_capabil
     assert_eq!(MCP_RESULT_UI_RESOURCE_URI, "ui://webcodex/changes/v2");
     assert_eq!(
         MCP_WORK_RESULT_UI_RESOURCE_URI,
-        "ui://webcodex/work-result/v1"
+        "ui://webcodex/work-result/v2"
     );
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/changes/v1"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v1"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v2"));
     assert!(MCP_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/result/v3"));
+    assert!(MCP_WORK_RESULT_UI_RESOURCE_LEGACY_URIS.contains(&"ui://webcodex/work-result/v1"));
     assert!(mcp_result_app_resource_meta(None)["ui"]
         .get("domain")
         .is_none());
@@ -2351,6 +2352,7 @@ fn observe_jobs_item_limit_matches_presentation_bound() {
             .map(|index| ObserveJobsItem {
                 job_id: format!("job-{index}"),
                 after_observation_token: None,
+                observation_ref: None,
             })
             .collect(),
         tail_lines: 40,

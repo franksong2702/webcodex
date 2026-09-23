@@ -152,6 +152,8 @@ pub(crate) enum RouteId {
     AgentTokensList,
     AgentTokensRevoke,
     PairingCreate,
+    PairingRunnerCapabilities,
+    RunnerCapabilityAuthorization,
     ShellRun,
     ShellFile,
     ShellJob,

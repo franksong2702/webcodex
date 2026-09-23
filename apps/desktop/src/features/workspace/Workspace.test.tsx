@@ -8,6 +8,7 @@ import { ActivityPanel } from "../activity/ActivityPanel";
 import { ExtensionsPanel } from "../extensions/ExtensionsPanel";
 import { WorkspaceProvider, sameProjectPath, sessionTitle } from "./WorkspaceContext";
 import { ChatgptObservation, observationTime } from "./WorkspaceStatus";
+import { DesktopMantineProvider } from "../../components/DesktopMantineProvider";
 
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
 const api = vi.hoisted(() => ({ runnerSettings: vi.fn(), updateRunnerSettings: vi.fn(), restartOwnedRunner: vi.fn(), addRunnerPlugin: vi.fn() }));
@@ -28,7 +29,7 @@ const state = {
   current_operation: null, chatgpt_activity: { observed: false, last_meaningful_activity_at_ms: null },
 } as unknown as DesktopState;
 const overview = { client_id: "mini", connected: true, projects: [alpha, beta], visible_project_count: 2, projects_truncated: false, recent_sessions: { sessions: [session], truncated: false, scan_truncated: false } };
-const wrap = (children: React.ReactNode, selected = state) => <LocaleProvider><WorkspaceProvider state={selected}>{children}</WorkspaceProvider></LocaleProvider>;
+const wrap = (children: React.ReactNode, selected = state) => <DesktopMantineProvider><LocaleProvider><WorkspaceProvider state={selected}>{children}</WorkspaceProvider></LocaleProvider></DesktopMantineProvider>;
 
 beforeEach(() => {
   vi.resetAllMocks(); localStorage.clear(); localStorage.setItem("webcodex.desktop.locale", "en-US");
@@ -59,16 +60,16 @@ describe("product workspace task flows", () => {
   it("shows every project with branch/activity and keeps other projects when switching current", async () => {
     const open = vi.fn(); const add = vi.fn();
     const view = render(wrap(<ProjectsPanel state={state} onChooseProject={add} onSelectProject={open} />));
-    await screen.findByText("2 active sessions"); expect(await screen.findAllByText("feat/export")).toHaveLength(2);
-    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    await screen.findByLabelText("2 active sessions"); expect(await screen.findAllByText("feat/export")).toHaveLength(2);
+    expect(screen.getAllByRole("row")).toHaveLength(3);
     fireEvent.click(screen.getByRole("button", { name: "Open Project beta" })); expect(open).toHaveBeenCalledWith(beta.path);
     const switched = { ...state, project: { ...state.project!, path: beta.path, runtime_project_id: beta.id } };
     view.rerender(wrap(<ProjectsPanel state={switched} onChooseProject={add} onSelectProject={open} />, switched));
-    await waitFor(() => expect(within(screen.getByRole("listitem", { name: "beta" })).getByText("Current")).toBeInTheDocument());
-    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    await waitFor(() => expect(within(screen.getByRole("row", { name: "beta" })).getByText("Current")).toBeInTheDocument());
+    expect(screen.getAllByRole("row")).toHaveLength(3);
     fireEvent.click(screen.getByRole("button", { name: "Add Project" })); expect(add).toHaveBeenCalledTimes(1);
     fireEvent.change(screen.getByRole("searchbox", { name: "Search projects" }), { target: { value: "ALPHA" } });
-    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getAllByRole("row")).toHaveLength(2);
   });
   it("opens a Window's associated Workflow Session and presents product activity rather than a ledger", async () => {
     render(wrap(<ActivityPanel activity={[]} />));
@@ -89,6 +90,7 @@ describe("product workspace task flows", () => {
   });
   it("opens effective instructions, lists real Skills and reloads a provider only on request", async () => {
     render(wrap(<ExtensionsPanel state={state} onState={vi.fn()} />));
+    fireEvent.click(screen.getByRole("tab", { name: "Instructions" }));
     fireEvent.click(await screen.findByRole("button", { name: "Open AGENTS.md" }));
     const document = await screen.findByRole("dialog", { name: "AGENTS.md" });
     await within(document).findByText(/Use existing tests/);
@@ -112,10 +114,10 @@ describe("product workspace task flows", () => {
     await waitFor(() => expect(overviewCalls).toBe(1));
     const switched = { ...state, project: { ...state.project!, path: beta.path, runtime_project_id: beta.id } };
     view.rerender(wrap(<ProjectsPanel state={switched} onChooseProject={vi.fn()} onSelectProject={vi.fn()} />, switched));
-    await screen.findByText("2 active sessions");
+    await screen.findByLabelText("2 active sessions");
     await act(async () => { complete({ ...overview, projects: [{ ...alpha, id: "agent:old:other", name: "Stale project", path: "/old" }] }); });
     expect(screen.queryByText("Stale project")).not.toBeInTheDocument();
-    expect(within(screen.getByRole("listitem", { name: "beta" })).getByText("Current")).toBeInTheDocument();
+    expect(within(screen.getByRole("row", { name: "beta" })).getByText("Current")).toBeInTheDocument();
   });
   it("uses timestamps, never inferred ChatGPT presence", () => {
     const view = render(<LocaleProvider><ChatgptObservation state={state} /></LocaleProvider>);

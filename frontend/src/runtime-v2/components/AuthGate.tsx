@@ -2,6 +2,7 @@ import { KeyRound, LockKeyhole } from "lucide-react";
 import { FormEvent, useState } from "react";
 import type { RuntimeLanguage } from "../../runtime_i18n.js";
 import { translate } from "../../runtime_i18n.js";
+import { BrandMark } from "./ui/BrandMark.js";
 
 type Props = {
   language: RuntimeLanguage;
@@ -22,7 +23,7 @@ export function AuthGate({ language, onConnect }: Props) {
   return (
     <main className="auth-shell">
       <section className="auth-card">
-        <div className="auth-brand"><span className="brand-mark">W</span><strong>WebCodex</strong></div>
+        <div className="auth-brand"><BrandMark /><strong>WebCodex</strong></div>
         <div className="auth-icon"><LockKeyhole size={23} /></div>
         <span className="eyebrow">{t("Runtime workspace")}</span>
         <h1>{t("Connect to your workspace")}</h1>

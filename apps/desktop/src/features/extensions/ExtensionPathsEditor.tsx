@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Button, Textarea } from "@mantine/core";
 import type { RunnerSettings } from "../../models/topology";
 import { useLocale } from "../../i18n/locale";
 import { useProduct } from "../../i18n/product";
@@ -15,10 +16,8 @@ export function ExtensionPathsEditor({ settings, disabled, onSave }: {
     const lines = (value: string) => value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
     void onSave({ instruction_files: lines(instructions), skill_roots: lines(skills) });
   }}>
-    <label htmlFor="instruction-files">{t("extensions.instructionFiles")}</label>
-    <textarea id="instruction-files" rows={3} value={instructions} onChange={event => setInstructions(event.target.value)} disabled={disabled} spellCheck={false} />
-    <label htmlFor="skill-roots">{t("extensions.skillRoots")}</label>
-    <textarea id="skill-roots" rows={3} value={skills} onChange={event => setSkills(event.target.value)} disabled={disabled} spellCheck={false} />
-    <button className="primary-button" type="submit" data-webcodex-action="save-runner-settings" disabled={disabled}>{p("save")}</button>
+    <Textarea id="instruction-files" label={t("extensions.instructionFiles")} rows={3} value={instructions} onChange={event => setInstructions(event.currentTarget.value)} disabled={disabled} spellCheck={false} />
+    <Textarea id="skill-roots" label={t("extensions.skillRoots")} rows={3} value={skills} onChange={event => setSkills(event.currentTarget.value)} disabled={disabled} spellCheck={false} />
+    <Button className="primary-button" type="submit" data-webcodex-action="save-runner-settings" disabled={disabled}>{p("save")}</Button>
   </form>;
 }

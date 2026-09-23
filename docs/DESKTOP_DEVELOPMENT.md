@@ -44,9 +44,12 @@ All platforms need:
 - the repository checkout;
 - enough disk space for the root Rust build and the separate Desktop Tauri build.
 
-Install Desktop JavaScript dependencies once per checkout/update:
+Install both JavaScript dependency sets once per checkout/update. Desktop uses
+shared UI source from `frontend/src/ui`, so its typecheck and build need the
+frontend packages as well:
 
 ```bash
+npm ci --prefix frontend
 npm ci --prefix apps/desktop
 ```
 

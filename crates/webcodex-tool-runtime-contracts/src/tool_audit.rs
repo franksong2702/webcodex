@@ -4081,9 +4081,13 @@ impl ToolCallAuditProjection for ToolCall {
                     .iter()
                     .filter(|item| item.after_observation_token.is_some())
                     .count(),
+                "observation_ref_count": items
+                    .iter()
+                    .filter(|item| item.observation_ref.is_some())
+                    .count(),
                 "job_ids": items
                     .iter()
-                    .map(|item| item.job_id.as_str())
+                    .filter_map(|item| (!item.job_id.is_empty()).then_some(item.job_id.as_str()))
                     .collect::<Vec<_>>(),
                 "tail_lines": tail_lines,
                 "wait_secs": wait_secs,
@@ -5506,6 +5510,17 @@ impl ToolCallAuditProjection for ToolCall {
                 "checkpoint_id": checkpoint_id,
                 "confirm": confirm,
             }),
+            Self::RecordExternalObservation {
+                project,
+                session_id,
+                ..
+            }
+            | Self::ListExternalObservations {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project, "session_id": session_id,
+            }),
             Self::PostSessionMessage {
                 session_id,
                 kind,
@@ -5514,6 +5529,7 @@ impl ToolCallAuditProjection for ToolCall {
                 reply_to,
                 priority,
                 requires_ack,
+                delivery_key: _,
             } => serde_json::json!({
                 "session_id": session_id,
                 "kind": kind,
@@ -5531,6 +5547,7 @@ impl ToolCallAuditProjection for ToolCall {
                 tags,
                 priority,
                 requires_ack,
+                delivery_key: _,
             } => serde_json::json!({
                 "peer_id": peer_id,
                 "kind": kind,

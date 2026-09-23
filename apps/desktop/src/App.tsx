@@ -1,5 +1,7 @@
 import { WorkspaceProvider } from "./features/workspace/WorkspaceContext";
-import brandIcon from "./assets/brand.png";
+import { Alert, Button } from "@mantine/core";
+import { DesktopMantineProvider } from "./components/DesktopMantineProvider";
+import { BrandMark } from "../../../frontend/src/ui/BrandMark";
 import { ExtensionsPanel } from "./features/extensions/ExtensionsPanel";
 import { ComputerPermissions } from "./features/settings/ComputerPermissions";
 import { Sidebar } from "./components/Sidebar";
@@ -18,16 +20,20 @@ import { useLocale } from "./i18n/locale";
 import { desktopCommandDiagnostics, desktopErrorPresentation, operationLabel } from "./i18n/presentation";
 
 export default function App() {
+  return <DesktopMantineProvider><DesktopApp /></DesktopMantineProvider>;
+}
+
+function DesktopApp() {
   const { t } = useLocale();
   const { state, activity, navigation, setNavigation, refreshing, error, setError, cancelSubmittingId, showSetup, setShowSetup, setStartupAttempt, mainRef, commitState, openSetup, chooseLocalProject, refresh, resumeRuntime, cancelCurrentOperation, runStateOperation } = useDesktopWorkspace();
   if (!state) {
     return (
       <main className="splash">
-        <img className="brand-mark" src={brandIcon} alt="" />
+        <BrandMark />
         {error ? (
           <section className="startup-error" aria-label="WebCodex">
             <AppError error={error} />
-            <button
+            <Button
               className="primary-button"
               type="button"
               onClick={() => {
@@ -37,7 +43,7 @@ export default function App() {
               data-webcodex-action="retry-desktop-startup"
             >
               {t("common.retry")}
-            </button>
+            </Button>
           </section>
         ) : (
           <span role="status">{t("app.loading")}</span>
@@ -76,7 +82,7 @@ export default function App() {
               <span>{t("operation.cancelNote")}</span>
             </div>
             {state.current_operation.cancellable && (
-              <button
+              <Button
                 className="secondary-button"
                 type="button"
                 disabled={
@@ -89,7 +95,7 @@ export default function App() {
                 {state.current_operation.phase === "cancelling"
                   ? t("operation.cancelling")
                   : t("operation.cancel")}
-              </button>
+              </Button>
             )}
           </section>
         )}
@@ -133,7 +139,7 @@ function AppError({ error }: { error: DesktopError }) {
   const presentation = desktopErrorPresentation(error, t);
   const diagnostics = desktopCommandDiagnostics(error);
   return (
-    <div className="error-card app-error" role="alert">
+    <Alert className="error-card app-error" role="alert" variant="light" color="red">
       <strong>{presentation.title}</strong>
       <span>{presentation.action}</span>
       <details>
@@ -150,6 +156,6 @@ function AppError({ error }: { error: DesktopError }) {
           </dl>
         )}
       </details>
-    </div>
+    </Alert>
   );
 }

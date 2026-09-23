@@ -1,17 +1,19 @@
 import {
   ArrowUpRight,
-  ChevronDown,
-  Clock3,
   Folder,
   GitBranch,
   Monitor,
   Search,
+  Plus,
 } from "lucide-react";
+import { Button, Modal, Select, TextInput } from "@mantine/core";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type { RuntimeLanguage } from "../../runtime_i18n.js";
 import { translate } from "../../runtime_i18n.js";
+import { ScopePicker } from "../../ui/ProjectPicker.js";
 import type { RuntimeV2Client } from "../api/client.js";
 import { registerProject } from "../api/projects.js";
+import { PageHeader } from "../components/ui/PageHeader.js";
 import { projectDisplayName, relativeTime } from "../model/format.js";
 import { phaseFromSession, workBucket } from "../model/work.js";
 import type { ProjectRow, RunnerSummary } from "../model/types.js";
@@ -97,39 +99,27 @@ export function ProjectsView({ client, language, runners, onOpenSession, onUnaut
   };
 
   return (
-    <main className="page">
-      <header className="page-heading">
-        <div>
-          <span className="eyebrow">{t("Repository workspace")}</span>
-          <h1>{t("Projects")}</h1>
-          <p>{t("Find a repository, then inspect the work Sessions currently active inside it.")}</p>
-        </div>
-        <div className="page-heading-actions">
+    <main className="page ui-workbench-surface">
+      <PageHeader title={t("Projects")} actions={
+        <>
           <span className="quiet-pill">
             {projectsState.availability === "stale" ? t("stale") :
               projectsState.availability === "loading" ? t("Loading projects…") :
                 String(projectsState.total) + " " + t("projects")}
           </span>
-          <button className="primary-button" type="button" onClick={() => { setAddOpen(true); setAddStatus(""); }}>{t("Add Project")}</button>
-        </div>
-      </header>
+          <Button className="runtime-primary" type="button" leftSection={<Plus size={16} />} onClick={() => { setAddOpen(true); setAddStatus(""); }}>{t("Add Project")}</Button>
+        </>
+      } />
 
-      <div className="filter-bar">
-        <Search size={16} />
-        <input
+      <div className="filter-bar project-filter-bar">
+        <TextInput className="project-filter-input" leftSection={<Search size={16} />}
           aria-label={t("Search projects")}
           placeholder={t("Filter by Project name, id, Runner, or workspace path")}
           value={projectsState.query}
-          onChange={(event) => projectsState.setQuery(event.target.value)}
+          onChange={(event) => projectsState.setQuery(event.currentTarget.value)}
         />
-        <label className="filter-select">
-          <span className="sr-only">{t("Runner")}</span>
-          <select value={projectsState.runner} onChange={(event) => projectsState.setRunner(event.target.value)}>
-            <option value="">{t("All Runners")}</option>
-            {runners.map((runner) => <option key={runner.client_id} value={runner.client_id}>{runner.client_id}</option>)}
-          </select>
-          <ChevronDown size={14} />
-        </label>
+        <ScopePicker kind="runner" className="runner-picker" label={t("Runner")} allLabel={t("All Runners")} emptyLabel={t("No matching Runners")} searchLabel={t("Search Runners")}
+          value={projectsState.runner} onChange={projectsState.setRunner} options={runners.map((runner) => ({ value: runner.client_id, label: runner.client_id }))} />
       </div>
 
       {projectsState.availability === "denied" && (
@@ -144,7 +134,7 @@ export function ProjectsView({ client, language, runners, onOpenSession, onUnaut
           const selected = selectedProject?.id === project.id;
           return (
             <button
-              className={"project-card" + (selected ? " selected" : "")}
+              className={"project-card ui-entity-row" + (selected ? " selected" : "")}
               key={project.id}
               type="button"
               onClick={() => openProject(project.id)}
@@ -154,7 +144,7 @@ export function ProjectsView({ client, language, runners, onOpenSession, onUnaut
                 <span className="project-icon"><Folder size={18} /></span>
                 <span>
                   <strong title={project.id}>{projectDisplayName(project.name, project.id)}</strong>
-                  <small>{project.client_id} · {project.project_ref || project.id}</small>
+                  <small title={project.path || project.id}>{project.path || project.client_id}</small>
                 </span>
                 <span className={"status-pill " + (project.connected ? "good" : "warn")}>
                   {project.connected ? t("online") : t("offline")}
@@ -163,9 +153,7 @@ export function ProjectsView({ client, language, runners, onOpenSession, onUnaut
               <div className="project-card-body">
                 <div><GitBranch size={14} /><span title={String(git?.branch || "")}>{git?.branch || t("Not checked")}</span></div>
                 <div><Monitor size={14} /><span>{retained} {t("Sessions")} · {active} {t("active")}</span></div>
-                <div><Clock3 size={14} /><span>{project.sessions?.latest_updated_at ? relativeTime(project.sessions.latest_updated_at) : "—"}</span></div>
               </div>
-              {project.path && <code className="project-path" title={project.path}>{project.path}</code>}
               <span className="project-open">{t("View Sessions")} <ArrowUpRight size={14} /></span>
             </button>
           );
@@ -184,7 +172,6 @@ export function ProjectsView({ client, language, runners, onOpenSession, onUnaut
           <div className="section-heading">
             <div>
               <h2>{projectDisplayName(selectedProject.name, selectedProject.id)} · {t("Sessions")}</h2>
-              <p>{t("A Project may host multiple Sessions. Window counts are bounded, independently authorized evidence.")}</p>
             </div>
             <span className="quiet-pill">{sessionsState.total} {t("Sessions")}</span>
           </div>
@@ -194,7 +181,7 @@ export function ProjectsView({ client, language, runners, onOpenSession, onUnaut
               const windows = sessionsState.windowCountBySession.get(session.session_id);
               return (
                 <button
-                  className="project-session-row"
+                  className="project-session-row ui-entity-row"
                   key={session.session_id}
                   type="button"
                   onClick={() => onOpenSession({
@@ -236,19 +223,20 @@ export function ProjectsView({ client, language, runners, onOpenSession, onUnaut
           </div>
         </section>
       )}
-      {addOpen && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !addPending) setAddOpen(false); }}>
-          <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="add-project-title">
-            <header><div><span className="eyebrow">{t("Projects")}</span><h2 id="add-project-title">{t("Add Project")}</h2></div><button className="icon-button" type="button" onClick={() => !addPending && setAddOpen(false)} aria-label={t("Close")}>×</button></header>
-            <form className="compact-form" onSubmit={(event) => void submitAddProject(event)}>
-              <label>{t("Runner")}<select required value={addRunner} onChange={(event) => setAddRunner(event.target.value)}>{runners.map((runner) => <option key={runner.client_id} value={runner.client_id}>{runner.client_id}</option>)}</select></label>
-              <label>{t("Project folder")}<input required maxLength={4096} autoComplete="off" spellCheck={false} value={addPath} onChange={(event) => setAddPath(event.target.value)} placeholder={t("Absolute folder path on the selected Runner")} /></label>
-              {addStatus && <p className="modal-status" role={addStatus.includes("could") || addStatus.includes("无法") ? "alert" : "status"}>{addStatus}</p>}
-              <div className="modal-actions"><button type="button" className="text-button" disabled={addPending} onClick={() => setAddOpen(false)}>{t("Cancel")}</button><button className="primary-button" type="submit" disabled={addPending || !addRunner || !addPath.trim()}>{addPending ? t("Adding project…") : t("Add Project")}</button></div>
-            </form>
-          </section>
-        </div>
-      )}
+      <Modal opened={addOpen} onClose={() => { if (!addPending) setAddOpen(false); }}
+        closeOnEscape={!addPending} closeOnClickOutside={!addPending} withCloseButton={!addPending}
+        closeButtonProps={{ "aria-label": t("Close") }}
+        title={t("Add Project")} centered size="lg" className="runtime-project-modal">
+        <form className="runtime-project-form" onSubmit={(event) => void submitAddProject(event)}>
+          <Select required label={t("Runner")} value={addRunner} onChange={(value) => setAddRunner(value || "")}
+            data={runners.map((runner) => ({ value: runner.client_id, label: runner.client_id }))} searchable comboboxProps={{ withinPortal: true }} />
+          <TextInput required label={t("Project folder")} maxLength={4096} autoComplete="off" spellCheck={false}
+            value={addPath} onChange={(event) => setAddPath(event.currentTarget.value)} placeholder={t("Absolute folder path on the selected Runner")} />
+          {addStatus && <p className="modal-status" role={addStatus.includes("could") || addStatus.includes("无法") ? "alert" : "status"}>{addStatus}</p>}
+          <div className="modal-actions"><Button type="button" variant="default" disabled={addPending} onClick={() => setAddOpen(false)}>{t("Cancel")}</Button>
+            <Button className="runtime-primary" type="submit" loading={addPending} disabled={!addRunner || !addPath.trim()}>{t("Add Project")}</Button></div>
+        </form>
+      </Modal>
     </main>
   );
 }

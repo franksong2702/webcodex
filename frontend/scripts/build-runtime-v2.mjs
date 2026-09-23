@@ -49,6 +49,8 @@ async function buildInto(outputDirectory) {
   });
   const html = readFileSync(htmlSource, "utf8").replace(/\r\n/g, "\n");
   writeFileSync(resolve(outputDirectory, "runtime.html"), html.endsWith("\n") ? html : html + "\n");
+  const scriptPath = resolve(outputDirectory, "app.js");
+  writeFileSync(scriptPath, readFileSync(scriptPath, "utf8").replace(/^[\t ]+$/gm, ""));
   for (const file of expectedFiles) {
     if (!existsSync(resolve(outputDirectory, file))) throw new Error("Runtime v2 build did not produce " + file);
   }

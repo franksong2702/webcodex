@@ -47,6 +47,8 @@ export function useDesktopWorkspace() {
   useEffect(() => {
     mainRef.current?.focus({ preventScroll: true });
     mainRef.current?.scrollTo?.({ top: 0 });
+    // Narrow layouts scroll the window rather than the main pane.
+    if (window.innerWidth <= 600) window.scrollTo(0, 0);
   }, [navigation, showSetup]);
 
   useEffect(() => {

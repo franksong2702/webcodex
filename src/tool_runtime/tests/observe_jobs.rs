@@ -18,6 +18,15 @@ fn item(job_id: &str, token: Option<String>) -> ObserveJobsItem {
     ObserveJobsItem {
         job_id: job_id.to_string(),
         after_observation_token: token,
+        observation_ref: None,
+    }
+}
+
+fn item_ref(observation_ref: &str) -> ObserveJobsItem {
+    ObserveJobsItem {
+        job_id: String::new(),
+        after_observation_token: None,
+        observation_ref: Some(observation_ref.to_string()),
     }
 }
 
@@ -392,10 +401,14 @@ fn observe_jobs_schema_catalog_permission_and_audit_are_public_and_token_safe() 
     assert!(spec.input_schema["properties"]["wait_secs"]
         .get("maximum")
         .is_none());
-    assert_eq!(
-        spec.input_schema["properties"]["items"]["items"]["additionalProperties"],
-        false
-    );
+    let selector_branches = spec.input_schema["properties"]["items"]["items"]["oneOf"]
+        .as_array()
+        .expect("observe_jobs selectors must be a closed oneOf");
+    assert_eq!(selector_branches.len(), 2);
+    assert_eq!(selector_branches[0]["required"], json!(["job_id"]));
+    assert_eq!(selector_branches[1]["required"], json!(["observation_ref"]));
+    assert_eq!(selector_branches[0]["additionalProperties"], false);
+    assert_eq!(selector_branches[1]["additionalProperties"], false);
     let output = &spec.output_schema["properties"]["output"]["anyOf"][0];
     let sparse_output = &spec.output_schema["properties"]["output"]["anyOf"][1];
     assert_eq!(
@@ -414,6 +427,14 @@ fn observe_jobs_schema_catalog_permission_and_audit_are_public_and_token_safe() 
     assert_eq!(
         observation["properties"]["observation_token"]["maxLength"],
         crate::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN
+    );
+    assert!(
+        observation["properties"].get("observation_ref").is_none(),
+        "observation_ref belongs to the batch item, not the canonical Job observation body"
+    );
+    assert_eq!(
+        output["properties"]["items"]["items"]["properties"]["observation_ref"]["maxLength"],
+        crate::job_observation::MAX_OBSERVATION_REF_LEN
     );
     for required in [
         "activity",
@@ -436,6 +457,10 @@ fn observe_jobs_schema_catalog_permission_and_audit_are_public_and_token_safe() 
         .iter()
         .any(|schema| schema["type"] == "null"));
     let sparse_observation = &sparse_output["properties"]["items"]["items"];
+    assert_eq!(
+        sparse_observation["properties"]["observation_ref"]["maxLength"],
+        crate::job_observation::MAX_OBSERVATION_REF_LEN
+    );
     for required in [
         "job_id",
         "status",
@@ -491,6 +516,7 @@ fn observe_jobs_schema_catalog_permission_and_audit_are_public_and_token_safe() 
     let summary = call.session_log_arguments();
     assert_eq!(summary["item_count"], 1);
     assert_eq!(summary["token_count"], 1);
+    assert_eq!(summary["observation_ref_count"], 0);
     assert_eq!(summary["job_ids"], json!(["job"]));
     assert_eq!(summary["tail_lines"], 40);
     assert_eq!(summary["wait_secs"], 5);
@@ -505,6 +531,7 @@ fn observe_jobs_schema_catalog_permission_and_audit_are_public_and_token_safe() 
         }),
     );
     assert_eq!(raw_summary["token_count"], 1);
+    assert_eq!(raw_summary["observation_ref_count"], 0);
     assert!(!serde_json::to_string(&raw_summary)
         .unwrap()
         .contains(opaque));
@@ -1034,6 +1061,184 @@ async fn observe_jobs_inaccessible_and_unknown_items_are_indistinguishable() {
         assert!(!error.contains("owner"));
         assert!(!error.contains("project-"));
     }
+}
+
+#[tokio::test]
+async fn observe_jobs_compact_ref_roundtrips_and_survives_model_projection() {
+    let runtime = test_runtime();
+    let (job_id, request, auth) =
+        register_and_start_agent_job(&runtime, "observe-ref-roundtrip").await;
+    update_observed_job(
+        &runtime,
+        "observe-ref-roundtrip",
+        &request,
+        "running",
+        Some("first line\n"),
+        Some(process_activity()),
+        false,
+    )
+    .await;
+
+    let first = runtime
+        .observe_jobs_for_auth(
+            vec![item(&job_id, None)],
+            40,
+            None,
+            ObserveJobsWakeOn::Change,
+            Some(&auth),
+        )
+        .await;
+    assert!(first.success, "{first:?}");
+    let first_ref = first.output["items"][0]["observation_ref"]
+        .as_str()
+        .expect("successful observation must mint compact ref")
+        .to_string();
+    assert!(first_ref.starts_with("~j"));
+    assert_eq!(first.output["items"][0]["job_id"], job_id);
+    assert!(first.output["items"][0]["output"]["observation_token"]
+        .as_str()
+        .is_some());
+
+    let projected = compact_projection(&first);
+    assert_eq!(projected.output["items"][0]["observation_ref"], first_ref);
+
+    let second = runtime
+        .observe_jobs_for_auth(
+            vec![item_ref(&first_ref)],
+            40,
+            None,
+            ObserveJobsWakeOn::Change,
+            Some(&auth),
+        )
+        .await;
+    assert!(second.success, "{second:?}");
+    assert_eq!(second.output["items"][0]["success"], true);
+    assert_eq!(second.output["items"][0]["job_id"], job_id);
+    let second_ref = second.output["items"][0]["observation_ref"]
+        .as_str()
+        .expect("follow-up observation must mint a fresh ref");
+    assert_ne!(second_ref, first_ref);
+}
+
+#[tokio::test]
+async fn observe_jobs_rejects_raw_and_ref_alias_of_same_job_after_resolution() {
+    let runtime = test_runtime();
+    let (job_id, request, auth) =
+        register_and_start_agent_job(&runtime, "observe-ref-duplicate").await;
+    update_observed_job(
+        &runtime,
+        "observe-ref-duplicate",
+        &request,
+        "running",
+        None,
+        Some(process_activity()),
+        false,
+    )
+    .await;
+
+    let baseline = runtime
+        .observe_jobs_for_auth(
+            vec![item(&job_id, None)],
+            40,
+            None,
+            ObserveJobsWakeOn::Change,
+            Some(&auth),
+        )
+        .await;
+    assert!(baseline.success, "{baseline:?}");
+    let observation_ref = baseline.output["items"][0]["observation_ref"]
+        .as_str()
+        .expect("baseline compact ref");
+
+    let duplicate = runtime
+        .observe_jobs_for_auth(
+            vec![item(&job_id, None), item_ref(observation_ref)],
+            40,
+            None,
+            ObserveJobsWakeOn::Change,
+            Some(&auth),
+        )
+        .await;
+    assert!(
+        !duplicate.success,
+        "resolved duplicate Job must fail closed"
+    );
+    assert!(duplicate
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("duplicate"));
+}
+
+#[tokio::test]
+async fn observe_jobs_unknown_ref_is_item_isolated_from_valid_ref() {
+    let runtime = test_runtime();
+    let (job_id, request, auth) =
+        register_and_start_agent_job(&runtime, "observe-ref-isolation").await;
+    update_observed_job(
+        &runtime,
+        "observe-ref-isolation",
+        &request,
+        "running",
+        None,
+        Some(process_activity()),
+        false,
+    )
+    .await;
+
+    let baseline = runtime
+        .observe_jobs_for_auth(
+            vec![item(&job_id, None)],
+            40,
+            None,
+            ObserveJobsWakeOn::Change,
+            Some(&auth),
+        )
+        .await;
+    assert!(baseline.success, "{baseline:?}");
+    let valid_ref = baseline.output["items"][0]["observation_ref"]
+        .as_str()
+        .expect("baseline compact ref")
+        .to_string();
+
+    let result = runtime
+        .observe_jobs_for_auth(
+            vec![item_ref("~j999999999"), item_ref(&valid_ref)],
+            40,
+            Some(55),
+            ObserveJobsWakeOn::AllTerminal,
+            Some(&auth),
+        )
+        .await;
+    assert!(
+        result.success,
+        "one expired ref must not fail the whole batch: {result:?}"
+    );
+    assert_eq!(result.output["requested_count"], 2);
+    assert_eq!(result.output["succeeded_count"], 1);
+    assert_eq!(result.output["failed_count"], 1);
+    assert_eq!(result.output["wait"]["outcome"], "item_error");
+    assert_eq!(result.output["wait"]["waited_ms"], 0);
+
+    let failed = &result.output["items"][0];
+    assert_eq!(failed["success"], false);
+    assert!(failed["job_id"].is_null());
+    assert_eq!(failed["observation_ref"], "~j999999999");
+    assert_eq!(failed["error_kind"], "unknown_observation_ref");
+    assert_eq!(failed["recovery_kind"], "fix_input");
+    assert!(failed.get("suggested_call").is_none());
+
+    let succeeded = &result.output["items"][1];
+    assert_eq!(succeeded["success"], true);
+    assert_eq!(succeeded["job_id"], job_id);
+    assert!(succeeded["observation_ref"].as_str().is_some());
+
+    let schema = super::super::registry::output_schema_for_tool("observe_jobs");
+    let value = serde_json::to_value(&result).unwrap();
+    assert!(
+        super::super::startup_brief::validate_schema_instance_for_test(&value, &schema).is_ok(),
+        "mixed compact-ref result did not satisfy output schema: {value}"
+    );
 }
 
 #[tokio::test]

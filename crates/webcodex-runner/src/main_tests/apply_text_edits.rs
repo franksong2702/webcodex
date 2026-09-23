@@ -550,6 +550,116 @@ fn file_apply_text_edits_expected_file_sha256_mismatch_without_write() {
 }
 
 #[test]
+fn file_apply_text_edits_duplicate_anchor_advisory_boundaries() {
+    let cases = [
+        ("insert_before", "prefix\nanchor\n", true),
+        ("insert_after", "anchor\nsuffix\n", true),
+        ("insert_before", "anchor\n", true),
+        ("insert_after", "anchor\n", true),
+        ("insert_before", "prefix\nanchor\nsuffix\n", false),
+        ("insert_after", "prefix\nanchor\nsuffix\n", false),
+        ("insert_before", "anchor\nsuffix\n", false),
+        ("insert_after", "prefix\nanchor\n", false),
+        ("insert_before", "anchor \n", false),
+        ("insert_after", " anchor\n", false),
+        ("insert_before", "anchor", false),
+        ("insert_after", "anchor", false),
+        ("insert_before", "", false),
+        ("insert_after", "", false),
+    ];
+    for dry_run in [true, false] {
+        for crlf in [false, true] {
+            for (kind, new_text, warned) in cases {
+                let tmp = tempfile::tempdir().unwrap();
+                let policy = project_policy(tmp.path());
+                let file = tmp.path().join("target.txt");
+                let source = "head\nanchor\ntail\n";
+                let original = if crlf {
+                    source.replace('\n', "\r\n")
+                } else {
+                    source.to_string()
+                };
+                std::fs::write(&file, &original).unwrap();
+                // Anchor and insertion deliberately use different newline forms.
+                let out = line_edit_json(handle_file_request(
+                    &policy,
+                    &apply_text_edits_request(
+                        tmp.path(),
+                        "target.txt",
+                        serde_json::json!({
+                            "dry_run": dry_run,
+                            "edits": [{"kind": kind, "anchor_text": "anchor\r\n", "new_text": new_text}]
+                        }),
+                    ),
+                ));
+                assert_eq!(out["execution_state"], "completed", "{out}");
+                assert_eq!(out["changed"], !dry_run && !new_text.is_empty());
+                assert_eq!(out["state_changed"], !dry_run && !new_text.is_empty());
+                assert_eq!(out["would_change"], !new_text.is_empty());
+                let edits = out["files"][0]["edits"].as_array().unwrap();
+                assert_eq!(edits.len(), usize::from(!new_text.is_empty()));
+                if let Some(edit) = edits.first() {
+                    assert_eq!(
+                        edit.get("warning").is_some(),
+                        warned,
+                        "{kind} {new_text:?}: {out}"
+                    );
+                    if warned {
+                        assert!(edit["warning"]
+                            .as_str()
+                            .unwrap()
+                            .contains("original anchor remains"));
+                    }
+                }
+                let expected = if kind == "insert_before" {
+                    format!("head\n{new_text}anchor\ntail\n")
+                } else {
+                    format!("head\nanchor\n{new_text}tail\n")
+                };
+                let expected = if dry_run {
+                    original
+                } else if crlf {
+                    expected.replace('\n', "\r\n")
+                } else {
+                    expected
+                };
+                assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn file_apply_text_edits_duplicate_anchor_advisory_tracks_sorted_edit_indices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    let file = tmp.path().join("target.txt");
+    std::fs::write(&file, "first\nanchor\nbody\nanchor\nbody\n").unwrap();
+    let out = line_edit_json(handle_file_request(
+        &policy,
+        &apply_text_edits_request(
+            tmp.path(),
+            "target.txt",
+            serde_json::json!({
+                "edits": [
+                    {"kind":"insert_after","anchor_text":"anchor\nbody\n","new_text":"anchor\r\nbody\r\n","occurrence":2,"line_scope":{"start_line":4,"end_line":5}},
+                    {"kind":"replace_exact","old_text":"first\n","new_text":"first\nfirst\n"}
+                ]
+            }),
+        ),
+    ));
+    let edits = out["files"][0]["edits"].as_array().unwrap();
+    assert_eq!(edits[0]["index"], 1);
+    assert!(edits[0].get("warning").is_none());
+    assert_eq!(edits[1]["index"], 0);
+    assert!(edits[1]["warning"].is_string());
+    assert_eq!(
+        std::fs::read_to_string(file).unwrap(),
+        "first\nfirst\nanchor\nbody\nanchor\nbody\nanchor\nbody\n"
+    );
+}
+
+#[test]
 fn file_apply_text_edits_insert_before_after_and_delete_exact() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());

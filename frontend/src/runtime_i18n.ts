@@ -217,6 +217,8 @@ export const RUNTIME_ZH_TEXT: Record<string, string> = {
   "Message, resolution, or id": "消息内容、处理说明或 ID",
   "This board shows retained Session messages. ACK is not a reply or completion. Host chat replies appear here only when explicitly posted to this Session.": "这里展示会话中保留的协作消息。ACK 不代表回复或完成；宿主聊天中的回复只有明确发布到此会话后才会显示。",
   "All Runners": "全部运行器",
+  "Search Runners": "搜索运行器",
+  "No matching Runners": "没有匹配的运行器",
   "Filter by Project name, id, Runner, or workspace path": "按项目名称、ID、运行器或工作空间路径筛选",
   "No project selected": "尚未选择项目",
   "No Projects match this filter.": "没有符合当前筛选条件的项目。",
@@ -838,6 +840,11 @@ Object.assign(RUNTIME_ZH_TEXT, {
   "Light": "浅色",
   "Dark": "深色",
   "Lock": "锁定",
+  "Collapse sidebar": "收起侧栏",
+  "Expand sidebar": "展开侧栏",
+  "Preferences": "偏好设置",
+  "Theme color": "主题色",
+  "Custom color": "自定义颜色",
 });
 
 export function languagePreference(value: unknown): RuntimeLanguage {

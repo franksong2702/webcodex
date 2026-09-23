@@ -587,6 +587,13 @@ fn observe_jobs_output_schema() -> Value {
                 "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN,
                 "description": "Opaque authoritative token copied unchanged from the canonical Job observation for the next after_observation_token."
             },
+            "observation_ref": {
+                "type": "string",
+                "pattern": "^~j[0-9]+$",
+                "minLength": 3,
+                "maxLength": webcodex_core::job_observation::MAX_OBSERVATION_REF_LEN,
+                "description": "Compact server-issued selector retained on the model-facing sparse item for the next ordinary observe_jobs follow-up."
+            },
             "exit_code": schema_type("integer", "Terminal process exit code when available and meaningful."),
             "command_execution_state": job_command_execution_state_schema(),
             "activity": job_activity_schema(),
@@ -637,12 +644,28 @@ fn observe_jobs_output_schema() -> Value {
                 "items": {
                     "type": "array", "minItems": 1, "maxItems": 1,
                     "items": {
-                        "type": "object", "additionalProperties": false,
-                        "properties": {
-                            "job_id": {"type": "string", "minLength": 1},
-                            "after_observation_token": {"type": "string", "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN}
-                        },
-                        "required": ["job_id"]
+                        "oneOf": [
+                            {
+                                "type": "object", "additionalProperties": false,
+                                "properties": {
+                                    "job_id": {"type": "string", "minLength": 1},
+                                    "after_observation_token": {"type": "string", "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN}
+                                },
+                                "required": ["job_id"]
+                            },
+                            {
+                                "type": "object", "additionalProperties": false,
+                                "properties": {
+                                    "observation_ref": {
+                                        "type": "string",
+                                        "pattern": "^~j[0-9]+$",
+                                        "minLength": 3,
+                                        "maxLength": webcodex_core::job_observation::MAX_OBSERVATION_REF_LEN
+                                    }
+                                },
+                                "required": ["observation_ref"]
+                            }
+                        ]
                     }
                 },
                 "tail_lines": {"type": "integer", "minimum": 1, "maximum": 200},
@@ -665,19 +688,27 @@ fn observe_jobs_output_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "index": {"type": "integer", "minimum": 0, "maximum": 7},
-            "job_id": {"type": "string", "minLength": 1},
+            "job_id": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
             "success": {"type": "boolean"},
             "output": {"anyOf": [job_observation.clone(), {"type": "null"}]},
             "error_kind": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "recovery_kind": recovery_kind_schema(),
             "suggested_call": list_jobs_recovery_call_schema(false),
-            "error": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            "error": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "observation_ref": {
+                "type": "string",
+                "pattern": "^~j[0-9]+$",
+                "minLength": 3,
+                "maxLength": webcodex_core::job_observation::MAX_OBSERVATION_REF_LEN,
+                "description": "Compact server-issued continuation selector for this item. Echo it verbatim in the next ordinary observe_jobs call instead of copying job_id + after_observation_token."
+            }
         },
         "required": ["index", "job_id", "success", "output", "error_kind", "error"],
         "allOf": [{
             "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
             "then": {
                 "properties": {
+                    "job_id": {"type": "string", "minLength": 1},
                     "output": job_observation,
                     "error_kind": {"type": "null"},
                     "recovery_kind": {"type": "null", "const": "__forbidden_on_success__"},
@@ -702,6 +733,17 @@ fn observe_jobs_output_schema() -> Value {
         "then": {
             "required": ["suggested_call"],
             "not": {"required": ["recovery_kind"]}
+        }
+    }));
+    item["allOf"].as_array_mut().unwrap().push(json!({
+        "if": {
+            "properties": {"error_kind": {"const": "unknown_observation_ref"}},
+            "required": ["error_kind"]
+        },
+        "then": {
+            "required": ["observation_ref", "recovery_kind"],
+            "properties": {"job_id": {"type": "null"}},
+            "not": {"required": ["suggested_call"]}
         }
     }));
     item["allOf"].as_array_mut().unwrap().push(json!({

@@ -1,8 +1,121 @@
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Mutex;
 
 const TOKEN_PREFIX: &str = "wj3_";
 pub const MAX_JOB_OBSERVATION_TOKEN_LEN: usize = 62;
+
+/// Prefix that distinguishes a compact observation ref from a `job_id` or bare
+/// observation token. Short enough to be unambiguous; not a valid `job_id` or
+/// `wj3_` token prefix.
+const OBSERVATION_REF_PREFIX: &str = "~j";
+
+/// Maximum number of (principal, ref) entries retained across all callers.
+/// Refs are ephemeral convenience handles; eviction is LRU on capacity.
+const OBSERVATION_REF_REGISTRY_CAPACITY: usize = 512;
+
+/// Maximum observation-ref string length (prefix + up to 20-digit decimal
+/// counter). Strict length check keeps deserialization predictable.
+pub const MAX_OBSERVATION_REF_LEN: usize = 22;
+
+/// Compact server-issued continuation selector that pins one exact Job
+/// observation state (job_id + observation token) for a specific principal.
+///
+/// A ref is **observation authority only**: it never starts, retries, stops,
+/// or redispatches a Job. Dereference re-authorizes visibility through the
+/// same canonical path as supplying job_id + after_observation_token directly.
+/// Stale or mismatched state fails closed — the underlying job_log call
+/// returns the same canonical reset/recovery semantics as today.
+///
+/// Refs survive only while the process is running; a server restart
+/// invalidates all refs fail-closed (the model falls back to job_id + token).
+#[derive(Debug)]
+pub struct ObservationRefRegistry {
+    entries: Mutex<VecDeque<ObservationRefEntry>>,
+    counter: Mutex<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ObservationRefEntry {
+    /// Opaque ref string, e.g. `~j42`.
+    ref_str: String,
+    /// Stable non-secret principal identifier scoped by the registry owner.
+    /// Cross-principal substitution is rejected at dereference time.
+    principal_id: String,
+    /// Exact job_id bound at mint time.
+    job_id: String,
+    /// Observation token string bound at mint time (the `observation_token`
+    /// field from the successful observe_jobs item output).
+    observation_token: String,
+}
+
+impl Default for ObservationRefRegistry {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(VecDeque::new()),
+            counter: Mutex::new(0),
+        }
+    }
+}
+
+impl ObservationRefRegistry {
+    /// Mint a new compact ref for `(principal_id, job_id, observation_token)`.
+    /// Returns the opaque ref string (e.g. `~j42`).
+    pub fn mint(
+        &self,
+        principal_id: impl Into<String>,
+        job_id: impl Into<String>,
+        observation_token: impl Into<String>,
+    ) -> String {
+        let mut counter = self.counter.lock().expect("observation ref counter lock");
+        let index = *counter;
+        *counter = counter.wrapping_add(1);
+        drop(counter);
+
+        let ref_str = format!("{OBSERVATION_REF_PREFIX}{index}");
+        let entry = ObservationRefEntry {
+            ref_str: ref_str.clone(),
+            principal_id: principal_id.into(),
+            job_id: job_id.into(),
+            observation_token: observation_token.into(),
+        };
+
+        let mut entries = self.entries.lock().expect("observation ref registry lock");
+        if entries.len() >= OBSERVATION_REF_REGISTRY_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+        ref_str
+    }
+
+    /// Resolve a ref back to `(job_id, observation_token)` for the given
+    /// principal.  Returns `None` when the ref is unknown, expired (evicted),
+    /// or belongs to a different principal.
+    pub fn resolve(&self, principal_id: &str, ref_str: &str) -> Option<(String, String)> {
+        let mut entries = self.entries.lock().expect("observation ref registry lock");
+        let index = entries
+            .iter()
+            .position(|entry| entry.ref_str == ref_str && entry.principal_id == principal_id)?;
+        let entry = entries.remove(index)?;
+        let resolved = (entry.job_id.clone(), entry.observation_token.clone());
+        entries.push_back(entry);
+        Some(resolved)
+    }
+
+    /// Return true iff the string looks like a well-formed observation ref
+    /// (prefix + non-empty decimal suffix, within the length bound).
+    /// This is a syntactic check only; it does not prove the ref is known.
+    pub fn is_ref_syntax(value: &str) -> bool {
+        if value.len() > MAX_OBSERVATION_REF_LEN {
+            return false;
+        }
+        let Some(suffix) = value.strip_prefix(OBSERVATION_REF_PREFIX) else {
+            return false;
+        };
+        !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+    }
+}
 
 /// Observation state, never execution identity or authority. A 96-bit digest
 /// binds the exact Job and registry generation without repeating either ID.
@@ -287,6 +400,55 @@ impl fmt::Display for JobObservationTokenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_ref_registry_is_principal_scoped_and_lru_bounded() {
+        let registry = ObservationRefRegistry::default();
+        let keep = registry.mint("principal:a", "job-keep", "token-keep");
+        assert_eq!(
+            registry.resolve("principal:a", &keep),
+            Some(("job-keep".to_string(), "token-keep".to_string()))
+        );
+        assert_eq!(registry.resolve("principal:b", &keep), None);
+
+        let mut first_other = None;
+        for index in 0..(OBSERVATION_REF_REGISTRY_CAPACITY - 1) {
+            let reference = registry.mint(
+                "principal:a",
+                format!("job-{index}"),
+                format!("token-{index}"),
+            );
+            first_other.get_or_insert(reference);
+        }
+
+        // Refreshing the oldest live ref must move it to the MRU end.
+        assert!(registry.resolve("principal:a", &keep).is_some());
+        registry.mint("principal:a", "job-extra", "token-extra");
+
+        assert!(
+            registry.resolve("principal:a", &keep).is_some(),
+            "recently resolved ref must survive LRU eviction"
+        );
+        assert_eq!(
+            registry.resolve("principal:a", first_other.as_deref().unwrap()),
+            None,
+            "least-recently-used ref must be evicted at capacity"
+        );
+    }
+
+    #[test]
+    fn observation_ref_syntax_is_small_and_unambiguous() {
+        for valid in ["~j0", "~j4", "~j18446744073709551615"] {
+            assert!(ObservationRefRegistry::is_ref_syntax(valid), "{valid}");
+        }
+        for invalid in ["", "~j", "j4", "~j-1", "~j1x", "wj3_abc"] {
+            assert!(!ObservationRefRegistry::is_ref_syntax(invalid), "{invalid}");
+        }
+        assert!(!ObservationRefRegistry::is_ref_syntax(&format!(
+            "~j{}",
+            "1".repeat(MAX_OBSERVATION_REF_LEN)
+        )));
+    }
 
     #[test]
     fn compact_cursor_binding_and_length() {

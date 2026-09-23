@@ -19,6 +19,12 @@ mod agent_wake;
 mod audit;
 mod communication;
 mod connection_observation;
+mod external_observations;
+#[cfg(test)]
+mod external_observations_tests;
+pub use external_observations::{
+    ExternalObservation, ExternalObservationError, MAX_EXTERNAL_OBSERVATIONS_PER_SESSION,
+};
 mod goal;
 mod goal_plan;
 #[cfg(test)]
@@ -109,8 +115,9 @@ pub use self::memory::{
 };
 pub use self::oauth::RotateResult;
 pub use self::peer_collaboration::{
-    NewPeerMessage, PeerAttentionBatch, PeerMessageRecord, PeerProjectionRollback,
-    RecentProjectPeerRecord, MAX_PEER_DISCOVERY_LIMIT, MAX_PEER_MESSAGE_LIMIT,
+    NewPeerMessage, PeerAttentionBatch, PeerMessageDelivery, PeerMessageDeliveryOutcome,
+    PeerMessageRecord, PeerProjectionRollback, RecentProjectPeerRecord, MAX_PEER_DISCOVERY_LIMIT,
+    MAX_PEER_MESSAGE_LIMIT,
 };
 pub use self::project_reference::{ProjectReferenceRecord, ProjectReferenceStoreError};
 pub use self::server_instance::ServerInstanceGuard;

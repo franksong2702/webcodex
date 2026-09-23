@@ -71,6 +71,16 @@ impl Database {
         let mut conn = self.lock_connection(crate::StoreDomain::Schema);
         conn.execute_batch(
             "
+            CREATE TABLE IF NOT EXISTS wc_external_observations (
+                session_id TEXT NOT NULL,
+                project TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                exit_code INTEGER,
+                recorded_at INTEGER NOT NULL,
+                PRIMARY KEY(session_id, adapter_id, event_id)
+            );
             CREATE TABLE IF NOT EXISTS wc_job_receipts (
                 job_id TEXT PRIMARY KEY,
                 client_id TEXT NOT NULL,
@@ -167,6 +177,7 @@ impl Database {
                 used_at INTEGER,
                 user_token_name TEXT,
                 agent_token_name TEXT,
+                runner_capabilities INTEGER NOT NULL DEFAULT 0 CHECK(runner_capabilities IN (0, 1)),
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
             CREATE INDEX IF NOT EXISTS idx_pairing_codes_hash ON pairing_codes(code_hash);
@@ -409,6 +420,19 @@ impl Database {
             ",
         )?;
 
+        // Preserve the authority of previously issued enrollment codes. Only a
+        // newly issued explicit admin grant adds ACP/SSH scopes; old codes stay 0.
+        {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !table_columns(&tx, "pairing_codes")?
+                .iter()
+                .any(|column| column == "runner_capabilities")
+            {
+                tx.execute_batch("ALTER TABLE pairing_codes ADD COLUMN runner_capabilities INTEGER NOT NULL DEFAULT 0 CHECK(runner_capabilities IN (0, 1));")?;
+            }
+            tx.commit()?;
+        }
+
         // ActionAudit predates Window correlation. Fresh databases already have
         // the current columns above; existing databases receive the same shape
         // through this additive, idempotent migration.
@@ -520,7 +544,9 @@ impl Database {
                 first_projected_at_ms INTEGER,
                 last_projected_at_ms INTEGER,
                 projection_count INTEGER NOT NULL DEFAULT 0,
-                first_ack_observed_at_ms INTEGER
+                first_ack_observed_at_ms INTEGER,
+                delivery_key_hash TEXT,
+                delivery_payload_hash TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_window_peer_messages_recipient
                 ON window_peer_messages(
@@ -557,6 +583,28 @@ impl Database {
         }
         tx.execute_batch(CHILD_SCHEMA)
             .context("create ActionAudit Window correlation schema")?;
+        let mut peer_columns = table_columns(&tx, "window_peer_messages")?;
+        for (name, definition) in [
+            ("delivery_key_hash", "TEXT"),
+            ("delivery_payload_hash", "TEXT"),
+        ] {
+            if peer_columns.iter().any(|column| column == name) {
+                continue;
+            }
+            tx.execute_batch(&format!(
+                "ALTER TABLE window_peer_messages ADD COLUMN {name} {definition};"
+            ))
+            .with_context(|| format!("add Peer message replay column {name}"))?;
+            peer_columns.push(name.to_string());
+        }
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_window_peer_messages_delivery
+                 ON window_peer_messages(
+                    principal_kind, principal_id, sender_window_key, delivery_key_hash
+                 )
+                 WHERE delivery_key_hash IS NOT NULL;",
+        )
+        .context("create Peer message delivery replay index")?;
         tx.commit()
             .context("commit ActionAudit Window schema migration")?;
         Ok(())

@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use webcodex_core::apply_patch_shared::ApplyPatchMatchingMode;
-use webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN;
+use webcodex_core::job_observation::{
+    ObservationRefRegistry, MAX_JOB_OBSERVATION_TOKEN_LEN, MAX_OBSERVATION_REF_LEN,
+};
 use webcodex_core::lsp_bridge::{
     CallHierarchyDirection, DEFAULT_CALL_HIERARCHY_DEPTH, DEFAULT_CALL_HIERARCHY_LIMIT,
 };
@@ -339,9 +341,15 @@ pub struct SearchProjectTextsQuery {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObserveJobsItem {
-    /// Existing opaque runtime Job id.
+    /// Existing opaque runtime Job id. Required unless `observation_ref` is supplied.
+    /// The empty string is used only as the serde default for an unresolved ref selector and
+    /// never reaches canonical Job observation.
     #[schemars(length(min = 1))]
-    #[serde(deserialize_with = "deserialize_non_empty_job_id")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_empty_job_id",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub job_id: String,
     /// Optional opaque Job-bound lifecycle/log-delta token from the latest observation. Return it
     /// unchanged without interpreting its cursor state. It is not execution identity or retry
@@ -350,6 +358,26 @@ pub struct ObserveJobsItem {
     #[schemars(length(max = 62))]
     #[serde(default, deserialize_with = "deserialize_optional_observation_token")]
     pub after_observation_token: Option<String>,
+    /// Compact server-issued continuation selector for one exact prior Job observation state.
+    /// Mutually exclusive with a non-empty `job_id`; when supplied, callers must not also supply
+    /// `after_observation_token`. Unknown or expired refs fail closed at observation time.
+    #[schemars(length(min = 3, max = 22))]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_observation_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observation_ref: Option<String>,
+}
+
+impl ObserveJobsItem {
+    pub fn resolved(job_id: String, after_observation_token: Option<String>) -> Self {
+        Self {
+            job_id,
+            after_observation_token,
+            observation_ref: None,
+        }
+    }
 }
 
 /// Which observable changes may end a bounded batch Job wait early.
@@ -395,6 +423,21 @@ where
         return Err(serde::de::Error::custom("job_id must not be empty"));
     }
     Ok(job_id)
+}
+
+fn deserialize_optional_observation_ref<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = value.as_deref() {
+        if !ObservationRefRegistry::is_ref_syntax(value) {
+            return Err(serde::de::Error::custom(
+                "observation_ref must use compact ~j<decimal> syntax",
+            ));
+        }
+    }
+    Ok(value)
 }
 
 fn deserialize_optional_observation_token<'de, D>(
@@ -456,17 +499,85 @@ where
             "items must contain between 1 and 8 entries",
         ));
     }
-    let mut job_ids = HashSet::with_capacity(items.len());
-    if let Some(duplicate) = items
-        .iter()
-        .map(|item| item.job_id.as_str())
-        .find(|job_id| !job_ids.insert(*job_id))
-    {
-        return Err(serde::de::Error::custom(format!(
-            "duplicate job_id in items: {duplicate}"
-        )));
+    let mut selectors = HashSet::with_capacity(items.len());
+    for item in &items {
+        let has_job_id = !item.job_id.is_empty();
+        match (has_job_id, item.observation_ref.as_deref()) {
+            (false, None) => {
+                return Err(serde::de::Error::custom(
+                    "each observe_jobs item must supply either job_id or observation_ref",
+                ));
+            }
+            (true, Some(_)) => {
+                return Err(serde::de::Error::custom(
+                    "observation_ref and job_id are mutually exclusive in the same item",
+                ));
+            }
+            (false, Some(_)) if item.after_observation_token.is_some() => {
+                return Err(serde::de::Error::custom(
+                    "after_observation_token must be absent when observation_ref is supplied",
+                ));
+            }
+            _ => {}
+        }
+        let selector = item
+            .observation_ref
+            .as_deref()
+            .unwrap_or(item.job_id.as_str());
+        if !selectors.insert(selector) {
+            return Err(serde::de::Error::custom(format!(
+                "duplicate selector in observe_jobs items: {selector}"
+            )));
+        }
     }
     Ok(items)
+}
+
+fn observe_jobs_items_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 8,
+        "items": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Existing opaque runtime Job id."
+                        },
+                        "after_observation_token": {
+                            "anyOf": [
+                                {"type": "string", "maxLength": MAX_JOB_OBSERVATION_TOKEN_LEN},
+                                {"type": "null"}
+                            ],
+                            "description": "Optional opaque Job-bound lifecycle/log-delta token from the latest observation. Return it unchanged without interpreting its cursor state. It is not execution identity or retry authority; a stale Server epoch resets the bounded log projection."
+                        },
+                        "observation_ref": {"type": "null"}
+                    },
+                    "required": ["job_id"]
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "after_observation_token": {"type": "null"},
+                        "observation_ref": {
+                            "type": "string",
+                            "pattern": "^~j[0-9]+$",
+                            "minLength": 3,
+                            "maxLength": MAX_OBSERVATION_REF_LEN,
+                            "description": "Compact server-issued continuation selector for one exact prior Job observation state. Unknown or expired refs fail closed."
+                        }
+                    },
+                    "required": ["observation_ref"]
+                }
+            ]
+        }
+    })
 }
 
 fn deserialize_observe_jobs_tail_lines<'de, D>(deserializer: D) -> Result<usize, D::Error>
@@ -1541,6 +1652,26 @@ pub enum ToolCall {
         limit: Option<usize>,
     },
 
+    /// Record a bounded external claim without creating native execution evidence.
+    RecordExternalObservation {
+        project: String,
+        session_id: String,
+        /// SHA-256 of the adapter's local conversation identity; not an authority token.
+        #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+        adapter_id: String,
+        /// Stable SHA-256 event identity within this adapter and exact Session.
+        #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+        event_id: String,
+        /// Tool name only; no command, argument, output or transcript text.
+        #[schemars(length(min = 1, max = 64), regex(pattern = "^[A-Za-z0-9_.:-]+$"))]
+        observed_tool: String,
+        /// External receipt claim only. Omit when no trustworthy execution receipt is available.
+        #[serde(default)]
+        exit_code: Option<i32>,
+    },
+    /// Read external claims separately from native Session/Job evidence.
+    ListExternalObservations { project: String, session_id: String },
+
     /// Post a bounded session-local ledger message for collaboration, progress,
     /// guidance, or design discussion. This is session metadata only.
     PostSessionMessage {
@@ -1569,6 +1700,12 @@ pub enum ToolCall {
         /// context-scoped and never resolves, accepts, executes, or gates work.
         #[serde(default)]
         requires_ack: bool,
+        /// Optional stable sender-scoped replay key. While the keyed message/replay metadata remains
+        /// retained, exact retries with the same canonical payload return the original message and survive
+        /// Server restart; reusing the key with a different retained payload fails closed.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default)]
+        delivery_key: Option<String>,
     },
 
     /// Send a bounded collaboration message to another recent ChatGPT/host window owned by the
@@ -1598,6 +1735,12 @@ pub enum ToolCall {
         /// again. ACK never grants authority, resolves the message, or requires a reply.
         #[serde(default)]
         requires_ack: bool,
+        /// Optional stable sender-window-scoped replay key. While the keyed peer message remains
+        /// retained, exact retries return the original message and survive Server restart; reusing the key
+        /// with a different retained payload fails closed.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default)]
+        delivery_key: Option<String>,
     },
 
     /// List session-local ledger messages in stable newest-first order.
@@ -3883,8 +4026,10 @@ pub enum ToolCall {
     /// item reuses the canonical single-Job observation-token and projection
     /// path; item failures are isolated and no Job is launched or modified.
     ObserveJobs {
-        /// Existing Jobs to observe in input order. Duplicate job_id values are rejected.
-        #[schemars(length(min = 1, max = 8))]
+        /// Existing Jobs to observe in input order. Each item supplies either a raw job_id
+        /// (optionally with after_observation_token) or one compact observation_ref from a prior
+        /// successful response. Selectors are mutually exclusive and duplicate resolved Jobs are rejected.
+        #[schemars(schema_with = "observe_jobs_items_schema")]
         #[serde(deserialize_with = "deserialize_observe_jobs_items")]
         items: Vec<ObserveJobsItem>,
         #[serde(
@@ -5287,6 +5432,8 @@ impl ToolCall {
             Self::UpdateSessionContext { .. } => "update_session_context",
             Self::CloseSession { .. } => "close_session",
             Self::ValidationSummary { .. } => "validation_summary",
+            Self::RecordExternalObservation { .. } => "record_external_observation",
+            Self::ListExternalObservations { .. } => "list_external_observations",
             Self::PostSessionMessage { .. } => "post_session_message",
             Self::PostPeerMessage { .. } => "post_peer_message",
             Self::ListSessionMessages { .. } => "list_session_messages",
@@ -5461,6 +5608,11 @@ impl ToolCall {
 
     pub fn session_id(&self) -> Option<&str> {
         match self {
+            // External-observation ingress/read carries an exact business Session
+            // that is independently re-authorized by the runtime method. Keep it
+            // out of this generic recorder projection so adapter traffic cannot
+            // become native Session evidence or consume the bounded event tail.
+            Self::RecordExternalObservation { .. } | Self::ListExternalObservations { .. } => None,
             #[cfg(feature = "experimental-code-mode")]
             Self::CodeModeExec { session_id, .. }
             | Self::CodeModeExecEffectful { session_id, .. }
@@ -5601,6 +5753,8 @@ impl ToolCall {
 
     pub fn project(&self) -> Option<&str> {
         match self {
+            Self::RecordExternalObservation { project, .. }
+            | Self::ListExternalObservations { project, .. } => Some(project),
             #[cfg(feature = "experimental-code-mode")]
             Self::CodeModeExec { project, .. }
             | Self::CodeModeExecEffectful { project, .. }
