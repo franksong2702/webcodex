@@ -305,6 +305,60 @@ async fn internal_handoff_projection_does_not_append_events_or_enqueue_agent_req
 }
 
 #[tokio::test]
+async fn hidden_handoff_state_is_non_recording_exact_recovery_read() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let runtime = ToolRuntime::new_for_tests();
+    let auth = bootstrap_auth_context();
+    let client_id = "handoff-state-hidden-read";
+    let project =
+        register_runner_project_at_path_with_auth(&runtime, client_id, "demo", root.path(), &auth)
+            .await;
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("hidden handoff read".to_string()),
+    );
+    add_instruction_for_project(
+        &runtime.sessions,
+        &session.session_id,
+        &project,
+        "preserve exact recovery state",
+    );
+    let before = runtime
+        .sessions
+        .summary(&session.session_id, Some(200))
+        .unwrap();
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::SessionHandoffState {
+                project: project.clone(),
+                session_id: session.session_id.clone(),
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["project"], project);
+    assert_eq!(result.output["session_id"], session.session_id);
+    assert!(result.output["handoff_brief"].is_object());
+    assert_eq!(
+        result.output["handoff_brief"]["external_observations"]["provenance"],
+        "external_report"
+    );
+    let after = runtime
+        .sessions
+        .summary(&session.session_id, Some(200))
+        .unwrap();
+    assert_eq!(before.events_total, after.events_total);
+    assert_eq!(before.updated_at, after.updated_at);
+    assert!(probe_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn public_handoff_dispatch_records_only_standard_telemetry_and_preserves_guidance() {
     let root = tempfile::tempdir().unwrap();
     init_git_repo(root.path());

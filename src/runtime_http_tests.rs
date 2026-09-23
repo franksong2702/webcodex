@@ -1579,6 +1579,76 @@ async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation(
 }
 
 #[tokio::test]
+async fn api_hidden_handoff_state_reads_exact_session_without_recording_it() {
+    let config = test_config(Some("secret"));
+    let (_db_tmp, db) = test_db();
+    let project_tmp = tempfile::tempdir().unwrap();
+    std::fs::write(project_tmp.path().join("README.md"), "hello\n").unwrap();
+    let (runtime, registry) = register_import_agent_with_capabilities(
+        project_tmp.path(),
+        Some(crate::runner_protocol::RunnerCapabilities {
+            shell: true,
+            git: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let executor = spawn_startup_agent_executor(registry);
+    let service = Service::new(build_projects_router(config, db, runtime.clone()));
+    let project = "agent:importer:demo";
+
+    let mut resp = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .json(&json!({
+            "tool": "start_session",
+            "params": {"project": project, "title": "local handoff target"}
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&resp), StatusCode::OK);
+    let start_body: Value = resp.take_json().await.unwrap();
+    let session_id = start_body["output"]["session_id"]
+        .as_str()
+        .expect("start_session id")
+        .to_string();
+    let before = runtime
+        .sessions
+        .summary(&session_id, None)
+        .expect("business Session before hidden handoff read");
+
+    let mut resp = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .json(&json!({
+            "tool": "session_handoff_state",
+            "params": {"project": project, "session_id": session_id}
+        }))
+        .send(&service)
+        .await;
+    let status = effective_status(&resp);
+    let body: Value = resp.take_json().await.unwrap();
+    executor.abort();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true, "{body}");
+    assert_eq!(body["output"]["project"], project);
+    assert_eq!(body["output"]["session_id"], session_id);
+    assert_eq!(
+        body["output"]["handoff_brief"]["session"]["session_id"],
+        session_id
+    );
+    assert_eq!(
+        body["output"]["handoff_brief"]["external_observations"]["provenance"],
+        "external_report"
+    );
+    let after = runtime
+        .sessions
+        .summary(&session_id, None)
+        .expect("business Session after hidden handoff read");
+    assert_eq!(after.events_total, before.events_total);
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+#[tokio::test]
 async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")

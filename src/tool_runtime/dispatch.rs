@@ -2129,9 +2129,8 @@ impl ToolRuntime {
                     .await
             }
 
-            call @ ToolCall::SessionHandoffSummary { .. } => {
-                self.dispatch_handoff_tool(call, auth).await
-            }
+            call @ (ToolCall::SessionHandoffSummary { .. }
+            | ToolCall::SessionHandoffState { .. }) => self.dispatch_handoff_tool(call, auth).await,
 
             #[cfg(feature = "workspace-checkpoints")]
             call @ (ToolCall::WorkspaceCheckpointCreate { .. }

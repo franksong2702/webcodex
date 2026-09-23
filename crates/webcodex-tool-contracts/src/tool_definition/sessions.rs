@@ -625,4 +625,34 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         ).with_gpt_action_description("Recover missing task context or perform an explicit handoff for an exact session_id. Do not use for routine progress/status polling or to establish a baseline. Returns a bounded handoff_brief; diagnostic=true adds detailed evidence. Check basis completeness before dependent work. Read-only.")),
         16,
     ),
+    requires_explicit_business_session(
+        def(
+            "session_handoff_state",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("project"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelHidden,
+            TOOL_CATEGORY_SESSION,
+            None,
+            TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ),
+            true,
+            NoPath,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        ),
+    ),
 ];

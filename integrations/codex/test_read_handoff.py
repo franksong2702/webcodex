@@ -34,6 +34,8 @@ class ReadHandoffTests(unittest.TestCase):
                 "provenance": "external_report", "coverage": {"complete": False},
                 "unknown_count": 1, "observations": [{"event_id": "a" * 64, "status": "unknown"}],
             },
+            "deterministic": True,
+            "llm_summary": False,
         }
         self.body = {"success": True, "output": {
             "project": self.config["project"],
@@ -68,7 +70,7 @@ class ReadHandoffTests(unittest.TestCase):
         self.assertEqual(result["handoff_brief"]["external_observations"]["unknown_count"], 1)
         request = call.args[0]
         self.assertEqual(json.loads(request.data), {
-            "tool": "session_handoff_summary",
+            "tool": "session_handoff_state",
             "params": {"project": self.config["project"], "session_id": self.config["workflow_session_id"]},
         })
         self.assertEqual(request.get_header("Authorization"), "Bearer fixture")
@@ -99,6 +101,30 @@ class ReadHandoffTests(unittest.TestCase):
         self.brief["basis"] = {"complete": "true"}
         with self.assertRaisesRegex(AdapterError, "handoff_basis_missing"):
             self.read()
+
+    def test_missing_external_contract_is_not_presented_as_recovery(self):
+        for edit in (
+            lambda: self.brief.pop("external_observations"),
+            lambda: self.brief["external_observations"].update(provenance="native"),
+            lambda: self.brief["external_observations"]["coverage"].update(complete=True),
+        ):
+            with self.subTest(edit=edit):
+                saved = json.loads(json.dumps(self.body))
+                edit()
+                with self.assertRaisesRegex(AdapterError, "handoff_external_observations_missing"):
+                    self.read()
+                self.body = saved
+                self.brief = self.body["output"]["handoff_brief"]
+
+    def test_nondeterministic_or_llm_summary_is_rejected(self):
+        for key, value in (("deterministic", False), ("llm_summary", True)):
+            with self.subTest(key=key):
+                saved = json.loads(json.dumps(self.body))
+                self.brief[key] = value
+                with self.assertRaisesRegex(AdapterError, "handoff_contract_invalid"):
+                    self.read()
+                self.body = saved
+                self.brief = self.body["output"]["handoff_brief"]
 
     def test_outside_project_never_sends(self):
         with patch.object(recovery.urllib.request, "build_opener") as opener:

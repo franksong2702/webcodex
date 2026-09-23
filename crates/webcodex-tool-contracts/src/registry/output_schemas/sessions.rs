@@ -460,7 +460,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
-        "session_handoff_summary" => Some(wrapped_output_schema(vec![
+        "session_handoff_summary" | "session_handoff_state" => Some(wrapped_output_schema(vec![
             (
                 "diagnostic",
                 schema_type("boolean", "True only when detailed evidence was explicitly requested."),
