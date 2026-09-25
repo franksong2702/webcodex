@@ -32,8 +32,7 @@ def discover(payload):
     return project if index.is_file() else None
 
 
-def dispatch(payload, binary, source_config=None):
-    deadline = time.monotonic() + HOOK_BUDGET_SECONDS
+def legacy_dispatch(payload, binary, source_config, deadline):
     project = discover(payload)
     if project is None:
         event = payload.get('hook_event_name')
@@ -58,10 +57,39 @@ def dispatch(payload, binary, source_config=None):
                   lambda task, checkpoint: probe(source_config, project, task, checkpoint, deadline=deadline))
 
 
+def dispatch(payload, binary, source_config=None, recovery_registry=None):
+    deadline = time.monotonic() + HOOK_BUDGET_SECONDS
+    recovered = None
+    if recovery_registry is not None and isinstance(payload, dict) and payload.get('hook_event_name') in {'SessionStart', 'UserPromptSubmit'}:
+        from session_recovery import entry_result, hook_output, AdapterError
+        try:
+            result = entry_result(recovery_registry, payload)
+            recovered = hook_output(result, payload['hook_event_name'])
+            # An unregistered local folder can still read an explicitly selected
+            # remote Session. Reading does not create or bind a local writer.
+            if discover(payload) is None:
+                return recovered
+        except (AdapterError, OSError, ValueError, TypeError, KeyError):
+            recovered = {'systemMessage': 'WebCodex recovery unavailable; current remote progress was not refreshed. Do not replay work.'}
+    legacy = legacy_dispatch(payload, binary, source_config, deadline)
+    if recovered is None:
+        return legacy
+    # Preserve the existing local checkpoint/capture guidance and its failures.
+    result = dict(legacy)
+    if 'hookSpecificOutput' in recovered:
+        current = result.get('hookSpecificOutput', {})
+        result['hookSpecificOutput'] = {**recovered['hookSpecificOutput'], 'additionalContext':
+            current.get('additionalContext', '') + '\n' + recovered['hookSpecificOutput']['additionalContext']}
+    if 'systemMessage' in recovered:
+        result['systemMessage'] = result.get('systemMessage', '') + '\n' + recovered['systemMessage']
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--source-config', type=Path)
+    parser.add_argument('--recovery-registry', type=Path)
     args = parser.parse_args()
     if args.source_config is not None and not args.source_config.is_absolute():
         parser.error('source configuration must be absolute')
@@ -71,7 +99,7 @@ def main():
         raw = sys.stdin.buffer.read(MAX_INPUT + 1)
         if len(raw) > MAX_INPUT:
             raise CheckpointError('hook_input_too_large')
-        output = dispatch(json.loads(raw), args.binary, args.source_config)
+        output = dispatch(json.loads(raw), args.binary, args.source_config, args.recovery_registry)
     except (ValueError, UnicodeError, OSError, CheckpointError) as exc:
         code = str(exc) if isinstance(exc, CheckpointError) else 'invalid_or_unavailable_context'
         output = {'systemMessage': 'Project handoff save not confirmed: ' + code}

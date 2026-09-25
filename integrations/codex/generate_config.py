@@ -18,7 +18,7 @@ def configuration(project, binary, source_config=None):
                       for event in ["SessionStart","UserPromptSubmit","PostToolUse","Stop"]}}
 
 
-def universal_configuration(binary, source_config=None):
+def universal_configuration(binary, source_config=None, recovery_registry=None):
     if not binary.is_absolute():
         raise ValueError("binary must be absolute")
     adapter = Path(__file__).with_name("universal_hook.py").resolve(strict=True)
@@ -27,6 +27,10 @@ def universal_configuration(binary, source_config=None):
         if not source_config.is_absolute():
             raise ValueError("source configuration must be absolute")
         command += " --source-config " + shlex.quote(str(source_config))
+    if recovery_registry is not None:
+        if not recovery_registry.is_absolute():
+            raise ValueError("recovery registry must be absolute")
+        command += " --recovery-registry " + shlex.quote(str(recovery_registry))
     return {"hooks": {event: [{"hooks": [{"type": "command", "command": command, "timeout": 30}]}]
                       for event in ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"]}}
 
@@ -38,6 +42,9 @@ if __name__ == "__main__":
     mode.add_argument("--universal",action="store_true")
     parser.add_argument("--binary",type=Path,required=True)
     parser.add_argument("--source-config",type=Path)
+    parser.add_argument("--recovery-registry",type=Path)
     args=parser.parse_args()
-    result = universal_configuration(args.binary, args.source_config) if args.universal else configuration(args.project,args.binary,args.source_config)
+    if args.recovery_registry and not args.universal:
+        parser.error("recovery registry requires universal mode")
+    result = universal_configuration(args.binary, args.source_config, args.recovery_registry) if args.universal else configuration(args.project,args.binary,args.source_config)
     print(json.dumps(result,indent=2))

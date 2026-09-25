@@ -7,6 +7,38 @@ import universal_hook as hook
 
 
 class UniversalHookTests(unittest.TestCase):
+    def test_remote_entry_without_local_index_does_not_create_or_bind_writer(self):
+        payload = dict(cwd=str(self.root), session_id='s', hook_event_name='UserPromptSubmit')
+        with patch('session_recovery.entry_result', return_value={'status': 'read', 'event_id': 'remote-one'}) as reader, patch.object(hook, 'call_writer') as writer:
+            value = hook.dispatch(payload, Path('/writer'), recovery_registry=Path('/operator/registry'))
+            self.assertIn('remote-one', str(value))
+            reader.assert_called_once()
+            writer.assert_not_called()
+            self.assertFalse((self.root / 'handoff').exists())
+
+    def test_remote_failure_is_visible_without_disabling_local_capture(self):
+        self.enable(self.root)
+        with patch('session_recovery.entry_result', side_effect=OSError('offline')), patch.object(hook, 'legacy_dispatch', return_value={'systemMessage': 'local preserved'}) as legacy:
+            value = hook.dispatch(dict(cwd=str(self.root), session_id='s', hook_event_name='SessionStart'), Path('/writer'), recovery_registry=Path('/operator/registry'))
+            self.assertIn('local preserved', str(value))
+            self.assertIn('not refreshed', str(value))
+            legacy.assert_called_once()
+
+    def test_capture_events_never_call_remote_recovery(self):
+        with patch('session_recovery.entry_result') as reader, patch.object(hook, 'legacy_dispatch', return_value={'captured': True}) as legacy:
+            for event in ['PostToolUse', 'Stop']:
+                value = hook.dispatch(dict(cwd=str(self.root), session_id='s', hook_event_name=event), Path('/writer'), recovery_registry=Path('/operator/registry'))
+                self.assertEqual(value, {'captured': True})
+            reader.assert_not_called()
+            self.assertEqual(legacy.call_count, 2)
+
+    def test_local_and_remote_evidence_are_both_offered(self):
+        self.enable(self.root)
+        with patch('session_recovery.entry_result', return_value={'status': 'read', 'event_id': 'remote-one'}), patch.object(hook, 'legacy_dispatch', return_value={'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': 'local facts'}}):
+            value = hook.dispatch(dict(cwd=str(self.root), session_id='s', hook_event_name='SessionStart'), Path('/writer'), recovery_registry=Path('/operator/registry'))
+            self.assertIn('local facts', str(value))
+            self.assertIn('remote-one', str(value))
+
     def test_missing_registration_stays_quiet_without_write_or_replay(self):
         with patch.object(hook, 'call_writer') as writer:
             for event in ['PostToolUse', 'Stop', 'UserPromptSubmit']:
