@@ -36,7 +36,13 @@ class SessionRecoveryTests(unittest.TestCase):
         self.registry_path.write_text(json.dumps(self.registry)); self.registry_path.chmod(0o600)
 
     def read(self):
-        return recovery.cached_recovery(recovery.load_registry(self.registry_path), self.payload, self.reader)
+        return recovery.cached_recovery(
+            self.registry_path,
+            recovery.load_registry(self.registry_path),
+            self.payload,
+            self.reader,
+            self.caller,
+        )
 
     def test_absent_local_handoff_still_reads_confirmed_remote_session(self):
         self.assertFalse((self.entry / "handoff").exists())
@@ -72,6 +78,24 @@ class SessionRecoveryTests(unittest.TestCase):
         with self.assertRaises(OSError): self.read()
         self.assertEqual(Path(value["snapshot_path"]).read_bytes(), before)
 
+    def test_registry_change_during_read_never_publishes_stale_association(self):
+        updated = copy.deepcopy(self.registry)
+        updated["bindings"][0]["workflow_session_id"] = "wc_sess_other"
+
+        def change_association_then_return(*args, **kwargs):
+            self.registry_path.write_text(json.dumps(updated))
+            self.registry_path.chmod(0o600)
+            return self.value
+
+        self.reader.side_effect = change_association_then_return
+        with self.assertRaisesRegex(AdapterError, "registry_changed"):
+            self.read()
+        self.assertEqual(
+            json.loads(self.registry_path.read_text())["bindings"][0]["workflow_session_id"],
+            "wc_sess_other",
+        )
+        self.assertEqual(list(self.state.glob("recovery-*.json")), [])
+
     def test_only_entry_events_read_and_no_business_commands_are_replayed(self):
         for event in ["PostToolUse", "Stop", "other"]:
             self.payload["hook_event_name"] = event
@@ -94,6 +118,45 @@ class SessionRecoveryTests(unittest.TestCase):
         self.binding["project_identity"][1] += 1; self.save()
         with self.assertRaisesRegex(AdapterError, "project_root_replaced"): self.read()
         self.reader.assert_not_called()
+
+    def test_remote_project_retarget_is_rejected_before_handoff(self):
+        def retargeted(registry, route, body):
+            if route.endswith("/projects"):
+                return {"projects": [{"id": self.binding["project"], "path": str(self.root / "other")}],
+                        "truncated": False}
+            raise AssertionError("Session inventory must not be read after a root mismatch")
+
+        with self.assertRaisesRegex(AdapterError, "project_identity_missing_or_ambiguous"):
+            recovery.cached_recovery(
+                self.registry_path,
+                recovery.load_registry(self.registry_path),
+                self.payload,
+                self.reader,
+                retargeted,
+            )
+        self.reader.assert_not_called()
+
+    def test_remote_project_change_during_handoff_never_publishes_evidence(self):
+        calls = 0
+
+        def changing(registry, route, body):
+            nonlocal calls
+            if not route.endswith("/projects"):
+                raise AssertionError("Recovery root fencing only needs Project inventory")
+            calls += 1
+            project_id = self.binding["project"] if calls == 1 else "agent:fixture:replacement"
+            return {"projects": [{"id": project_id, "path": str(self.project)}], "truncated": False}
+
+        with self.assertRaisesRegex(AdapterError, "project_binding_changed"):
+            recovery.cached_recovery(
+                self.registry_path,
+                recovery.load_registry(self.registry_path),
+                self.payload,
+                self.reader,
+                changing,
+            )
+        self.reader.assert_called_once()
+        self.assertEqual(list(self.state.glob("recovery-*.json")), [])
 
     def test_multiple_tasks_require_selection_not_newest(self):
         other = copy.deepcopy(self.binding); other["workflow_session_id"] = "wc_sess_other"
@@ -143,6 +206,23 @@ class SessionRecoveryTests(unittest.TestCase):
     def test_discovery_refuses_truncated_or_ambiguous_inventory(self):
         for result in [{"projects": [], "truncated": True}, {"projects": [], "truncated": False}]:
             with self.assertRaises(AdapterError): recovery.discover(self.registry, self.project, lambda *a: result)
+
+    def test_discovery_rejects_malformed_inventory_rows(self):
+        with self.assertRaisesRegex(AdapterError, "invalid_discovery_response"):
+            recovery.discover(
+                self.registry,
+                self.project,
+                lambda *a: {"projects": ["not-a-project"], "truncated": False},
+            )
+
+        def malformed_session(registry, route, body):
+            if route.endswith("/projects"):
+                return {"projects": [{"id": self.binding["project"], "path": str(self.project)}],
+                        "truncated": False}
+            return {"sessions": ["not-a-session"], "truncated": False}
+
+        with self.assertRaisesRegex(AdapterError, "invalid_discovery_response"):
+            recovery.discover(self.registry, self.project, malformed_session)
 
     def test_association_verifies_membership_and_is_idempotent(self):
         empty = {**self.registry, "bindings": []}; self.registry_path.write_text(json.dumps(empty))

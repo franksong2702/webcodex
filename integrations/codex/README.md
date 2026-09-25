@@ -180,7 +180,9 @@ local checkouts to read the same remote work. `--local-session` restricts an
 association to one local conversation; otherwise a new conversation at the same
 entry can recover it. Several matching Sessions require selection; an explicit
 conversation association takes precedence. Root canonical paths and filesystem
-identities are checked, and nested repositories do not inherit a parent entry.
+identities are checked, nested repositories do not inherit a parent entry, and each
+recovery rechecks that the current Server Project still maps the associated canonical
+Project id to that exact root.
 
 Each entry rereads the server. A changed brief is offered as Hook context; an
 unchanged prompt gets a short snapshot reference. `SessionStart` reintroduces the
