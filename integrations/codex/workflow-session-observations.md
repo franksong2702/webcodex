@@ -207,3 +207,37 @@ client UI, bind the exact independent local conversation, perform a minimal real
 read, verify one report through actual MCP, and retain `unknown` when no receipt is
 available. Verify the wrong-project and offline cases separately. Do not exercise
 this candidate against a production server that lacks the new endpoints.
+
+## Downstream rollout evidence (2026-09-25)
+
+The downstream runtime was deployed from clean commit
+`caa8980e11e19322490c3df7f40cf01e2319e170`. This section is a documentation update,
+not another runtime release. The automatic reader contribution is
+[upstream PR #671](https://github.com/yyjeqhc/webcodex/pull/671), at
+`f2b1849b82afdec94fd2a7de0f536510b3bab47d`, related to #631.
+
+- Downstream adapter tests: 102 passed; upstream adapter tests: 43 passed.
+- Card tests: 62 passed. The card fix is a local backport; upstream already
+  accepts the previously rejected `unproven` status, so no duplicate PR was filed.
+- Four independent real old/new runtime transitions passed: success entered the
+  candidate; post_start, manifest_fsync and journal_unavailable failures restored
+  the previous build. Original terminal Job receipts and project state survived.
+- Real isolated HTTP recovery preserved unknown reports and did not record its
+  own reads as workflow progress. Those lifecycle inputs were synthetic.
+- Following normal user trust approval, the actual local Codex conversation
+  automatically received the selected remote Session's progress and then an
+  unchanged-snapshot reference. The Agent read this context and checked the
+  saved snapshot. The source ledger stayed at 25 events. Native hooks/list
+  reported all four installed hooks enabled and trusted. No simulated input,
+  manual event insertion or business replay generated this native context.
+
+The current-conversation automatic recovery check passed. Separate raw Hook
+lifecycle envelopes were not retained, so this is not independent coverage of
+every event or arbitrary new-project association. The card's direct production
+MCP resource read returned HTTP 403 and was not retried with different authority;
+production browser rendering remains unverified. These limits do not change the
+reader's read-only contract or imply that an unknown operation failed.
+
+PR #671 is submitted for upstream review; merge ownership stays with upstream.
+Machine-specific connection and association files remain private and are not
+part of this repository or PR.
