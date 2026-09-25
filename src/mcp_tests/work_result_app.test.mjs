@@ -81,6 +81,75 @@ const nextState = {
   },
 };
 
+// The producer's current_validation_status explicitly emits `unproven` when
+// recorded checks do not establish validation of the current source.
+for (const via of ["initial", "refresh"]) {
+  test(`unproven validation via ${via} is evidence, not an invalid Work Result`, async () => {
+    const view = app("mcp_work_result_app.html");
+    view.toolInput(input);
+    await view.initialize();
+    const state = {
+      ...baseState,
+      state_version: `wr1_${"d".repeat(64)}`,
+      validation: { ...baseState.validation, current_status: "unproven", reason: "validation_source_unproven" },
+    };
+    if (via === "initial") view.toolResult({ work_result: state });
+    else {
+      view.toolResult({ work_result: baseState });
+      view.nodes.refresh.onclick();
+      await flush();
+      await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: state }));
+    }
+    assert.equal(view.nodes.validationStatus.textContent, "Unproven");
+    assert.match(view.nodes.validationStatus.className, /tone-warning/);
+    assert.equal(view.nodes.progressStatus.textContent, "show_changes · completed");
+    assert.equal(view.nodes.changesTitle.textContent, "Changed 1 file");
+    assert.equal(view.nodes.refresh.disabled, false);
+    assert.doesNotMatch(view.nodes.status.textContent, /Invalid|Unavailable/);
+    // Recovery reads only the same Project/Session; it does not run validation.
+    view.nodes.refresh.onclick();
+    await flush();
+    const request = view.calls("work_result_state").at(-1);
+    assert.deepEqual({ ...request.params.arguments }, input);
+    await view.reply(request, toolResult({ work_result: nextState }));
+    assert.equal(view.nodes.validationStatus.textContent, "Failed");
+    assert.equal(view.nodes.changesTitle.textContent, "Workspace clean");
+    assert.equal(view.nodes.refresh.disabled, false);
+  });
+}
+
+for (const hadSnapshot of [false, true]) {
+  test(`invalid snapshot clears misleading ${hadSnapshot ? "previous" : "waiting"} state without claiming task failure`, async () => {
+    const view = app("mcp_work_result_app.html");
+    view.toolInput(input);
+    await view.initialize();
+    if (hadSnapshot) view.toolResult({ work_result: baseState });
+    else {
+      // The lightweight DOM fixture does not parse initial HTML text.
+      view.nodes.progressStatus = { textContent: "Waiting for Session activity…" };
+      view.nodes.changesTitle = { textContent: "Waiting for Work state…" };
+    }
+    view.toolResult({ work_result: { ...baseState, validation: { ...baseState.validation, current_status: "not-a-real-status" } } });
+    assert.equal(view.nodes.badge.textContent, "Unavailable");
+    assert.match(view.nodes.badge.className, /tone-unavailable/);
+    assert.equal(view.nodes.progressStatus.textContent, "Progress unavailable");
+    assert.equal(view.nodes.changesTitle.textContent, "Workspace state unavailable");
+    assert.equal(view.nodes.validationStatus.textContent, "Unknown");
+    assert.equal(view.nodes.reviewStatus.textContent, "Review state unavailable");
+    assert.match(view.nodes.liveDot.className, /tone-unavailable/);
+    assert.equal(view.nodes.files.hidden, true);
+    assert.equal(view.nodes.finalChanges.hidden, true);
+    assert.equal(view.nodes.refresh.disabled, true);
+    assert.equal(view.timers.size, 0);
+    assert.equal(view.calls("work_result_state").length, 0);
+    // A failed identity/shape check is still terminal, not an auto-rebind.
+    view.toolResult({ work_result: baseState });
+    await view.visibility(false);
+    assert.equal(view.nodes.progressStatus.textContent, "Progress unavailable");
+    assert.equal(view.calls("work_result_state").length, 0);
+  });
+}
+
 for (const first of ["input", "result"]) {
   test(`Work Result ${first}-first bootstrap renders the initial snapshot without automatic refresh`, async () => {
     const view = app("mcp_work_result_app.html");

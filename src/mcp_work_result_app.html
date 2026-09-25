@@ -152,6 +152,7 @@ h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color:
 .diff-line.hunk { color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, transparent); }
 .app-footer { display: flex; align-items: center; gap: 7px; min-height: 34px; padding: 8px 13px; border-top: 1px solid var(--divider); background: var(--card-header); }
 .live-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 999px; background: var(--success); box-shadow: 0 0 0 3px var(--success-soft); }
+.live-dot.tone-unavailable { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
 @media (max-width: 620px) {
   .app-header { align-items: flex-start; }
   .actions { flex-direction: column-reverse; align-items: flex-end; }
@@ -198,7 +199,7 @@ h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color:
       <div id="frozenFooter" class="secondary"></div>
     </section>
   </div>
-  <footer class="app-footer"><span class="live-dot" aria-hidden="true"></span><div id="status" class="status">App active · initializing Host</div></footer>
+  <footer class="app-footer"><span id="liveDot" class="live-dot" aria-hidden="true"></span><div id="status" class="status">App active · initializing Host</div></footer>
 </main>
 <script>
 (() => {
@@ -226,7 +227,7 @@ h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color:
   let hasRefreshed = false;
   const diffCache = new Map();
   const diffInFlight = new Set();
-  const VALIDATION = new Set(["not_run", "passed", "failed", "mixed", "expected", "inconclusive", "stale", "unknown"]);
+  const VALIDATION = new Set(["not_run", "passed", "failed", "mixed", "expected", "inconclusive", "stale", "unknown", "unproven"]);
   let nextId = 1;
   let identity = null;
   let lastStateVersion = null;
@@ -270,8 +271,24 @@ h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color:
 
   function failClosed(message) {
     teardown();
+    // Invalid card data is not evidence that the task failed, has no activity,
+    // or passed validation. Clear placeholders and stale success indicators.
+    el("badge").className = "badge tone-unavailable";
     el("badge").textContent = "Unavailable";
+    el("liveDot").className = "live-dot tone-unavailable";
     el("status").textContent = message;
+    el("branch").textContent = "Workflow session";
+    el("progressStatus").textContent = "Progress unavailable";
+    el("progressMeta").textContent = "Card data could not be validated; task outcome is unknown";
+    el("changesTitle").textContent = "Workspace state unavailable";
+    el("changesStats").replaceChildren();
+    el("files").textContent = "";
+    el("files").hidden = true;
+    el("validationStatus").textContent = "Unknown";
+    el("validationStatus").className = "status-value tone-warning";
+    el("validationMeta").textContent = "Card data unavailable";
+    el("reviewStatus").textContent = "Review state unavailable";
+    el("reviewMeta").textContent = "";
     el("finalChanges").hidden = true;
     el("frozenFiles").replaceChildren();
     diffCache.clear();
@@ -568,6 +585,7 @@ h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color:
     if (status === "failed") return "Failed";
     if (status === "mixed") return "Mixed";
     if (status === "stale") return "Stale";
+    if (status === "unproven") return "Unproven";
     if (status === "not_run") return "Not run";
     if (status === "expected") return "Expected result recorded";
     if (status === "inconclusive") return "Inconclusive";
@@ -576,7 +594,7 @@ h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color:
 
   function renderValidation(validation) {
     el("validationStatus").textContent = validationLabel(validation.current_status);
-    const validationTone = validation.current_status === "passed" ? "passed" : validation.current_status === "failed" ? "failed" : validation.current_status === "stale" || validation.current_status === "inconclusive" ? "warning" : "active";
+    const validationTone = validation.current_status === "passed" ? "passed" : validation.current_status === "failed" ? "failed" : ["stale", "inconclusive", "unproven"].includes(validation.current_status) ? "warning" : "active";
     el("validationStatus").className = `status-value tone-${validationTone}`;
     const pieces = [];
     if (safeCount(validation.successes)) pieces.push(`${validation.successes} validations`);
