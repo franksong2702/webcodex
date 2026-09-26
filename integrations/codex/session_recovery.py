@@ -142,23 +142,38 @@ def request(registry, route, body, timeout=6):
     return result
 
 
-def discover(registry, project_root, caller=request):
-    """Read exact-root candidates; discovery neither selects nor associates."""
+def discover_project(registry, project_root, caller=request):
+    """Resolve one currently visible exact root without selecting a Session."""
     root = canonical(project_root)
     result = caller(registry, "/api/runtime-console/projects", {"query": str(root), "limit": 100})
     if result.get("truncated") is not False or not isinstance(result.get("projects"), list):
         raise AdapterError("project_inventory_incomplete")
+    if not all(isinstance(project, dict) for project in result["projects"]):
+        raise AdapterError("invalid_discovery_response")
     projects = [p for p in result["projects"] if p.get("path") == str(root)]
-    if len(projects) != 1:
+    if (len(projects) != 1 or not isinstance(projects[0].get("id"), str)
+            or not projects[0]["id"].startswith("agent:")):
         raise AdapterError("project_identity_missing_or_ambiguous")
-    project = projects[0]["id"]
+    return {"project": projects[0]["id"], "project_root": str(root)}
+
+
+def discover(registry, project_root, caller=request):
+    """Read exact-root candidates; discovery neither selects nor associates."""
+    found = discover_project(registry, project_root, caller)
+    project = found["project"]
     result = caller(registry, "/api/runtime-console/workflow-sessions", {"project": project, "limit": 100})
     if result.get("truncated") is not False or not isinstance(result.get("sessions"), list):
         raise AdapterError("session_inventory_incomplete")
-    return {"project": project, "project_root": str(root), "sessions": result["sessions"], "writes": False}
+    sessions = result["sessions"]
+    if not all(isinstance(session, dict)
+               and isinstance(session.get("session_id"), str)
+               and re.fullmatch(r"wc_sess_[A-Za-z0-9_-]{1,128}", session["session_id"])
+               for session in sessions):
+        raise AdapterError("invalid_discovery_response")
+    return {**found, "sessions": sessions, "writes": False}
 
 
-def recovery(registry, payload, reader=read_handoff):
+def recovery(registry, payload, reader=read_handoff, caller=request):
     if not isinstance(payload, dict):
         raise AdapterError("invalid_hook_payload")
     if payload.get("hook_event_name") not in EVENTS:
@@ -176,17 +191,24 @@ def recovery(registry, payload, reader=read_handoff):
     b = matches[0]
     if identity(b["project_root"]) != b["project_identity"]:
         raise AdapterError("project_root_replaced")
+    current_project = discover_project(registry, b["project_root"], caller)
+    if current_project["project"] != b["project"]:
+        raise AdapterError("project_binding_changed")
     config = {**registry, **b}
     # Only the verified operator association allows an alternate entry root.
-    # The existing reader still checks the exact authorized remote identity.
+    # Revalidate the current Server Project id-to-root mapping before the
+    # existing reader checks the exact authorized remote Session identity.
     value = reader(config, current_dir=Path(b["project_root"]))
+    current_project = discover_project(registry, b["project_root"], caller)
+    if current_project["project"] != b["project"]:
+        raise AdapterError("project_binding_changed")
     return {"status": "read", "local_cwd": str(cwd), **value}
 
 
-def cached_recovery(registry, payload, reader=read_handoff):
+def cached_recovery(registry_path, registry, payload, reader=read_handoff, caller=request):
     # The cache is evidence offered to the Host, not a receipt that an Agent read it.
     # A new SessionStart always reintroduces the current brief after compaction.
-    value = recovery(registry, payload, reader)
+    value = recovery(registry, payload, reader, caller)
     if value.get("status") != "read":
         return value
     key = hashlib.sha256(json.dumps([registry["server_url"], payload["session_id"],
@@ -194,6 +216,11 @@ def cached_recovery(registry, payload, reader=read_handoff):
     fingerprint = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
     path = Path(registry["state_dir"]) / ("recovery-" + key + ".json")
     with state_lock(registry):
+        # Association changes share this lock. If an operator changed the
+        # registry while the remote read was in flight, never publish evidence
+        # selected by the stale association.
+        if load_registry(registry_path) != registry:
+            raise AdapterError("registry_changed")
         previous = json.loads(private_file(path)) if path.exists() or path.is_symlink() else None
         unchanged = isinstance(previous, dict) and previous.get("fingerprint") == fingerprint
         if not unchanged:
@@ -221,7 +248,8 @@ def hook_output(result, event):
 
 
 def entry_result(path, payload):
-    result = cached_recovery(load_registry(path), payload)
+    registry = load_registry(path)
+    result = cached_recovery(path, registry, payload)
     if result.get("status") == "unassociated":
         import shlex
         result["agent_next_step"] = ("After the user confirms the project and work, discover existing Sessions with "

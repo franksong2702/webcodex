@@ -47,6 +47,11 @@ refreshes remote evidence on SessionStart/UserPromptSubmit even when there is no
 local `handoff/index.json`. Existing local checkpoint capture is preserved;
 reading remote work does not bind a local observation writer.
 
+Recovery verifies the current Server Project-to-root mapping before and after
+reading, then checks that the operator association has not changed before
+publishing the snapshot. Changed or unavailable identities leave recovery
+unconfirmed; no previous snapshot is substituted as current evidence.
+
 ## Behavior and limits
 
 - `SessionStart` and `UserPromptSubmit` discover the project checkpoint and direct
