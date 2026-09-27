@@ -204,6 +204,57 @@ fn handoff_brief_schema_is_shared_strict_and_absent_from_startup() {
     handoff_shape.as_object_mut().unwrap().remove("description");
     assert_eq!(finish_shape, handoff_shape);
     assert_all_objects_strict(finish_schema, "handoff_brief");
+    let goal_context_schema =
+        &handoff.output_schema["properties"]["output"]["properties"]["goal_context"];
+    assert_eq!(
+        goal_context_schema["properties"]["source"]["const"],
+        "explicit_workflow_session_correlation"
+    );
+    assert_eq!(
+        goal_context_schema["properties"]["candidates"]["maxItems"],
+        8
+    );
+    assert!(
+        finish.output_schema["properties"]["output"]["properties"]
+            .get("goal_context")
+            .is_none(),
+        "finish keeps its existing goal_follow_up instead of duplicating recovery goal_context"
+    );
+    let selection_context = json!({
+        "version": 1,
+        "source": "explicit_workflow_session_correlation",
+        "status": "selection_required",
+        "reason_code": "multiple_active_goals",
+        "truncated": false,
+        "goal": null,
+        "candidates": [
+            {"goal_id": "wc_goal_a", "title": "A", "title_truncated": false, "lifecycle": "active", "revision": 1},
+            {"goal_id": "wc_goal_b", "title": "B", "title_truncated": false, "lifecycle": "active", "revision": 2}
+        ]
+    });
+    let selection_envelope = json!({
+        "success": true,
+        "output": {"goal_context": selection_context}
+    });
+    validate_schema_instance_for_test(&selection_envelope, &handoff.output_schema).unwrap();
+
+    let mut ambiguous_with_one = selection_envelope.clone();
+    ambiguous_with_one["output"]["goal_context"]["candidates"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert!(
+        validate_schema_instance_for_test(&ambiguous_with_one, &handoff.output_schema).is_err()
+    );
+
+    let mut available_without_goal = selection_envelope;
+    available_without_goal["output"]["goal_context"]["status"] = json!("available");
+    available_without_goal["output"]["goal_context"]["reason_code"] = Value::Null;
+    available_without_goal["output"]["goal_context"]["candidates"] = json!([]);
+    assert!(
+        validate_schema_instance_for_test(&available_without_goal, &handoff.output_schema).is_err()
+    );
+
     let external_schema = &finish_schema["properties"]["external_observations"];
     assert_eq!(
         external_schema["properties"]["provenance"]["const"],
@@ -343,6 +394,10 @@ async fn hidden_handoff_state_is_non_recording_exact_recovery_read() {
     assert_eq!(result.output["project"], project);
     assert_eq!(result.output["session_id"], session.session_id);
     assert!(result.output["handoff_brief"].is_object());
+    assert!(
+        result.output.get("goal_context").is_none(),
+        "zero correlated active Goals must omit recovery goal_context"
+    );
     assert_eq!(
         result.output["handoff_brief"]["external_observations"]["provenance"],
         "external_report"
