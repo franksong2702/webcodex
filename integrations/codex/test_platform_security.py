@@ -59,6 +59,47 @@ class PlatformSecurityTests(unittest.TestCase):
             with locked_state_directory(self.state):
                 self.fail("broad state directory must not be opened")
 
+    @unittest.skipUnless(os.name == "nt", "Windows ACL contract")
+    def test_windows_broad_write_access_is_rejected(self):
+        path = self.root / "writeable-secret"
+        path.write_bytes(b"secret")
+        secure_created_path(path)
+        subprocess.run(
+            ["icacls", str(path), "/grant", "*S-1-1-0:(W)"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with self.assertRaisesRegex(SecurityError, "not_private"):
+            read_private_file(path, 32, "not_private", "too_large")
+
+        writable_state = self.root / "writeable-state"
+        writable_state.mkdir()
+        secure_created_path(writable_state)
+        subprocess.run(
+            ["icacls", str(writable_state), "/grant", "*S-1-1-0:(OI)(CI)(W)"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with self.assertRaisesRegex(SecurityError, "private_state_directory_required"):
+            with locked_state_directory(writable_state):
+                self.fail("broadly writable state directory must not be opened")
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL contract")
+    def test_windows_other_principal_access_is_rejected(self):
+        path = self.root / "other-principal-secret"
+        path.write_bytes(b"secret")
+        secure_created_path(path)
+        subprocess.run(
+            ["icacls", str(path), "/grant", "*S-1-5-32-546:(R)"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with self.assertRaisesRegex(SecurityError, "not_private"):
+            read_private_file(path, 32, "not_private", "too_large")
+
     def test_state_lock_is_nonblocking_and_json_is_private(self):
         with locked_state_directory(self.state) as state:
             state.create_json("event.json", {"status": "pending"})

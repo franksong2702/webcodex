@@ -79,8 +79,8 @@ The pre-created outbox directory must also be private. Keep all three outside th
 project so reading an untrusted checkout cannot change the target or obtain credentials.
 On macOS/Linux, files must be owned by the current user with mode 0600 and the state
 directory with mode 0700. On Windows, files/directories must be owned by the current
-user, must not be reparse points, and their ACL must not give read access to Everyone,
-Authenticated Users, or the local Users group. The adapter refuses symlink/reparse
+user, must not be reparse points, and their DACL may grant access only to the
+current user, SYSTEM, and the local Administrators group. The adapter refuses symlink/reparse
 targets and redirects on every platform; remote transport requires HTTPS and HTTP is
 accepted only for loopback. It uses the configured origin directly, not ambient proxy
 settings.

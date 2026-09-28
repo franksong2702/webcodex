@@ -2,7 +2,7 @@
 
 Unix preserves the existing owner/mode/no-follow contract. Windows mirrors the
 repository's native private-path policy: no reparse points, current-user owner,
-and no effective read access for Everyone, Authenticated Users, or local Users.
+and no effective access for Everyone, Authenticated Users, or local Users.
 """
 
 import contextlib
@@ -25,7 +25,7 @@ class SecurityError(Exception):
 
 
 _REPARSE_POINT = 0x400
-_WINDOWS_BROAD_SIDS = ("S-1-1-0", "S-1-5-11", "S-1-5-32-545")
+_WINDOWS_ALLOWED_SIDS = ("S-1-5-18", "S-1-5-32-544")
 
 
 def _is_reparse_or_link(path):
@@ -94,6 +94,21 @@ def _windows_api():
         ctypes.POINTER(wintypes.DWORD),
     ]
     advapi.GetEffectiveRightsFromAclW.restype = wintypes.DWORD
+    advapi.GetAclInformation.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    advapi.GetAclInformation.restype = wintypes.BOOL
+    advapi.GetAce.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.GetAce.restype = wintypes.BOOL
+    advapi.IsValidSid.argtypes = [ctypes.c_void_p]
+    advapi.IsValidSid.restype = wintypes.BOOL
     advapi.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     advapi.EqualSid.restype = wintypes.BOOL
     advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
@@ -189,20 +204,22 @@ def _windows_private_acl(path):
     OWNER_SECURITY_INFORMATION = 0x00000001
     DACL_SECURITY_INFORMATION = 0x00000004
     SE_FILE_OBJECT = 1
-    FILE_READ_DATA = 0x0001
-    GENERIC_READ = 0x80000000
-    GENERIC_ALL = 0x10000000
-    NO_MULTIPLE_TRUSTEE = 0
-    TRUSTEE_IS_SID = 0
-    TRUSTEE_IS_GROUP = 2
+    ACL_SIZE_INFORMATION = 2
+    ACCESS_ALLOWED_ACE_TYPE = 0
+    ACCESS_DENIED_ACE_TYPE = 1
 
-    class TrusteeW(ctypes.Structure):
+    class AclSizeInformation(ctypes.Structure):
         _fields_ = [
-            ("pMultipleTrustee", ctypes.c_void_p),
-            ("MultipleTrusteeOperation", wintypes.DWORD),
-            ("TrusteeForm", wintypes.DWORD),
-            ("TrusteeType", wintypes.DWORD),
-            ("ptstrName", ctypes.c_void_p),
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
+    class AceHeader(ctypes.Structure):
+        _fields_ = [
+            ("AceType", ctypes.c_ubyte),
+            ("AceFlags", ctypes.c_ubyte),
+            ("AceSize", ctypes.c_ushort),
         ]
 
     owner = ctypes.c_void_p()
@@ -231,29 +248,40 @@ def _windows_private_acl(path):
         finally:
             current_kernel.LocalFree(current_sid)
 
-        for sid_text in _WINDOWS_BROAD_SIDS:
+        allowed = [current_sid]
+        allocated = []
+        for sid_text in _WINDOWS_ALLOWED_SIDS:
             sid, sid_kernel = _windows_sid(sid_text)
-            try:
-                trustee = TrusteeW(
-                    None,
-                    NO_MULTIPLE_TRUSTEE,
-                    TRUSTEE_IS_SID,
-                    TRUSTEE_IS_GROUP,
-                    sid,
-                )
-                rights = wintypes.DWORD()
-                status = advapi.GetEffectiveRightsFromAclW(
-                    acl, ctypes.byref(trustee), ctypes.byref(rights)
-                )
-                if (
-                    status != 0
-                    or rights.value & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL) != 0
-                    or advapi.EqualSid(owner, sid)
-                ):
+            allowed.append(sid)
+            allocated.append((sid, sid_kernel))
+        try:
+            info = AclSizeInformation()
+            if not advapi.GetAclInformation(
+                acl,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                ACL_SIZE_INFORMATION,
+            ):
+                return False
+            for index in range(info.AceCount):
+                ace = ctypes.c_void_p()
+                if not advapi.GetAce(acl, index, ctypes.byref(ace)) or not ace.value:
                     return False
-            finally:
+                header = ctypes.cast(ace, ctypes.POINTER(AceHeader)).contents
+                if header.AceType == ACCESS_DENIED_ACE_TYPE:
+                    continue
+                if header.AceType != ACCESS_ALLOWED_ACE_TYPE or header.AceSize < 12:
+                    return False
+                # ACCESS_ALLOWED_ACE is ACE_HEADER + ACCESS_MASK + SID.
+                trustee_sid = ctypes.c_void_p(ace.value + 8)
+                if not advapi.IsValidSid(trustee_sid):
+                    return False
+                if not any(advapi.EqualSid(trustee_sid, sid) for sid in allowed):
+                    return False
+            return True
+        finally:
+            for sid, sid_kernel in allocated:
                 sid_kernel.LocalFree(sid)
-        return True
     finally:
         kernel.LocalFree(descriptor)
 
