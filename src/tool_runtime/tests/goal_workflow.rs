@@ -1,6 +1,6 @@
 use super::*;
 use crate::db::{GoalCheckpoint, NewAgentEndpoint, NewGoal, NewGoalStep};
-use crate::tool_runtime::{AgentWaitEventSelectorCall, AgentWaitModeCall, ToolResult};
+use crate::tool_runtime::{AgentWaitEventSelectorCall, AgentWaitModeCall, ToolCall, ToolResult};
 
 const T0: i64 = 100_000_000;
 const THRESHOLD: i64 = crate::db::GOAL_ACTIVITY_ATTENTION_AFTER_MS;
@@ -1936,6 +1936,58 @@ async fn session_handoff_goal_context_is_read_only_exact_and_preserves_ambiguity
     );
     assert_eq!(after_session.events_total, before_session.events_total);
     assert_eq!(after_session.updated_at, before_session.updated_at);
+
+    // Codex recovery uses the hidden adapter-only handoff tool, not the public
+    // model-facing summary. Prove that the hidden route carries the same exact
+    // Goal context without turning the read into business-Session activity.
+    let hidden_before_goal = fixture
+        .db
+        .read_goal(&fixture.principal(), &fixture.goal_id)
+        .unwrap();
+    let hidden_before_session = fixture
+        .runtime
+        .sessions
+        .summary(&fixture.session_id, Some(200))
+        .unwrap();
+    let hidden = fixture
+        .runtime
+        .dispatch_with_auth(
+            ToolCall::SessionHandoffState {
+                project: fixture.project.clone(),
+                session_id: fixture.session_id.clone(),
+            },
+            Some(&fixture.auth),
+        )
+        .await;
+    assert!(hidden.success, "{:?}", hidden.output);
+    assert_eq!(hidden.output["project"], fixture.project);
+    assert_eq!(hidden.output["session_id"], fixture.session_id);
+    assert_eq!(hidden.output["goal_context"]["status"], "available");
+    assert_eq!(
+        hidden.output["goal_context"]["goal"]["goal_id"],
+        fixture.goal_id
+    );
+    assert_eq!(hidden.output["goal_context"]["goal"]["revision"], 3);
+    assert_eq!(
+        fixture
+            .db
+            .read_goal(&fixture.principal(), &fixture.goal_id)
+            .unwrap(),
+        hidden_before_goal
+    );
+    let hidden_after_session = fixture
+        .runtime
+        .sessions
+        .summary(&fixture.session_id, Some(200))
+        .unwrap();
+    assert_eq!(
+        hidden_after_session.events_total,
+        hidden_before_session.events_total
+    );
+    assert_eq!(
+        hidden_after_session.updated_at,
+        hidden_before_session.updated_at
+    );
     let mut unavailable_runtime = fixture.runtime.clone();
     unavailable_runtime.communication_db = None;
     let unavailable = unavailable_runtime

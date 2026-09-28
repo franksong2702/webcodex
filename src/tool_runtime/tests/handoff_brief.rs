@@ -359,7 +359,13 @@ async fn internal_handoff_projection_does_not_append_events_or_enqueue_agent_req
 async fn hidden_handoff_state_is_non_recording_exact_recovery_read() {
     let root = tempfile::tempdir().unwrap();
     init_git_repo(root.path());
-    let runtime = ToolRuntime::new_for_tests();
+    // This case specifically proves the available-store/zero-Goal contract.
+    // A missing Goal store has distinct explicit `unavailable` semantics and
+    // is covered by the Goal workflow recovery test.
+    let goal_store = tempfile::tempdir().unwrap();
+    let goal_db =
+        Arc::new(crate::db::Database::open(&goal_store.path().join("handoff-goals.db")).unwrap());
+    let runtime = ToolRuntime::new_for_tests().with_communication_database(goal_db);
     let auth = bootstrap_auth_context();
     let client_id = "handoff-state-hidden-read";
     let project =
