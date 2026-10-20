@@ -21,6 +21,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SCHEMA_VERSION = 1
+# Bound container nesting before decoding, independent of CPython's recursion
+# checks (which do not impose the same JSON limit across Python versions).
+# Manifests and receipts have shallow schemas; 128 leaves ample metadata room
+# while keeping decoding safely below the usual Python recursion budget.
+MAX_JSON_DEPTH = 128
 DEFAULT_CASE_MANIFEST = Path(__file__).with_name("agent_loop_cases.json")
 CODE_MODE_TOOLS = frozenset(("execute_code_mode", "execute_effectful_code_mode", "execute_mutating_code_mode"))
 CANONICAL_CODE_MODE_SURFACES = ("read_only", "validation", "guarded_edit")
@@ -169,6 +174,31 @@ def validate_case_manifest(value: Any) -> dict[str, Any]:
     return value
 
 
+def load_bounded_json(text: str) -> Any:
+    """Decode JSON after bounding container nesting, ignoring string contents."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError("JSON container nesting exceeds limit")
+        elif char in "]}":
+            depth -= 1
+    # Syntax validation remains the standard decoder's responsibility.
+    return json.loads(text)
+
+
 def load_case_manifest(path: Path) -> dict[str, Any]:
     try:
         text = path.read_text(encoding="utf-8")
@@ -177,7 +207,7 @@ def load_case_manifest(path: Path) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise ReportError(f"case manifest must be UTF-8: {path}") from exc
     try:
-        value = json.loads(text)
+        value = load_bounded_json(text)
     except json.JSONDecodeError as exc:
         raise ReportError(f"case manifest is not valid JSON: {path}:{exc.lineno}") from exc
     except (RecursionError, ValueError) as exc:

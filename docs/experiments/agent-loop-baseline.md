@@ -351,6 +351,13 @@ only reproducibility mechanics:
 - cleanup of only the worktrees/temp state created by the orchestrator, including targeted rollback of an owned worktree registration when checkout setup fails; no global `git worktree prune` is used;
 - Host-driver process ownership currently uses POSIX process groups; Windows runs are retained explicitly as `unsupported` until equivalent descendant ownership can be guaranteed.
 
+Case manifests read by `agent_loop_report.py` and Host-driver JSON receipts read
+by the benchmark are limited to 128 nested containers before JSON decoding.
+Objects and arrays each count as one level, including the root; brackets inside
+strings do not count. Deeper inputs fail with a bounded-JSON contract error even
+if the Python interpreter would accept them. This explicit limit replaces
+reliance on interpreter-dependent recursion checks.
+
 Example:
 
 ```bash

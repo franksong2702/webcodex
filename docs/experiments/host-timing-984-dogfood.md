@@ -66,6 +66,10 @@ baseline summary, candidate summary) to 64 KiB **before UTF-8 decoding and JSON
 parsing**. A larger file fails with a static error; no file content, source path
 or private field is printed. This protects the existing read-only comparison
 workflow from unexpectedly large or untrusted input files.
+These inputs also have an explicit limit of 128 nested objects or arrays,
+counting the root container and excluding brackets inside strings. The nesting
+check runs before JSON decoding and rejects deeper inputs with the same static
+invalid-input error, independently of the interpreter's recursion behavior.
 
 ## Interpretation and guardrails
 

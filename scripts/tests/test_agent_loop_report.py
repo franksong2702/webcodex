@@ -1379,6 +1379,38 @@ class AgentLoopReportTests(unittest.TestCase):
         with self.assertRaisesRegex(report.ReportError, "duplicate case id"):
             report.validate_case_manifest(manifest)
 
+    def test_bounded_json_container_depth_boundary(self) -> None:
+        for opening, closing in (("[", "]"), ('{"child":', "}")):
+            with self.subTest(opening=opening):
+                raw = opening * report.MAX_JSON_DEPTH + "0" + closing * report.MAX_JSON_DEPTH
+                self.assertEqual(report.load_bounded_json(raw), json.loads(raw))
+                with self.assertRaisesRegex(ValueError, "nesting exceeds limit"):
+                    report.load_bounded_json(opening + raw + closing)
+
+    def test_bounded_json_ignores_escaped_string_contents(self) -> None:
+        value = {"text": ('[]{}"\\' * report.MAX_JSON_DEPTH) + "\\", "child": [{}]}
+        self.assertEqual(report.load_bounded_json(json.dumps(value)), value)
+
+    def test_bounded_json_mixed_container_depth_boundary(self) -> None:
+        raw = "0"
+        for depth in range(report.MAX_JSON_DEPTH):
+            raw = "[" + raw + "]" if depth % 2 else '{"child":' + raw + "}"
+        self.assertEqual(report.load_bounded_json(raw), json.loads(raw))
+        with self.assertRaisesRegex(ValueError, "nesting exceeds limit"):
+            report.load_bounded_json("[" + raw + "]")
+
+    def test_bounded_json_negative_depth_prefix_remains_invalid(self) -> None:
+        depth = report.MAX_JSON_DEPTH + 1
+        raw = "]" + "[" * depth + "0" + "]" * depth
+        with self.assertRaises(json.JSONDecodeError):
+            report.load_bounded_json(raw)
+
+    def test_bounded_json_preserves_syntax_errors(self) -> None:
+        for raw in ('{"child":[}', '{"text":"unterminated', "]", '{"text":"\\\\'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(json.JSONDecodeError):
+                    report.load_bounded_json(raw)
+
     def test_manifest_loader_fail_closes_on_pathological_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

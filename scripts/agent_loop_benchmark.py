@@ -439,7 +439,7 @@ def _load_driver_receipt(path: Path) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise BenchmarkError("driver result must be UTF-8 JSON") from exc
     try:
-        value = json.loads(text)
+        value = report.load_bounded_json(text)
     except json.JSONDecodeError as exc:
         raise BenchmarkError(f"driver result is not valid JSON: {exc}") from exc
     except (RecursionError, ValueError) as exc:
