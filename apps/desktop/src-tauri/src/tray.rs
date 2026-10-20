@@ -1,3 +1,4 @@
+use crate::desktop_locale::{DesktopLocale, DesktopLocaleState};
 use crate::desktop_shell::{self, NavigationTarget};
 use crate::models::{
     DesktopOperationPhase, DesktopStateSnapshot, Experience, RunnerReadiness, ServerReadiness,
@@ -13,12 +14,12 @@ use tauri::{AppHandle, Manager};
 
 const TRAY_ID: &str = "webcodex-desktop";
 const OPEN_ID: &str = "tray.open";
+const LIGHTWEIGHT_ID: &str = "tray.lightweight";
 const ACTIVITY_ID: &str = "tray.activity";
 const SETTINGS_ID: &str = "tray.settings";
 const RESUME_RUNTIME_ID: &str = "tray.resume_runtime";
 const STOP_RUNTIME_ID: &str = "tray.stop_runtime";
-const CONNECT_ID: &str = "tray.connect";
-const DISCONNECT_ID: &str = "tray.disconnect";
+const CONNECT_ID: &str = "tray.connections";
 const STOP_QUICK_SHARE_ID: &str = "tray.stop_quick_share";
 const CANCEL_OPERATION_PREFIX: &str = "tray.cancel_operation:";
 const LAUNCH_AT_LOGIN_ID: &str = "tray.launch_at_login";
@@ -48,12 +49,13 @@ enum RuntimeAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionAction {
-    Connect,
-    Disconnect,
+    Manage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TrayProjection {
+    locale: DesktopLocale,
+    lightweight_available: bool,
     runtime_status: RuntimeStatus,
     connection_status: ConnectionStatus,
     runtime_action: Option<RuntimeAction>,
@@ -72,7 +74,18 @@ pub struct TrayPresentationCache {
 }
 
 impl TrayProjection {
-    fn from_snapshot(snapshot: &DesktopStateSnapshot, launch_at_login: Option<bool>) -> Self {
+    fn with_lightweight_available(mut self, available: bool) -> Self {
+        self.lightweight_available = available;
+        self
+    }
+}
+
+impl TrayProjection {
+    fn from_snapshot(
+        snapshot: &DesktopStateSnapshot,
+        launch_at_login: Option<bool>,
+        locale: DesktopLocale,
+    ) -> Self {
         let local_full = snapshot.topology.as_ref().is_some_and(|topology| {
             topology.experience == Experience::Full
                 && matches!(&topology.server, ServerTopology::Local)
@@ -86,9 +99,8 @@ impl TrayProjection {
         } else {
             RuntimeStatus::NeedsAttention
         };
-        let tunnel_error = snapshot.regular_tunnel.as_ref().is_some_and(|tunnel| {
-            tunnel.status == crate::models::RegularTunnelStatus::Error
-        });
+        let tunnel_error =
+            snapshot.connections.running == 0 && snapshot.connections.needs_attention > 0;
         let observed_use = snapshot.readiness.runtime_ready
             && snapshot
                 .chatgpt_activity
@@ -100,11 +112,9 @@ impl TrayProjection {
             ConnectionStatus::NeedsAttention
         } else if observed_use {
             ConnectionStatus::ObservedUse
-        } else if snapshot.regular_tunnel.as_ref().is_some_and(|tunnel| {
-            tunnel.status == crate::models::RegularTunnelStatus::Ready && tunnel.ready_for_chatgpt
-        }) {
+        } else if snapshot.connections.running > 0 {
             ConnectionStatus::WaitingForChatGpt
-        } else if snapshot.regular_tunnel.is_some() {
+        } else if snapshot.connections.any_active() {
             ConnectionStatus::NeedsAttention
         } else {
             ConnectionStatus::NotConnected
@@ -118,17 +128,7 @@ impl TrayProjection {
         } else {
             None
         };
-        let connection_action = if local_full && snapshot.regular_tunnel.is_some() {
-            Some(ConnectionAction::Disconnect)
-        } else if local_full
-            && snapshot.readiness.runtime_ready
-            && snapshot.openai_tunnel_configured
-            && snapshot.regular_tunnel_available
-        {
-            Some(ConnectionAction::Connect)
-        } else {
-            None
-        };
+        let connection_action = local_full.then_some(ConnectionAction::Manage);
         let cancel_operation_id = snapshot
             .current_operation
             .as_ref()
@@ -142,6 +142,8 @@ impl TrayProjection {
                     operation.cancellable && operation.phase == DesktopOperationPhase::Running
                 });
         Self {
+            locale,
+            lightweight_available: true,
             runtime_status,
             connection_status,
             runtime_action,
@@ -163,7 +165,15 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone_from(&launch_at_login);
-    let projection = TrayProjection::from_snapshot(&snapshot, launch_at_login);
+    let projection = TrayProjection::from_snapshot(
+        &snapshot,
+        launch_at_login,
+        app.state::<DesktopLocaleState>().get(),
+    )
+    .with_lightweight_available(
+        app.state::<desktop_shell::DesktopShellState>()
+            .can_enter_lightweight(),
+    );
     let menu = build_menu(app, &projection)?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
@@ -204,13 +214,54 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Exactly one native observer per Desktop. Loaded renderers already observe;
+/// while unloaded, refresh only existing persistent service status. This never
+/// resumes Runtime or Connections and never overlaps its own previous refresh.
+pub fn start_background_observer(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let shell = app.state::<desktop_shell::DesktopShellState>();
+            if shell.close_disposition() == desktop_shell::CloseDisposition::AllowExit {
+                break;
+            }
+            if !shell.needs_background_observation() {
+                continue;
+            }
+            let state = app.state::<AppState>();
+            let mut snapshot = state.get_state();
+            if should_refresh_persistent_status(&snapshot) {
+                if let Ok(fresh) = state.refresh_runtime_status().await {
+                    snapshot = fresh;
+                }
+            }
+            refresh_from_snapshot(&app, &snapshot);
+        }
+    });
+}
+
+fn should_refresh_persistent_status(snapshot: &DesktopStateSnapshot) -> bool {
+    snapshot.persistent_environment.is_some() && snapshot.current_operation.is_none()
+}
+
 pub fn refresh_from_snapshot(app: &AppHandle, snapshot: &DesktopStateSnapshot) {
     let cache = app.state::<TrayPresentationCache>();
     let launch_at_login = *cache
         .launch_at_login
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let projection = TrayProjection::from_snapshot(snapshot, launch_at_login);
+    let projection = TrayProjection::from_snapshot(
+        snapshot,
+        launch_at_login,
+        app.state::<DesktopLocaleState>().get(),
+    )
+    .with_lightweight_available(
+        app.state::<desktop_shell::DesktopShellState>()
+            .can_enter_lightweight(),
+    );
     {
         let cached = cache
             .projection
@@ -251,13 +302,14 @@ fn observe_launch_at_login(app: &AppHandle) {
 }
 
 fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Menu<tauri::Wry>> {
+    let locale = projection.locale;
     let menu = Menu::new(app)?;
     let runtime = MenuItem::new(
         app,
         match projection.runtime_status {
-            RuntimeStatus::Ready => "Runtime: Ready",
-            RuntimeStatus::Stopped => "Runtime: Stopped",
-            RuntimeStatus::NeedsAttention => "Runtime: Needs attention",
+            RuntimeStatus::Ready => locale.text("tray.runtimeReady"),
+            RuntimeStatus::Stopped => locale.text("tray.runtimeStopped"),
+            RuntimeStatus::NeedsAttention => locale.text("tray.runtimeNeedsAttention"),
         },
         false,
         None::<&str>,
@@ -265,19 +317,38 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
     let connection = MenuItem::new(
         app,
         match projection.connection_status {
-            ConnectionStatus::Ready => "Connection: Verified",
-            ConnectionStatus::ObservedUse => "ChatGPT: Project use observed",
-            ConnectionStatus::WaitingForChatGpt => "Tunnel: Ready; waiting for ChatGPT",
-            ConnectionStatus::NotConnected => "ChatGPT: Project use not observed",
-            ConnectionStatus::NeedsAttention => "Connection: Needs attention",
+            ConnectionStatus::Ready => locale.text("tray.connectionVerified"),
+            ConnectionStatus::ObservedUse => locale.text("tray.projectUseObserved"),
+            ConnectionStatus::WaitingForChatGpt => locale.text("tray.waitingForChatGpt"),
+            ConnectionStatus::NotConnected => locale.text("tray.projectUseNotObserved"),
+            ConnectionStatus::NeedsAttention => locale.text("tray.connectionNeedsAttention"),
         },
         false,
         None::<&str>,
     )?;
     let status_separator = PredefinedMenuItem::separator(app)?;
-    let open = MenuItem::with_id(app, OPEN_ID, "Open WebCodex", true, None::<&str>)?;
-    let activity = MenuItem::with_id(app, ACTIVITY_ID, "Activity…", true, None::<&str>)?;
-    let settings = MenuItem::with_id(app, SETTINGS_ID, "Settings…", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, OPEN_ID, locale.text("tray.open"), true, None::<&str>)?;
+    let lightweight = MenuItem::with_id(
+        app,
+        LIGHTWEIGHT_ID,
+        locale.text("tray.lightweight"),
+        projection.lightweight_available,
+        None::<&str>,
+    )?;
+    let activity = MenuItem::with_id(
+        app,
+        ACTIVITY_ID,
+        locale.text("tray.activity"),
+        true,
+        None::<&str>,
+    )?;
+    let settings = MenuItem::with_id(
+        app,
+        SETTINGS_ID,
+        locale.text("tray.settings"),
+        true,
+        None::<&str>,
+    )?;
     menu.append_items(&[
         &runtime,
         &connection,
@@ -285,13 +356,14 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
         &open,
         &activity,
         &settings,
+        &lightweight,
     ])?;
 
     let mut has_context_action = false;
     if let Some(action) = projection.runtime_action {
         let (id, text) = match action {
-            RuntimeAction::Resume => (RESUME_RUNTIME_ID, "Resume local runtime"),
-            RuntimeAction::Stop => (STOP_RUNTIME_ID, "Stop local runtime"),
+            RuntimeAction::Resume => (RESUME_RUNTIME_ID, locale.text("tray.resumeRuntime")),
+            RuntimeAction::Stop => (STOP_RUNTIME_ID, locale.text("tray.stopRuntime")),
         };
         let item = MenuItem::with_id(app, id, text, !projection.operation_busy, None::<&str>)?;
         if !has_context_action {
@@ -302,8 +374,7 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
     }
     if let Some(action) = projection.connection_action {
         let (id, text) = match action {
-            ConnectionAction::Connect => (CONNECT_ID, "Start OpenAI Secure Tunnel"),
-            ConnectionAction::Disconnect => (DISCONNECT_ID, "Stop OpenAI Secure Tunnel"),
+            ConnectionAction::Manage => (CONNECT_ID, locale.text("tray.connections")),
         };
         let item = MenuItem::with_id(app, id, text, !projection.operation_busy, None::<&str>)?;
         if !has_context_action {
@@ -316,7 +387,7 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
         let item = MenuItem::with_id(
             app,
             STOP_QUICK_SHARE_ID,
-            "Stop Quick Share",
+            locale.text("tray.stopQuickShare"),
             !projection.operation_busy,
             None::<&str>,
         )?;
@@ -330,7 +401,7 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
         let item = MenuItem::with_id(
             app,
             format!("{CANCEL_OPERATION_PREFIX}{operation_id}"),
-            "Cancel current operation",
+            locale.text("tray.cancelOperation"),
             projection.cancel_operation_enabled,
             None::<&str>,
         )?;
@@ -344,13 +415,13 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
     let launch_at_login = CheckMenuItem::with_id(
         app,
         LAUNCH_AT_LOGIN_ID,
-        "Launch at Login",
+        locale.text("tray.launchAtLogin"),
         projection.launch_at_login.is_some(),
         projection.launch_at_login.unwrap_or(false),
         None::<&str>,
     )?;
     let quit_separator = PredefinedMenuItem::separator(app)?;
-    let quit = MenuItem::with_id(app, QUIT_ID, "Quit WebCodex", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, QUIT_ID, locale.text("tray.quit"), true, None::<&str>)?;
     menu.append_items(&[
         &preferences_separator,
         &launch_at_login,
@@ -360,10 +431,15 @@ fn build_menu(app: &AppHandle, projection: &TrayProjection) -> tauri::Result<Men
     Ok(menu)
 }
 
-fn handle_menu_event(app: &AppHandle, id: &str) {
+pub(crate) fn handle_menu_event(app: &AppHandle, id: &str) {
     match id {
         OPEN_ID => {
             let _ = desktop_shell::show_main_window(app);
+        }
+        LIGHTWEIGHT_ID => {
+            if let Err(error) = desktop_shell::enter_lightweight_mode(app) {
+                eprintln!("WebCodex tray action failed: {}", error.code);
+            }
         }
         ACTIVITY_ID => {
             let _ = desktop_shell::navigate(app, NavigationTarget::Activity);
@@ -373,8 +449,9 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         }
         RESUME_RUNTIME_ID => spawn_state_action(app, TrayStateAction::ResumeRuntime),
         STOP_RUNTIME_ID => spawn_state_action(app, TrayStateAction::StopRuntime),
-        CONNECT_ID => spawn_state_action(app, TrayStateAction::StartRegularTunnel),
-        DISCONNECT_ID => spawn_state_action(app, TrayStateAction::StopRegularTunnel),
+        CONNECT_ID => {
+            let _ = desktop_shell::navigate(app, NavigationTarget::Connections);
+        }
         STOP_QUICK_SHARE_ID => spawn_state_action(app, TrayStateAction::StopQuickShare),
         LAUNCH_AT_LOGIN_ID => match desktop_shell::launch_at_login_enabled(app) {
             Ok(current) => match desktop_shell::set_launch_at_login(app, !current) {
@@ -408,8 +485,6 @@ fn cancel_action_from_menu_id(id: &str) -> Option<TrayStateAction> {
 enum TrayStateAction {
     ResumeRuntime,
     StopRuntime,
-    StartRegularTunnel,
-    StopRegularTunnel,
     StopQuickShare,
     CancelOperation(String),
 }
@@ -421,8 +496,6 @@ fn spawn_state_action(app: &AppHandle, action: TrayStateAction) {
         let result = match action {
             TrayStateAction::ResumeRuntime => state.resume_saved_runtime().await,
             TrayStateAction::StopRuntime => state.stop_local_runtime().await,
-            TrayStateAction::StartRegularTunnel => state.start_regular_tunnel().await,
-            TrayStateAction::StopRegularTunnel => state.stop_regular_tunnel().await,
             TrayStateAction::StopQuickShare => state.stop_quick_share().await,
             // Keep the operation observed by the menu, even if a newer operation
             // starts before this task runs. AppState rejects stale IDs.
@@ -445,7 +518,7 @@ mod tests {
     use super::*;
     use crate::models::{
         ChatGptActivitySnapshot, DesktopOperationKind, DesktopOperationSnapshot, Exposure,
-        RegularTunnelState, RegularTunnelStatus, RunnerTopology, RuntimeTopology,
+        RunnerTopology, RuntimeTopology,
     };
 
     fn local_snapshot() -> DesktopStateSnapshot {
@@ -463,11 +536,58 @@ mod tests {
     }
 
     #[test]
+    fn background_observation_only_refreshes_existing_idle_persistent_state() {
+        let mut snapshot = local_snapshot();
+        assert!(!should_refresh_persistent_status(&snapshot));
+        snapshot.persistent_environment = Some("existing-environment".into());
+        assert!(should_refresh_persistent_status(&snapshot));
+        snapshot.current_operation = Some(DesktopOperationSnapshot {
+            id: "busy".into(),
+            kind: DesktopOperationKind::RuntimeResume,
+            phase: DesktopOperationPhase::Running,
+            started_at_ms: 1,
+            cancellable: true,
+        });
+        assert!(!should_refresh_persistent_status(&snapshot));
+        let shell = desktop_shell::DesktopShellState::default();
+        assert!(!shell.needs_background_observation());
+        shell.mark_exit_requested();
+        assert!(!shell.needs_background_observation());
+    }
+
+    #[test]
+    fn lightweight_projection_changes_only_ui_action_availability() {
+        let snapshot = local_snapshot();
+        let normal = TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::EnUs);
+        let light = normal.clone().with_lightweight_available(false);
+        assert_ne!(normal, light);
+        assert!(!light.lightweight_available);
+        assert_eq!(light.clone().with_lightweight_available(true), normal);
+        assert_eq!(light.runtime_status, normal.runtime_status);
+        assert_eq!(light.connection_status, normal.connection_status);
+        assert_eq!(light.runtime_action, normal.runtime_action);
+        assert_eq!(light.connection_action, normal.connection_action);
+    }
+
+    #[test]
+    fn changing_language_invalidates_the_tray_cache_without_changing_runtime_actions() {
+        let snapshot = local_snapshot();
+        let chinese = TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::ZhCn);
+        let english = TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::EnUs);
+        assert_ne!(chinese, english);
+        assert_eq!(chinese.runtime_action, english.runtime_action);
+        assert_eq!(chinese.connection_status, english.connection_status);
+        assert_eq!(chinese.locale.text("tray.open"), "打开 WebCodex");
+        assert_eq!(english.locale.text("tray.open"), "Open WebCodex");
+    }
+
+    #[test]
     fn stopped_runtime_projects_resume_action() {
         let mut snapshot = local_snapshot();
         snapshot.readiness.server = ServerReadiness::Stopped;
         snapshot.readiness.runner = RunnerReadiness::Stopped;
-        let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let projection =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert_eq!(projection.runtime_status, RuntimeStatus::Stopped);
         assert_eq!(projection.runtime_action, Some(RuntimeAction::Resume));
     }
@@ -478,14 +598,12 @@ mod tests {
         snapshot.readiness.server = ServerReadiness::Ready;
         snapshot.readiness.runner = RunnerReadiness::Ready;
         snapshot.readiness.runtime_ready = true;
-        let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let projection =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert_eq!(projection.runtime_status, RuntimeStatus::Ready);
         assert_eq!(projection.runtime_action, Some(RuntimeAction::Stop));
         assert_eq!(projection.connection_status, ConnectionStatus::NotConnected);
-        assert_eq!(
-            projection.connection_action,
-            Some(ConnectionAction::Connect)
-        );
+        assert_eq!(projection.connection_action, Some(ConnectionAction::Manage));
     }
 
     #[test]
@@ -498,11 +616,12 @@ mod tests {
             observed: true,
             last_meaningful_activity_at_ms: Some(1234),
         });
-        let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let projection =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert_eq!(projection.connection_status, ConnectionStatus::ObservedUse);
         assert_eq!(
             projection.connection_action,
-            Some(ConnectionAction::Connect),
+            Some(ConnectionAction::Manage),
             "observed use must not pretend Desktop owns a tunnel"
         );
     }
@@ -513,32 +632,28 @@ mod tests {
         snapshot.readiness.server = ServerReadiness::Ready;
         snapshot.readiness.runner = RunnerReadiness::Ready;
         snapshot.readiness.runtime_ready = true;
-        snapshot.regular_tunnel = Some(RegularTunnelState {
-            provider: "openai".to_string(),
-            status: RegularTunnelStatus::Ready,
-            clipboard_state: "copied".to_string(),
-            clipboard_contains: "tunnel_id".to_string(),
-            ready_for_chatgpt: true,
-        });
+        snapshot.connections.running = 2;
         snapshot.chatgpt_activity = Some(ChatGptActivitySnapshot {
             observed: true,
             last_meaningful_activity_at_ms: Some(1234),
         });
-        let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let projection =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert_eq!(projection.connection_status, ConnectionStatus::ObservedUse);
-        assert_eq!(projection.connection_action, Some(ConnectionAction::Disconnect));
+        assert_eq!(projection.connection_action, Some(ConnectionAction::Manage));
     }
 
     #[test]
-    fn unconfigured_tunnel_does_not_offer_connect_action() {
+    fn unconfigured_tunnel_offers_connections_management_not_implicit_start() {
         let mut snapshot = local_snapshot();
         snapshot.readiness.server = ServerReadiness::Ready;
         snapshot.readiness.runner = RunnerReadiness::Ready;
         snapshot.readiness.runtime_ready = true;
         snapshot.openai_tunnel_configured = false;
-        let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let projection =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert_eq!(projection.connection_status, ConnectionStatus::NotConnected);
-        assert_eq!(projection.connection_action, None);
+        assert_eq!(projection.connection_action, Some(ConnectionAction::Manage));
     }
 
     #[test]
@@ -546,30 +661,23 @@ mod tests {
         let mut snapshot = local_snapshot();
         snapshot.readiness.server = ServerReadiness::Ready;
         snapshot.readiness.runner = RunnerReadiness::Connecting;
-        let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let projection =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert_eq!(projection.runtime_status, RuntimeStatus::NeedsAttention);
     }
 
     #[test]
-    fn locally_ready_tunnel_waits_for_chatgpt_and_offers_stop_action() {
+    fn locally_ready_connections_wait_for_chatgpt_and_offer_profile_management() {
         let mut snapshot = local_snapshot();
-        snapshot.regular_tunnel = Some(RegularTunnelState {
-            provider: "openai".into(),
-            status: RegularTunnelStatus::Ready,
-            clipboard_state: "copied".into(),
-            clipboard_contains: "tunnel_id".into(),
-            ready_for_chatgpt: true,
-        });
+        snapshot.connections.running = 2;
         snapshot.readiness.ready_for_chatgpt = false;
-        let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let projection =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert_eq!(
             projection.connection_status,
             ConnectionStatus::WaitingForChatGpt
         );
-        assert_eq!(
-            projection.connection_action,
-            Some(ConnectionAction::Disconnect)
-        );
+        assert_eq!(projection.connection_action, Some(ConnectionAction::Manage));
     }
 
     #[test]
@@ -590,7 +698,8 @@ mod tests {
             started_at_ms: 1,
             cancellable: true,
         });
-        let projection = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let projection =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert!(projection.stop_quick_share);
         assert_eq!(
             projection.cancel_operation_id.as_deref(),
@@ -610,13 +719,14 @@ mod tests {
             started_at_ms: 1,
             cancellable: true,
         });
-        let first = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let first = TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         let menu_id = format!(
             "{CANCEL_OPERATION_PREFIX}{}",
             first.cancel_operation_id.as_ref().unwrap()
         );
         snapshot.current_operation.as_mut().unwrap().id = "operation-b".into();
-        let second = TrayProjection::from_snapshot(&snapshot, Some(false));
+        let second =
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default());
         assert_ne!(
             first, second,
             "a new operation must invalidate the menu cache"
@@ -633,15 +743,18 @@ mod tests {
     fn autostart_projection_tracks_authoritative_os_observation() {
         let snapshot = local_snapshot();
         assert_eq!(
-            TrayProjection::from_snapshot(&snapshot, Some(false)).launch_at_login,
+            TrayProjection::from_snapshot(&snapshot, Some(false), DesktopLocale::default())
+                .launch_at_login,
             Some(false)
         );
         assert_eq!(
-            TrayProjection::from_snapshot(&snapshot, Some(true)).launch_at_login,
+            TrayProjection::from_snapshot(&snapshot, Some(true), DesktopLocale::default())
+                .launch_at_login,
             Some(true)
         );
         assert_eq!(
-            TrayProjection::from_snapshot(&snapshot, None).launch_at_login,
+            TrayProjection::from_snapshot(&snapshot, None, DesktopLocale::default())
+                .launch_at_login,
             None
         );
     }

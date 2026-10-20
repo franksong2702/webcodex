@@ -1,0 +1,64 @@
+[data-selection-motion] {
+  isolation: isolate;
+}
+[data-selection-motion] [data-selection-motion-item] {
+  position: relative;
+  z-index: 1;
+  background: transparent !important;
+  color: var(--selection-motion-base-ink, var(--ui-text-primary)) !important;
+}
+[data-selection-motion] [data-selection-motion-item]:not(:focus-visible) {
+  box-shadow: none !important;
+}
+[data-selection-motion] [data-selection-motion-overlay] {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: block;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  pointer-events: none !important;
+  user-select: none;
+  /* WAAPI owns these layers. Ancestor/Host CSS must not add a second motion. */
+  transition: none !important;
+  animation: none !important;
+}
+[data-selection-motion] [data-selection-motion-plate] {
+  z-index: 0;
+  background: var(--selection-motion-fill, var(--ui-text-primary));
+  transform-origin: center;
+}
+[data-selection-motion] [data-selection-motion-foreground] {
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  background: transparent;
+}
+[data-selection-motion] [data-selection-motion-label] {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+[data-selection-motion-foreground],
+[data-selection-motion-foreground] * {
+  color: var(--selection-motion-ink, var(--ui-content)) !important;
+}
+[data-selection-motion] [data-selection-motion-overlay][hidden] { display: none; }
+@media (forced-colors: active) {
+  [data-selection-motion] [data-selection-motion-overlay] { display: none; }
+  [data-selection-motion] [data-selection-motion-item] { color: ButtonText !important; }
+  [data-selection-motion] [data-selection-motion-selected] {
+    background: Highlight !important;
+    color: HighlightText !important;
+    forced-color-adjust: none;
+  }
+  [data-selection-motion] [data-selection-motion-selected] * { color: HighlightText !important; }
+}
+
+[data-selection-motion] [data-selection-motion-origin] { width: 0; height: 0; overflow: hidden; }

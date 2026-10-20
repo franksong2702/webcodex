@@ -359,7 +359,7 @@ async fn checkpoint_defaults_metadata_for_old_or_minimal_checkpoint() {
     let storage_dir = storage_path.parent().unwrap();
     let mut legacy: Value =
         serde_json::from_str(&fs::read_to_string(&storage_path).unwrap()).unwrap();
-    let legacy_id = "wc_ckpt_legacy_missing_metadata";
+    let legacy_id = "wc_ckpt_AAAAAAAAAAAAAAAB";
     legacy["checkpoint_id"] = json!(legacy_id);
     legacy["title"] = json!("legacy checkpoint");
     legacy["created_at"] = json!(created.output["created_at"].as_i64().unwrap_or_default() + 1);
@@ -657,7 +657,7 @@ async fn checkpoint_restore_tracked_changes() {
         .sessions
         .summary(&session.session_id, Some(20))
         .unwrap();
-    let event = finished_event(&summary, "workspace_checkpoint_restore");
+    let event = finished_event(&summary, "restore_workspace_checkpoint");
     assert_eq!(event.status.as_deref(), Some("succeeded"));
     assert!(event.write_like);
     assert!(!event.read_like);
@@ -762,7 +762,7 @@ async fn checkpoint_restore_requires_confirm() {
         .dispatch_with_auth(
             ToolCall::WorkspaceCheckpointRestore {
                 project,
-                checkpoint_id: "wc_ckpt_missing".to_string(),
+                checkpoint_id: "wc_ckpt_AAAAAAAAAAAAAAAC".to_string(),
                 confirm: false,
                 session_id: None,
             },
@@ -963,7 +963,7 @@ async fn checkpoint_restore_rejects_malicious_untracked_paths() {
     let mut checkpoint: Value =
         serde_json::from_str(&fs::read_to_string(&storage_path).unwrap()).unwrap();
 
-    let traversal_id = "wc_ckpt_reject_traversal";
+    let traversal_id = "wc_ckpt_AAAAAAAAAAAAAAAD";
     checkpoint["checkpoint_id"] = json!(traversal_id);
     checkpoint["untracked_files"] = json!([{"path": "../escape.txt", "content": "escape\n"}]);
     fs::write(
@@ -986,7 +986,7 @@ async fn checkpoint_restore_rejects_malicious_untracked_paths() {
     assert_eq!(traversal.output["error_kind"], "invalid_checkpoint");
     assert!(!tmp.path().join("escape.txt").exists());
 
-    let sensitive_id = "wc_ckpt_reject_sensitive";
+    let sensitive_id = "wc_ckpt_AAAAAAAAAAAAAAAE";
     checkpoint["checkpoint_id"] = json!(sensitive_id);
     checkpoint["untracked_files"] =
         json!([{"path": "secrets/agent-token.txt", "content": "secret\n"}]);
@@ -1156,7 +1156,7 @@ async fn checkpoint_session_guards() {
         .sessions
         .summary(&read_only_session, Some(20))
         .unwrap();
-    let restore_event = finished_event(&summary, "workspace_checkpoint_restore");
+    let restore_event = finished_event(&summary, "restore_workspace_checkpoint");
     assert_eq!(restore_event.status.as_deref(), Some("failed"));
     assert!(restore_event.write_like);
 }
@@ -1208,7 +1208,7 @@ async fn checkpoint_session_input_summary_does_not_leak_commands() {
         .events
         .iter()
         .find(|event| {
-            event.kind == "tool_call_started" && event.tool_name == "workspace_checkpoint_create"
+            event.kind == "tool_call_started" && event.tool_name == "create_workspace_checkpoint"
         })
         .unwrap();
     let input_summary = started.input_summary.as_ref().unwrap();

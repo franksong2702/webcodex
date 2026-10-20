@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f4f5f7" />
+    <script>
+      (() => {
+        const appearanceKey = "webcodex.runtime.appearance.v1";
+        const languageKey = "webcodex.runtime.language.v1";
+        let appearance = "system";
+        const supportedLanguages = ["en", "zh-CN", "zh-TW", "ja-JP", "ko-KR", "de-DE", "fr-FR"];
+        const normalizeLanguage = (value) => {
+          const tag = String(value || "").toLowerCase();
+          if (!tag) return null;
+          if (tag === "zh-tw" || tag === "zh-hk" || tag.startsWith("zh-hant")) return "zh-TW";
+          if (tag.startsWith("zh")) return "zh-CN";
+          return supportedLanguages.find(candidate => candidate.toLowerCase() === tag || candidate.split("-")[0].toLowerCase() === tag.split("-")[0]) || null;
+        };
+        let language = (navigator.languages || []).map(normalizeLanguage).find(Boolean) || normalizeLanguage(navigator.language) || "en";
+        try {
+          const storedAppearance = localStorage.getItem(appearanceKey);
+          if (storedAppearance === "light" || storedAppearance === "dark" || storedAppearance === "system") appearance = storedAppearance;
+          const storedLanguage = localStorage.getItem(languageKey);
+          language = normalizeLanguage(storedLanguage) || language;
+        } catch {}
+        const resolved = appearance === "system"
+          ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
+          : appearance;
+        document.documentElement.dataset.theme = appearance;
+        document.documentElement.dataset.resolvedTheme = resolved;
+        document.documentElement.dataset.language = language;
+        document.documentElement.lang = language;
+      })();
+    </script>
+    <title>WebCodex — Runtime Workspace</title>
+    <link rel="stylesheet" href="/runtime/styles.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/runtime/app.js"></script>
+  </body>
+</html>

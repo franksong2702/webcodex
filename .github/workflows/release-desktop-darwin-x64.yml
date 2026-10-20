@@ -1,0 +1,426 @@
+name: Release macOS Intel Desktop
+
+run-name: Release macOS Intel Desktop ${{ github.event.release.tag_name || inputs.tag }}
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published immutable release tag (v0.4.3+)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-desktop-darwin-x64-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      source_sha: ${{ steps.release.outputs.source_sha }}
+      source_short: ${{ steps.release.outputs.source_short }}
+      built_at: ${{ steps.release.outputs.built_at }}
+    steps:
+      - name: Require reviewed workflow source
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Manual macOS Intel Desktop publication must be dispatched from main." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Resolve immutable published release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = release ]; then
+            tag="$EVENT_TAG"
+          else
+            tag="$INPUT_TAG"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+
+          release_json="$RUNNER_TEMP/release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$release_json"
+          python3 - "$release_json" "$tag" <<'PY'
+          import json
+          import sys
+
+          release = json.load(open(sys.argv[1], encoding="utf-8"))
+          tag = sys.argv[2]
+          if release.get("tag_name") != tag:
+              raise SystemExit("GitHub Release tag does not match requested tag")
+          if release.get("draft") is not False or not release.get("published_at"):
+              raise SystemExit("macOS Intel Desktop may be attached only to a public GitHub Release")
+          version = tag.removeprefix("v").split("+", 1)[0].split("-", 1)[0]
+          core = tuple(int(part) for part in version.split("."))
+          if core < (0, 4, 3):
+              raise SystemExit("supplemental macOS Intel Desktop publication starts with v0.4.3")
+          PY
+
+          if [ "$(git cat-file -t "$tag")" != tag ]; then
+            echo "$tag must be an annotated tag." >&2
+            exit 1
+          fi
+          source_sha="$(git rev-list -n 1 "$tag")"
+          if [ "$(git rev-parse HEAD)" != "$source_sha" ]; then
+            echo "Checked-out source does not match $tag." >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+            echo "Release checkout is not clean." >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          package_version="$(python3 -c 'import json; print(json.load(open("npm/webcodex/package.json", encoding="utf-8"))["version"])')"
+          if [ "$package_version" != "$version" ]; then
+            echo "Tag/package version mismatch: tag=$version package=$package_version" >&2
+            exit 1
+          fi
+          built_at="$(git for-each-ref --format='%(taggerdate:unix)' "refs/tags/$tag")"
+          if [[ ! "$built_at" =~ ^[0-9]+$ ]]; then
+            echo "Could not resolve immutable tagger time for $tag." >&2
+            exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "source_sha=$source_sha"
+            echo "built_at=$built_at"
+          } >> "$GITHUB_OUTPUT"
+
+  build-and-publish:
+    needs: resolve
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      BUILD_KIND: release
+      WEBCODEX_MACOS_CERTIFICATE_SHA1: ${{ vars.MACOS_CERTIFICATE_SHA1 }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+      WEBCODEX_BUILT_AT: ${{ needs.resolve.outputs.built_at }}
+      PLATFORM: darwin-x64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-desktop-darwin-x64
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+
+      - name: Download and verify immutable darwin-x64 runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+          archive="webcodex-v$VERSION-$PLATFORM.tar.gz"
+          runtime_dir="$RUNNER_TEMP/webcodex-$PLATFORM-runtime"
+          download_dir="$RUNNER_TEMP/webcodex-$PLATFORM-release"
+          mkdir -p "$runtime_dir" "$download_dir"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$archive" --dir "$download_dir"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$download_dir"
+
+          expected="$(awk -v name="$archive" '$2 == name { print $1 }' "$download_dir/SHA256SUMS")"
+          if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "SHA256SUMS is missing one exact $archive entry." >&2
+            exit 1
+          fi
+          actual="$(shasum -a 256 "$download_dir/$archive" | awk '{print $1}')"
+          test "$actual" = "$expected"
+
+          python3 - "$download_dir/$archive" "$runtime_dir" <<'PY'
+          import pathlib
+          import sys
+          import tarfile
+
+          archive_path = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2])
+          expected = {"webcodex", "webcodex-server", "webcodex-runner"}
+          with tarfile.open(archive_path, "r:gz") as archive:
+              members = [member for member in archive.getmembers() if not member.isdir()]
+              names = set()
+              for member in members:
+                  name = member.name
+                  while name.startswith("./"):
+                      name = name[2:]
+                  if not member.isfile() or not name or "/" in name or "\\" in name:
+                      raise SystemExit(f"invalid release archive member: {member.name}")
+                  names.add(name)
+              if names != expected or len(members) != len(expected):
+                  raise SystemExit(f"unexpected release archive members: {sorted(names)}")
+              for member in members:
+                  name = member.name.removeprefix("./")
+                  source = archive.extractfile(member)
+                  if source is None:
+                      raise SystemExit(f"cannot read release archive member: {member.name}")
+                  target = destination / name
+                  target.write_bytes(source.read())
+                  target.chmod(0o755)
+          PY
+
+          build_info_dir="$RUNNER_TEMP/webcodex-$PLATFORM-build-info"
+          mkdir -p "$build_info_dir"
+          for name in webcodex webcodex-server webcodex-runner; do
+            binary="$runtime_dir/$name"
+            "$binary" --build-info-json > "$build_info_dir/$name.json"
+            file "$binary" | grep -Fq x86_64
+          done
+          python3 - "$build_info_dir" "$VERSION" "$SOURCE_SHA" "$WEBCODEX_BUILT_AT" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          version, source_sha, built_at = sys.argv[2:]
+          names = ("webcodex", "webcodex-server", "webcodex-runner")
+          commits = set()
+          for name in names:
+              info = json.loads((root / f"{name}.json").read_text(encoding="utf-8"))
+              if info.get("schema_version") != 1 or info.get("binary") != name:
+                  raise SystemExit(f"unexpected build-info schema: {name}")
+              if info.get("version") != version or info.get("git_dirty") is not False or info.get("built_at") != built_at:
+                  raise SystemExit(f"immutable runtime identity mismatch: {name}")
+              if info.get("target") != "x86_64-apple-darwin" or info.get("architecture") != "x86_64":
+                  raise SystemExit(f"immutable runtime target mismatch: {name}")
+              commit = info.get("git_commit")
+              if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{12,40}", commit):
+                  raise SystemExit(f"immutable runtime commit identity is malformed: {name}")
+              if not source_sha.startswith(commit):
+                  raise SystemExit(f"immutable runtime commit does not identify release source: {name}")
+              commits.add(commit)
+          if len(commits) != 1:
+              raise SystemExit("immutable runtime binaries disagree on commit identity")
+          PY
+          # Preserve immutable runtime provenance here; the final Desktop bundle
+          # is re-signed below with the configured persistent release identity.
+          echo "RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+
+      - name: Configure persistent macOS signing
+        shell: bash
+        env:
+          WEBCODEX_MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE || 'self-signed' }}
+          WEBCODEX_MACOS_CERTIFICATE_SHA1: ${{ vars.MACOS_CERTIFICATE_SHA1 }}
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_SIGNING_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: bash scripts/macos_ci_signing_setup.sh
+
+      - name: Probe native DMG services before compiling Desktop
+        run: bash scripts/macos_finalize_dmg.sh --preflight
+
+      - name: Install Desktop dependencies
+        run: |
+          npm ci --prefix frontend
+          npm ci --prefix apps/desktop
+
+      - name: Stage exact published runtime for macOS Intel Desktop
+        id: desktop_bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/webcodex-desktop-$PLATFORM-bundle"
+          signing_mode="$WEBCODEX_MACOS_SIGNING_MODE"
+          python3 scripts/prepare_desktop_bundle_macos.py \
+            --bin-dir "$RUNTIME_DIR" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --built-at "$WEBCODEX_BUILT_AT" \
+            --platform "$PLATFORM" \
+            --signing-mode "$signing_mode" \
+            --output-dir "$stage"
+          {
+            echo "config=$stage/tauri.bundle.conf.json"
+            echo "metadata=$stage/desktop-bundle.json"
+            echo "signing_mode=$signing_mode"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS Intel Desktop DMG
+        id: desktop_dmg
+        working-directory: apps/desktop
+        shell: bash
+        env:
+          CI: "true"
+          WEBCODEX_MACOS_CERTIFICATE_SHA1: ${{ vars.MACOS_CERTIFICATE_SHA1 }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ "$WEBCODEX_MACOS_SIGNING_MODE" != developer-id ]; then
+            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/webcodex-desktop-$PLATFORM-tauri"
+          tauri_identity="$APPLE_SIGNING_IDENTITY"
+          if [ "$WEBCODEX_MACOS_SIGNING_MODE" = self-signed ]; then tauri_identity=-; fi
+          env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_TEAM_ID APPLE_SIGNING_IDENTITY="$tauri_identity" npm exec tauri -- build \
+            --bundles dmg \
+            --config "${{ steps.desktop_bundle.outputs.config }}" \
+            --ci -- --locked
+          bundle_dir="$CARGO_TARGET_DIR/release/bundle/dmg"
+          shopt -s nullglob
+          candidates=("$bundle_dir"/*.dmg)
+          if [ "${#candidates[@]}" -ne 1 ]; then
+            echo "Expected exactly one native macOS Intel DMG, found ${#candidates[@]}." >&2
+            exit 1
+          fi
+          desktop="$RUNNER_TEMP/webcodex-desktop-v$VERSION-$PLATFORM.dmg"
+          bash ../../scripts/macos_finalize_dmg.sh "${candidates[0]}" "$WEBCODEX_MACOS_SIGNING_MODE" "$APPLE_SIGNING_IDENTITY"
+          cp "${candidates[0]}" "$desktop"
+          digest="$(shasum -a 256 "$desktop" | awk '{print $1}')"
+          printf '%s  %s\n' "$digest" "$(basename "$desktop")" > "$desktop.sha256"
+          {
+            echo "path=$desktop"
+            echo "checksum=$desktop.sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Preserve native DMG stage diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: intel-dmg-diagnostics-${{ github.run_attempt }}
+          path: target/dmg-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Smoke macOS Intel Desktop DMG and signing evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/desktop_install_macos_smoke.sh \
+            --dmg "${{ steps.desktop_dmg.outputs.path }}" \
+            --version "$VERSION" \
+            --source-sha "$SOURCE_SHA" \
+            --built-at "$WEBCODEX_BUILT_AT" \
+            --platform "$PLATFORM" \
+            --stage-metadata "${{ steps.desktop_bundle.outputs.metadata }}" \
+            --signing-mode "${{ steps.desktop_bundle.outputs.signing_mode }}" \
+            --evidence "$RUNNER_TEMP/webcodex-desktop-v$VERSION-$PLATFORM.dmg.evidence.json"
+
+      - name: Clean ephemeral signing material
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${WEBCODEX_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$WEBCODEX_SIGNING_KEYCHAIN"
+          fi
+
+      - name: Reconcile immutable supplemental Release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          dmg="${{ steps.desktop_dmg.outputs.path }}"
+          checksum="${{ steps.desktop_dmg.outputs.checksum }}"
+          release_json="$RUNNER_TEMP/release-assets.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$release_json"
+
+          compare_dir="$RUNNER_TEMP/existing-supplemental-assets"
+          mkdir -p "$compare_dir"
+          dmg_name="$(basename "$dmg")"
+          checksum_name="$(basename "$checksum")"
+          read -r dmg_count checksum_count < <(python3 - "$release_json" "$dmg_name" "$checksum_name" <<'PY'
+          import json
+          import sys
+
+          release = json.load(open(sys.argv[1], encoding="utf-8"))
+          names = sys.argv[2:]
+          counts = [sum(1 for item in release.get("assets", []) if item.get("name") == name) for name in names]
+          print(*counts)
+          PY
+          )
+          if [ "$dmg_count" -gt 1 ] || [ "$checksum_count" -gt 1 ]; then
+            echo "Refusing duplicate macOS Intel Desktop Release assets." >&2
+            exit 1
+          fi
+
+          if [ "$dmg_count" -eq 1 ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$dmg_name" --dir "$compare_dir"
+            existing_dmg="$compare_dir/$dmg_name"
+            existing_digest="$(shasum -a 256 "$existing_dmg" | awk '{print $1}')"
+            printf '%s  %s\n' "$existing_digest" "$dmg_name" > "$compare_dir/$checksum_name.expected"
+
+            if [ "$checksum_count" -eq 1 ]; then
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$checksum_name" --dir "$compare_dir"
+              if ! cmp -s "$compare_dir/$checksum_name.expected" "$compare_dir/$checksum_name"; then
+                echo "$checksum_name does not describe the existing immutable $dmg_name." >&2
+                exit 1
+              fi
+            else
+              # Treat an already-published DMG as immutable authority. Recover
+              # a partial sidecar upload from those exact bytes instead of replacing
+              # the existing artifact with a newly built candidate.
+              cp "$compare_dir/$checksum_name.expected" "$compare_dir/$checksum_name"
+              gh release upload "$TAG" "$compare_dir/$checksum_name" --repo "$GITHUB_REPOSITORY"
+            fi
+          elif [ "$checksum_count" -eq 1 ]; then
+            echo "Found orphan $checksum_name without $dmg_name; reconcile manually instead of replacing the immutable checksum." >&2
+            exit 1
+          else
+            # Upload the DMG first. If the sidecar upload is interrupted, a
+            # rerun can derive the missing checksum from the already-immutable DMG.
+            gh release upload "$TAG" "$dmg" --repo "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" "$checksum" --repo "$GITHUB_REPOSITORY"
+          fi
+
+          {
+            echo "### Published supplemental macOS Intel Desktop"
+            echo "- tag: \`$TAG\`"
+            echo "- source: \`$SOURCE_SHA\`"
+            echo "- runtime input: immutable published \`webcodex-v$VERSION-$PLATFORM.tar.gz\`"
+            echo "- Desktop: \`$(basename "$dmg")\`"
+            echo "- checksum: \`$(basename "$checksum")\`"
+          } >> "$GITHUB_STEP_SUMMARY"

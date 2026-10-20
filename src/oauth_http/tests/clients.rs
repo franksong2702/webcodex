@@ -30,7 +30,7 @@ async fn oauth_client_create_returns_client_secret_once() {
 
     let mut resp = authorized_post_json(
         "http://localhost/api/oauth/clients/create",
-        create_client_json("ChatGPT Action", &["https://example.com/callback"], None),
+        create_client_json("MCP client", &["https://example.com/callback"], None),
         &token,
     )
     .send(&service)
@@ -105,6 +105,21 @@ async fn managed_oauth_client_api_hides_and_cannot_mutate_project_share_clients(
     .await;
     assert_eq!(update.status_code, Some(StatusCode::NOT_FOUND));
 
+    for path in ["add_redirect_uri", "remove_redirect_uri"] {
+        let redirect = authorized_post_json(
+            &format!("http://localhost/api/oauth/clients/{path}"),
+            serde_json::json!({
+                "client_id": project_client.client_id,
+                "redirect_uri": "https://client.example/callback",
+            })
+            .to_string(),
+            &token,
+        )
+        .send(&service)
+        .await;
+        assert_eq!(redirect.status_code, Some(StatusCode::NOT_FOUND), "{path}");
+    }
+
     let revoke = authorized_post_json(
         "http://localhost/api/oauth/clients/revoke",
         serde_json::json!({"client_id": project_client.client_id}).to_string(),
@@ -171,6 +186,19 @@ async fn oauth_client_management_is_owner_scoped_for_pats_and_global_for_bootstr
     .await;
     assert_eq!(update.status_code, Some(StatusCode::NOT_FOUND));
 
+    let redirect = authorized_post_json(
+        "http://localhost/api/oauth/clients/add_redirect_uri",
+        serde_json::json!({
+            "client_id": bob_client.client_id,
+            "redirect_uri": "https://alice.example/should-not-be-added",
+        })
+        .to_string(),
+        &alice_pat,
+    )
+    .send(&service)
+    .await;
+    assert_eq!(redirect.status_code, Some(StatusCode::NOT_FOUND));
+
     let revoke = authorized_post_json(
         "http://localhost/api/oauth/clients/revoke",
         serde_json::json!({"client_id": bob_client.client_id}).to_string(),
@@ -179,12 +207,14 @@ async fn oauth_client_management_is_owner_scoped_for_pats_and_global_for_bootstr
     .send(&service)
     .await;
     assert_eq!(revoke.status_code, Some(StatusCode::NOT_FOUND));
+    let bob_stored = db
+        .get_oauth_client_by_client_id(&bob_client.client_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(bob_stored.allowed_scopes, "runtime:read project:read");
     assert_eq!(
-        db.get_oauth_client_by_client_id(&bob_client.client_id)
-            .unwrap()
-            .unwrap()
-            .allowed_scopes,
-        "runtime:read project:read"
+        bob_stored.redirect_uris_vec(),
+        vec!["https://bob.example/callback"]
     );
 
     let mut bootstrap_list = authorized_post_json(
@@ -302,6 +332,24 @@ async fn oauth_client_create_validates_redirect_uris() {
         .send(&service)
         .await;
         assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST), "{uri}");
+    }
+
+    // URL parsers may discard embedded ASCII controls, but the persisted
+    // newline-delimited representation must never reinterpret one input as
+    // multiple registered redirect URIs.
+    for uri in [
+        "https://example.com/callback\nhttp://attacker.example/callback",
+        "https://example.com/callback\rhttps://attacker.example/callback",
+        "https://example.com/callback\thttps://attacker.example/callback",
+    ] {
+        let resp = authorized_post_json(
+            "http://localhost/api/oauth/clients/create",
+            create_client_json("Bad", &[uri], None),
+            &token,
+        )
+        .send(&service)
+        .await;
+        assert_eq!(resp.status_code, Some(StatusCode::BAD_REQUEST), "{uri:?}");
     }
 
     // http loopback accepted
@@ -571,6 +619,172 @@ async fn oauth_client_create_accepts_explicit_clipboard_scopes() {
             "computer:clipboard_read",
             "computer:clipboard_write"
         ])
+    );
+}
+
+#[tokio::test]
+async fn oauth_client_redirect_uri_management_preserves_client_secret_and_tokens() {
+    let config = test_config(oauth2_enabled());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_user_token(&db, &user);
+    let client = seed_client_with_redirects_and_scopes(
+        &db,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+    );
+    let (_access_record, access_token) = seed_access_token(&db, &client, &user, "runtime:read");
+    let service = Service::new(build_router(config, db.clone()));
+
+    let mut add = authorized_post_json(
+        "http://localhost/api/oauth/clients/add_redirect_uri",
+        serde_json::json!({
+            "client_id": client.client_id,
+            "redirect_uri": "https://example.com/new-callback"
+        })
+        .to_string(),
+        &token,
+    )
+    .send(&service)
+    .await;
+    assert_eq!(add.status_code, Some(StatusCode::OK));
+    let add_body: serde_json::Value = add.take_json().await.unwrap();
+    assert_eq!(add_body["changed"], true);
+    assert_eq!(add_body["tokens_revoked"], false);
+
+    let stored = db
+        .get_oauth_client_by_client_id(&client.client_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.client_secret_hash, client.client_secret_hash);
+    assert_eq!(
+        stored.redirect_uris_vec(),
+        vec![
+            "https://example.com/callback",
+            "https://example.com/new-callback",
+        ]
+    );
+    let access = db
+        .get_oauth_access_token_by_hash(&hash_token(&access_token))
+        .unwrap()
+        .unwrap();
+    assert_eq!(access.revoked_at, None);
+
+    let mut remove = authorized_post_json(
+        "http://localhost/api/oauth/clients/remove_redirect_uri",
+        serde_json::json!({
+            "client_id": client.client_id,
+            "redirect_uri": "https://example.com/new-callback"
+        })
+        .to_string(),
+        &token,
+    )
+    .send(&service)
+    .await;
+    assert_eq!(remove.status_code, Some(StatusCode::OK));
+    let remove_body: serde_json::Value = remove.take_json().await.unwrap();
+    assert_eq!(remove_body["changed"], true);
+    assert_eq!(remove_body["tokens_revoked"], false);
+
+    let stored = db
+        .get_oauth_client_by_client_id(&client.client_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.client_secret_hash, client.client_secret_hash);
+    assert_eq!(
+        stored.redirect_uris_vec(),
+        vec!["https://example.com/callback"]
+    );
+    let access = db
+        .get_oauth_access_token_by_hash(&hash_token(&access_token))
+        .unwrap()
+        .unwrap();
+    assert_eq!(access.revoked_at, None);
+}
+
+#[tokio::test]
+async fn oauth_client_redirect_uri_management_enforces_validation_and_limits() {
+    let config = test_config(oauth2_enabled());
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let token = seed_user_token(&db, &user);
+    let client = seed_client_with_redirects_and_scopes(
+        &db,
+        &user,
+        "https://example.com/callback",
+        "runtime:read",
+    );
+    let service = Service::new(build_router(config, db.clone()));
+
+    for redirect_uri in [
+        "https://safe.example/callback\nhttp://attacker.example/callback",
+        "https://safe.example/callback\rhttps://attacker.example/callback",
+        "https://safe.example/callback\thttps://attacker.example/callback",
+    ] {
+        let add = authorized_post_json(
+            "http://localhost/api/oauth/clients/add_redirect_uri",
+            serde_json::json!({
+                "client_id": client.client_id,
+                "redirect_uri": redirect_uri,
+            })
+            .to_string(),
+            &token,
+        )
+        .send(&service)
+        .await;
+        assert_eq!(
+            add.status_code,
+            Some(StatusCode::BAD_REQUEST),
+            "{redirect_uri:?}"
+        );
+    }
+    assert_eq!(
+        db.get_oauth_client_by_client_id(&client.client_id)
+            .unwrap()
+            .unwrap()
+            .redirect_uris_vec(),
+        vec!["https://example.com/callback"]
+    );
+
+    let remove_last = authorized_post_json(
+        "http://localhost/api/oauth/clients/remove_redirect_uri",
+        serde_json::json!({
+            "client_id": client.client_id,
+            "redirect_uri": "https://example.com/callback",
+        })
+        .to_string(),
+        &token,
+    )
+    .send(&service)
+    .await;
+    assert_eq!(remove_last.status_code, Some(StatusCode::BAD_REQUEST));
+
+    let max_redirects = (0..16)
+        .map(|index| format!("https://example.com/callback/{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let full_client =
+        seed_client_with_redirects_and_scopes(&db, &user, &max_redirects, "runtime:read");
+    let overflow = authorized_post_json(
+        "http://localhost/api/oauth/clients/add_redirect_uri",
+        serde_json::json!({
+            "client_id": full_client.client_id,
+            "redirect_uri": "https://example.com/overflow",
+        })
+        .to_string(),
+        &token,
+    )
+    .send(&service)
+    .await;
+    assert_eq!(overflow.status_code, Some(StatusCode::BAD_REQUEST));
+    assert_eq!(
+        db.get_oauth_client_by_client_id(&full_client.client_id)
+            .unwrap()
+            .unwrap()
+            .redirect_uris_vec()
+            .len(),
+        16
     );
 }
 
@@ -1027,6 +1241,21 @@ async fn oauth_client_management_rejects_oauth2_token() {
     .send(&service)
     .await;
     assert_eq!(resp.status_code, Some(StatusCode::FORBIDDEN));
+
+    for path in ["add_redirect_uri", "remove_redirect_uri"] {
+        let resp = authorized_post_json(
+            &format!("http://localhost/api/oauth/clients/{path}"),
+            serde_json::json!({
+                "client_id": client.client_id,
+                "redirect_uri": "https://example.com/callback",
+            })
+            .to_string(),
+            &oauth_access_token,
+        )
+        .send(&service)
+        .await;
+        assert_eq!(resp.status_code, Some(StatusCode::FORBIDDEN), "{path}");
+    }
 }
 
 #[tokio::test]
@@ -1058,4 +1287,60 @@ async fn oauth_client_management_allows_api_token_or_bootstrap() {
     assert_eq!(resp.status_code, Some(StatusCode::OK));
     let body: serde_json::Value = resp.take_json().await.unwrap();
     assert_eq!(body["success"], true);
+}
+
+#[tokio::test]
+async fn client_management_requires_first_party_account_authority_and_ownership() {
+    let _env = crate::auth::AuthEnvGuard::auth_required();
+    let (_tmp, db) = test_db();
+    let user = seed_user(&db, "alice");
+    let other = seed_user(&db, "bob");
+    let (own, _) = seed_client(&db, &user, "own");
+    let (foreign, _) = seed_client(&db, &other, "foreign");
+    let service = Service::new(build_router(test_config(oauth2_enabled()), db.clone()));
+    for (scopes, has_account, admin) in [
+        ("runtime:read", false, false),
+        ("account:manage", true, false),
+        ("admin", true, true),
+    ] {
+        let token = seed_user_token_with_scopes(&db, &user, scopes);
+        for (route, body) in [
+            ("create", create_client_json("new", &["https://example.com/callback"], Some(&["runtime:read"]))),
+            ("list", "{}".to_string()),
+            ("update_scopes", serde_json::json!({"client_id": own.client_id, "allowed_scopes": ["runtime:read", "project:read"]}).to_string()),
+            ("add_redirect_uri", serde_json::json!({"client_id": own.client_id, "redirect_uri": "https://example.com/second"}).to_string()),
+            ("remove_redirect_uri", serde_json::json!({"client_id": own.client_id, "redirect_uri": "https://example.com/second"}).to_string()),
+        ] {
+            let resp = authorized_post_json(&format!("http://localhost/api/oauth/clients/{route}"), body, &token).send(&service).await;
+            assert_eq!(resp.status_code, Some(if has_account { StatusCode::OK } else { StatusCode::FORBIDDEN }), "{route}");
+        }
+        let resp = authorized_post_json("http://localhost/api/oauth/clients/update_scopes", serde_json::json!({"client_id": foreign.client_id, "allowed_scopes": ["runtime:read", "project:read"]}).to_string(), &token).send(&service).await;
+        assert_eq!(
+            resp.status_code,
+            Some(if admin {
+                StatusCode::OK
+            } else if has_account {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::FORBIDDEN
+            })
+        );
+        let resp = authorized_post_json(
+            "http://localhost/api/oauth/clients/revoke",
+            serde_json::json!({"client_id": foreign.client_id}).to_string(),
+            &token,
+        )
+        .send(&service)
+        .await;
+        assert_eq!(
+            resp.status_code,
+            Some(if admin {
+                StatusCode::OK
+            } else if has_account {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::FORBIDDEN
+            })
+        );
+    }
 }

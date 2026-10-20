@@ -29,16 +29,184 @@ fn mcp_gateway_tool_call_params_do_not_retain_outer_meta() {
     }
 }
 
+#[test]
+fn mcp_tool_action_audit_ids_keep_successful_business_session_internal_and_bounded() {
+    let mut correlation = crate::tool_runtime::ToolCallCorrelation::default();
+    correlation.business_session_id = Some("wc_sess_AAAAAAAAAAAAAAAA".to_string());
+    let ids = mcp_tool_action_audit_ids(true, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None)
+        .expect("successful bounded ids");
+    assert_eq!(ids["business_session_id"], "wc_sess_AAAAAAAAAAAAAAAA");
+    assert_eq!(ids["goal_id"], "wc_goal_BBBBBBBBBBBBBBBB");
+    assert_eq!(ids.as_object().unwrap().len(), 2);
+    assert!(
+        mcp_tool_action_audit_ids(false, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None,)
+            .is_none()
+    );
+
+    correlation.business_session_id = None;
+    assert_eq!(
+        mcp_tool_action_audit_ids(true, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None,),
+        Some(json!({"goal_id": "wc_goal_BBBBBBBBBBBBBBBB"}))
+    );
+    assert!(mcp_tool_action_audit_ids(true, None, &correlation, None).is_none());
+}
+
+#[test]
+fn mcp_job_audit_correlation_keeps_only_stable_job_identity() {
+    let handoff = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "promoted_to_job": true,
+                    "job_id": "wc_job_background_123",
+                    "observation_token": "opaque-token-must-not-be-recorded"
+                }
+            }
+        }
+    });
+    let correlated = mcp_tool_job_audit_correlation(Some("cargo_test"), &handoff);
+    assert_eq!(
+        correlated.async_job_id.as_deref(),
+        Some("wc_job_background_123")
+    );
+    assert!(correlated.observed_job_ids.is_empty());
+
+    let sparse_pending = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "execution_state": "pending",
+                    "continuation": {
+                        "tool": "observe_jobs",
+                        "arguments": {"items": [{"job_id": "wc_job_sparse_pending_123"}]}
+                    }
+                }
+            }
+        }
+    });
+    let correlated = mcp_tool_job_audit_correlation(Some("run_process"), &sparse_pending);
+    assert_eq!(
+        correlated.async_job_id.as_deref(),
+        Some("wc_job_sparse_pending_123"),
+        "model-sparse pending handoff must retain originating Job identity in ActionAudit"
+    );
+
+    let observed = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "items": [
+                        {"job_id": "wc_job_background_123", "project": "agent:special:demo", "observation_token": "one"},
+                        {"job_id": "wc_job_second_456", "project": "agent:special:demo", "observation_token": "two"},
+                        {"job_id": "wc_job_background_123", "project": "agent:special:demo", "observation_token": "duplicate"},
+                        {"job_id": "../unsafe"}
+                    ]
+                }
+            }
+        }
+    });
+    let correlated = mcp_tool_job_audit_correlation(Some("observe_jobs"), &observed);
+    assert_eq!(
+        correlated.observed_job_ids,
+        vec![
+            "wc_job_background_123".to_string(),
+            "wc_job_second_456".to_string()
+        ]
+    );
+    assert!(correlated.async_job_id.is_none());
+    assert_eq!(
+        correlated.resolved_project.as_deref(),
+        Some("agent:special:demo")
+    );
+
+    let mixed_projects = json!({
+        "result": {"structuredContent": {"success": true, "output": {"items": [
+            {"job_id": "wc_job_background_123", "project": "agent:special:demo"},
+            {"job_id": "wc_job_second_456", "project": "agent:special:other"}
+        ]}}}
+    });
+    assert!(
+        mcp_tool_job_audit_correlation(Some("observe_jobs"), &mixed_projects)
+            .resolved_project
+            .is_none(),
+        "a multi-Project observe_jobs call must not be assigned to one Project"
+    );
+
+    let ids = mcp_tool_action_audit_ids(
+        true,
+        None,
+        &crate::tool_runtime::ToolCallCorrelation::default(),
+        Some(&correlated),
+    )
+    .unwrap();
+    assert_eq!(
+        ids,
+        json!({"observed_job_ids":["wc_job_background_123","wc_job_second_456"]})
+    );
+    assert!(!ids.to_string().contains("token"));
+}
+
+#[test]
+fn work_result_app_internal_tools_do_not_start_live_window_activity() {
+    for tool in [
+        "present_work_result",
+        "work_result_thread_panel",
+        "get_work_result_state",
+        "read_work_result_activity_detail",
+        "send_work_result_message",
+        "read_changed_file_diff",
+    ] {
+        assert!(work_result_app_internal_tool(Some(tool)), "{tool}");
+    }
+    for tool in [
+        "get_runtime_status",
+        "read_current_window_activity",
+        "observe_jobs",
+        "read_files",
+    ] {
+        assert!(!work_result_app_internal_tool(Some(tool)), "{tool}");
+    }
+    assert!(!work_result_app_internal_tool(None));
+}
+
 fn test_runtime() -> ToolRuntime {
-    test_runtime_with_surface(ModelSurface::LocalCoding)
+    ToolRuntime::new_for_tests()
 }
 
-fn test_runtime_with_exposure(runtime_exposure: RuntimeExposure) -> ToolRuntime {
-    ToolRuntime::new_for_tests().with_runtime_exposure(runtime_exposure)
+/// Build a runtime with an explicit MCP startup snapshot, so tests assert the
+/// frozen values instead of holding process-global env guards across requests.
+fn test_runtime_with_mcp_snapshot(
+    compact_schemas: bool,
+    apps_enabled: bool,
+    text_json_compat_enabled: bool,
+) -> ToolRuntime {
+    ToolRuntime::new(
+        std::sync::Arc::new(crate::runner_http::RunnerRegistry::default()),
+        std::sync::Arc::new(crate::tool_runtime::RuntimeInfo {
+            mcp_compact_schemas: compact_schemas,
+            mcp_apps_enabled: apps_enabled,
+            mcp_text_json_compat_enabled: text_json_compat_enabled,
+            ..Default::default()
+        }),
+    )
 }
 
-fn test_runtime_with_surface(model_surface: ModelSurface) -> ToolRuntime {
-    test_runtime_with_exposure(RuntimeExposure::Runtime(model_surface))
+fn test_runtime_with_mcp_settings(compact_schemas: bool, apps_enabled: bool) -> ToolRuntime {
+    test_runtime_with_mcp_snapshot(compact_schemas, apps_enabled, false)
+}
+
+fn test_runtime_with_public_url(public_url: &str) -> ToolRuntime {
+    let runtime_info = crate::tool_runtime::RuntimeInfo {
+        configured_public_url: Some(public_url.to_string()),
+        ..Default::default()
+    };
+    ToolRuntime::new(
+        std::sync::Arc::new(crate::runner_http::RunnerRegistry::default()),
+        std::sync::Arc::new(runtime_info),
+    )
 }
 
 fn start_authorized_test_session(
@@ -62,50 +230,6 @@ fn start_authorized_test_session(
         .unwrap()
 }
 
-/// Run one synchronous operation with a temporary model-surface env value.
-/// The previous value is restored while the shared env lock is still held,
-/// including during unwinding. Async request tests receive an already-built
-/// runtime so process-global env state never needs to span an await.
-fn with_model_surface_env<T>(value: Option<&str>, operation: impl FnOnce() -> T) -> T {
-    struct Restore {
-        previous: Option<std::ffi::OsString>,
-        _guard: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            match self.previous.as_ref() {
-                Some(previous) => {
-                    std::env::set_var(crate::model_surface::MCP_MODEL_SURFACE_ENV, previous)
-                }
-                None => std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV),
-            }
-        }
-    }
-
-    let guard = crate::admin_cli::TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = std::env::var_os(crate::model_surface::MCP_MODEL_SURFACE_ENV);
-    match value {
-        Some(value) => std::env::set_var(crate::model_surface::MCP_MODEL_SURFACE_ENV, value),
-        None => std::env::remove_var(crate::model_surface::MCP_MODEL_SURFACE_ENV),
-    }
-    let _restore = Restore {
-        previous,
-        _guard: guard,
-    };
-    operation()
-}
-
-fn test_runtime_from_model_surface_env(value: Option<&str>) -> ToolRuntime {
-    with_model_surface_env(value, || {
-        let runtime_exposure = crate::model_surface::resolve_runtime_exposure(None)
-            .expect("test runtime exposure configuration");
-        test_runtime_with_exposure(runtime_exposure)
-    })
-}
-
 fn rpc(method: &str, id: Option<Value>, params: Value) -> JsonRpcRequest {
     JsonRpcRequest {
         jsonrpc: Some("2.0".to_string()),
@@ -113,6 +237,13 @@ fn rpc(method: &str, id: Option<Value>, params: Value) -> JsonRpcRequest {
         params,
         id,
     }
+}
+
+fn adaptive_runtime_gateway_params(tool: &str, arguments: Value) -> Value {
+    json!({
+        "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        "arguments": {"tool": tool, "arguments": arguments}
+    })
 }
 
 fn mcp_2026_params(mut params: Value) -> Value {
@@ -127,38 +258,6 @@ fn mcp_2026_params(mut params: Value) -> Value {
             }),
         );
     params
-}
-
-fn mcp_2026_tasks_params(mut params: Value) -> Value {
-    params
-        .as_object_mut()
-        .expect("MCP params must be an object")
-        .insert(
-            "_meta".to_string(),
-            json!({
-                "io.modelcontextprotocol/protocolVersion": MCP_STATELESS_PROTOCOL_VERSION,
-                "io.modelcontextprotocol/clientCapabilities": {
-                    "extensions": {
-                        MCP_TASKS_EXTENSION: {}
-                    }
-                }
-            }),
-        );
-    params
-}
-
-#[test]
-fn mcp_2026_tasks_capability_is_request_scoped_and_shape_strict() {
-    assert!(!request_supports_tasks(&mcp_2026_params(json!({}))));
-    assert!(request_supports_tasks(&mcp_2026_tasks_params(json!({}))));
-
-    let mut malformed = mcp_2026_params(json!({}));
-    malformed["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({
-        "extensions": {
-            MCP_TASKS_EXTENSION: true
-        }
-    });
-    assert!(!request_supports_tasks(&malformed));
 }
 
 fn mcp_2026_ui_params(mut params: Value) -> Value {
@@ -193,34 +292,64 @@ fn mcp_export_api_auth(api_key_id: &str, username: &str) -> crate::auth::AuthCon
     auth
 }
 
+#[path = "mcp_tests/agent_continuation_app.rs"]
+mod agent_continuation_app;
 #[path = "mcp_tests/artifact_export.rs"]
 mod artifact_export;
 #[path = "mcp_tests/computer_app.rs"]
 mod computer_app;
+#[path = "mcp_tests/computer_contracts.rs"]
+mod computer_contracts;
+#[path = "mcp_tests/conformance.rs"]
+mod conformance;
+#[path = "mcp_tests/execution_control.rs"]
+mod execution_control;
+#[path = "mcp_tests/execution_feedback.rs"]
+mod execution_feedback;
 #[path = "mcp_tests/file_import.rs"]
 mod file_import;
+#[path = "mcp_tests/goal_plan_app.rs"]
+mod goal_plan_app;
 #[path = "mcp_tests/http_transport.rs"]
 mod http_transport;
+#[path = "mcp_tests/invocation_envelope.rs"]
+mod invocation_envelope;
+#[path = "mcp_tests/job_terminal_continuation_app.rs"]
+mod job_terminal_continuation_app;
 #[path = "mcp_tests/model_ergonomics.rs"]
 mod model_ergonomics;
 #[path = "mcp_tests/model_surface.rs"]
 mod model_surface;
 #[path = "mcp_tests/oauth_scope.rs"]
 mod oauth_scope;
+#[path = "mcp_tests/pdf_document_app.rs"]
+mod pdf_document_app;
 #[path = "mcp_tests/plugin_check.rs"]
 mod plugin_check;
 #[path = "mcp_tests/plugin_tools.rs"]
 mod plugin_tools;
-#[path = "mcp_tests/project_connector.rs"]
-mod project_connector;
 #[path = "mcp_tests/protocol.rs"]
 mod protocol;
+#[path = "mcp_tests/request_policy.rs"]
+mod request_policy;
+#[path = "mcp_tests/resource_references.rs"]
+mod resource_references;
+#[path = "mcp_tests/response.rs"]
+mod response_tests;
+#[path = "mcp_tests/result_app.rs"]
+mod result_app;
 #[path = "mcp_tests/runtime_tools.rs"]
 mod runtime_tools;
 #[path = "mcp_tests/ssh_resource.rs"]
 mod ssh_resource;
+#[path = "mcp_tests/structured_failure.rs"]
+mod structured_failure;
 #[path = "mcp_tests/tools.rs"]
 mod tools;
+#[path = "mcp_tests/work_result_app.rs"]
+mod work_result_app;
+#[path = "mcp_tests/workbench_http.rs"]
+mod workbench_http;
 
 // =========================================================================
 // HTTP integration tests — exercise the real Salvo router + AuthMiddleware.
@@ -241,13 +370,19 @@ fn seed_oauth_access_token(
     let now = chrono::Utc::now().timestamp();
     let plaintext = crate::auth::generate_oauth_access_token();
     let record = crate::models::OAuthAccessTokenRecord {
+        // Fixture input describes effective authority; public storage excludes admin.
+        admin_authority: scopes.split_whitespace().any(|scope| scope == "admin"),
         id: uuid::Uuid::new_v4().to_string(),
         token_hash: crate::auth::hash_token(&plaintext),
         client_id: client.client_id.clone(),
         subject_kind: "managed_user".to_string(),
         subject_id: user.id.clone(),
         user_id: Some(user.id.clone()),
-        scopes: scopes.to_string(),
+        scopes: scopes
+            .split_whitespace()
+            .filter(|scope| *scope != "admin")
+            .collect::<Vec<_>>()
+            .join(" "),
         resource: None,
         shared_key_hash: None,
         created_at: now,
@@ -271,9 +406,6 @@ fn build_test_router(
         .hoop(affix_state::inject(config))
         .hoop(affix_state::inject(db))
         .hoop(affix_state::inject(runtime))
-        .hoop(affix_state::inject(
-            crate::connector_runtime::ConnectorRuntimeSlot::default(),
-        ))
         .push(
             Router::with_path("mcp")
                 .hoop(crate::AuthMiddleware)
@@ -334,3 +466,58 @@ async fn oauth_mcp_request(
     let body = resp.take_json::<Value>().await.unwrap();
     (status, body, challenge)
 }
+
+#[test]
+fn readiness_audit_correlation_retains_exact_jobs_without_guessing_project() {
+    let body = json!({"result":{"structuredContent":{"success":true,"output":{
+        "wait_state":"ready", "ready":[{"job_id":"wc_job_A","status":"completed","outcome":"succeeded"}],
+        "pending_job_ids":["wc_job_B"], "project":"untrusted-guess"
+    }}}});
+    let correlation = mcp_tool_job_audit_correlation(Some("wait_for_job_readiness"), &body);
+    assert_eq!(correlation.observed_job_ids, vec!["wc_job_A", "wc_job_B"]);
+    assert!(correlation.resolved_project.is_none());
+    assert!(correlation.async_job_id.is_none());
+}
+
+#[path = "mcp_tests/workbench_app.rs"]
+mod workbench_app;
+#[path = "mcp_tests/workbench_upgrade.rs"]
+mod workbench_upgrade;
+
+#[path = "mcp_tests/work_result_thread_empty.rs"]
+mod work_result_thread_empty;
+
+#[path = "mcp_tests/resource_mentions.rs"]
+mod resource_mentions;
+
+#[path = "mcp_tests/retired_app_resources.rs"]
+mod retired_app_resources;
+
+// Stateless App policy fixture. Window-aware carrier tests keep their own explicit identity.
+async fn handle_with_app_policy(
+    runtime: &ToolRuntime,
+    request: JsonRpcRequest,
+    auth: Option<&crate::auth::AuthContext>,
+    enabled: bool,
+) -> McpOutcome {
+    let protocol_era = super::inferred_protocol_era(&request);
+    super::handle_mcp_request_with_lifecycle(
+        runtime,
+        request,
+        auth,
+        protocol_era,
+        super::HostFileImportTrust::Untrusted,
+        None,
+        None,
+        None,
+        crate::model_surface::effective_mcp_compact_schemas(
+            crate::config::mcp_compact_schemas_override(),
+        ),
+        enabled,
+        None,
+    )
+    .await
+}
+
+#[path = "mcp_tests/docx_document_app.rs"]
+mod docx_document_app;

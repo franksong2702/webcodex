@@ -24,10 +24,12 @@ async fn run_shell_declared_validation_enters_unified_summary_with_shell_and_roo
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "cargo test focused".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: Some(".".to_string()),
                         purpose: Some(ExecutionPurpose::Test),
                         shell: Some(ExecutionShell::Bash),
@@ -39,7 +41,8 @@ async fn run_shell_declared_validation_enters_unified_summary_with_shell_and_roo
     });
     let request = wait_for_patch_agent_request(&runtime, "validation-shell").await;
     assert_eq!(request.kind, "run_shell");
-    assert!(request.command.starts_with("exec bash -c "));
+    assert_eq!(request.command, "cargo test focused");
+    assert_eq!(request.shell, Some(ExecutionShell::Bash));
     complete_patch_agent_request(
         &runtime,
         "validation-shell",
@@ -67,7 +70,8 @@ async fn run_shell_declared_validation_enters_unified_summary_with_shell_and_roo
         .await;
     assert!(summary.success, "{:?}", summary.error);
     let event = &summary.output["validation"]["latest"];
-    assert_eq!(event["execution_source"], "run_shell");
+    assert!(event.get("execution_source").is_none());
+    assert_eq!(event["tool_name"], "run_shell");
     assert_eq!(event["purpose"], "test");
     assert_eq!(event["validation_kind"], "test");
     assert_eq!(event["cwd"], ".");
@@ -81,6 +85,8 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
     let auth = open_auth_context();
     let capabilities = crate::runner_protocol::RunnerCapabilities {
         async_shell_jobs: true,
+        explicit_shell_selection: true,
+        bash_login_shell: true,
         ..Default::default()
     };
     register_agent_projects_for_auth(
@@ -99,7 +105,7 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
     let assertion_name = "direct run job validation";
     let expected_identity =
         crate::tool_runtime::tool_audit::assertion_validation_identity(assertion_name);
-    let (call, recorder_metadata) = ToolCall::from_tool_name_with_recorder_metadata(
+    let (call, recorder_metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
         "run_job",
         json!({
             "project": project,
@@ -136,18 +142,19 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
             job_id: job_id.clone(),
             request_id: Some(request.request_id),
             status: "completed".to_string(),
-            stdout_chunk: None,
-            stderr_chunk: None,
-            stdout_tail: Some(
+            stdout_chunk: Some(
                 "running 1 test\n\ntest result: ok. 1 passed; 0 failed; 0 ignored\n".to_string(),
             ),
-            stderr_tail: Some(String::new()),
+            stderr_chunk: None,
             log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(12),
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: true,
         })
@@ -162,7 +169,7 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
                 include_workspace: Some(false),
                 include_checkpoints: Some(false),
                 include_validation: Some(true),
-                summary_only: true,
+                diagnostic: true,
                 limit: Some(20),
             },
             Some(&auth),
@@ -171,7 +178,8 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
     assert!(handoff.success, "{:?}", handoff.error);
     assert_eq!(handoff.output["validation"]["status"], "passed");
     let event = &handoff.output["validation"]["latest"];
-    assert_eq!(event["execution_source"], "run_job");
+    assert!(event.get("execution_source").is_none());
+    assert_eq!(event["tool_name"], "run_job");
     assert_eq!(event["purpose"], "test");
     assert_eq!(event["execution_state"], "completed");
     assert_eq!(event["exit_code"], 0);
@@ -212,7 +220,7 @@ async fn promoted_run_process_cargo_test_materializes_canonical_validation_evide
     let assertion_name = "promoted process validation";
     let expected_identity =
         crate::tool_runtime::tool_audit::assertion_validation_identity(assertion_name);
-    let (call, recorder_metadata) = ToolCall::from_tool_name_with_recorder_metadata(
+    let (call, recorder_metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
         "run_process",
         json!({
             "project": project,
@@ -245,8 +253,7 @@ async fn promoted_run_process_cargo_test_materializes_canonical_validation_evide
     assert_eq!(request.process.as_ref().unwrap().executable, "cargo");
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    let job_id = handoff.output["job_id"].as_str().unwrap().to_string();
+    let job_id = assert_sparse_pending_job_handoff(&handoff.output).to_string();
     let admitted = runtime.runner_registry.get_job(&job_id).await.unwrap();
     let metadata = admitted.structured_execution.as_ref().unwrap();
     assert_eq!(metadata.execution_source, "run_process");
@@ -269,19 +276,20 @@ async fn promoted_run_process_cargo_test_materializes_canonical_validation_evide
             job_id: job_id.clone(),
             request_id: Some(request.request_id),
             status: "completed".to_string(),
-            stdout_chunk: None,
-            stderr_chunk: None,
-            stdout_tail: Some(
+            stdout_chunk: Some(
                 "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
                     .to_string(),
             ),
-            stderr_tail: Some(String::new()),
+            stderr_chunk: None,
             log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(12),
             error: None,
             command_execution_state: Some(crate::runner_protocol::ShellCommandExecutionState::Completed),
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: true,
         })
@@ -303,7 +311,8 @@ async fn promoted_run_process_cargo_test_materializes_canonical_validation_evide
     assert_eq!(validation["status"], "passed");
     assert_eq!(validation["unresolved_failures"]["count"], 0);
     let latest = &validation["latest"];
-    assert_eq!(latest["execution_source"], "run_process");
+    assert!(latest.get("execution_source").is_none());
+    assert_eq!(latest["tool_name"], "run_process");
     assert_eq!(latest["validation_kind"], "test");
     assert_eq!(latest["identity"], target);
     assert_eq!(latest["assertion_name"], assertion_name);
@@ -339,8 +348,8 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                 base_ref: None,
                 instruction: "validation finish".to_string(),
                 session_id: None,
-                include_project_instructions: true,
-                include_workflow_guidance: true,
+                guidance_profile: Default::default(),
+                include_extension_catalog: false,
             },
             Some(&auth),
         )
@@ -365,8 +374,9 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                         no_default_features: None,
                         features: None,
                         package: None,
-                        timeout_secs: Some(60),
-                        sync_wait_secs: None,
+                        packages: None,
+                        timeout_secs: Some(55),
+                        sync_wait_secs: Some(55),
                     },
                     Some(&auth),
                 )
@@ -395,6 +405,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                         session_id: Some(session_id),
                         cwd: None,
                         filter: None,
+                        lib: None,
                         all_targets: None,
                         all_features: None,
                         no_default_features: None,
@@ -403,8 +414,8 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                         no_run: None,
                         require_tests: None,
                         min_tests: None,
-                        timeout_secs: Some(60),
-                        sync_wait_secs: None,
+                        timeout_secs: Some(55),
+                        sync_wait_secs: Some(55),
                     },
                     Some(&auth),
                 )
@@ -434,6 +445,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: false,
@@ -475,14 +487,11 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
     assert_eq!(validation["latest_success"]["tool_name"], "cargo_check");
     assert_eq!(validation["latest_success"]["validation_kind"], "check");
     assert_eq!(validation["latest_success"]["exit_code"], 0);
-    assert_eq!(
-        validation["latest_success"]["summary"],
-        "cargo_check succeeded"
-    );
+    assert!(validation["latest_success"].get("summary").is_none());
     assert_eq!(validation["latest_failure"]["tool_name"], "cargo_test");
     assert_eq!(validation["latest_failure"]["validation_kind"], "test");
     assert_eq!(validation["latest_failure"]["exit_code"], 101);
-    assert_eq!(validation["latest_failure"]["summary"], "cargo_test failed");
+    assert!(validation["latest_failure"].get("summary").is_none());
     assert_eq!(validation["parser"]["available"], true);
     assert_eq!(validation["parser"]["kind"], PARSER_KIND);
     assert!(validation["parser"].get("reason").is_none());
@@ -504,7 +513,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                 include_workspace: Some(false),
                 include_checkpoints: Some(false),
                 include_validation: Some(true),
-                summary_only: false,
+                diagnostic: true,
                 limit: None,
             },
             Some(&auth),
@@ -528,7 +537,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                 include_workspace: Some(false),
                 include_checkpoints: Some(false),
                 include_validation: Some(true),
-                summary_only: true,
+                diagnostic: true,
                 limit: None,
             },
             Some(&auth),
@@ -549,6 +558,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: true,

@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use webcodex_admin::ServerHttpOptions;
 
 use super::connect::profile::{atomic_write, render_project_file, resolve_project};
-use super::{http_post_json_status, read_optional_token, shell_command, validate_user_api_token};
+use super::{
+    call_runtime_tool_status, http_post_json_status, read_optional_token, shell_command,
+    validate_user_api_token,
+};
 
 #[cfg(test)]
 #[path = "tests/project_activation_identity.rs"]
@@ -46,7 +49,7 @@ struct RegistrationRunnerConfig {
     #[serde(default)]
     project_registry_dir: Option<PathBuf>,
     #[serde(default, rename = "projects_dir")]
-    legacy_projects_dir: Option<PathBuf>,
+    removed_projects_dir: Option<toml::Value>,
     #[serde(default)]
     policy: RegistrationPolicy,
 }
@@ -153,49 +156,6 @@ fn prepare_project_authority(
         canonical_project,
         allowed_roots,
         authority_changed,
-    })
-}
-
-fn prepare_exact_project_authority(
-    project: &Path,
-    configured_roots: &[PathBuf],
-    allow_cwd_anywhere: bool,
-) -> Result<PreparedProjectAuthority, String> {
-    webcodex_runner_config::paths::validate_project_path_ingress(project)?;
-    if project
-        .components()
-        .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Err("project path must not contain parent traversal".to_string());
-    }
-    let canonical_project = canonical_existing_directory(project, "project path")?;
-    let canonical_roots =
-        webcodex_runner_config::paths::canonicalize_usable_allowed_roots(configured_roots);
-    let exact_root_present = canonical_roots
-        .iter()
-        .any(|root| webcodex_runner_config::paths::paths_equal(root, &canonical_project));
-    let mut allowed_roots = configured_roots.to_vec();
-    if !exact_root_present {
-        allowed_roots.push(canonical_project.clone());
-    }
-    let canonical_after =
-        webcodex_runner_config::paths::canonicalize_usable_allowed_roots(&allowed_roots);
-    webcodex_runner_config::paths::validate_project_path_policy(
-        &canonical_project,
-        &canonical_after,
-        allow_cwd_anywhere,
-    )?;
-    if !exact_root_present
-        && project
-            .ancestors()
-            .any(|path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink()))
-    {
-        return Err("project symlink resolves outside allowed_roots; select the canonical directory explicitly".to_string());
-    }
-    Ok(PreparedProjectAuthority {
-        canonical_project,
-        allowed_roots,
-        authority_changed: !exact_root_present,
     })
 }
 
@@ -345,16 +305,15 @@ fn persist_registration_allowed_roots(path: &Path, roots: &[PathBuf]) -> Result<
 }
 
 fn registration_project_registry_dir(config: &RegistrationRunnerConfig) -> Result<PathBuf, String> {
-    match (
-        config.project_registry_dir.as_ref(),
-        config.legacy_projects_dir.as_ref(),
-    ) {
-        (Some(_), Some(_)) => Err(
-            "project_registry_dir and legacy projects_dir cannot both be configured; keep exactly one Runner project registry setting"
+    if config.removed_projects_dir.is_some() {
+        return Err(
+            "Runner config field 'projects_dir' is retired; use 'project_registry_dir' instead"
                 .to_string(),
-        ),
-        (Some(path), None) | (None, Some(path)) => Ok(path.clone()),
-        (None, None) => {
+        );
+    }
+    match config.project_registry_dir.as_ref() {
+        Some(path) => Ok(path.clone()),
+        None => {
             let base = webcodex_runner_config::paths::default_client_config_base_dir()?;
             webcodex_runner_config::paths::select_project_registry_dir(&base)
         }
@@ -400,20 +359,31 @@ fn reread_activation_config(
     Ok(snapshot)
 }
 
+pub(super) fn server_url_is_loopback(server_url: &str) -> bool {
+    url::Url::parse(server_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
 async fn operator_tool_call(
     server_url: &str,
     token: &str,
     path: &str,
     body: Value,
 ) -> Result<OperatorToolResult, String> {
-    let (status, content_type, value) = http_post_json_status(
-        server_url,
-        &ServerHttpOptions::default(),
-        path,
-        Some(token),
-        body,
-    )
-    .await?;
+    let server_http = ServerHttpOptions {
+        no_system_proxy: server_url_is_loopback(server_url),
+        ..ServerHttpOptions::default()
+    };
+    let (status, content_type, value) =
+        http_post_json_status(server_url, &server_http, path, Some(token), body).await?;
     if matches!(status, 404 | 405) {
         return Ok(OperatorToolResult {
             success: false,
@@ -432,6 +402,40 @@ async fn operator_tool_call(
     };
     serde_json::from_value(value)
         .map_err(|_| format!("operator endpoint returned an unexpected response (HTTP {status})"))
+}
+
+async fn runtime_tool_call(
+    server_url: &str,
+    token: &str,
+    tool: &str,
+    params: Value,
+) -> Result<OperatorToolResult, String> {
+    let server_http = ServerHttpOptions {
+        no_system_proxy: server_url_is_loopback(server_url),
+        ..ServerHttpOptions::default()
+    };
+    let (status, content_type, value) =
+        call_runtime_tool_status(server_url, &server_http, Some(token), tool, params).await?;
+    if matches!(status, 404 | 405) {
+        return Ok(OperatorToolResult {
+            success: false,
+            output: json!({
+                "failure_kind": "capability_unavailable",
+                "error_code": "runtime_tool_endpoint_unavailable",
+                "http_status": status,
+            }),
+            error: Some(
+                "canonical runtime tool endpoint is unavailable on this Server version".to_string(),
+            ),
+        });
+    }
+    let Some(value) = value else {
+        return Err(format!(
+            "runtime tool {tool} returned HTTP {status} without JSON ({content_type})"
+        ));
+    };
+    serde_json::from_value(value)
+        .map_err(|_| format!("runtime tool {tool} returned an unexpected response (HTTP {status})"))
 }
 
 fn operator_error_code(result: &OperatorToolResult) -> Option<&str> {
@@ -482,10 +486,10 @@ async fn reconcile_project_from_inventory(
     client_id: &str,
     canonical_project: &Path,
 ) -> Result<Option<Value>, String> {
-    let listed = operator_tool_call(
+    let listed = runtime_tool_call(
         server_url,
         token,
-        "/api/projects/list",
+        "list_projects",
         json!({"client_id": client_id, "limit": 100}),
     )
     .await?;
@@ -533,10 +537,10 @@ async fn reconcile_reload_generation(
     if !runner_config_candidate_unchanged(config_path, expected_candidate)? {
         return Err("project_activation_config_conflict: Runner config changed while reload outcome was uncertain; re-observe the current operator configuration".to_string());
     }
-    let checked = operator_tool_call(
+    let checked = runtime_tool_call(
         server_url,
         token,
-        "/api/runners/config/check",
+        "check_runner_config",
         json!({"client_id": client_id}),
     )
     .await
@@ -634,7 +638,7 @@ pub(crate) async fn run_project_activate(opts: ProjectActivateOptions) -> Result
     validate_user_api_token(&token)?;
 
     let (mut config, mut config_content) = read_activation_config(&opts.config)?;
-    let mut prepared = prepare_exact_project_authority(
+    let mut prepared = prepare_project_authority(
         &opts.project,
         &config.policy.allowed_roots,
         config.policy.allow_cwd_anywhere,
@@ -648,8 +652,8 @@ pub(crate) async fn run_project_activate(opts: ProjectActivateOptions) -> Result
     let mut generation_after = None;
     let mut reload_reconciled = false;
 
-    // Idempotence fast path: if the exact root is already persisted, let the
-    // current Runner prove active authority and canonical registration before
+    // Fast path: if the selected project is already covered by the current
+    // filesystem authority, register/resolve it without rewriting policy or
     // touching config generation.
     if !prepared.authority_changed {
         match resolve_project_operator(&server_url, &token, &client_id, &canonical_project).await {
@@ -738,10 +742,10 @@ pub(crate) async fn run_project_activate(opts: ProjectActivateOptions) -> Result
             authority_changed = true;
         }
 
-        let checked = operator_tool_call(
+        let checked = runtime_tool_call(
             &server_url,
             &token,
-            "/api/runners/config/check",
+            "check_runner_config",
             json!({"client_id": client_id}),
         )
         .await?;
@@ -786,7 +790,7 @@ pub(crate) async fn run_project_activate(opts: ProjectActivateOptions) -> Result
             let snapshot = reread_activation_config(&opts.config, &server_url, &client_id)?;
             config = snapshot.0;
             config_content = snapshot.1;
-            prepared = prepare_exact_project_authority(
+            prepared = prepare_project_authority(
                 &canonical_project,
                 &config.policy.allowed_roots,
                 config.policy.allow_cwd_anywhere,
@@ -794,10 +798,10 @@ pub(crate) async fn run_project_activate(opts: ProjectActivateOptions) -> Result
             continue;
         }
 
-        let reload = operator_tool_call(
+        let reload = runtime_tool_call(
             &server_url,
             &token,
-            "/api/runners/config/reload",
+            "reload_runner_config",
             json!({"client_id": client_id, "expected_generation": generation}),
         )
         .await;
@@ -825,7 +829,7 @@ pub(crate) async fn run_project_activate(opts: ProjectActivateOptions) -> Result
                 let snapshot = reread_activation_config(&opts.config, &server_url, &client_id)?;
                 config = snapshot.0;
                 config_content = snapshot.1;
-                prepared = prepare_exact_project_authority(
+                prepared = prepare_project_authority(
                     &canonical_project,
                     &config.policy.allowed_roots,
                     config.policy.allow_cwd_anywhere,
@@ -1063,15 +1067,23 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             let mut requests = Vec::new();
-            for (expected_path, body) in responses {
+            for (expected_target, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = vec![0u8; 64 * 1024];
                 let read = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..read]).to_string();
-                assert!(
-                    request.starts_with(&format!("POST {expected_path} ")),
-                    "unexpected request: {request}"
-                );
+                if let Some(expected_tool) = expected_target.strip_prefix("tool:") {
+                    assert!(
+                        request.starts_with("POST /api/tools/call "),
+                        "unexpected request: {request}"
+                    );
+                    assert_eq!(request_json(&request)["tool"], expected_tool);
+                } else {
+                    assert!(
+                        request.starts_with(&format!("POST {expected_target} ")),
+                        "unexpected request: {request}"
+                    );
+                }
                 assert!(
                     request.contains(&format!("Authorization: Bearer {TEST_USER_TOKEN}"))
                         || request.contains(&format!("authorization: Bearer {TEST_USER_TOKEN}")),
@@ -1159,27 +1171,33 @@ mod tests {
     }
 
     #[test]
-    fn activation_adds_exact_root_even_when_parent_or_cwd_anywhere_already_authorizes_path() {
+    fn activation_reuses_existing_authority_and_only_adds_an_exact_root_when_needed() {
         let tmp = canonical_test_tempdir();
         let parent = tmp.path().join("parent");
         let project = parent.join("demo");
+        let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
         let parent = parent.canonicalize().unwrap();
         let project = project.canonicalize().unwrap();
+        let outside = outside.canonicalize().unwrap();
 
-        let prepared = prepare_exact_project_authority(&project, &[parent.clone()], false).unwrap();
-        assert!(prepared.authority_changed);
+        let covered = prepare_project_authority(&project, &[parent.clone()], false).unwrap();
+        assert!(!covered.authority_changed);
+        assert_eq!(covered.allowed_roots, vec![parent.clone()]);
+
+        let expanded = prepare_project_authority(&outside, &[parent.clone()], false).unwrap();
+        assert!(expanded.authority_changed);
         assert_eq!(
-            prepared.allowed_roots,
-            vec![parent.clone(), project.clone()]
+            expanded.allowed_roots,
+            vec![parent.clone(), outside.clone()]
         );
 
-        let cwd_anywhere = prepare_exact_project_authority(&project, &[], true).unwrap();
-        assert!(cwd_anywhere.authority_changed);
-        assert_eq!(cwd_anywhere.allowed_roots, vec![project.clone()]);
+        let cwd_anywhere = prepare_project_authority(&outside, &[], true).unwrap();
+        assert!(!cwd_anywhere.authority_changed);
 
         let repeated =
-            prepare_exact_project_authority(&project, &[parent, project.clone()], false).unwrap();
+            prepare_project_authority(&project, &[parent, project.clone()], false).unwrap();
         assert!(!repeated.authority_changed);
         assert_eq!(
             repeated
@@ -1192,7 +1210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_existing_exact_root_and_project_skips_config_reload() {
+    async fn activation_existing_parent_root_and_project_skips_config_reload() {
         let tmp = canonical_test_tempdir();
         let project = tmp.path().join("demo");
         std::fs::create_dir_all(&project).unwrap();
@@ -1215,7 +1233,7 @@ mod tests {
         activation_config(
             &config_path,
             &server_url,
-            std::slice::from_ref(&canonical_project),
+            &[tmp.path().canonicalize().unwrap()],
             false,
         );
         let token_file = tmp.path().join("user-token");
@@ -1298,19 +1316,19 @@ mod tests {
         let canonical_project = project.canonicalize().unwrap();
         let responses = vec![
             (
-                "/api/runners/config/check",
+                "tool:check_runner_config",
                 json!({"success":true,"output":{"valid":true,"current_generation":1,"restart_required":false}}),
             ),
             (
-                "/api/runners/config/reload",
+                "tool:reload_runner_config",
                 json!({"success":false,"output":{"execution_state":"not_started","error_code":"config_generation_conflict","current_generation":2},"error":"generation changed"}),
             ),
             (
-                "/api/runners/config/check",
+                "tool:check_runner_config",
                 json!({"success":true,"output":{"valid":true,"current_generation":2,"restart_required":false}}),
             ),
             (
-                "/api/runners/config/reload",
+                "tool:reload_runner_config",
                 json!({"success":true,"output":{"execution_state":"completed","valid":true,"current_generation":3,"restart_required":false}}),
             ),
             (
@@ -1320,7 +1338,15 @@ mod tests {
         ];
         let (server_url, server) = spawn_operator_server(responses);
         let config_path = tmp.path().join("runner.toml");
-        activation_config(&config_path, &server_url, &[], false);
+        let unrelated = tmp.path().join("authorized");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let unrelated = unrelated.canonicalize().unwrap();
+        activation_config(
+            &config_path,
+            &server_url,
+            std::slice::from_ref(&unrelated),
+            false,
+        );
         let token_file = tmp.path().join("user-token");
         std::fs::write(&token_file, TEST_USER_TOKEN).unwrap();
 
@@ -1339,14 +1365,24 @@ mod tests {
 
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 5);
-        assert_eq!(request_json(&requests[1])["expected_generation"], 1);
-        assert_eq!(request_json(&requests[3])["expected_generation"], 2);
+        assert_eq!(
+            request_json(&requests[1])["params"]["expected_generation"],
+            1
+        );
+        assert_eq!(
+            request_json(&requests[3])["params"]["expected_generation"],
+            2
+        );
         let parsed: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
         let roots = parsed["policy"]["allowed_roots"].as_array().unwrap();
-        assert_eq!(roots.len(), 1);
+        assert_eq!(roots.len(), 2);
         assert_eq!(
             roots[0].as_str(),
+            Some(unrelated.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            roots[1].as_str(),
             Some(canonical_project.to_string_lossy().as_ref())
         );
     }
@@ -1359,15 +1395,15 @@ mod tests {
         let canonical_project = project.canonicalize().unwrap();
         let responses = vec![
             (
-                "/api/runners/config/check",
+                "tool:check_runner_config",
                 json!({"success":true,"output":{"valid":true,"current_generation":7,"restart_required":false}}),
             ),
             (
-                "/api/runners/config/reload",
+                "tool:reload_runner_config",
                 json!({"success":false,"output":{"execution_state":"outcome_unknown","error_code":"operation_indeterminate"},"error":"response lost"}),
             ),
             (
-                "/api/runners/config/check",
+                "tool:check_runner_config",
                 json!({"success":true,"output":{"valid":true,"current_generation":8,"restart_required":false}}),
             ),
             (
@@ -1377,7 +1413,15 @@ mod tests {
         ];
         let (server_url, server) = spawn_operator_server(responses);
         let config_path = tmp.path().join("runner.toml");
-        activation_config(&config_path, &server_url, &[], false);
+        let unrelated = tmp.path().join("authorized");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let unrelated = unrelated.canonicalize().unwrap();
+        activation_config(
+            &config_path,
+            &server_url,
+            std::slice::from_ref(&unrelated),
+            false,
+        );
         let token_file = tmp.path().join("user-token");
         std::fs::write(&token_file, TEST_USER_TOKEN).unwrap();
 
@@ -1401,11 +1445,11 @@ mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.starts_with("POST /api/runners/config/reload "))
+                .filter(|request| request_json(request)["tool"] == "reload_runner_config")
                 .count(),
             1
         );
-        assert!(requests[2].starts_with("POST /api/runners/config/check "));
+        assert_eq!(request_json(&requests[2])["tool"], "check_runner_config");
         assert!(requests[3].starts_with("POST /api/projects/resolve-or-register "));
     }
 
@@ -1416,21 +1460,29 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let responses = vec![
             (
-                "/api/runners/config/check",
+                "tool:check_runner_config",
                 json!({"success":true,"output":{"valid":true,"current_generation":7,"restart_required":false}}),
             ),
             (
-                "/api/runners/config/reload",
+                "tool:reload_runner_config",
                 json!({"success":false,"output":{"execution_state":"outcome_unknown","error_code":"operation_indeterminate"},"error":"response lost"}),
             ),
             (
-                "/api/runners/config/check",
+                "tool:check_runner_config",
                 json!({"success":true,"output":{"valid":true,"current_generation":7,"restart_required":false}}),
             ),
         ];
         let (server_url, server) = spawn_operator_server(responses);
         let config_path = tmp.path().join("runner.toml");
-        activation_config(&config_path, &server_url, &[], false);
+        let unrelated = tmp.path().join("authorized");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let unrelated = unrelated.canonicalize().unwrap();
+        activation_config(
+            &config_path,
+            &server_url,
+            std::slice::from_ref(&unrelated),
+            false,
+        );
         let token_file = tmp.path().join("user-token");
         std::fs::write(&token_file, TEST_USER_TOKEN).unwrap();
 
@@ -1451,7 +1503,7 @@ mod tests {
         assert_eq!(
             requests
                 .iter()
-                .filter(|request| request.starts_with("POST /api/runners/config/reload "))
+                .filter(|request| request_json(request)["tool"] == "reload_runner_config")
                 .count(),
             1,
             "uncertain reload with unchanged generation must never be retried"
@@ -1476,7 +1528,7 @@ mod tests {
                 json!({"success":false,"output":{"execution_state":"outcome_unknown","error_code":"operation_indeterminate","state_changed":true},"error":"response lost"}),
             ),
             (
-                "/api/projects/list",
+                "tool:list_projects",
                 json!({"success":true,"output":{"projects":[{"id":"agent:client:demo","agent_project_id":"demo","client_id":"client","path":canonical_project.to_string_lossy()}]}}),
             ),
         ];
@@ -1609,7 +1661,7 @@ mod tests {
         let _guard = crate::webcodex_cli::test_support::env_test_guard();
         let config = RegistrationRunnerConfig {
             project_registry_dir: None,
-            legacy_projects_dir: None,
+            removed_projects_dir: None,
             policy: RegistrationPolicy::default(),
         };
         let base = webcodex_runner_config::paths::default_client_config_base_dir().unwrap();
@@ -1621,25 +1673,27 @@ mod tests {
     }
 
     #[test]
-    fn registration_config_accepts_legacy_projects_dir_alias() {
-        let legacy = PathBuf::from("/tmp/legacy-projects.d");
+    fn registration_config_rejects_retired_projects_dir() {
         let config = RegistrationRunnerConfig {
             project_registry_dir: None,
-            legacy_projects_dir: Some(legacy.clone()),
-            policy: RegistrationPolicy::default(),
-        };
-        assert_eq!(registration_project_registry_dir(&config).unwrap(), legacy);
-    }
-
-    #[test]
-    fn registration_config_rejects_both_registry_fields() {
-        let config = RegistrationRunnerConfig {
-            project_registry_dir: Some(PathBuf::from("/tmp/project-registry")),
-            legacy_projects_dir: Some(PathBuf::from("/tmp/projects.d")),
+            removed_projects_dir: Some(toml::Value::String("/tmp/projects.d".to_string())),
             policy: RegistrationPolicy::default(),
         };
         let error = registration_project_registry_dir(&config).unwrap_err();
-        assert!(error.contains("cannot both be configured"), "{error}");
+        assert!(error.contains("'projects_dir' is retired"), "{error}");
+        assert!(error.contains("'project_registry_dir'"), "{error}");
+    }
+
+    #[test]
+    fn registration_config_rejects_retired_projects_dir_with_canonical_field() {
+        let config = RegistrationRunnerConfig {
+            project_registry_dir: Some(PathBuf::from("/tmp/project-registry")),
+            removed_projects_dir: Some(toml::Value::String("/tmp/projects.d".to_string())),
+            policy: RegistrationPolicy::default(),
+        };
+        let error = registration_project_registry_dir(&config).unwrap_err();
+        assert!(error.contains("'projects_dir' is retired"), "{error}");
+        assert!(error.contains("'project_registry_dir'"), "{error}");
     }
 
     #[test]

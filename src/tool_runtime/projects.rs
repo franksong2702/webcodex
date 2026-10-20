@@ -2,9 +2,9 @@
 //! and `create_project`.
 //!
 //! Registration and creation route to the selected Runner through the project-op
-//! path. Unregistration reuses the shared project lifecycle path so the
-//! model-facing tool and `POST /api/projects/unregister` have the same revision
-//! CAS, active-Job fence, capability check, uncertain-delivery semantics, and
+//! path. Unregistration reuses the shared project lifecycle core so canonical
+//! runtime execution keeps the same revision CAS, active-Job fence, capability
+//! check, uncertain-delivery semantics, and
 //! server inventory update. The Runner remains authoritative for its local
 //! project registration records in the Runner project registry.
 //!
@@ -17,10 +17,13 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::tool_result::{RecoveryKind, ToolResult};
+mod maintenance;
+
 use super::{runner_project_runtime_id, ToolRuntime};
-use crate::auth::AuthContext;
+use crate::auth::{AuthContext, SCOPE_PROJECT_READ};
 use crate::runner_http::{RunnerFeature, RunnerSemanticView};
 use crate::runner_protocol::{RunnerProjectSummary, RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION};
+use maintenance::registered_git_summary;
 
 /// Maximum time the runtime waits for a Runner project-op response. Project
 /// operations are fast (write a small TOML, maybe create a directory + git
@@ -30,6 +33,7 @@ const AUTO_REGISTERED_PROJECT_SOURCE: &str = "auto_registered";
 
 const LIST_PROJECTS_MAX_QUERY_CHARS: usize = 200;
 const LIST_PROJECTS_MAX_RESULTS: usize = 100;
+const RUNTIME_CONSOLE_LIST_PROJECTS_MAX_RESULTS: usize = 2_000;
 
 #[derive(Debug, Default)]
 pub(crate) struct ListProjectsOptions {
@@ -38,6 +42,7 @@ pub(crate) struct ListProjectsOptions {
     pub(crate) query: Option<String>,
     pub(crate) limit: Option<usize>,
     pub(crate) summary_only: bool,
+    pub(crate) include_git_summary: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -49,6 +54,7 @@ pub(super) struct ProjectCandidate {
 
 fn validate_list_projects_options(
     options: &ListProjectsOptions,
+    max_results: usize,
 ) -> Result<(Option<String>, Option<usize>), ToolResult> {
     if options
         .client_id
@@ -95,8 +101,8 @@ fn validate_list_projects_options(
         options.client_id.is_some() || options.project.is_some() || options.query.is_some();
     let limit = options
         .limit
-        .map(|limit| limit.clamp(1, LIST_PROJECTS_MAX_RESULTS))
-        .or_else(|| filtered.then_some(LIST_PROJECTS_MAX_RESULTS));
+        .map(|limit| limit.clamp(1, max_results))
+        .or_else(|| filtered.then_some(max_results));
     Ok((query, limit))
 }
 
@@ -138,10 +144,87 @@ fn project_candidates(
     candidates
 }
 
+fn project_registry_scope_denied(operation: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        format!(
+            "{operation} is unavailable to project-scoped credentials; use an already-visible Project, or derive an isolated Project with work_on_project(mode=worktree)"
+        ),
+        json!({
+            "error_kind": "project_registry_scope_denied",
+            "failure_kind": "authorization_denied",
+            "state_changed": false,
+        }),
+    )
+    .with_recovery(RecoveryKind::UserAction)
+}
+
+fn project_registry_mutation_denied(
+    auth: Option<&AuthContext>,
+    operation: &str,
+) -> Option<ToolResult> {
+    auth.is_some_and(AuthContext::is_project_scoped_model_subject)
+        .then(|| project_registry_scope_denied(operation))
+}
+
+fn existing_project_path_result(client_id: &str, project: &RunnerProjectSummary) -> ToolResult {
+    ToolResult::ok(json!({
+        "id": runner_project_runtime_id(client_id, &project.id),
+        "agent_project_id": project.id,
+        "client_id": client_id,
+        "name": project.name,
+        "path": project.path,
+        "kind": project.kind,
+        "description": project.description,
+        "allow_patch": project.allow_patch,
+        "disabled": project.disabled,
+        "revision": project.revision,
+        "source": "path",
+        "outcome": "reused_existing_registration",
+        "registered": false,
+        "created_config": false,
+        "changed": false,
+        "recovered": true,
+    }))
+}
+
 impl ToolRuntime {
+    #[cfg(test)]
     pub(crate) async fn list_projects(&self, auth: Option<&AuthContext>) -> ToolResult {
         self.list_projects_with_options(auth, ListProjectsOptions::default())
             .await
+    }
+
+    /// For project-scoped model/API credentials, path-based coding may only use
+    /// an exact path already present in that ProjectGrant's caller-visible
+    /// Runner inventory. This prevents broad Runner filesystem authority (needed
+    /// for canonical managed-worktree siblings) from becoming Project-registry
+    /// authority. Other credential classes keep the ordinary path-registration
+    /// behavior.
+    pub(crate) async fn project_scoped_visible_project_for_exact_path(
+        &self,
+        client_id: &str,
+        path: &str,
+        auth: Option<&AuthContext>,
+    ) -> Result<Option<RunnerProjectSummary>, ToolResult> {
+        if !auth.is_some_and(AuthContext::is_project_scoped_model_subject) {
+            return Ok(None);
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        let Some(client) = self
+            .runner_registry
+            .get_runner_semantic_view_for_auth(client_id, access.as_ref())
+            .await
+        else {
+            return Err(project_registry_scope_denied("project path resolution"));
+        };
+        let project = client
+            .view
+            .projects
+            .iter()
+            .find(|project| !project.disabled && project.path == path)
+            .cloned()
+            .ok_or_else(|| project_registry_scope_denied("project path resolution"))?;
+        Ok(Some(project))
     }
 
     pub(crate) async fn list_projects_with_options(
@@ -149,16 +232,71 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
         options: ListProjectsOptions,
     ) -> ToolResult {
-        let (query, limit) = match validate_list_projects_options(&options) {
+        self.list_projects_with_options_cap(auth, options, LIST_PROJECTS_MAX_RESULTS)
+            .await
+    }
+
+    pub(crate) async fn list_projects_for_runtime_console(
+        &self,
+        auth: Option<&AuthContext>,
+        client_id: Option<String>,
+        project: Option<String>,
+        query: Option<String>,
+        limit: usize,
+    ) -> ToolResult {
+        self.list_projects_with_options_cap(
+            auth,
+            ListProjectsOptions {
+                client_id,
+                project,
+                query,
+                limit: Some(limit),
+                summary_only: false,
+                include_git_summary: false,
+            },
+            RUNTIME_CONSOLE_LIST_PROJECTS_MAX_RESULTS,
+        )
+        .await
+    }
+
+    pub(super) async fn list_projects_with_options_cap(
+        &self,
+        auth: Option<&AuthContext>,
+        options: ListProjectsOptions,
+        max_results: usize,
+    ) -> ToolResult {
+        let (query, limit) = match validate_list_projects_options(&options, max_results) {
             Ok(validated) => validated,
             Err(result) => return result,
         };
         let access = crate::runner_http::runner_access_from_auth(auth);
         let clients = self
             .runner_registry
-            .list_runner_semantic_views_for_auth(access.as_ref())
+            .list_project_semantic_views_for_auth(
+                access.as_ref(),
+                options.client_id.as_deref(),
+                options.project.as_deref(),
+            )
             .await;
         self.list_projects_from_semantic_clients(auth, &options, query.as_deref(), limit, &clients)
+            .await
+    }
+
+    /// Reuse the canonical Runner/project visibility projection for an exact
+    /// Project id without dispatching a model-visible tool. This is an
+    /// observability fence only: it grants no Project authority and callers
+    /// must still hold `project:read` explicitly.
+    pub(crate) async fn exact_project_visible_to_auth(
+        &self,
+        auth: &AuthContext,
+        project: &str,
+    ) -> bool {
+        if !auth.has_scope(SCOPE_PROJECT_READ) {
+            return false;
+        }
+        let access = crate::runner_http::runner_access_from_auth(Some(auth));
+        self.runner_registry
+            .exact_project_visible_for_auth_snapshot(access.as_ref(), project)
             .await
     }
 
@@ -169,10 +307,11 @@ impl ToolRuntime {
         options: ListProjectsOptions,
         clients: &[crate::runner_protocol::RunnerView],
     ) -> ToolResult {
-        let (query, limit) = match validate_list_projects_options(&options) {
-            Ok(validated) => validated,
-            Err(result) => return result,
-        };
+        let (query, limit) =
+            match validate_list_projects_options(&options, LIST_PROJECTS_MAX_RESULTS) {
+                Ok(validated) => validated,
+                Err(result) => return result,
+            };
         let semantic_clients = clients
             .iter()
             .cloned()
@@ -203,6 +342,14 @@ impl ToolRuntime {
             candidates.truncate(limit);
         }
         let truncated = candidates.len() < matched_count;
+        let project_ids: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.runtime_id.as_str())
+            .collect();
+        let active_jobs_by_project = self
+            .runner_registry
+            .count_active_jobs_for_projects(access.as_ref(), &project_ids)
+            .await;
 
         let mut list = Vec::with_capacity(candidates.len());
         for ProjectCandidate {
@@ -211,10 +358,9 @@ impl ToolRuntime {
             project_index,
         } in candidates
         {
-            // Extract only one selected Project and the small Runner fields used by
-            // its projection before awaiting Job state. Candidate staging above
-            // never owns or clones a RunnerView (and therefore never clones
-            // the Runner's complete projects Vec per match).
+            // Extract only one selected Project and its small Runner projection.
+            // Candidate staging never clones a Runner's complete project inventory;
+            // Job counts above share one authorized registry snapshot.
             let (
                 client_id,
                 runner_status,
@@ -245,15 +391,21 @@ impl ToolRuntime {
                     smoke_project_capabilities(client, project),
                 )
             };
-            let active_jobs = self
-                .runner_registry
-                .count_active_jobs_for_project(access.as_ref(), &runtime_id)
-                .await;
-            let value = if options.summary_only {
+            let active_jobs = active_jobs_by_project
+                .get(&runtime_id)
+                .copied()
+                .unwrap_or(0);
+            let project_ref = self.project_reference_for_identity(
+                &runtime_id,
+                project.root_fingerprint.as_deref(),
+                auth,
+            );
+            let mut value = if options.summary_only {
                 json!({
                     "id": runtime_id,
                     "agent_project_id": project.id,
                     "name": project.name,
+                    "path": project.path,
                     "description": project.description,
                     "executor": "agent",
                     "client_id": client_id,
@@ -295,6 +447,12 @@ impl ToolRuntime {
                     "capabilities": capabilities,
                 })
             };
+            if options.include_git_summary {
+                value["git"] = registered_git_summary(&project);
+            }
+            if let Some(project_ref) = project_ref {
+                value["project_ref"] = json!(project_ref);
+            }
             list.push(value);
         }
         let recommended_for_smoke: Vec<Value> = list
@@ -351,13 +509,16 @@ impl ToolRuntime {
     /// Remove only one exact Runner project registration. The caller supplies
     /// the revision observed from `list_projects`; the shared lifecycle core
     /// keeps CAS, active-Job fencing, owner filtering, and uncertain-delivery
-    /// semantics identical to `POST /api/projects/unregister`.
+    /// semantics in one canonical runtime path.
     pub(crate) async fn unregister_project(
         &self,
         project: String,
         expected_revision: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        if let Some(result) = project_registry_mutation_denied(auth, "unregister_project") {
+            return result;
+        }
         let response = crate::admin_project_lifecycle::unregister_project_runtime(
             self,
             auth,
@@ -427,7 +588,6 @@ impl ToolRuntime {
         path: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Err(error) = validate_project_op_path(&path) {
             return ToolResult::err_with_output(
                 error,
@@ -439,6 +599,15 @@ impl ToolRuntime {
                 }),
             );
         }
+        match self
+            .project_scoped_visible_project_for_exact_path(&client_id, &path, auth)
+            .await
+        {
+            Ok(Some(project)) => return existing_project_path_result(&client_id, &project),
+            Ok(None) => {}
+            Err(result) => return result,
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Some(client) = self
             .runner_registry
             .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
@@ -462,7 +631,7 @@ impl ToolRuntime {
                         "state_changed": false,
                     }),
                 )
-                .with_recovery(RecoveryKind::NoAction, None);
+                .with_recovery(RecoveryKind::NoAction);
             }
         }
         self.submit_project_op(
@@ -484,9 +653,10 @@ impl ToolRuntime {
         base_ref: Option<String>,
         operation_id: String,
         resume_project_id: Option<String>,
+        expected_source_project_id: Option<String>,
+        expected_source_root_fingerprint: Option<String>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Err(error) = validate_project_op_path(&path) {
             return ToolResult::err_with_output(
                 error,
@@ -498,6 +668,14 @@ impl ToolRuntime {
                 }),
             );
         }
+        match self
+            .project_scoped_visible_project_for_exact_path(&client_id, &path, auth)
+            .await
+        {
+            Ok(Some(_)) | Ok(None) => {}
+            Err(result) => return result,
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
         if let Some(client) = self
             .runner_registry
             .get_runner_semantic_view_for_auth(&client_id, access.as_ref())
@@ -520,16 +698,34 @@ impl ToolRuntime {
                         "state_changed": false,
                     }),
                 )
-                .with_recovery(RecoveryKind::NoAction, None);
+                .with_recovery(RecoveryKind::NoAction);
             }
         }
         let fresh_managed_bootstrap = resume_project_id.is_none();
-        let payload = json!({
+        let mut payload = json!({
             "path": path,
             "base_ref": base_ref,
             "operation_id": operation_id,
             "resume_project_id": resume_project_id,
         });
+        match (expected_source_project_id, expected_source_root_fingerprint) {
+            (Some(project_id), Some(root_fingerprint)) => {
+                payload["expected_source_project_id"] = json!(project_id);
+                payload["expected_source_root_fingerprint"] = json!(root_fingerprint);
+            }
+            (None, None) => {}
+            _ => {
+                return ToolResult::err_with_output(
+                    "managed worktree source identity must be complete",
+                    json!({
+                        "error_kind": "managed_worktree_source_identity_unavailable",
+                        "failure_kind": "operation_failed",
+                        "state_changed": false,
+                    }),
+                )
+                .with_recovery(RecoveryKind::Reobserve);
+            }
+        }
         let first = self
             .submit_project_op(
                 "prepare_managed_worktree",
@@ -590,6 +786,9 @@ impl ToolRuntime {
         overwrite: bool,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        if let Some(result) = project_registry_mutation_denied(auth, kind) {
+            return result;
+        }
         // -- basic server-side request shape validation ----------------------
         // The Runner does the authoritative path/policy validation, but the
         // server rejects obviously malformed requests early so the Runner is
@@ -702,7 +901,7 @@ impl ToolRuntime {
         if stdout.is_empty() {
             return ToolResult::err("Runner returned empty project op result");
         }
-        let result: Value = match serde_json::from_str::<Value>(stdout) {
+        let mut result: Value = match serde_json::from_str::<Value>(stdout) {
             Ok(value) => value,
             Err(error) => {
                 return ToolResult::err(format!(
@@ -733,6 +932,8 @@ impl ToolRuntime {
                 "authoritative_project_summary_missing",
             );
         };
+        let resolved_project = runner_project_runtime_id(&client_id, &project.id);
+        let root_fingerprint = project.root_fingerprint.clone();
         if let Err(error) = self
             .runner_registry
             .upsert_runner_project_for_instance(&client_id, &expected_runner_instance_id, project)
@@ -750,6 +951,13 @@ impl ToolRuntime {
             );
         }
 
+        if let Some(project_ref) = self.project_reference_for_identity(
+            &resolved_project,
+            root_fingerprint.as_deref(),
+            auth,
+        ) {
+            result["project_ref"] = json!(project_ref);
+        }
         ToolResult::ok(result)
     }
 }
@@ -780,7 +988,7 @@ fn project_projection_reconcile_required(
             "reason_code": reason_code,
             "state_changed": state_changed,
             "client_id": client_id,
-            "agent_instance_id": runner_instance_id,
+            "runner_instance_id": runner_instance_id,
             "agent_project_id": project_id.clone(),
             "revision": revision.clone(),
             "authoritative_outcome": result.get("outcome").cloned().unwrap_or(Value::Null),
@@ -820,7 +1028,9 @@ fn project_source(project: &RunnerProjectSummary) -> &'static str {
     }
 }
 
-fn project_git_available(project: &crate::runner_protocol::RunnerProjectSummary) -> Option<bool> {
+pub(super) fn project_git_available(
+    project: &crate::runner_protocol::RunnerProjectSummary,
+) -> Option<bool> {
     if project.git_branch.is_some() || project.git_head.is_some() || project.git_dirty.is_some() {
         Some(true)
     } else {
@@ -869,7 +1079,7 @@ fn smoke_project_capabilities(
 ///   configured; `"not_configured"` if no profile resolves at all; and
 ///   `"unknown"` if the Runner did not report a shell-profiles summary so the
 ///   configured set cannot be checked.
-fn resolve_project_shell_profile(
+pub(super) fn resolve_project_shell_profile(
     project_shell_profile: Option<&str>,
     summary: Option<&crate::runner_protocol::ShellProfilesSummary>,
 ) -> (Option<String>, &'static str) {
@@ -972,7 +1182,7 @@ fn truncate_for_error(s: &str) -> String {
 /// Parse a `RunnerProjectSummary` from the Runner's project-op JSON
 /// response so the server can upsert it into the cached project list. The
 /// response includes `agent_project_id`, `client_id`, `name`, `path`, and
-/// `allow_patch` — enough to build a summary that `listProjects` can show
+/// `allow_patch` — enough to build a summary that `list_projects` can show
 /// immediately.
 fn parse_project_summary_from_result(
     result: &Value,
@@ -988,6 +1198,10 @@ fn parse_project_summary_from_result(
         .get("allow_patch")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
+    let lineage = match result.get("lineage") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
+    };
     Some(RunnerProjectSummary {
         id: agent_project_id.to_string(),
         name: name.or_else(|| Some(agent_project_id.to_string())),
@@ -1014,6 +1228,11 @@ fn parse_project_summary_from_result(
             .get("revision")
             .and_then(Value::as_str)
             .map(str::to_string),
+        root_fingerprint: result
+            .get("root_fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        lineage,
         git_branch: None,
         git_head: None,
         git_dirty: None,
@@ -1039,6 +1258,8 @@ mod tests {
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -1061,6 +1282,8 @@ mod tests {
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -1167,7 +1390,7 @@ mod tests {
         let input = "界".repeat(67);
         let truncated = truncate_for_error(&input);
         assert!(truncated.ends_with('…'));
-        assert_eq!(truncated.trim_end_matches('…').as_bytes().len(), 198);
+        assert_eq!(truncated.trim_end_matches('…').len(), 198);
     }
 
     #[test]

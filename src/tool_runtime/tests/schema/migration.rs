@@ -64,7 +64,7 @@ fn plugin_tool_call_parser_is_typed_bounded_and_closed() {
         json!({"action":"list","unknown":true}),
         json!({"action":"list","plugin":"repo-tools"}),
         json!({"action":"call","binding":"wc_pbind_bad","arguments":{}}),
-        json!({"action":"call","binding":"wc_pbind_00000000000000000000000000000000"}),
+        json!({"action":"call","binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA"}),
         json!({"action":"describe","runner":"runner-a","plugin":"repo-tools"}),
     ] {
         assert!(
@@ -76,7 +76,7 @@ fn plugin_tool_call_parser_is_typed_bounded_and_closed() {
         "plugin_tool",
         json!({
             "action":"call",
-            "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+            "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
             "arguments":{}
         }),
     )
@@ -136,74 +136,8 @@ fn tool_definition_metadata_fallback_facade_is_unknown_only() {
 }
 
 #[test]
-fn tool_definition_surface_counts_stay_fixed() {
+fn tool_definition_surface_counts_stay_canonical() {
     use crate::tool_runtime::tool_definition::{lookup_tool_definition, model_hidden_tool_names};
-
-    let openapi = crate::openapi::build_openapi_spec();
-    let openapi_operation_count: usize = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|methods| methods.as_object().unwrap().len())
-        .sum();
-    assert_eq!(openapi_operation_count, 22, "OpenAPI operation count");
-
-    let operation_ids = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .flat_map(|methods| methods.as_object().unwrap().values())
-        .map(|operation| operation["operationId"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    for forbidden in [
-        "runCodex",
-        "RunCodex",
-        "sessionHandoffSummary",
-        "SessionHandoff",
-        "applyTextEdits",
-        "ApplyTextEdits",
-        "artifactUpload",
-        "ArtifactUpload",
-    ] {
-        assert!(
-            !operation_ids
-                .iter()
-                .any(|operation_id| operation_id.contains(forbidden)),
-            "{forbidden} must remain hidden/runtime-only and not become a dedicated GPT Action: {operation_ids:?}"
-        );
-    }
-
-    let tool_call_properties = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        .as_object()
-        .expect("ToolCallRequest properties");
-    for field in ["summary_only", "include_command_preview", "compact"] {
-        assert!(
-            tool_call_properties.contains_key(field),
-            "callRuntimeTool must keep flattened GPT Action field {field}"
-        );
-    }
-    assert!(
-        !tool_call_properties.contains_key("detail"),
-        "hidden start-only detail must not be published by callRuntimeTool"
-    );
-    for field in [
-        "expected_failure",
-        "expected_failure_kind",
-        "assertion_name",
-        "test_expect_failure_kind",
-    ] {
-        assert!(
-            !tool_call_properties.contains_key(field),
-            "callRuntimeTool model-facing schema must not publish testing metadata field {field}"
-        );
-    }
-    let tool_description = tool_call_properties["tool"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(
-        !tool_description.contains("run_codex"),
-        "callRuntimeTool model-facing accepted-name description must not advertise run_codex"
-    );
 
     let model_facing_names = registered_tool_names();
     assert!(
@@ -256,15 +190,6 @@ fn current_session_tools_are_absent_from_all_discovery_surfaces() {
     }
 }
 
-#[test]
-fn tool_definition_dead_code_residue_is_narrow_and_documented() {
-    let source = include_str!("../../tool_definition.rs");
-    assert!(
-        !source.contains("#![allow(dead_code)]"),
-        "tool_definition.rs must not use a module-wide dead_code allowance"
-    );
-}
-
 fn assert_model_facing_surfaces_do_not_list_name(name: &str) {
     let specs = registered_tool_specs();
     let spec_names = specs
@@ -292,21 +217,11 @@ fn assert_model_facing_surfaces_do_not_list_name(name: &str) {
         "{name} must not appear in MCP tools/list names"
     );
 
-    let openapi = crate::openapi::build_openapi_spec();
-    let tool_description = openapi["components"]["schemas"]["ToolCallRequest"]["properties"]
-        [TOOL_CALL_TOOL_FIELD]["description"]
-        .as_str()
-        .expect("ToolCallRequest.tool description");
-    assert!(
-        !tool_description.contains(name),
-        "{name} must not appear in callRuntimeTool accepted-name text"
-    );
-
     let runtime = test_runtime();
     let manifest = runtime.compact_tool_manifest_payload();
     assert!(
         !serde_json::to_string(&manifest).unwrap().contains(name),
-        "{name} must not appear in compact tool_manifest"
+        "{name} must not appear in compact read_tool_manifest"
     );
     let list_tools = runtime.list_tools_payload(ListToolsOptions {
         category: None,
@@ -331,14 +246,13 @@ fn assert_model_facing_surfaces_do_not_list_name(name: &str) {
         "{name} must not appear in full list_tools discovery"
     );
 
-    // Static discovery surfaces: category groups and recommended flows are
-    // compiled straight into the model-facing catalog.
-    for group in crate::tool_runtime::tool_definition::TOOL_DISCOVERY_GROUPS {
-        assert!(
-            !group.tools.contains(&name),
-            "{name} must not appear in discovery group {}",
-            group.name
-        );
+    // Categories derive from admitted definitions; retired names stay absent.
+    for members in registered_tool_categories().as_object().unwrap().values() {
+        assert!(members
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|member| member != name));
     }
     for flow in crate::tool_runtime::tool_catalog::TOOL_RECOMMENDED_FLOWS {
         assert!(

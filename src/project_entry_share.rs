@@ -131,7 +131,7 @@ pub(crate) fn parse_share_options(args: &[String]) -> Result<ShareCommandOptions
         return Err("--public-url requires --tunnel none; managed tunnel providers own their transport endpoint".to_string());
     }
     if tunnel == TunnelProvider::OpenAiSecure && auth != ShareAuth::Bearer {
-        return Err("--tunnel openai currently requires --auth bearer; WebCodex keeps that temporary Bearer credential local and tunnel-client injects it into the private MCP hop".to_string());
+        return Err("--tunnel openai currently requires --auth bearer; WebCodex keeps that temporary Bearer credential local and the native Tunnel client injects it into the private MCP hop".to_string());
     }
     match auth {
         ShareAuth::OAuth if oauth_redirect_uri.as_deref().is_none_or(str::is_empty) => {
@@ -268,7 +268,7 @@ impl ShareSession {
         let share_root = state.join("share");
         create_private_dir(&share_root)?;
         let directory = share_root.join(uuid::Uuid::new_v4().simple().to_string());
-        let credential_file = directory.join("connector-key");
+        let credential_file = directory.join("project-credential");
         let result = (|| {
             create_private_dir(&directory)?;
             let credential = generate_project_credential();
@@ -284,12 +284,6 @@ impl ShareSession {
             let _ = std::fs::remove_dir_all(&directory);
         }
         result
-    }
-
-    fn write_openai_authorization_file(&self) -> Result<PathBuf, ProductError> {
-        let path = self.directory.join("openai-mcp-authorization");
-        write_new_private(&path, format!("Bearer {}", self.credential).as_bytes())?;
-        Ok(path)
     }
 }
 
@@ -468,8 +462,43 @@ fn prepare_share_oauth_client(
 #[derive(Debug)]
 struct CloudflareTunnel {
     child: Child,
+    process_group_id: Option<u32>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+}
+
+struct CloudflareTunnelStartup {
+    child: Child,
+    process_group_id: Option<u32>,
+    stdout_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
+    recent: Arc<Mutex<VecDeque<String>>>,
+    url_rx: mpsc::Receiver<String>,
+}
+
+/// Owns the startup-stage process group until it is either explicitly
+/// terminated or transferred into a live `CloudflareTunnel`. This closes the
+/// async-cancellation/error gap before the tunnel object itself exists: Tokio's
+/// `Child::kill_on_drop` only kills the direct child, not inherited descendants.
+struct CloudflareStartupProcessGroupGuard {
+    process_group_id: Option<u32>,
+}
+
+impl CloudflareStartupProcessGroupGuard {
+    fn new(process_group_id: Option<u32>) -> Self {
+        Self { process_group_id }
+    }
+
+    fn take(&mut self) -> Option<u32> {
+        self.process_group_id.take()
+    }
+}
+
+impl Drop for CloudflareStartupProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        signal_cloudflare_process_group(self.process_group_id.take());
+    }
 }
 
 impl CloudflareTunnel {
@@ -479,6 +508,8 @@ impl CloudflareTunnel {
             .wait()
             .await
             .map_err(|_| tunnel_runtime_error())?;
+        #[cfg(unix)]
+        signal_cloudflare_process_group(self.process_group_id.take());
         Err(ProductError::new(
             "tunnel_unavailable",
             format!("Cloudflare Quick Tunnel stopped unexpectedly ({status})"),
@@ -487,8 +518,8 @@ impl CloudflareTunnel {
     }
 
     async fn stop(&mut self) {
-        let _ = self.child.start_kill();
-        let _ = self.child.wait().await;
+        let process_group_id = self.process_group_id.take();
+        terminate_cloudflare_process_tree(&mut self.child, process_group_id).await;
         self.stdout_task.abort();
         self.stderr_task.abort();
     }
@@ -496,9 +527,59 @@ impl CloudflareTunnel {
 
 impl Drop for CloudflareTunnel {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        signal_cloudflare_process_group(self.process_group_id);
         self.stdout_task.abort();
         self.stderr_task.abort();
     }
+}
+
+/// Put cloudflared in its own process group so the whole tree it spawns
+/// (including backgrounded descendants and the npm wrapper's children) can be
+/// reaped as a group. `process_group(0)` makes the child's pid its group id.
+#[cfg(unix)]
+fn configure_cloudflare_process_tree(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_cloudflare_process_tree(_command: &mut Command) {}
+
+/// Best-effort SIGKILL of the tunnel's whole process group (`kill(-pgid,
+/// SIGKILL)`; a negative target signals every process in the group). Reaps
+/// background descendants `cloudflared` or its npm wrapper may leave behind,
+/// which a direct child kill alone would leak. `pgid` is always our own
+/// child's pid (made a group leader via `process_group(0)`), so this only ever
+/// targets the tunnel's own subtree. Uses the direct syscall: the `kill`
+/// binary rejects negative pgid arguments on some coreutils builds. Failure
+/// (e.g. the group already fully exited, ESRCH) is expected and ignored.
+#[cfg(unix)]
+fn signal_cloudflare_process_group(process_group_id: Option<u32>) {
+    // Guard against ever signalling pid 0 / -1 ("current group" / "all
+    // processes") if a caller somehow passed a zero id.
+    let Some(process_group_id) = process_group_id.filter(|value| *value > 0) else {
+        return;
+    };
+    // SAFETY: the process group id is captured from our own child immediately
+    // after spawning it as a new group leader. A stale/invalid pgid yields
+    // ESRCH, which we deliberately ignore.
+    unsafe {
+        libc::kill(-(process_group_id as i32), libc::SIGKILL);
+    }
+}
+
+/// Tear down the tunnel process tree: on Unix signal the whole group (covering
+/// any background descendants a direct kill would miss), then reap the child.
+/// On non-Unix targets fall back to a direct child kill.
+async fn terminate_cloudflare_process_tree(child: &mut Child, _process_group_id: Option<u32>) {
+    #[cfg(unix)]
+    signal_cloudflare_process_group(_process_group_id);
+    #[cfg(not(unix))]
+    {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
 }
 
 fn tunnel_runtime_error() -> ProductError {
@@ -530,7 +611,7 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
         config.port,
         "Stop the conflicting process, then retry webcodex share.",
     )?;
-    let persistent_credential = read_project_credential(&paths.connector_key)?;
+    let persistent_credential = read_project_credential(&paths.project_credential)?;
     let session = ShareSession::create(&paths.state)?;
     if session.credential == persistent_credential {
         return Err(ProductError::new(
@@ -586,7 +667,7 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
         &options.project,
         LocalRuntimeOptions {
             public_url: Some(public_url.clone()),
-            connector_credential_file: Some(session.credential_file.clone()),
+            project_credential_file: Some(session.credential_file.clone()),
             mcp_query_token_auth: options.auth == ShareAuth::QueryToken,
             project_share_oauth,
             child_environment_remove: if options.tunnel == TunnelProvider::OpenAiSecure {
@@ -625,18 +706,10 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
     }
 
     let mut openai_tunnel = if let Some(prerequisites) = openai_prerequisites.as_ref() {
-        let authorization_file = match session.write_openai_authorization_file() {
-            Ok(path) => path,
-            Err(error) => {
-                runtime.stop().await;
-                return Err(error);
-            }
-        };
-        match super::openai_tunnel_service::start_openai_tunnel(
+        match super::openai_tunnel_service::start_temporary_openai_tunnel(
             prerequisites,
             &mcp_url(&runtime.local_url),
-            &authorization_file,
-            &session.directory,
+            &session.credential,
             startup_deadline,
         )
         .await
@@ -766,14 +839,18 @@ pub(crate) async fn share(options: &ShareCommandOptions) -> Result<(), ProductEr
         task.abort();
         let _ = task.await;
     }
-    runtime.stop().await;
+    // Keep the owned local MCP server available until Tunnel response delivery
+    // has settled. Closing HTTP first turns otherwise clean stops into uncertainty.
+    let stopped = if let Some(tunnel) = openai_tunnel.as_mut() {
+        tunnel.stop_with_outcome().await
+    } else {
+        Ok(())
+    };
     if let Some(tunnel) = cloudflare_tunnel.as_mut() {
         tunnel.stop().await;
     }
-    if let Some(tunnel) = openai_tunnel.as_mut() {
-        tunnel.stop().await;
-    }
-    outcome
+    runtime.stop().await;
+    outcome.and(stopped)
 }
 
 async fn wait_for_share_stop_signal(stop_on_stdin_eof: bool) {
@@ -855,7 +932,7 @@ fn share_access_labels(
 
 fn render_openai_share_ready(project_name: &str, tunnel_id: &str) -> String {
     format!(
-        "WebCodex ready\n\nTemporary share\nThis session ends when this command exits.\n\nWhat to do next\n1. In ChatGPT Developer Mode, create a custom MCP app.\n2. Connection: Tunnel\n3. Tunnel: {tunnel_id}\n4. Authentication: No authentication\n5. Scan Tools.\n6. First prompt: \"Inspect this repository and summarize its structure. Do not make changes.\"\n\nReady for ChatGPT through OpenAI Secure MCP Tunnel.\n\nDetails\nProject: {project_name}\nRuntime: local\nTunnel: OpenAI Secure MCP Tunnel\nPublic access: no public WebCodex endpoint; outbound-only OpenAI Tunnel transport\nWebCodex authentication: the temporary Bearer credential stays local and is injected by tunnel-client into the private MCP hop. Do not paste it into ChatGPT.\nCredential lifetime: temporary; stopping this share removes the local credential and tunnel-client process. The Platform Tunnel identity remains operator managed.\nPress Ctrl-C to stop sharing."
+        "WebCodex ready\n\nTemporary share\nThis session ends when this command exits.\n\nWhat to do next\n1. In ChatGPT Developer Mode, create a custom MCP app.\n2. Connection: Tunnel\n3. Tunnel: {tunnel_id}\n4. Authentication: No authentication\n5. Scan Tools.\n6. First prompt: \"Inspect this repository and summarize its structure. Do not make changes.\"\n\nReady for ChatGPT through OpenAI Secure MCP Tunnel.\n\nDetails\nProject: {project_name}\nRuntime: local\nTunnel: OpenAI Secure MCP Tunnel\nPublic access: no public WebCodex endpoint; outbound-only OpenAI Tunnel transport\nWebCodex authentication: the temporary Bearer credential stays local and is injected by the native Tunnel client into the private MCP hop. Do not paste it into ChatGPT.\nCredential lifetime: temporary; stopping this share removes the local credential and Tunnel task. The Platform Tunnel identity remains operator managed.\nPress Ctrl-C to stop sharing."
     )
 }
 
@@ -939,6 +1016,14 @@ async fn start_cloudflare_quick_with_binary(
     local_url: &str,
     deadline: Instant,
 ) -> Result<(String, CloudflareTunnel), ProductError> {
+    let startup = spawn_cloudflare_quick_with_binary(binary, local_url)?;
+    wait_for_cloudflare_quick_url(startup, deadline).await
+}
+
+fn spawn_cloudflare_quick_with_binary(
+    binary: &Path,
+    local_url: &str,
+) -> Result<CloudflareTunnelStartup, ProductError> {
     let mut tunnel_command = Command::new(binary);
     remove_npm_wrapper_network_environment(&mut tunnel_command);
     tunnel_command
@@ -948,22 +1033,69 @@ async fn start_cloudflare_quick_with_binary(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = tunnel_command.spawn().map_err(|_| {
+    configure_cloudflare_process_tree(&mut tunnel_command);
+    let mut child = tunnel_command.spawn().map_err(|error| {
         ProductError::new(
             "tunnel_unavailable",
-            "cloudflared could not start",
+            format!("cloudflared could not start ({:?})", error.kind()),
             Some("Check the cloudflared executable and retry webcodex share."),
         )
     })?;
+    let process_group_id = child.id();
     let stdout = child.stdout.take().ok_or_else(tunnel_runtime_error)?;
     let stderr = child.stderr.take().ok_or_else(tunnel_runtime_error)?;
     let recent = Arc::new(Mutex::new(VecDeque::with_capacity(TUNNEL_LOG_LINES)));
-    let (url_tx, mut url_rx) = mpsc::channel(2);
+    let (url_tx, url_rx) = mpsc::channel(2);
     let stdout_task = spawn_tunnel_reader(stdout, recent.clone(), url_tx.clone());
     let stderr_task = spawn_tunnel_reader(stderr, recent.clone(), url_tx);
+    Ok(CloudflareTunnelStartup {
+        child,
+        process_group_id,
+        stdout_task,
+        stderr_task,
+        recent,
+        url_rx,
+    })
+}
 
+async fn wait_for_cloudflare_quick_url(
+    startup: CloudflareTunnelStartup,
+    deadline: Instant,
+) -> Result<(String, CloudflareTunnel), ProductError> {
+    let CloudflareTunnelStartup {
+        mut child,
+        process_group_id,
+        stdout_task,
+        stderr_task,
+        recent,
+        mut url_rx,
+    } = startup;
+    let mut process_group_guard = CloudflareStartupProcessGroupGuard::new(process_group_id);
     loop {
         if let Some(status) = child.try_wait().map_err(|_| tunnel_runtime_error())? {
+            // The child can exit after writing a valid Quick Tunnel URL but before
+            // the async pipe readers are scheduled. Give those readers one bounded
+            // chance to publish a URL already emitted by the child before classifying
+            // startup as failed. A returned tunnel may therefore already be terminal;
+            // the normal forwarding/exit supervision path will report that state.
+            if let Ok(Some(url)) =
+                tokio::time::timeout(TUNNEL_LOG_DRAIN_TIMEOUT, url_rx.recv()).await
+            {
+                return Ok((
+                    url,
+                    CloudflareTunnel {
+                        child,
+                        process_group_id: process_group_guard.take(),
+                        stdout_task,
+                        stderr_task,
+                    },
+                ));
+            }
+            terminate_cloudflare_process_tree(&mut child, process_group_guard.take()).await;
+            // Kill any descendants first so inherited pipe handles are closed.
+            // Bytes already written to the kernel pipes remain readable, letting
+            // the reader tasks deterministically drain diagnostics to EOF instead
+            // of racing a timeout against a still-open descendant descriptor.
             drain_tunnel_readers(stdout_task, stderr_task).await;
             let detail = bounded_tunnel_log_summary(&recent);
             let message = if detail.is_empty() {
@@ -979,8 +1111,7 @@ async fn start_cloudflare_quick_with_binary(
         }
         let now = Instant::now();
         if now >= deadline {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            terminate_cloudflare_process_tree(&mut child, process_group_guard.take()).await;
             stdout_task.abort();
             stderr_task.abort();
             return Err(ProductError::new(
@@ -995,6 +1126,7 @@ async fn start_cloudflare_quick_with_binary(
                 url,
                 CloudflareTunnel {
                     child,
+                    process_group_id: process_group_guard.take(),
                     stdout_task,
                     stderr_task,
                 },
@@ -1032,7 +1164,7 @@ async fn wait_for_cloudflare_forwarding(
         .timeout(Duration::from_secs(2))
         .build()
         .map_err(|_| tunnel_runtime_error())?;
-    let probe_url = format!("{}/openapi.json", public_url.trim_end_matches('/'));
+    let probe_url = format!("{}/healthz", public_url.trim_end_matches('/'));
     loop {
         if let Some(status) = tunnel
             .child
@@ -1162,7 +1294,7 @@ fn bounded_tunnel_log_summary(recent: &Arc<Mutex<VecDeque<String>>>) -> String {
         .unwrap_or_default()
 }
 
-fn parse_quick_tunnel_url(line: &str) -> Option<String> {
+pub(super) fn parse_quick_tunnel_url(line: &str) -> Option<String> {
     let start = line.find("https://")?;
     let candidate = line[start..]
         .split_whitespace()
@@ -1174,6 +1306,9 @@ fn parse_quick_tunnel_url(line: &str) -> Option<String> {
     let host = parsed.host_str()?;
     (parsed.scheme() == "https"
         && host.ends_with(".trycloudflare.com")
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.port().is_none()
         && parsed.path() == "/"
         && parsed.query().is_none()
         && parsed.fragment().is_none())
@@ -1350,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn share_output_contains_only_the_temporary_connector_credential() {
+    fn share_output_contains_only_the_temporary_project_credential() {
         let persistent = "webcodex_persistent-never-print";
         let temporary = "webcodex_temporary-print-once";
         let output = render_share_ready(
@@ -1499,18 +1634,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
         create_private_dir(&state).unwrap();
-        let persistent = state.join("credentials/connector-key");
+        let persistent = state.join("credentials/project-credential");
         let persistent_value = generate_project_credential();
         write_new_private(&persistent, format!("{persistent_value}\n").as_bytes()).unwrap();
         let persistent_before = fs::read_to_string(&persistent).unwrap();
         let session = ShareSession::create(&state).unwrap();
         assert_ne!(session.credential, persistent_value);
         assert_eq!(fs::read_to_string(&persistent).unwrap(), persistent_before);
-        let authorization_file = session.write_openai_authorization_file().unwrap();
-        assert_eq!(
-            fs::read_to_string(&authorization_file).unwrap(),
-            format!("Bearer {}", session.credential)
-        );
         assert_eq!(
             crate::auth::read_protected_secret(&session.credential_file).unwrap(),
             session.credential
@@ -1542,14 +1672,6 @@ mod tests {
                     & 0o777,
                 0o600
             );
-            assert_eq!(
-                fs::metadata(&authorization_file)
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
         }
         let directory = session.directory.clone();
         #[cfg(windows)]
@@ -1558,7 +1680,6 @@ mod tests {
                 (state.join("share"), true),
                 (session.directory.clone(), true),
                 (session.credential_file.clone(), false),
-                (authorization_file.clone(), false),
             ] {
                 let sddl =
                     super::super::windows_private_state::dacl_sddl(&path, directory).unwrap();
@@ -1573,14 +1694,13 @@ mod tests {
         }
         drop(session);
         assert!(!directory.exists());
-        assert!(!authorization_file.exists());
         assert!(persistent.is_file());
     }
 
     #[cfg(unix)]
     fn fake_cloudflared(script: &str) -> (tempfile::TempDir, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::executable_tempdir();
         let path = temp.path().join("cloudflared");
         fs::write(&path, script).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
@@ -1588,8 +1708,96 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn tunnel_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        &LOCK
+    }
+
+    #[cfg(unix)]
+    enum FakeCloudflaredLifecycle {
+        StartupTimeout,
+        Ready,
+        ParentExit,
+    }
+
+    /// Make a fake cloudflared parent that creates its own long-lived shell
+    /// descendant, writes that child's PID only after the background spawn
+    /// succeeds, then follows the requested tunnel lifecycle. The background
+    /// child inherits the parent's process group, exactly like a descendant
+    /// cloudflared or npm wrapper leaves behind in production. It traps the
+    /// term-able signals, so only the group-level SIGKILL used by cleanup can
+    /// reap it: a stray SIGTERM/SIGINT code path would leave it alive and
+    /// `assert_pid_gone` would fail. The subshell itself is the recorded
+    /// descendant (no extra `sleep` child), so a failed background spawn
+    /// leaves the PID file empty and the test fails instead of passing vacuously.
+    #[cfg(unix)]
+    fn fake_cloudflared_with_descendant(
+        lifecycle: FakeCloudflaredLifecycle,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let lifecycle_script = match lifecycle {
+            FakeCloudflaredLifecycle::StartupTimeout => "while :; do :; done\n",
+            FakeCloudflaredLifecycle::Ready => {
+                "echo https://cleanup-test.trycloudflare.com >&2\nwhile :; do :; done\n"
+            }
+            FakeCloudflaredLifecycle::ParentExit => {
+                "echo https://short-lived.trycloudflare.com >&2\nexit 9\n"
+            }
+        };
+        let script = format!(
+            "#!/bin/sh\n( trap '' TERM INT HUP; while :; do :; done ) &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > \"$0.descendant-pid\"\n{lifecycle_script}"
+        );
+        let (temp, binary) = fake_cloudflared(&script);
+        let pid_file = PathBuf::from(format!("{}.descendant-pid", binary.display()));
+        (temp, binary, pid_file)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid_file(path: &Path, deadline: Instant) -> u32 {
+        loop {
+            if let Ok(value) = fs::read_to_string(path) {
+                if let Ok(pid) = value.trim().parse::<u32>() {
+                    assert!(pid > 0, "fake cloudflared published pid 0");
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fake cloudflared did not publish descendant pid at {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_pid_gone(pid: u32, deadline: Instant) {
+        loop {
+            // SAFETY: `kill(pid, 0)` does not signal the process. It only checks
+            // whether the kernel still has a process table entry for this exact
+            // PID. The test's fake parent published this PID after spawning the
+            // descendant, so ESRCH is the required proof that cleanup reaped it.
+            let result = unsafe { libc::kill(pid as i32, 0) };
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "descendant pid {pid} became inaccessible for an unexpected reason: {error}"
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pid {pid} still exists after the process-tree cleanup deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn tunnel_startup_failure_is_reported() {
+    async fn cloudflare_quick_tunnel_startup_failure_reports_bounded_diagnostics() {
+        let _lock = tunnel_test_lock().lock().await;
         let (_temp, binary) = fake_cloudflared("#!/bin/sh\necho startup-failed >&2\nexit 7\n");
         let error = start_cloudflare_quick_with_binary(
             &binary,
@@ -1604,25 +1812,61 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn tunnel_startup_timeout_kills_fake_process() {
-        let (_temp, binary) = fake_cloudflared("#!/bin/sh\nsleep 5\n");
-        let error = start_cloudflare_quick_with_binary(
-            &binary,
-            "http://127.0.0.1:23456",
-            Instant::now() + Duration::from_millis(100),
+    async fn cloudflare_quick_tunnel_cancelled_startup_reaps_descendant() {
+        let _lock = tunnel_test_lock().lock().await;
+        let (_temp, binary, pid_file) =
+            fake_cloudflared_with_descendant(FakeCloudflaredLifecycle::StartupTimeout);
+        let startup =
+            spawn_cloudflare_quick_with_binary(&binary, "http://127.0.0.1:23456").unwrap();
+        let parent_pid = startup.child.id().unwrap();
+        let descendant_pid =
+            wait_for_pid_file(&pid_file, Instant::now() + Duration::from_secs(2)).await;
+        assert_ne!(parent_pid, descendant_pid);
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            wait_for_cloudflare_quick_url(startup, Instant::now() + Duration::from_secs(5)),
         )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, "tunnel_unavailable");
-        assert!(error.message.contains("startup timeout"));
+        .await;
+        assert!(cancelled.is_err(), "startup future unexpectedly completed");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_pid_gone(parent_pid, deadline).await;
+        assert_pid_gone(descendant_pid, deadline).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn tunnel_stop_reaps_fake_process() {
-        let (_temp, binary) = fake_cloudflared(
-            "#!/bin/sh\necho https://cleanup-test.trycloudflare.com >&2\nsleep 5\n",
+    async fn cloudflare_quick_tunnel_startup_timeout_reaps_descendant() {
+        let _lock = tunnel_test_lock().lock().await;
+        let (_temp, binary, pid_file) =
+            fake_cloudflared_with_descendant(FakeCloudflaredLifecycle::StartupTimeout);
+        let startup =
+            spawn_cloudflare_quick_with_binary(&binary, "http://127.0.0.1:23456").unwrap();
+        let parent_pid = startup.child.id().unwrap();
+        let descendant_pid =
+            wait_for_pid_file(&pid_file, Instant::now() + Duration::from_secs(2)).await;
+        assert_ne!(parent_pid, descendant_pid);
+        let error = wait_for_cloudflare_quick_url(startup, Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "tunnel_unavailable");
+        assert!(
+            error.message.contains("startup timeout"),
+            "unexpected tunnel startup error: {}",
+            error.message
         );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_pid_gone(parent_pid, deadline).await;
+        assert_pid_gone(descendant_pid, deadline).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cloudflare_quick_tunnel_stop_reaps_descendant() {
+        let _lock = tunnel_test_lock().lock().await;
+        let (_temp, binary, pid_file) =
+            fake_cloudflared_with_descendant(FakeCloudflaredLifecycle::Ready);
         let (_url, mut tunnel) = start_cloudflare_quick_with_binary(
             &binary,
             "http://127.0.0.1:23456",
@@ -1630,16 +1874,22 @@ mod tests {
         )
         .await
         .unwrap();
+        let parent_pid = tunnel.child.id().unwrap();
+        let descendant_pid =
+            wait_for_pid_file(&pid_file, Instant::now() + Duration::from_secs(2)).await;
+        assert_ne!(parent_pid, descendant_pid);
         tunnel.stop().await;
         assert!(tunnel.child.try_wait().unwrap().is_some());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_pid_gone(descendant_pid, deadline).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn tunnel_early_exit_after_url_is_supervised() {
-        let (_temp, binary) = fake_cloudflared(
-            "#!/bin/sh\necho https://short-lived.trycloudflare.com >&2\nsleep 0.1\nexit 9\n",
-        );
+    async fn cloudflare_quick_tunnel_parent_exit_reaps_descendant() {
+        let _lock = tunnel_test_lock().lock().await;
+        let (_temp, binary, pid_file) =
+            fake_cloudflared_with_descendant(FakeCloudflaredLifecycle::ParentExit);
         let (url, mut tunnel) = start_cloudflare_quick_with_binary(
             &binary,
             "http://127.0.0.1:23456",
@@ -1648,8 +1898,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(url, "https://short-lived.trycloudflare.com");
+        let descendant_pid =
+            wait_for_pid_file(&pid_file, Instant::now() + Duration::from_secs(2)).await;
         let error = tunnel.wait_for_exit().await.unwrap_err();
         assert_eq!(error.code, "tunnel_unavailable");
         assert!(error.message.contains("stopped unexpectedly"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_pid_gone(descendant_pid, deadline).await;
     }
 }

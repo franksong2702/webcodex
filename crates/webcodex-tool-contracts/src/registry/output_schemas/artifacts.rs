@@ -1,11 +1,134 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, nullable_schema, open_object_schema, schema_type, wrapped_output_schema,
+    array_schema, nullable_schema, open_object_schema, schema_type, suggested_tool_call_schema,
+    wrapped_output_schema,
 };
+
+fn read_project_artifact_suggested_call_schema() -> Value {
+    suggested_tool_call_schema(
+        webcodex_core::runtime_contract::GeneratedFollowUpKind::MechanicallyFollowable,
+        "read_project_artifact_chunk",
+        json!({
+            "type": "object",
+            "description": "Parser-ready next ranged read of the same exact full-file artifact incarnation.",
+            "additionalProperties": false,
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1},
+                "encoding": {"type": "string", "const": "base64"},
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": 65536},
+                "expected_sha256": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                },
+                "session_id": {"type": "string", "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"}
+            },
+            "required": [
+                "project",
+                "path",
+                "encoding",
+                "offset",
+                "length",
+                "expected_sha256"
+            ]
+        }),
+        "Parser-ready advisory call for the next ranged read of the same exact artifact content snapshot. It grants no Project or Session authority.",
+    )
+}
+
+fn project_artifact_suggested_call_schema() -> Value {
+    suggested_tool_call_schema(
+        webcodex_core::runtime_contract::GeneratedFollowUpKind::MechanicallyFollowable,
+        "inspect_project_artifact",
+        json!({
+            "type": "object",
+            "description": "Parser-ready continuation for one more bounded inspect of the same exact full-file artifact incarnation.",
+            "additionalProperties": false,
+            "properties": {
+                "project": {"type": "string", "minLength": 1},
+                "path": {"type": "string", "minLength": 1},
+                "action": {"type": "string", "const": "inspect"},
+                "offset": {"type": "integer", "minimum": 0},
+                "length": {"type": "integer", "minimum": 1, "maximum": 65536},
+                "expected_sha256": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$"
+                },
+                "session_id": {"type": "string", "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"}
+            },
+            "required": [
+                "project",
+                "path",
+                "action",
+                "offset",
+                "length",
+                "expected_sha256"
+            ]
+        }),
+        "Parser-ready advisory continuation for inspect_project_artifact(action=inspect). It carries the observed full-file SHA-256 fence and grants no Project or Session authority.",
+    )
+}
+
+fn project_artifact_output_schema() -> Value {
+    let mut merged = wrapped_output_schema(vec![]);
+    let target = merged["properties"]["output"]["properties"]
+        .as_object_mut()
+        .expect("inspect_project_artifact output properties");
+    for specialist in [
+        "read_project_artifact_metadata",
+        "read_project_artifact_chunk",
+    ] {
+        let source = output_schema_for_tool(specialist).expect("artifact specialist output schema");
+        let properties = source["properties"]["output"]["properties"]
+            .as_object()
+            .expect("artifact specialist output properties");
+        for (name, schema) in properties {
+            target.entry(name.clone()).or_insert_with(|| schema.clone());
+        }
+    }
+    target.insert(
+        "project".to_string(),
+        schema_type("string", "Canonical resolved Runtime Project id."),
+    );
+    target.insert(
+        "name".to_string(),
+        schema_type(
+            "string",
+            "Safe basename presented by inspect_project_artifact(action=export).",
+        ),
+    );
+    target.insert(
+        "suggested_call".to_string(),
+        project_artifact_suggested_call_schema(),
+    );
+    target.insert(
+        "content_delivery".to_string(),
+        json!({
+            "type": "string",
+            "const": "mcp_image",
+            "description": "MCP image action marker after native-image framing; image bytes are carried in an MCP image ContentBlock instead of structuredContent."
+        }),
+    );
+    merged
+}
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "present_spreadsheet" => Some(wrapped_output_schema(vec![
+            ("project", schema_type("string", "Canonical resolved Runtime Project id.")),
+            ("path", schema_type("string", "Exact Project-relative spreadsheet path.")),
+            ("name", schema_type("string", "Safe spreadsheet basename.")),
+            ("bytes", schema_type("integer", "Observed file size, at most 5 MiB.")),
+            ("sha256", schema_type("string", "SHA-256 fence for this exact file incarnation.")),
+            ("mime_type", schema_type("string", "Validated file MIME type.")),
+        ])),
+        "inspect_project_artifact" => Some(project_artifact_output_schema()),
         "save_project_artifact" => Some(wrapped_output_schema(vec![
             (
                 "path",
@@ -24,7 +147,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("string", "Caller-provided MIME type, when provided."),
             ),
         ])),
-        "import_conversation_files_to_project" => Some(wrapped_output_schema(vec![
+        "import_host_files" => Some(wrapped_output_schema(vec![
             (
                 "count",
                 schema_type("integer", "Number of conversation attachments imported."),
@@ -37,27 +160,97 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
-        "export_project_artifact" => Some(wrapped_output_schema(vec![
+        "transfer_project_artifact" => Some(wrapped_output_schema(vec![
             (
-                "project",
-                schema_type("string", "Canonical Runner-registered project id."),
+                "source_project",
+                schema_type("string", "Canonical resolved source Runtime Project id."),
             ),
             (
-                "path",
-                schema_type("string", "Project-relative artifact path."),
+                "source_path",
+                schema_type("string", "Project-relative source artifact path."),
             ),
-            ("bytes", schema_type("integer", "Artifact size in bytes.")),
+            (
+                "destination_project",
+                schema_type("string", "Canonical resolved destination Runtime Project id."),
+            ),
+            (
+                "destination_path",
+                schema_type("string", "Project-relative destination artifact path."),
+            ),
+            (
+                "bytes",
+                schema_type("integer", "Transferred artifact size in bytes."),
+            ),
             (
                 "sha256",
-                schema_type("string", "sha256 digest of the full artifact file."),
+                schema_type("string", "SHA-256 of the exact source snapshot and committed destination."),
             ),
             (
                 "mime_type",
-                schema_type("string", "Validated artifact MIME type."),
+                schema_type("string", "Canonical artifact presentation MIME type."),
+            ),
+        ])),
+        "import_artifact_handoff" => Some(wrapped_output_schema(vec![
+            (
+                "acceptance_id",
+                schema_type("string", "Durable logical acceptance/import id."),
             ),
             (
-                "name",
-                schema_type("string", "Safe basename presented by the MCP ResourceLink."),
+                "grant_id",
+                schema_type("string", "Exact accepted artifact handoff grant id."),
+            ),
+            (
+                "replayed",
+                schema_type(
+                    "boolean",
+                    "True when the original logical result was replayed.",
+                ),
+            ),
+            (
+                "destination_project",
+                schema_type("string", "Canonical destination Runtime Project id."),
+            ),
+            (
+                "destination_path",
+                schema_type("string", "Project-relative destination artifact path."),
+            ),
+            (
+                "bytes",
+                schema_type("integer", "Imported artifact size in bytes."),
+            ),
+            (
+                "sha256",
+                schema_type("string", "SHA-256 of the exact imported snapshot."),
+            ),
+            (
+                "mime_type",
+                schema_type("string", "Canonical artifact presentation MIME type."),
+            ),
+            (
+                "provenance",
+                json!({
+                    "type": "object",
+                    "description": "Bounded grant/source snapshot metadata. It is informational and grants no access to the source Project.",
+                    "additionalProperties": false,
+                    "properties": {
+                        "grant_id": {"type": "string"},
+                        "source_project": {"type": "string"},
+                        "source_path": {"type": "string"},
+                        "source_bytes": {"type": "integer"},
+                        "source_sha256": {"type": "string"},
+                        "source_mime_type": {"type": "string"},
+                        "source_name": {"type": "string"}
+                    },
+                    "required": [
+                        "grant_id",
+                        "source_project",
+                        "source_path",
+                        "source_bytes",
+                        "source_sha256",
+                        "source_mime_type",
+                        "source_name"
+                    ]
+                }),
             ),
         ])),
         "read_project_artifact_metadata" => Some(wrapped_output_schema(vec![
@@ -105,7 +298,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("integer", "Zip entry count, when cheaply detected."),
             ),
         ])),
-        "artifact_upload_begin" | "artifact_upload_chunk" => Some(wrapped_output_schema(vec![
+        "begin_artifact_upload" | "upload_artifact_chunk" => Some(wrapped_output_schema(vec![
             (
                 "path",
                 schema_type("string", "Project-relative artifact path."),
@@ -143,10 +336,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "committed",
-                schema_type("boolean", "False until artifact_upload_finish succeeds."),
+                schema_type("boolean", "False until finish_artifact_upload succeeds."),
             ),
         ])),
-        "artifact_upload_finish" => Some(wrapped_output_schema(vec![
+        "finish_artifact_upload" => Some(wrapped_output_schema(vec![
             (
                 "path",
                 schema_type("string", "Project-relative artifact path."),
@@ -184,7 +377,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("boolean", "True when commit completed."),
             ),
         ])),
-        "artifact_upload_abort" => Some(wrapped_output_schema(vec![
+        "abort_artifact_upload" => Some(wrapped_output_schema(vec![
             (
                 "path",
                 schema_type("string", "Project-relative artifact path."),
@@ -247,7 +440,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
-        "read_project_artifact" => Some(wrapped_output_schema(vec![
+        "read_project_artifact_chunk" => Some(wrapped_output_schema(vec![
             (
                 "path",
                 schema_type("string", "Project-relative artifact path."),
@@ -275,7 +468,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "next_offset",
-                schema_type("integer", "Offset to use for the next chunk."),
+                schema_type(
+                    "integer",
+                    "Domain metadata for the next chunk offset. Models should continue through suggested_call, which also carries the observed full-file SHA-256 snapshot fence.",
+                ),
             ),
             (
                 "truncated",
@@ -284,6 +480,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "eof",
                 schema_type("boolean", "True when this chunk reaches end of file."),
+            ),
+            (
+                "suggested_call",
+                read_project_artifact_suggested_call_schema(),
             ),
         ])),
         _ => None,

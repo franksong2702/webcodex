@@ -18,7 +18,7 @@ use webcodex_core::ssh_resource::{
     validate_response_for_request, SshResourceRequest, SshResourceResponse,
 };
 
-pub(crate) const SSH_RESOURCE_TOOL_NAME: &str = "ssh_resource";
+pub(crate) const SSH_RESOURCE_TOOL_NAME: &str = "manage_ssh_resource";
 const MAX_BINDINGS: usize = 256;
 const RUNNER_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 
@@ -79,7 +79,7 @@ impl SshResourceGatewayRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let binding = loop {
-            let candidate = format!("wc_sbind_{}", uuid::Uuid::new_v4().simple());
+            let candidate = format!("wc_sbind_{}", webcodex_core::compact::random_suffix::<16>());
             if !store.values.contains_key(&candidate) {
                 break candidate;
             }
@@ -162,10 +162,10 @@ pub(crate) fn operation_policy(
     let action = arguments
         .get("action")
         .and_then(Value::as_str)
-        .ok_or("ssh_resource action is required")?;
+        .ok_or("manage_ssh_resource action is required")?;
     SshResourceOperation::parse(action)
         .map(SshResourceOperation::policy)
-        .ok_or("ssh_resource action must be one of list, register, or remove")
+        .ok_or("manage_ssh_resource action must be one of list, register, or remove")
 }
 
 #[derive(Debug, Clone)]
@@ -238,7 +238,7 @@ pub(crate) fn mcp_output_schema() -> Value {
                 "additionalProperties": false,
                 "properties": {
                     "runner": {"type": "string", "minLength": 1, "maxLength": 128},
-                    "binding": {"type": "string", "pattern": "^wc_sbind_[0-9a-f]{32}$"},
+                    "binding": {"type": "string", "pattern": "^wc_sbind_[A-Za-z0-9_-]{21}[AQgw]$"},
                     "resources": {
                         "type": "array",
                         "maxItems": webcodex_core::ssh_resource::MANAGED_SSH_RESOURCE_MAX_COUNT,
@@ -281,33 +281,6 @@ pub(crate) fn mcp_output_schema() -> Value {
             }
         ]
     })
-}
-
-pub(crate) fn tool_spec(compact: bool) -> Value {
-    let definition = webcodex_tool_contracts::lookup_tool_definition(SSH_RESOURCE_TOOL_NAME)
-        .expect("ssh_resource ToolDefinition");
-    let model_spec = definition.model_spec.expect("ssh_resource model spec");
-    let mut input_schema = (model_spec.input_schema)();
-    if let Some(properties) = input_schema["properties"].as_object_mut() {
-        properties.insert(
-            "recording_session_id".to_string(),
-            json!({
-                "type": "string",
-                "pattern": "^wc_sess_[A-Za-z0-9_]+$",
-                "description": "Optional explicit Workflow Session used for authority, read-only/guard, permission, and audit governance. It is never inferred from MCP transport identity."
-            }),
-        );
-    }
-    let mut value = json!({
-        "name": SSH_RESOURCE_TOOL_NAME,
-        "description": model_spec.description,
-        "inputSchema": input_schema,
-        "annotations": webcodex_tool_contracts::tool_annotations(SSH_RESOURCE_TOOL_NAME)
-    });
-    if !compact {
-        value["outputSchema"] = mcp_output_schema();
-    }
-    value
 }
 
 /// Body-free audit projection for the MCP lifecycle. The raw target is never
@@ -439,7 +412,7 @@ pub(crate) async fn call(
         Err(_) => {
             return error_result(GatewayError::new(
                 "ssh_resource_invalid",
-                "ssh_resource arguments are invalid",
+                "manage_ssh_resource arguments are invalid",
             ))
         }
     };
@@ -631,7 +604,11 @@ async fn resolve_binding(
     auth: Option<&AuthContext>,
 ) -> Result<(String, Binding, ResolvedRunner), GatewayError> {
     let binding_id = binding.ok_or_else(binding_required_error)?;
-    if !binding_id.starts_with("wc_sbind_") || binding_id.len() != 41 {
+    if binding_id
+        .strip_prefix("wc_sbind_")
+        .and_then(webcodex_core::compact::decode::<16>)
+        .is_none()
+    {
         return Err(binding_required_error());
     }
     let observed = runtime
@@ -885,7 +862,7 @@ fn required<'a>(value: &'a Option<String>, field: &'static str) -> Result<&'a st
 fn binding_required_error() -> GatewayError {
     GatewayError::new(
         "ssh_resource_binding_required",
-        "a current opaque binding from ssh_resource action=list is required",
+        "a current opaque binding from manage_ssh_resource action=list is required",
     )
     .recovery("List SSH resources on the intended exact Runner, then retry with its binding.")
 }
@@ -945,7 +922,7 @@ mod tests {
         let cwd = "C:/private/work";
         let audit = audit_arguments(&json!({
             "action": "register",
-            "binding": "wc_sbind_0123456789abcdef0123456789abcdef",
+            "binding": "wc_sbind_ASNFZ4mrze8BI0VniavN7w",
             "name": "w10",
             "target": target,
             "default_cwd": cwd
@@ -964,7 +941,7 @@ mod tests {
         for value in [
             json!({
                 "runner": "runner-a",
-                "binding": "wc_sbind_0123456789abcdef0123456789abcdef",
+                "binding": "wc_sbind_ASNFZ4mrze8BI0VniavN7w",
                 "resources": [{
                     "name": "spe",
                     "source": "managed",
@@ -989,7 +966,7 @@ mod tests {
         ] {
             crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&value, &schema)
                 .unwrap_or_else(|error| {
-                    panic!("ssh_resource MCP schema rejected {value}: {error}")
+                    panic!("manage_ssh_resource MCP schema rejected {value}: {error}")
                 });
         }
     }

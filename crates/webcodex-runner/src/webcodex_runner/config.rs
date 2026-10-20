@@ -4,22 +4,25 @@ use super::managed_ssh::ManagedSshResourceStore;
 use super::mcp_gateway::McpGatewayManager;
 use super::plugin::PluginManager;
 use super::shutdown::lock_unpoison;
-use crate::runner_config::{
-    effective_allowed_roots, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_TIMEOUT_SECS,
-    DEFAULT_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS, TRANSPORT_AUTO, TRANSPORT_POLLING,
-    TRANSPORT_QUIC, TRANSPORT_WEBSOCKET,
-};
-use crate::runner_protocol::{
-    RunnerCapabilities, RunnerConfigAction, RunnerConfigExecutionState,
-    RunnerConfigOperationResponse, RunnerConfigReloadStatus, RunnerHostContext,
-    RUNNER_JOB_CONCURRENCY_MAX, RUNNER_JOB_CONCURRENCY_MIN,
-};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use webcodex_core::coding_agent::CodingAgentConfigValue;
+use webcodex_core::runner_protocol::{
+    RunnerCapabilities, RunnerConfigAction, RunnerConfigErrorCode, RunnerConfigErrorField,
+    RunnerConfigErrorReason, RunnerConfigExecutionState, RunnerConfigOperationResponse,
+    RunnerConfigReloadStatus, RunnerHostContext, RUNNER_JOB_CONCURRENCY_MAX,
+    RUNNER_JOB_CONCURRENCY_MIN,
+};
+use webcodex_runner_config::{
+    effective_allowed_roots, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_TIMEOUT_SECS,
+    DEFAULT_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS, TRANSPORT_AUTO, TRANSPORT_POLLING,
+    TRANSPORT_QUIC, TRANSPORT_WEBSOCKET,
+};
 
+#[cfg(unix)]
 const DEFAULT_SYSTEM_CONFIG_DIR: &str = "/etc/webcodex";
 pub(crate) const CLIENT_PROFILE_ERROR: &str =
     "--profile must be a safe path component using only ASCII letters, digits, '.', '_' or '-'";
@@ -40,9 +43,29 @@ const DEFAULT_PERSISTENT_SHELL_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 const MIN_PERSISTENT_SHELL_IDLE_TIMEOUT_SECS: u64 = 1;
 const MAX_PERSISTENT_SHELL_IDLE_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 
+pub(crate) const MAX_CONFIGURED_SKILL_ROOTS: usize = 16;
+pub(crate) const MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_CONFIGURED_INSTRUCTION_FILES: usize = 16;
+pub(crate) const MAX_CONFIGURED_INSTRUCTION_PATH_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct InstructionsConfig {
+    #[serde(default)]
+    pub(crate) files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct SkillsConfig {
+    #[serde(default)]
+    pub(crate) roots: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RunnerConfig {
     pub(crate) server_url: String,
+    /// Process-only CLI precedence; never deserialized from runner.toml.
+    #[serde(skip)]
+    pub(crate) server_url_override: Option<String>,
     pub(crate) token: String,
     pub(crate) client_id: String,
     #[serde(default)]
@@ -57,11 +80,6 @@ pub(crate) struct RunnerConfig {
     pub(crate) host_context: Option<RunnerHostContext>,
     #[serde(default)]
     pub(crate) project_registry_dir: Option<PathBuf>,
-    /// Legacy config spelling retained only for load-time compatibility. A
-    /// loaded config is normalized into `project_registry_dir` and clears this
-    /// field so runtime comparisons operate on one effective registry path.
-    #[serde(default, rename = "projects_dir")]
-    pub(crate) legacy_projects_dir: Option<PathBuf>,
     /// Minimum delay after an empty polling response. Repeated idle polls back
     /// off through the built-in schedule while never going below this value.
     #[serde(default = "default_poll_interval_ms")]
@@ -72,6 +90,10 @@ pub(crate) struct RunnerConfig {
     pub(crate) max_concurrent_jobs: Option<usize>,
     #[serde(default)]
     pub(crate) policy: RunnerPolicy,
+    #[serde(default)]
+    pub(crate) skills: SkillsConfig,
+    #[serde(default)]
+    pub(crate) instructions: InstructionsConfig,
     /// Transport selection: `"websocket"` (default), `"polling"`, `"quic"`,
     /// or explicit `"auto"` fallback mode.
     #[serde(default)]
@@ -119,6 +141,10 @@ pub(crate) struct AcpConfig {
     pub(crate) max_concurrent_runs: usize,
     #[serde(default = "default_acp_permission_timeout_secs")]
     pub(crate) permission_timeout_secs: u64,
+    /// Runner-owned admission policy applied to every ACP Coding Agent session.
+    /// The upstream default is intentionally empty and provider-neutral.
+    #[serde(default)]
+    pub(crate) forced_config: BTreeMap<String, CodingAgentConfigValue>,
     #[serde(default)]
     pub(crate) agents: Vec<AcpAgentConfig>,
 }
@@ -152,12 +178,15 @@ impl Default for AcpConfig {
         Self {
             max_concurrent_runs: default_acp_max_concurrent_runs(),
             permission_timeout_secs: default_acp_permission_timeout_secs(),
+            forced_config: BTreeMap::new(),
             agents: Vec::new(),
         }
     }
 }
 
-const MCP_GATEWAY_MAX_ENV_MAPPINGS: usize = 64;
+use webcodex_core::mcp_gateway::{
+    MCP_GATEWAY_DEFAULT_DESCRIPTION_BYTES, MCP_GATEWAY_MAX_ENV_MAPPINGS,
+};
 const MCP_GATEWAY_MAX_ENV_NAME_BYTES: usize = 256;
 pub(crate) const MCP_GATEWAY_MAX_CWD_BYTES: usize = 4_096;
 
@@ -165,6 +194,10 @@ pub(crate) const MCP_GATEWAY_MAX_CWD_BYTES: usize = 4_096;
 pub(crate) struct McpGatewayConfig {
     #[serde(default = "default_mcp_gateway_request_timeout_secs")]
     pub(crate) request_timeout_secs: u64,
+    /// Runner-owned soft limit for one local MCP tool description, in bytes.
+    /// The shared wire hard cap remains enforced independently by the Server.
+    #[serde(default = "default_mcp_gateway_max_tool_description_bytes")]
+    pub(crate) max_tool_description_bytes: usize,
     #[serde(default)]
     pub(crate) providers: Vec<McpGatewayProviderConfig>,
 }
@@ -180,7 +213,9 @@ pub(crate) struct McpGatewayProviderConfig {
     #[serde(default)]
     pub(crate) cwd: Option<String>,
     /// Explicit provider-env-key -> Runner-process-env-key mapping. Values are
-    /// resolved only immediately before first spawn and are never advertised.
+    /// resolved only immediately before spawn and are never advertised. On
+    /// Windows, the Runner separately supplies only the non-secret SYSTEMROOT
+    /// bootstrap unless the operator explicitly maps that destination.
     #[serde(default)]
     pub(crate) env_from_env: BTreeMap<String, String>,
     /// Optional per-provider request deadline. When absent, inherit
@@ -193,10 +228,15 @@ fn default_mcp_gateway_request_timeout_secs() -> u64 {
     30
 }
 
+fn default_mcp_gateway_max_tool_description_bytes() -> usize {
+    MCP_GATEWAY_DEFAULT_DESCRIPTION_BYTES
+}
+
 impl Default for McpGatewayConfig {
     fn default() -> Self {
         Self {
             request_timeout_secs: default_mcp_gateway_request_timeout_secs(),
+            max_tool_description_bytes: default_mcp_gateway_max_tool_description_bytes(),
             providers: Vec::new(),
         }
     }
@@ -310,7 +350,7 @@ pub(crate) struct QuicClientConfig {
 pub(crate) const MAX_QUIC_KEEPALIVE_INTERVAL_SECS: u64 = 25;
 
 pub(crate) fn default_quic_alpn() -> String {
-    crate::runner_protocol::RUNNER_QUIC_ALPN_V1.to_string()
+    webcodex_core::runner_protocol::RUNNER_QUIC_ALPN_V1.to_string()
 }
 pub(crate) fn default_quic_connect_timeout_secs() -> u64 {
     10
@@ -335,6 +375,8 @@ pub(crate) struct RunnerPolicy {
     pub(crate) allowed_roots: Vec<PathBuf>,
     #[serde(default = "default_max_timeout_secs")]
     pub(crate) max_timeout_secs: u64,
+    /// Per-stream Runner capture/presentation policy for stdout and stderr.
+    /// Independent from transport envelope sizes and model-facing result caps.
     #[serde(default = "default_max_output_bytes")]
     pub(crate) max_output_bytes: usize,
 }
@@ -494,6 +536,8 @@ pub(crate) struct HotRunnerConfig {
     pub(crate) generation: u64,
     pub(crate) policy: RunnerPolicy,
     pub(crate) shell: ShellConfig,
+    pub(crate) skills: SkillsConfig,
+    pub(crate) instructions: InstructionsConfig,
     /// Static/manual `[ssh.resources]` from the current runner.toml generation.
     pub(crate) static_ssh: SshConfig,
     /// Effective process-local resources: current static resources plus the
@@ -515,6 +559,8 @@ impl HotRunnerConfig {
             generation,
             policy: cfg.policy.clone(),
             shell: cfg.shell.clone(),
+            skills: cfg.skills.clone(),
+            instructions: cfg.instructions.clone(),
             static_ssh: cfg.ssh.clone(),
             ssh,
             external_tools: Arc::new(ExternalToolRouter::new(&cfg.tool_providers)),
@@ -594,6 +640,10 @@ impl ReloadableRunnerConfig {
     }
 
     pub(crate) fn begin_shutdown(&self) {
+        // Serialize shutdown with authoritative config activation. Once this
+        // guard is held, a successful reload cannot commit Plugin/MCP state
+        // after their managers have entered stopping state.
+        let _reload_guard = lock_unpoison(&self.reload_lock);
         self.stopping.store(true, Ordering::SeqCst);
         self.mcp_gateway.shutdown();
         self.plugins.shutdown();
@@ -651,7 +701,7 @@ impl ReloadableRunnerConfig {
             return config_not_started(
                 RunnerConfigAction::Check,
                 Some(active.generation),
-                "runner_unavailable",
+                RunnerConfigErrorCode::RunnerUnavailable,
             );
         }
         match self.load_candidate() {
@@ -679,7 +729,8 @@ impl ReloadableRunnerConfig {
     }
 
     fn load_candidate(&self) -> Result<RunnerConfig, String> {
-        let candidate = load_config(&self.path)?;
+        let candidate =
+            load_config_with_server_url(&self.path, self.startup.server_url_override.as_deref())?;
         ManagedSshResourceStore::merge_active(&candidate.ssh, &self.startup_managed_ssh)
             .map_err(str::to_string)?;
         Ok(candidate)
@@ -693,6 +744,7 @@ impl ReloadableRunnerConfig {
 
     /// Authoritative reload primitive used by Unix SIGHUP. Formal first-class
     /// reload goes through the same implementation with an optimistic fence.
+    #[cfg(any(unix, test))]
     pub(crate) fn reload(&self) -> RunnerConfigReloadStatus {
         self.reload_internal(None).0
     }
@@ -710,7 +762,7 @@ impl ReloadableRunnerConfig {
                 config_not_started(
                     RunnerConfigAction::Reload,
                     Some(active.generation),
-                    "runner_unavailable",
+                    RunnerConfigErrorCode::RunnerUnavailable,
                 ),
             );
         }
@@ -721,7 +773,7 @@ impl ReloadableRunnerConfig {
                 config_not_started(
                     RunnerConfigAction::Reload,
                     Some(active.generation),
-                    "config_generation_conflict",
+                    RunnerConfigErrorCode::ConfigGenerationConflict,
                 ),
             );
         }
@@ -733,18 +785,24 @@ impl ReloadableRunnerConfig {
                 let status = {
                     let mut status = active.reload_status.lock().unwrap();
                     status.last_reload_result = "failure".to_string();
-                    status.last_reload_error_code = Some(code.to_string());
-                    status.last_reload_error_field = error_field.map(str::to_string);
-                    status.last_reload_error_reason = error_reason.map(str::to_string);
+                    status.last_reload_error_code = Some(config_wire_atom(code));
+                    status.last_reload_error_field = error_field.map(config_wire_atom);
+                    status.last_reload_error_reason = error_reason.map(config_wire_atom);
                     status.clone()
                 };
                 active.external_tools.configuration_status_changed();
                 if let (Some(field), Some(reason)) = (error_field, error_reason) {
                     eprintln!(
-                        "webcodex-runner config reload failed: {code} field={field} reason={reason}"
+                        "webcodex-runner config reload failed: {} field={} reason={}",
+                        config_wire_atom(code),
+                        config_wire_atom(field),
+                        config_wire_atom(reason)
                     );
                 } else {
-                    eprintln!("webcodex-runner config reload failed: {code}");
+                    eprintln!(
+                        "webcodex-runner config reload failed: {}",
+                        config_wire_atom(code)
+                    );
                 }
                 return (
                     status,
@@ -783,13 +841,18 @@ impl ReloadableRunnerConfig {
                 let status = {
                     let mut status = active.reload_status.lock().unwrap();
                     status.last_reload_result = "failure".to_string();
-                    status.last_reload_error_code = Some("config_validation_failed".to_string());
+                    status.last_reload_error_code = Some(config_wire_atom(
+                        RunnerConfigErrorCode::ConfigValidationFailed,
+                    ));
                     status.last_reload_error_field = None;
                     status.last_reload_error_reason = None;
                     status.clone()
                 };
                 active.external_tools.configuration_status_changed();
-                eprintln!("webcodex-runner config reload failed: config_validation_failed");
+                eprintln!(
+                    "webcodex-runner config reload failed: {}",
+                    config_wire_atom(RunnerConfigErrorCode::ConfigValidationFailed)
+                );
                 return (
                     status,
                     config_candidate_error_response(
@@ -804,6 +867,17 @@ impl ReloadableRunnerConfig {
         match self
             .plugins
             .apply_config_candidate_and_then(&candidate, || {
+                let mcp_reload = self
+                    .mcp_gateway
+                    .apply_config_candidate(&candidate.mcp_gateway)
+                    .expect("config reload lock serializes MCP activation with shutdown");
+                tracing::debug!(
+                    preserved = mcp_reload.preserved,
+                    replaced = mcp_reload.replaced,
+                    added = mcp_reload.added,
+                    removed = mcp_reload.removed,
+                    "webcodex-runner MCP provider config activated"
+                );
                 {
                     let mut routers = lock_unpoison(&self.external_routers);
                     routers.retain(|router| router.strong_count() > 0);
@@ -823,7 +897,7 @@ impl ReloadableRunnerConfig {
                     config_not_started(
                         RunnerConfigAction::Reload,
                         Some(active.generation),
-                        "plugin_reload_busy",
+                        RunnerConfigErrorCode::PluginReloadBusy,
                     ),
                 );
             }
@@ -833,7 +907,7 @@ impl ReloadableRunnerConfig {
                     config_not_started(
                         RunnerConfigAction::Reload,
                         Some(active.generation),
-                        "runner_unavailable",
+                        RunnerConfigErrorCode::RunnerUnavailable,
                     ),
                 );
             }
@@ -843,7 +917,7 @@ impl ReloadableRunnerConfig {
                     config_not_started(
                         RunnerConfigAction::Reload,
                         Some(active.generation),
-                        "plugin_reload_failed",
+                        RunnerConfigErrorCode::PluginReloadFailed,
                     ),
                 );
             }
@@ -851,13 +925,17 @@ impl ReloadableRunnerConfig {
                 let status = {
                     let mut status = active.reload_status.lock().unwrap();
                     status.last_reload_result = "failure".to_string();
-                    status.last_reload_error_code = Some("plugin_reload_failed".to_string());
+                    status.last_reload_error_code =
+                        Some(config_wire_atom(RunnerConfigErrorCode::PluginReloadFailed));
                     status.last_reload_error_field = None;
                     status.last_reload_error_reason = None;
                     status.clone()
                 };
                 active.external_tools.configuration_status_changed();
-                eprintln!("webcodex-runner config reload failed: plugin_reload_failed");
+                eprintln!(
+                    "webcodex-runner config reload failed: {}",
+                    config_wire_atom(RunnerConfigErrorCode::PluginReloadFailed)
+                );
                 return (
                     status,
                     RunnerConfigOperationResponse {
@@ -865,7 +943,7 @@ impl ReloadableRunnerConfig {
                         execution_state: RunnerConfigExecutionState::Completed,
                         valid: Some(false),
                         current_generation: Some(active.generation),
-                        error_code: Some("plugin_reload_failed".to_string()),
+                        error_code: Some(RunnerConfigErrorCode::PluginReloadFailed),
                         error_field: None,
                         error_reason: None,
                         restart_required: false,
@@ -895,51 +973,97 @@ impl ReloadableRunnerConfig {
     }
 }
 
-fn reload_error_code(error: &str) -> &'static str {
-    if error.starts_with("failed to read config") {
-        "config_read_failed"
-    } else if error.starts_with("failed to parse config") {
-        "config_parse_failed"
-    } else if error.starts_with("tool_providers.") {
-        "provider_config_invalid"
-    } else {
-        "config_validation_failed"
+fn config_wire_atom<T: serde::Serialize>(value: T) -> String {
+    match serde_json::to_value(value).expect("Runner config enum must serialize") {
+        serde_json::Value::String(value) => value,
+        _ => unreachable!("Runner config enum serialization must be a string"),
     }
 }
 
-fn reload_error_diagnostic(error: &str) -> (Option<&'static str>, Option<&'static str>) {
-    const OUT_OF_RANGE_FIELDS: &[(&str, &str)] = &[
+fn reload_error_code(error: &str) -> RunnerConfigErrorCode {
+    if error.starts_with("failed to read config") {
+        RunnerConfigErrorCode::ConfigReadFailed
+    } else if error.starts_with("failed to parse config") {
+        RunnerConfigErrorCode::ConfigParseFailed
+    } else if error.starts_with("tool_providers.") {
+        RunnerConfigErrorCode::ProviderConfigInvalid
+    } else {
+        RunnerConfigErrorCode::ConfigValidationFailed
+    }
+}
+
+fn reload_error_diagnostic(
+    error: &str,
+) -> (
+    Option<RunnerConfigErrorField>,
+    Option<RunnerConfigErrorReason>,
+) {
+    const OUT_OF_RANGE_FIELDS: &[(&str, RunnerConfigErrorField)] = &[
+        (
+            "skills.roots may contain at most ",
+            RunnerConfigErrorField::SkillsRoots,
+        ),
+        (
+            "instructions.files may contain at most ",
+            RunnerConfigErrorField::InstructionsFiles,
+        ),
+        (
+            "skills.roots entries must be non-empty paths of at most ",
+            RunnerConfigErrorField::SkillsRoots,
+        ),
+        (
+            "instructions.files entries must be non-empty paths of at most ",
+            RunnerConfigErrorField::InstructionsFiles,
+        ),
         (
             "max_concurrent_jobs must be between ",
-            "max_concurrent_jobs",
+            RunnerConfigErrorField::MaxConcurrentJobs,
         ),
         (
             "shell.max_persistent_shells must be between ",
-            "shell.max_persistent_shells",
+            RunnerConfigErrorField::ShellMaxPersistentShells,
         ),
         (
             "shell.persistent_shell_idle_timeout_secs must be between ",
-            "shell.persistent_shell_idle_timeout_secs",
+            RunnerConfigErrorField::ShellPersistentShellIdleTimeoutSecs,
         ),
         (
             "acp.max_concurrent_runs must be between ",
-            "acp.max_concurrent_runs",
+            RunnerConfigErrorField::AcpMaxConcurrentRuns,
         ),
         (
             "acp.permission_timeout_secs must be between ",
-            "acp.permission_timeout_secs",
+            RunnerConfigErrorField::AcpPermissionTimeoutSecs,
         ),
         (
             "mcp.request_timeout_secs must be between ",
-            "mcp.request_timeout_secs",
+            RunnerConfigErrorField::McpRequestTimeoutSecs,
         ),
     ];
+    if error.starts_with("instructions.files entries must be absolute paths")
+        || error.starts_with("instructions.files contains an unsupported Windows path namespace")
+        || error.starts_with("instructions.files contains duplicate path identities")
+    {
+        return (
+            Some(RunnerConfigErrorField::InstructionsFiles),
+            Some(RunnerConfigErrorReason::InvalidPath),
+        );
+    }
+    if error.starts_with("skills.roots entries must be absolute paths")
+        || error.starts_with("skills.roots contains an unsupported Windows path namespace")
+        || error.starts_with("skills.roots contains duplicate path identities")
+    {
+        return (
+            Some(RunnerConfigErrorField::SkillsRoots),
+            Some(RunnerConfigErrorReason::InvalidPath),
+        );
+    }
     OUT_OF_RANGE_FIELDS
         .iter()
         .find_map(|(prefix, field)| {
             error
                 .starts_with(prefix)
-                .then_some((Some(*field), Some("out_of_range")))
+                .then_some((Some(*field), Some(RunnerConfigErrorReason::OutOfRange)))
         })
         .unwrap_or((None, None))
 }
@@ -955,9 +1079,9 @@ fn config_candidate_error_response(
         execution_state: RunnerConfigExecutionState::Completed,
         valid: Some(false),
         current_generation: Some(generation),
-        error_code: Some(reload_error_code(error).to_string()),
-        error_field: error_field.map(str::to_string),
-        error_reason: error_reason.map(str::to_string),
+        error_code: Some(reload_error_code(error)),
+        error_field,
+        error_reason,
         restart_required: false,
         restart_required_fields: Vec::new(),
     }
@@ -966,14 +1090,14 @@ fn config_candidate_error_response(
 fn config_not_started(
     action: RunnerConfigAction,
     generation: Option<u64>,
-    error_code: &str,
+    error_code: RunnerConfigErrorCode,
 ) -> RunnerConfigOperationResponse {
     RunnerConfigOperationResponse {
         action,
         execution_state: RunnerConfigExecutionState::NotStarted,
         valid: None,
         current_generation: generation,
-        error_code: Some(error_code.to_string()),
+        error_code: Some(error_code),
         error_field: None,
         error_reason: None,
         restart_required: false,
@@ -988,7 +1112,7 @@ pub(crate) fn restart_required_fields(
     macro_rules! classify {
         ($($field:ident),+ $(,)?) => {{
             let RunnerConfig {
-                policy: _, shell: _, ssh: _, plugins: _, tool_providers: _, legacy_projects_dir: _,
+                server_url_override: _, policy: _, shell: _, skills: _, instructions: _, ssh: _, plugins: _, tool_providers: _, mcp_gateway: _,
                 $($field: _),+
             } = candidate;
             [$((stringify!($field), startup.$field != candidate.$field)),+]
@@ -1005,7 +1129,6 @@ pub(crate) fn restart_required_fields(
         host_context,
         max_concurrent_jobs,
         acp,
-        mcp_gateway,
         owner,
         poll_interval_ms,
         project_registry_dir,
@@ -1350,9 +1473,14 @@ fn validate_optional_toml_string(
     Ok(())
 }
 
-fn validate_shell_profile_toml_shape(content: &str) -> Result<(), String> {
+fn validate_runner_config_toml_shape(content: &str) -> Result<(), String> {
     let value: toml::Value = toml::from_str(content)
         .map_err(|e| format!("failed to parse config TOML syntax: {}", e))?;
+    if value.get("projects_dir").is_some() {
+        return Err(
+            "Runner config field 'projects_dir' is retired; use 'project_registry_dir'".to_string(),
+        );
+    }
     let Some(shell) = value.get("shell") else {
         return Ok(());
     };
@@ -1422,14 +1550,43 @@ fn validate_shell_profile_toml_shape(content: &str) -> Result<(), String> {
     }
     Ok(())
 }
+fn validate_server_url(raw: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(raw.trim())
+        .map_err(|_| "server_url_invalid: expected an HTTP(S) origin".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.port() == Some(0)
+    {
+        return Err("server_url_invalid: expected an HTTP(S) origin without credentials, path, query or fragment".into());
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
 
 pub(crate) fn load_config(path: &Path) -> Result<RunnerConfig, String> {
+    load_config_with_server_url(path, None)
+}
+
+pub(crate) fn load_config_with_server_url(
+    path: &Path,
+    server_url: Option<&str>,
+) -> Result<RunnerConfig, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read config {}: {}", path.display(), e))?;
-    validate_shell_profile_toml_shape(&content)
+    validate_runner_config_toml_shape(&content)
         .map_err(|e| format!("failed to parse config {}: {}", path.display(), e))?;
     let mut cfg: RunnerConfig = toml::from_str(&content)
         .map_err(|e| format!("failed to parse config {}: {}", path.display(), e))?;
+    if let Some(server_url) = server_url {
+        cfg.server_url = validate_server_url(server_url)?;
+        cfg.server_url_override = Some(cfg.server_url.clone());
+    }
+    // Use the same origin contract for config and CLI, with no secret echo.
+    cfg.server_url = validate_server_url(&cfg.server_url)?;
     if cfg.server_url.trim().is_empty() {
         return Err("server_url cannot be empty".to_string());
     }
@@ -1443,6 +1600,8 @@ pub(crate) fn load_config(path: &Path) -> Result<RunnerConfig, String> {
         return Err("websocket_connect_timeout_secs must be > 0".to_string());
     }
     validate_max_concurrent_jobs(cfg.max_concurrent_jobs)?;
+    validate_skills_config(&cfg.skills)?;
+    validate_instructions_config(&cfg.instructions)?;
     if let Some(host_context) = cfg.host_context.take() {
         cfg.host_context = Some(host_context.normalized()?);
     }
@@ -1477,23 +1636,9 @@ pub(crate) fn load_config(path: &Path) -> Result<RunnerConfig, String> {
     let effective =
         effective_allowed_roots(&cfg.policy.allowed_roots, cfg.policy.allow_cwd_anywhere)?;
     cfg.policy.allowed_roots = effective;
-    // Normalize old/new config spellings into one effective registry path. Two
-    // explicit fields are ambiguous and fail closed rather than guessing
-    // precedence. With neither field configured, select the on-disk layout
-    // using the shared four-state compatibility contract.
-    cfg.project_registry_dir = match (
-        cfg.project_registry_dir.take(),
-        cfg.legacy_projects_dir.take(),
-    ) {
-        (Some(_), Some(_)) => {
-            return Err(
-                "project_registry_dir and legacy projects_dir cannot both be configured; keep exactly one Runner project registry setting"
-                    .to_string(),
-            );
-        }
-        (Some(path), None) | (None, Some(path)) => Some(path),
-        (None, None) => Some(default_project_registry_dir()?),
-    };
+    if cfg.project_registry_dir.is_none() {
+        cfg.project_registry_dir = Some(default_project_registry_dir()?);
+    }
     validate_shell_config(&cfg.shell)?;
     validate_ssh_config(&mut cfg.ssh)?;
     if let Some(quic) = &cfg.quic {
@@ -1515,6 +1660,146 @@ pub(crate) fn load_config(path: &Path) -> Result<RunnerConfig, String> {
     Ok(cfg)
 }
 
+pub(crate) fn configured_skill_root_identity(root: &Path) -> String {
+    let lexical = root.components().collect::<PathBuf>();
+    webcodex_runner_config::paths::normalize_path_identity(&lexical)
+}
+
+fn validate_instructions_config(config: &InstructionsConfig) -> Result<(), String> {
+    use std::collections::HashSet;
+    if config.files.len() > MAX_CONFIGURED_INSTRUCTION_FILES {
+        return Err(format!(
+            "instructions.files may contain at most {MAX_CONFIGURED_INSTRUCTION_FILES} entries"
+        ));
+    }
+    let mut identities = HashSet::with_capacity(config.files.len());
+    for path in &config.files {
+        let text = path.to_string_lossy();
+        if text.is_empty()
+            || text.len() > MAX_CONFIGURED_INSTRUCTION_PATH_BYTES
+            || text.contains('\0')
+        {
+            return Err(format!(
+                "instructions.files entries must be non-empty paths of at most {MAX_CONFIGURED_INSTRUCTION_PATH_BYTES} bytes"
+            ));
+        }
+        if !path.is_absolute()
+            || webcodex_runner_config::paths::project_path_has_parent_traversal(path)
+        {
+            return Err(
+                "instructions.files entries must be absolute paths without parent traversal"
+                    .to_string(),
+            );
+        }
+        #[cfg(windows)]
+        if webcodex_runner_config::paths::windows_project_path_kind(path)
+            == Some(webcodex_runner_config::paths::WindowsProjectPathKind::UnsupportedNamespace)
+        {
+            return Err(
+                "instructions.files contains an unsupported Windows path namespace".to_string(),
+            );
+        }
+        let identity = configured_skill_root_identity(path);
+        if !identities.insert(identity) {
+            return Err("instructions.files contains duplicate path identities".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod instruction_windows_path_tests {
+    use super::*;
+
+    #[test]
+    fn instruction_paths_follow_windows_namespace_and_traversal_rules() {
+        let valid = InstructionsConfig {
+            files: vec![PathBuf::from(r"C:\Users\alice\.codex\AGENTS.md")],
+        };
+        assert!(validate_instructions_config(&valid).is_ok());
+
+        let parent = InstructionsConfig {
+            files: vec![PathBuf::from(r"C:\Users\alice\..\bob\AGENTS.md")],
+        };
+        assert!(validate_instructions_config(&parent)
+            .unwrap_err()
+            .contains("without parent traversal"));
+
+        // Canonical Windows paths use the supported verbatim disk/UNC forms.
+        // Only device and generic verbatim namespaces are outside the contract.
+        for path in [
+            r"\\?\C:\Users\alice\.codex\AGENTS.md",
+            r"\\server\share\AGENTS.md",
+            r"\\?\UNC\server\share\AGENTS.md",
+        ] {
+            let config = InstructionsConfig {
+                files: vec![PathBuf::from(path)],
+            };
+            assert!(validate_instructions_config(&config).is_ok(), "{path}");
+        }
+        for path in [r"\\.\device\AGENTS.md", r"\\?\GLOBALROOT\Device\AGENTS.md"] {
+            let config = InstructionsConfig {
+                files: vec![PathBuf::from(path)],
+            };
+            assert!(
+                validate_instructions_config(&config)
+                    .unwrap_err()
+                    .contains("unsupported Windows path namespace"),
+                "{path}"
+            );
+        }
+        let aliases = InstructionsConfig {
+            files: vec![
+                PathBuf::from(r"C:\Users\alice\.codex\AGENTS.md"),
+                PathBuf::from(r"\\?\C:\Users\alice\.codex\AGENTS.md"),
+            ],
+        };
+        assert!(validate_instructions_config(&aliases)
+            .unwrap_err()
+            .contains("duplicate"));
+    }
+}
+
+fn validate_skills_config(config: &SkillsConfig) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    if config.roots.len() > MAX_CONFIGURED_SKILL_ROOTS {
+        return Err(format!(
+            "skills.roots may contain at most {MAX_CONFIGURED_SKILL_ROOTS} entries"
+        ));
+    }
+    let mut identities = HashSet::with_capacity(config.roots.len());
+    for root in &config.roots {
+        let text = root.to_string_lossy();
+        if text.is_empty()
+            || text.len() > MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES
+            || text.contains('\0')
+        {
+            return Err(format!(
+                "skills.roots entries must be non-empty paths of at most {MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES} bytes"
+            ));
+        }
+        if !root.is_absolute()
+            || webcodex_runner_config::paths::project_path_has_parent_traversal(root)
+        {
+            return Err(
+                "skills.roots entries must be absolute paths without parent traversal".to_string(),
+            );
+        }
+        #[cfg(windows)]
+        if webcodex_runner_config::paths::windows_project_path_kind(root)
+            == Some(webcodex_runner_config::paths::WindowsProjectPathKind::UnsupportedNamespace)
+        {
+            return Err("skills.roots contains an unsupported Windows path namespace".to_string());
+        }
+        let identity = configured_skill_root_identity(root);
+        if !identities.insert(identity) {
+            return Err("skills.roots contains duplicate path identities".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn validate_acp_env_name(value: &str) -> Result<(), ()> {
     if value.is_empty()
         || value.len() > ACP_MAX_ENV_NAME_BYTES
@@ -1530,7 +1815,8 @@ fn validate_acp_env_name(value: &str) -> Result<(), ()> {
 fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
     use std::collections::HashSet;
     use webcodex_core::coding_agent::{
-        validate_provider_id, CODING_AGENT_MAX_CONFIG_KEY_BYTES, CODING_AGENT_MAX_PROVIDERS,
+        validate_provider_id, CODING_AGENT_MAX_CONFIG_KEY_BYTES, CODING_AGENT_MAX_CONFIG_OPTIONS,
+        CODING_AGENT_MAX_CONFIG_VALUE_BYTES, CODING_AGENT_MAX_PROVIDERS,
         CODING_AGENT_MAX_PROVIDER_NAME_BYTES,
     };
 
@@ -1550,6 +1836,25 @@ fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
         return Err(format!(
             "acp.agents may contain at most {CODING_AGENT_MAX_PROVIDERS} entries"
         ));
+    }
+    if config.forced_config.len() > CODING_AGENT_MAX_CONFIG_OPTIONS {
+        return Err(format!(
+            "acp.forced_config may contain at most {CODING_AGENT_MAX_CONFIG_OPTIONS} entries"
+        ));
+    }
+    for (option, value) in &config.forced_config {
+        if option.is_empty()
+            || option.len() > CODING_AGENT_MAX_CONFIG_KEY_BYTES
+            || option.chars().any(char::is_control)
+            || value.serialized_len() > CODING_AGENT_MAX_CONFIG_VALUE_BYTES
+        {
+            return Err("acp.forced_config contains an invalid option".to_string());
+        }
+        if matches!(value, CodingAgentConfigValue::Integer(_)) {
+            return Err(
+                "acp.forced_config supports only string/select and boolean values".to_string(),
+            );
+        }
     }
     let mut ids = HashSet::new();
     for agent in &config.agents {
@@ -1615,7 +1920,7 @@ fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
                 || super::shell::is_sensitive_env_key(source)
             {
                 return Err(format!(
-                    "ACP agent '{}' env_from_env may not map WebCodex transport credentials",
+                    "ACP agent '{}' env_from_env may not map WebCodex-sensitive environment variables",
                     agent.id
                 ));
             }
@@ -1646,6 +1951,16 @@ fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
                 ));
             }
         }
+        if config
+            .forced_config
+            .keys()
+            .any(|option| config_ids.contains(option.as_str()))
+        {
+            return Err(format!(
+                "ACP agent '{}' cannot allow an option that is forced globally",
+                agent.id
+            ));
+        }
     }
     Ok(())
 }
@@ -1663,13 +1978,22 @@ fn validate_mcp_gateway_env_name(value: &str) -> Result<(), ()> {
 }
 
 fn validate_mcp_gateway_config(config: &McpGatewayConfig) -> Result<(), String> {
-    use crate::mcp_gateway::{
-        validate_provider_id, validate_provider_name, MCP_GATEWAY_MAX_PROVIDERS,
-    };
     use std::collections::HashSet;
+    use webcodex_core::mcp_gateway::{
+        validate_provider_id, validate_provider_name, MCP_GATEWAY_MAX_DESCRIPTION_BYTES,
+        MCP_GATEWAY_MAX_PROVIDERS,
+    };
 
     if !(1..=120).contains(&config.request_timeout_secs) {
         return Err("mcp.request_timeout_secs must be between 1 and 120".to_string());
+    }
+    if !(4 * 1024..=MCP_GATEWAY_MAX_DESCRIPTION_BYTES).contains(&config.max_tool_description_bytes)
+    {
+        return Err(format!(
+            "mcp.max_tool_description_bytes must be between {} and {}",
+            4 * 1024,
+            MCP_GATEWAY_MAX_DESCRIPTION_BYTES
+        ));
     }
     if config.providers.len() > MCP_GATEWAY_MAX_PROVIDERS {
         return Err(format!(
@@ -1764,7 +2088,7 @@ fn validate_mcp_gateway_config(config: &McpGatewayConfig) -> Result<(), String> 
             }
             if destinations
                 .iter()
-                .any(|existing| super::shell::env_keys_equal(*existing, destination))
+                .any(|existing| super::shell::env_keys_equal(existing, destination))
             {
                 return Err(format!(
                     "mcp provider '{}' env_from_env contains conflicting destination names for this platform",
@@ -1852,6 +2176,116 @@ fn validate_plugin_config(config: &PluginConfig, shell: &ShellConfig) -> Result<
 }
 
 #[cfg(test)]
+mod acp_config_tests {
+    use super::*;
+
+    fn agent() -> AcpAgentConfig {
+        AcpAgentConfig {
+            id: "agent".to_string(),
+            name: "Agent".to_string(),
+            executable: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+            env_from_env: BTreeMap::new(),
+            allowed_config_options: Vec::new(),
+        }
+    }
+
+    fn validate(agent: AcpAgentConfig) -> Result<(), String> {
+        validate_acp_config(&AcpConfig {
+            agents: vec![agent],
+            ..AcpConfig::default()
+        })
+    }
+
+    #[test]
+    fn desktop_owned_acp_marker_is_configuration_metadata_not_provider_inventory() {
+        let executable = toml::Value::String(agent().executable).to_string();
+        let source = format!(
+            r#"
+max_concurrent_runs = 1
+permission_timeout_secs = 5
+[[agents]]
+id = "pi"
+name = "Pi Agent"
+executable = {executable}
+args = ["--acp"]
+desktop_owner = "fixture-desktop-owner"
+[agents.env_from_env]
+OPENAI_API_KEY = "SUB2API_API_KEY"
+"#
+        );
+        let config: AcpConfig = toml::from_str(&source).unwrap();
+        validate_acp_config(&config).unwrap();
+        assert_eq!(config.agents[0].id, "pi");
+        assert_eq!(
+            config.agents[0].env_from_env["OPENAI_API_KEY"],
+            "SUB2API_API_KEY"
+        );
+    }
+
+    #[test]
+    fn acp_global_forced_config_is_empty_by_default() {
+        assert!(AcpConfig::default().forced_config.is_empty());
+    }
+
+    #[test]
+    fn acp_global_forced_config_rejects_allowed_overlap() {
+        let mut configured = agent();
+        configured.allowed_config_options.push("model".to_string());
+        let mut config = AcpConfig {
+            agents: vec![configured],
+            ..AcpConfig::default()
+        };
+        config.forced_config.insert(
+            "model".to_string(),
+            CodingAgentConfigValue::String("policy-model".to_string()),
+        );
+        assert!(validate_acp_config(&config)
+            .unwrap_err()
+            .contains("forced globally"));
+    }
+
+    #[test]
+    fn acp_global_forced_config_rejects_integer_values() {
+        let mut config = AcpConfig::default();
+        config.forced_config.insert(
+            "integer-option".to_string(),
+            CodingAgentConfigValue::Integer(7),
+        );
+        assert!(validate_acp_config(&config)
+            .unwrap_err()
+            .contains("string/select and boolean"));
+    }
+
+    #[test]
+    fn acp_env_mapping_rejects_webcodex_pat() {
+        for (destination, source) in [("WEBCODEX_PAT", "SOURCE"), ("DEST", "WEBCODEX_PAT")] {
+            let mut sensitive = agent();
+            sensitive
+                .env_from_env
+                .insert(destination.to_string(), source.to_string());
+            assert!(validate(sensitive)
+                .unwrap_err()
+                .contains("WebCodex-sensitive"));
+        }
+
+        #[cfg(windows)]
+        {
+            let mut mixed_case = agent();
+            mixed_case
+                .env_from_env
+                .insert("DEST".to_string(), "WebCodex_Pat".to_string());
+            assert!(validate(mixed_case)
+                .unwrap_err()
+                .contains("WebCodex-sensitive"));
+        }
+    }
+}
+
+#[cfg(test)]
 mod plugin_config_tests {
     use super::*;
 
@@ -1905,8 +2339,34 @@ mod mcp_gateway_config_tests {
     fn validate(provider: McpGatewayProviderConfig) -> Result<(), String> {
         validate_mcp_gateway_config(&McpGatewayConfig {
             request_timeout_secs: 30,
+            max_tool_description_bytes: MCP_GATEWAY_DEFAULT_DESCRIPTION_BYTES,
             providers: vec![provider],
         })
+    }
+
+    #[test]
+    fn mcp_gateway_description_limit_has_bounded_operator_override() {
+        let default = McpGatewayConfig::default();
+        assert_eq!(default.max_tool_description_bytes, 64 * 1024);
+        validate_mcp_gateway_config(&default).unwrap();
+
+        let configured: McpGatewayConfig =
+            toml::from_str("max_tool_description_bytes = 131072\nrequest_timeout_secs = 30")
+                .unwrap();
+        assert_eq!(configured.max_tool_description_bytes, 128 * 1024);
+        validate_mcp_gateway_config(&configured).unwrap();
+
+        for invalid in [
+            0,
+            4095,
+            webcodex_core::mcp_gateway::MCP_GATEWAY_MAX_DESCRIPTION_BYTES + 1,
+        ] {
+            let mut config = McpGatewayConfig::default();
+            config.max_tool_description_bytes = invalid;
+            assert!(validate_mcp_gateway_config(&config)
+                .unwrap_err()
+                .contains("mcp.max_tool_description_bytes must be between"));
+        }
     }
 
     #[test]
@@ -1983,6 +2443,8 @@ mod mcp_gateway_config_tests {
     fn mcp_gateway_execution_context_rejects_sensitive_and_platform_duplicate_names() {
         for (destination, source) in [
             ("WEBCODEX_TOKEN", "SOURCE"),
+            ("WEBCODEX_PAT", "SOURCE"),
+            ("DEST", "WEBCODEX_PAT"),
             ("DEST", "WEBCODEX_AGENT_TOKEN"),
             ("WEBCODEX_USER_TOKEN", "SOURCE"),
             ("DEST", "AUTHORIZATION"),
@@ -1992,6 +2454,17 @@ mod mcp_gateway_config_tests {
                 .env_from_env
                 .insert(destination.to_string(), source.to_string());
             assert!(validate(sensitive)
+                .unwrap_err()
+                .contains("WebCodex-sensitive"));
+        }
+
+        #[cfg(windows)]
+        {
+            let mut mixed_case_pat = provider();
+            mixed_case_pat
+                .env_from_env
+                .insert("DEST".to_string(), "WebCodex_Pat".to_string());
+            assert!(validate(mixed_case_pat)
                 .unwrap_err()
                 .contains("WebCodex-sensitive"));
         }
@@ -2025,7 +2498,7 @@ pub(crate) fn hostname() -> Option<String> {
 
 fn default_project_registry_dir() -> Result<PathBuf, String> {
     let base = default_client_base_dir()?;
-    crate::runner_config::paths::select_project_registry_dir(&base)
+    webcodex_runner_config::paths::select_project_registry_dir(&base)
 }
 
 pub(crate) fn project_registry_dir(cfg: &RunnerConfig) -> Result<PathBuf, String> {

@@ -3,6 +3,7 @@ use super::*;
 async fn register_structured_delete_runner(registry: &RunnerRegistry, client_id: &str) {
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -276,6 +277,7 @@ async fn instance_replacement_keeps_job_reconciliation_contract_unchanged() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("replace-job-sync".to_string()),
                 cwd: None,

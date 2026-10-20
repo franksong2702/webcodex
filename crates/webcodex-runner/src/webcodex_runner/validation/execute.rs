@@ -1,9 +1,5 @@
 //! Bounded process execution for validation adapters.
 
-use crate::validation_bridge::{
-    sanitize_bridge_text, MAX_VALIDATION_STDERR_CAPTURE_BYTES, MAX_VALIDATION_STDERR_SUMMARY_CHARS,
-    MAX_VALIDATION_STDOUT_BYTES,
-};
 use crate::webcodex_runner::output_text::{normalize_output_text, OutputTextSource};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,6 +8,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use webcodex_core::validation_bridge::{
+    sanitize_bridge_text, MAX_VALIDATION_STDERR_CAPTURE_BYTES, MAX_VALIDATION_STDERR_SUMMARY_CHARS,
+    MAX_VALIDATION_STDOUT_BYTES,
+};
 use webcodex_process::{GracefulTermination, ManagedChild};
 
 #[derive(Debug)]
@@ -367,7 +367,19 @@ fn bound_stderr(text: &str) -> String {
 /// Resolve an executable by env override then PATH search. Callers must not
 /// expose the absolute executable path across the bridge.
 pub(crate) fn resolve_executable(env_override: &str, executable_name: &str) -> Option<PathBuf> {
-    if let Ok(value) = std::env::var(env_override) {
+    resolve_executable_with_env(
+        std::env::var(env_override).ok().as_deref(),
+        std::env::var_os("PATH").as_deref(),
+        executable_name,
+    )
+}
+
+fn resolve_executable_with_env(
+    override_value: Option<&str>,
+    path_value: Option<&std::ffi::OsStr>,
+    executable_name: &str,
+) -> Option<PathBuf> {
+    if let Some(value) = override_value {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
             #[cfg(windows)]
@@ -375,8 +387,8 @@ pub(crate) fn resolve_executable(env_override: &str, executable_name: &str) -> O
                 // The override may be a bare name ("pyright"), a batch shim
                 // ("pyright.cmd") or a path; resolve through the platform
                 // rules so extensionless POSIX shims are never selected.
-                let path_var = std::env::var_os("PATH").unwrap_or_default();
-                return crate::webcodex_runner::util::resolve_program_in_path(trimmed, &path_var)
+                let path_var = path_value.unwrap_or_else(|| std::ffi::OsStr::new(""));
+                return crate::webcodex_runner::util::resolve_program_in_path(trimmed, path_var)
                     .map(|program| program.path().to_path_buf());
             }
             #[cfg(not(windows))]
@@ -386,15 +398,17 @@ pub(crate) fn resolve_executable(env_override: &str, executable_name: &str) -> O
             }
         }
     }
-    let path_var = std::env::var_os("PATH")?;
-    crate::webcodex_runner::util::find_executable_in_path(executable_name, &path_var)
+    crate::webcodex_runner::util::find_executable_in_path(executable_name, path_value?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "runner-real-process-tests")]
     use std::path::PathBuf;
+    #[cfg(feature = "runner-real-process-tests")]
     use std::sync::{Arc, OnceLock};
+    #[cfg(feature = "runner-real-process-tests")]
     use std::time::SystemTime;
 
     #[cfg(unix)]
@@ -402,23 +416,20 @@ mod tests {
     fn env_override_requires_an_executable_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        const ENV: &str = "WEBCODEX_TEST_VALIDATION_EXECUTABLE";
         const MISSING_NAME: &str = "webcodex-validation-executable-that-does-not-exist";
-        let _env_lock = crate::tests::test_env_lock();
         let temp = tempfile::tempdir().unwrap();
 
-        let env = crate::tests::EnvGuard::new().set(ENV, temp.path());
-        assert!(resolve_executable(ENV, MISSING_NAME).is_none());
+        let resolve = |path: &Path| resolve_executable_with_env(path.to_str(), None, MISSING_NAME);
+        assert!(resolve(temp.path()).is_none());
 
         let file = temp.path().join("tool");
         std::fs::write(&file, "#!/bin/sh\nexit 0\n").unwrap();
-        let _env = env.set(ENV, &file);
-        assert!(resolve_executable(ENV, MISSING_NAME).is_none());
+        assert!(resolve(&file).is_none());
 
         let mut permissions = std::fs::metadata(&file).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&file, permissions).unwrap();
-        assert_eq!(resolve_executable(ENV, MISSING_NAME), Some(file));
+        assert_eq!(resolve(&file), Some(file));
     }
 
     // -----------------------------------------------------------------------
@@ -430,19 +441,22 @@ mod tests {
     /// Compiled copy of the `validation_tree_helper` fixture, kept alive for
     /// the whole test process so its binary path never disappears under a
     /// running descendant (same pattern as the MCP/LSP/job-tree fixtures).
+    #[cfg(feature = "runner-real-process-tests")]
     struct ValidationTreeHelper {
         _temp: tempfile::TempDir,
         path: PathBuf,
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     static VALIDATION_TREE_HELPER: OnceLock<Arc<ValidationTreeHelper>> = OnceLock::new();
 
+    #[cfg(feature = "runner-real-process-tests")]
     fn helper_binary() -> PathBuf {
         VALIDATION_TREE_HELPER
             .get_or_init(|| {
                 let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("src/webcodex_runner/validation/validation_tree_helper.rs");
-                let temp = tempfile::tempdir().unwrap();
+                let temp = crate::tests::executable_tempdir();
                 let output = temp.path().join(format!(
                     "validation-tree-helper{}",
                     std::env::consts::EXE_SUFFIX
@@ -475,8 +489,10 @@ mod tests {
     }
 
     /// A unique temp file, removed on drop.
+    #[cfg(feature = "runner-real-process-tests")]
     struct CleanupPath(PathBuf);
 
+    #[cfg(feature = "runner-real-process-tests")]
     impl std::ops::Deref for CleanupPath {
         type Target = PathBuf;
         fn deref(&self) -> &PathBuf {
@@ -484,12 +500,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     impl Drop for CleanupPath {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     fn unique_temp_path(tag: &str) -> CleanupPath {
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -507,6 +525,7 @@ mod tests {
     /// on the small GitHub CI runners, process startup can take well over a
     /// few seconds, so callers pass a generous 30s budget (matching the
     /// helper's own 30s gate).
+    #[cfg(feature = "runner-real-process-tests")]
     fn wait_until_file(path: &Path, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -521,6 +540,7 @@ mod tests {
     }
 
     /// Parse `KEY=<pid>` from a marker file written by the helper.
+    #[cfg(feature = "runner-real-process-tests")]
     fn read_pid(marker: &Path, key: &str) -> u32 {
         let text = std::fs::read_to_string(marker).expect("read pid marker");
         text.lines()
@@ -532,6 +552,7 @@ mod tests {
             .unwrap_or_else(|| panic!("marker {marker:?} missing {key}: {text}"))
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     #[cfg(windows)]
     fn process_alive(pid: u32) -> bool {
         use windows_sys::Win32::System::Threading::{
@@ -551,6 +572,7 @@ mod tests {
         ok == 1 && exit_code == 259 // 259 == STILL_ACTIVE
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     #[cfg(target_os = "linux")]
     fn process_alive(pid: u32) -> bool {
         // `kill(pid, 0)` also succeeds for zombies, while ManagedChild's Linux
@@ -572,6 +594,7 @@ mod tests {
         state != "Z" && state != "X"
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     #[cfg(all(unix, not(target_os = "linux")))]
     fn process_alive(pid: u32) -> bool {
         // SAFETY: signal 0 is an existence probe; the pid comes from our own
@@ -581,10 +604,12 @@ mod tests {
 
     /// Upper bound for the whole test body including cleanup; the child sleeps
     /// far longer, so any run exceeding this is a cleanup hang, not a slow exit.
+    #[cfg(feature = "runner-real-process-tests")]
     const BOUNDEDNESS_LIMIT: Duration = Duration::from_secs(30);
 
     /// A. Normal completion: real exit code, stdout/stderr capture, no errors.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_normal_completion_preserves_exit_code_and_capture() {
         let cwd = tempfile::tempdir().unwrap();
@@ -610,6 +635,7 @@ mod tests {
     /// B. Timeout terminates the entire tree: parent AND descendant must both
     /// be gone, with the timeout semantics unchanged.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_timeout_terminates_entire_tree() {
         let parent_marker = unique_temp_path("timeout-parent");
@@ -668,6 +694,7 @@ mod tests {
     /// cleanup: the descendant is terminated, the reader reaches EOF, and
     /// run_bounded stays bounded.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_parent_exit_alone_does_not_finish_cleanup() {
         let parent_marker = unique_temp_path("parent-first");
@@ -719,6 +746,7 @@ mod tests {
     /// D. Runner shutdown terminates the whole tree with the shutdown
     /// semantics unchanged.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_runner_shutdown_terminates_whole_tree() {
         let parent_marker = unique_temp_path("shutdown-parent");
@@ -782,7 +810,7 @@ mod tests {
 
     /// E. A SIGTERM-resistant tree is escalated to force: the graceful request
     /// gets a bounded grace, then the whole tree is killed. Never unbounded.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "runner-real-process-tests"))]
     #[test]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_sigterm_resistant_tree_is_forcefully_escalated() {
@@ -840,6 +868,7 @@ mod tests {
     /// F. Cleanup of an already-exited tree: no panic, no false infrastructure
     /// error, and it is idempotent.
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: spawns the validation process-tree fixture"]
     fn runner_real_process_validation_already_exited_cleanup_is_not_an_error() {
         // Normal completion runs cleanup after the tree already exited; the

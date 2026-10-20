@@ -1,17 +1,16 @@
-use super::common::{array_schema, schema_type, wrapped_output_schema};
+use super::common::{array_schema, nullable_schema, schema_type, wrapped_output_schema};
 use serde_json::{json, Value};
-
-fn nullable_integer(description: &str) -> Value {
+fn agent_continuation_ref_schema() -> Value {
     json!({
-        "anyOf": [{"type": "integer"}, {"type": "null"}],
-        "description": description
-    })
-}
-
-fn nullable_string(description: &str) -> Value {
-    json!({
-        "anyOf": [{"type": "string"}, {"type": "null"}],
-        "description": description
+        "anyOf": [
+            {
+                "type": "string",
+                "pattern": crate::AGENT_CONTINUATION_REF_PATTERN,
+                "description": "Server-issued selector pinned to one exact Agent, Endpoint, and controller generation."
+            },
+            {"type": "null"}
+        ],
+        "description": "Selector for the exact Endpoint generation named by this result, or null when this result does not issue one. Not a credential or execution authority. An older selector never follows a newer generation."
     })
 }
 
@@ -32,8 +31,8 @@ fn agent_schema() -> Value {
             "active_endpoint_count": schema_type("integer", "Current unexpired generation-matching Endpoint count."),
             "queued_delivery_count": schema_type("integer", "Queued Inbox deliveries for this Agent."),
             "unresolved_wake_count": schema_type("integer", "Durable Wake Intents not yet consumed."),
-            "latest_wake_id": nullable_string("Most recently created durable Wake Intent, if any."),
-            "latest_wake_state": nullable_string("Latest Wake state, independent from Inbox Delivery state.")
+            "latest_wake_id": nullable_schema("string", "Most recently created durable Wake Intent, if any."),
+            "latest_wake_state": nullable_schema("string", "Latest Wake state, independent from Inbox Delivery state.")
         },
         "required": [
             "agent_id", "handle", "display_name", "description", "specialty_labels",
@@ -44,6 +43,21 @@ fn agent_schema() -> Value {
     })
 }
 
+fn listed_agent_schema() -> Value {
+    let mut schema = agent_schema();
+    schema["properties"]["production_auto_resume_available"] = schema_type(
+        "boolean",
+        "True only when this listed Agent snapshot has a current unexpired generation-matching wake-capable Endpoint and the current Server process has a production Host carrier for that exact generation. This is continuation readiness only: it does not mean idle, reserve capacity, grant execution authority, or guarantee immediate Host scheduling.",
+    );
+    schema["properties"]["agent_continuation_ref"] = agent_continuation_ref_schema();
+    let required = schema["required"]
+        .as_array_mut()
+        .expect("agent schema required fields");
+    required.push(json!("production_auto_resume_available"));
+    required.push(json!("agent_continuation_ref"));
+    schema
+}
+
 fn endpoint_schema() -> Value {
     json!({
         "type": "object",
@@ -52,15 +66,15 @@ fn endpoint_schema() -> Value {
             "endpoint_id": schema_type("string", "Canonical current attachment id."),
             "agent_id": schema_type("string", "Durable Agent carried by this Endpoint."),
             "host": schema_type("string", "Host adapter name."),
-            "client_attachment_id": nullable_string("Optional host-local attachment id."),
+            "client_attachment_id": nullable_schema("string", "Optional host-local attachment id."),
             "wake_capable": schema_type("boolean", "True only when this exact Endpoint generation also has a current callable process-local continuation adapter; never execution authority."),
             "controller_generation": schema_type("integer", "Server-assigned monotonic continuation ownership generation."),
             "lifecycle": {"type": "string", "enum": ["attached", "detached", "expired"]},
             "attached_at_unix_ms": schema_type("integer", "Attachment time in Unix milliseconds."),
             "last_seen_at_unix_ms": schema_type("integer", "Latest infrastructure liveness or communication activity time."),
             "lease_expires_at_unix_ms": schema_type("integer", "Bounded Endpoint lease expiry in Unix milliseconds."),
-            "expired_at_unix_ms": nullable_integer("Server-observed expiry time, or null when not expired."),
-            "detached_at_unix_ms": nullable_integer("Explicit detach time, or null when not detached.")
+            "expired_at_unix_ms": nullable_schema("integer", "Server-observed expiry time, or null when not expired."),
+            "detached_at_unix_ms": nullable_schema("integer", "Explicit detach time, or null when not detached.")
         },
         "required": [
             "endpoint_id", "agent_id", "host", "client_attachment_id", "wake_capable",
@@ -70,17 +84,127 @@ fn endpoint_schema() -> Value {
     })
 }
 
+pub(super) fn agent_continuation_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "agent_id": schema_type("string", "Exact durable Agent identity."),
+            "display_name": schema_type("string", "Safe Agent display name only; private description and specialty labels are omitted."),
+            "endpoint_id": schema_type("string", "Exact current Endpoint identity."),
+            "controller_generation": schema_type("integer", "Exact Endpoint controller generation."),
+            "endpoint_lease_expires_at_unix_ms": schema_type("integer", "Current bounded Endpoint lease expiry."),
+            "host_binding": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "bound": schema_type("boolean", "Whether this exact Endpoint generation has a current process-local Host carrier."),
+                    "adapter_kind": nullable_schema("string", "Safe Host carrier kind, if present."),
+                    "production_auto_resume_available": schema_type("boolean", "Whether the current Host carrier has a demonstrated production new-turn primitive.")
+                },
+                "required": ["bound", "adapter_kind", "production_auto_resume_available"]
+            },
+            "wake": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "wake_id": schema_type("string", "Exact unresolved durable Wake identity."),
+                            "state": {"type": "string", "enum": ["pending", "claimed", "prepared", "delivered", "delivery_unknown"]},
+                            "revision": schema_type("integer", "Current durable Wake revision."),
+                            "wait_id": nullable_schema("string", "Exact AgentWait source for an agent_wait_events Wake; null for other Wake kinds."),
+                            "wait_match_count": nullable_schema("integer", "Frozen/coalescing Wait match-count snapshot for agent_wait_events; null for other Wake kinds."),
+                            "wait_match_sequence": nullable_schema("integer", "Frozen/coalescing Wait match high-watermark for agent_wait_events; null for other Wake kinds.")
+                        },
+                        "required": ["wake_id", "state", "revision", "wait_id", "wait_match_count", "wait_match_sequence"]
+                    },
+                    {"type": "null"}
+                ]
+            },
+            "queued_delivery_count": schema_type("integer", "Current authoritative queued Inbox count; no Message bodies are included."),
+            "dispatch_observation": {
+                "anyOf": [
+                    {"type": "string", "enum": ["dispatch_prepared", "dispatch_accepted", "dispatch_unknown", "continuation_consumed"]},
+                    {"type": "null"}
+                ],
+                "description": "Process-local Host observation only; only continuation_consumed proves a later turn exact-consumed the durable Wake."
+            },
+            "recovery": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "kind": {"type": "string", "const": "host_binding_missing_in_process"}
+                        },
+                        "required": ["kind"]
+                    },
+                    {"type": "null"}
+                ],
+                "description": "Null during ordinary state. The sole object variant is emitted only for fingerprint-proven Server-restart loss of this exact process-local MCP App binding."
+            }
+        },
+        "required": [
+            "version", "agent_id", "display_name", "endpoint_id", "controller_generation",
+            "endpoint_lease_expires_at_unix_ms", "host_binding", "wake",
+            "queued_delivery_count", "dispatch_observation", "recovery"
+        ]
+    })
+}
+
+fn agent_continuation_endpoint_recovery_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"type": "string", "enum": ["controller_live", "endpoint_replaced"]},
+            "replacement": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "agent_id": schema_type("string", "Durable Agent identity, unchanged by replacement."),
+                            "from_endpoint_id": schema_type("string", "Exact stale Endpoint authorized for replacement."),
+                            "from_controller_generation": schema_type("integer", "Exact stale controller generation authorized for replacement."),
+                            "endpoint_id": schema_type("string", "Server-created replacement Endpoint identity."),
+                            "controller_generation": schema_type("integer", "Monotonically increased replacement generation."),
+                            "reason": {"type": "string", "const": "endpoint_expired"}
+                        },
+                        "required": [
+                            "agent_id", "from_endpoint_id", "from_controller_generation",
+                            "endpoint_id", "controller_generation", "reason"
+                        ]
+                    },
+                    {"type": "null"}
+                ]
+            },
+            "successor_needs_recovery": schema_type(
+                "boolean",
+                "True only when the exact one-hop successor is itself naturally expired and must be supplied as the predecessor of another recovery call."
+            )
+        },
+        "required": ["kind", "replacement", "successor_needs_recovery"]
+    })
+}
+
 fn participant_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "participant_id": schema_type("string", "Canonical Conversation participant record id."),
+            "participant_id": {
+                "type": "string",
+                "pattern": "^wc_participant_[A-Za-z0-9_-]{16}$",
+                "description": "Canonical Conversation participant record id."
+            },
             "participant_kind": {"type": "string", "enum": ["human", "agent"]},
-            "agent_id": nullable_string("Canonical Agent id for Agent participants."),
-            "handle": nullable_string("Current Agent handle projection."),
-            "display_name": nullable_string("Current Agent display-name projection."),
-            "principal_kind": nullable_string("Bounded credential class for Human provenance; no secret identity is returned."),
+            "agent_id": nullable_schema("string", "Canonical Agent id for Agent participants."),
+            "handle": nullable_schema("string", "Current Agent handle projection."),
+            "display_name": nullable_schema("string", "Current Agent display-name projection."),
+            "principal_kind": nullable_schema("string", "Bounded credential class for Human provenance; no secret identity is returned."),
             "joined_at_unix_ms": schema_type("integer", "Join time in Unix milliseconds.")
         },
         "required": [
@@ -96,10 +220,10 @@ fn author_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "participant_kind": {"type": "string", "enum": ["human", "agent"]},
-            "agent_id": nullable_string("Canonical Agent author id when participant_kind is agent."),
-            "handle": nullable_string("Current Agent handle projection."),
-            "display_name": nullable_string("Current Agent display-name projection."),
-            "principal_kind": nullable_string("Bounded Human credential class; no credential digest is returned.")
+            "agent_id": nullable_schema("string", "Canonical Agent author id when participant_kind is agent."),
+            "handle": nullable_schema("string", "Current Agent handle projection."),
+            "display_name": nullable_schema("string", "Current Agent display-name projection."),
+            "principal_kind": nullable_schema("string", "Bounded Human credential class; no credential digest is returned.")
         },
         "required": ["participant_kind", "agent_id", "handle", "display_name", "principal_kind"]
     })
@@ -115,7 +239,7 @@ fn delivery_schema() -> Value {
             "recipient_agent_id": schema_type("string", "Recipient Agent identity."),
             "state": {"type": "string", "enum": ["queued", "consumed"]},
             "created_at_unix_ms": schema_type("integer", "Delivery creation time in Unix milliseconds."),
-            "consumed_at_unix_ms": nullable_integer("Consumption time, or null while queued.")
+            "consumed_at_unix_ms": nullable_schema("integer", "Consumption time, or null while queued.")
         },
         "required": [
             "delivery_order", "delivery_id", "recipient_agent_id", "state",
@@ -134,7 +258,7 @@ fn message_schema() -> Value {
             "seq": schema_type("integer", "Stable monotonic sequence within the Conversation."),
             "author": author_schema(),
             "body": schema_type("string", "Message body."),
-            "reply_to": nullable_string("Optional parent Message in the same Conversation."),
+            "reply_to": nullable_schema("string", "Optional parent Message in the same Conversation."),
             "created_at_unix_ms": schema_type("integer", "Creation time in Unix milliseconds."),
             "deliveries": array_schema(delivery_schema(), "Recipient-specific delivery state, distinct from the Message transcript record.")
         },
@@ -151,14 +275,14 @@ fn conversation_summary_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "conversation_id": schema_type("string", "Canonical durable Conversation id."),
-            "title": nullable_string("Optional Conversation title."),
+            "title": nullable_schema("string", "Optional Conversation title."),
             "lifecycle": {"type": "string", "enum": ["open", "closed"]},
             "created_at_unix_ms": schema_type("integer", "Creation time in Unix milliseconds."),
             "updated_at_unix_ms": schema_type("integer", "Latest transcript update time in Unix milliseconds."),
             "participant_count": schema_type("integer", "Current participant count."),
             "message_count": schema_type("integer", "Append-only transcript message count."),
             "last_seq": schema_type("integer", "Latest stable transcript sequence."),
-            "queued_delivery_count": nullable_integer("Queued deliveries for an Agent view; null for a Human view.")
+            "queued_delivery_count": nullable_schema("integer", "Queued deliveries for an Agent view; null for a Human view.")
         },
         "required": [
             "conversation_id", "title", "lifecycle", "created_at_unix_ms",
@@ -177,7 +301,7 @@ fn conversation_detail_schema() -> Value {
             "participants": array_schema(participant_schema(), "Human and Agent participant provenance."),
             "messages": array_schema(message_schema(), "Ordered append-only transcript page."),
             "after_seq": schema_type("integer", "Requested exclusive transcript cursor."),
-            "next_after_seq": nullable_integer("Continuation cursor when truncated."),
+            "next_after_seq": nullable_schema("integer", "Continuation cursor when truncated."),
             "truncated": schema_type("boolean", "True when more transcript messages remain.")
         },
         "required": [
@@ -218,7 +342,7 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("offset", schema_type("integer", "Returned page offset.")),
             (
                 "next_offset",
-                nullable_integer("Next page offset when truncated."),
+                nullable_schema("integer", "Next page offset when truncated."),
             ),
             (
                 "truncated",
@@ -226,25 +350,43 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "agents",
-                array_schema(agent_schema(), "Bounded Agent Card page."),
+                array_schema(
+                    listed_agent_schema(),
+                    "Bounded Agent Card page with current continuation readiness.",
+                ),
             ),
         ]),
-        "attach_agent_endpoint" | "detach_agent_endpoint" => wrapped_output_schema(vec![
+        "present_agent_continuation" => wrapped_output_schema(vec![(
+            "agent_continuation",
+            agent_continuation_projection_schema(),
+        )]),
+        "recover_agent_continuation_endpoint" => wrapped_output_schema(vec![
+            ("agent_continuation", json!({
+                "anyOf": [agent_continuation_projection_schema(), {"type": "null"}],
+                "description": "Live continuation projection for the returned selector, or null when the exact one-hop successor is itself expired and requires another bounded recovery step."
+            })),
+            ("endpoint_recovery", agent_continuation_endpoint_recovery_schema()),
+            ("replayed", schema_type("boolean", "True when the exact expired-endpoint replacement was replayed.")),
+            ("state_changed", schema_type("boolean", "True only when this call created the replacement Endpoint.")),
+        ]),
+
+        "rotate_agent_continuation_endpoint" | "detach_agent_endpoint" => wrapped_output_schema(vec![
+            ("agent_continuation_ref", agent_continuation_ref_schema()),
             ("endpoint", endpoint_schema()),
             (
                 "created",
                 schema_type(
                     "boolean",
-                    "True only for first attachment; false for detach.",
+                    "True only when this call created a new Endpoint; false for detach or exact replay.",
                 ),
             ),
             (
                 "replayed",
-                schema_type("boolean", "True for exact idempotent attach replay."),
+                schema_type("boolean", "True when an exact idempotent Endpoint creation or rotation request replayed the original result."),
             ),
             (
                 "state_changed",
-                schema_type("boolean", "Whether attachment state changed."),
+                schema_type("boolean", "Whether Endpoint/controller lifecycle state changed."),
             ),
         ]),
         "bootstrap_agent_conversation" => wrapped_output_schema(vec![
@@ -280,14 +422,22 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
                                 "wake_id": schema_type("string", "Exact unresolved durable Wake identity."),
                                 "state": {"type": "string", "enum": ["pending", "claimed", "prepared", "delivered", "delivery_unknown"]},
                                 "revision": schema_type("integer", "Current Wake revision."),
-                                "conversation_id": schema_type("string", "Latest Conversation represented by the Wake."),
-                                "latest_message_id": schema_type("string", "Latest Message id represented by the Wake; no Message body is included."),
-                                "queued_delivery_count": schema_type("integer", "Bounded queued count snapshot represented by the Wake."),
-                                "inbox_high_watermark": schema_type("integer", "Durable delivery high-watermark represented by the Wake.")
+                                "trigger_kind": {"type": "string", "enum": ["inbox_changed", "agent_task_attempt", "attention_event"]},
+                                "conversation_id": nullable_schema("string", "Latest Conversation represented by an inbox_changed Wake; null for task and attention sources."),
+                                "latest_message_id": nullable_schema("string", "Latest Message id represented by an inbox_changed Wake; null for task and attention sources and no Message body is included."),
+                                "queued_delivery_count": nullable_schema("integer", "Bounded queued count snapshot for an inbox_changed Wake; null for task and attention sources."),
+                                "inbox_high_watermark": nullable_schema("integer", "Durable delivery high-watermark for an inbox_changed Wake; null for task and attention sources."),
+                                "task_id": nullable_schema("string", "Exact AgentTask id for Task-attempt or Task-terminal attention; null for Goal workflow stall attention and non-Task sources."),
+                                "task_attempt_id": nullable_schema("string", "Exact AgentTaskAttempt id for Task sources; null for Goal workflow stall attention and non-Task sources."),
+                                "event_id": nullable_schema("string", "Exact durable semantic attention Event id for attention_event; null for other Wake sources."),
+                                "goal_id": nullable_schema("string", "Exact correlated Goal id for attention_event; null for other Wake sources. Identity grants no Goal authority."),
+                                "attention_kind": {"anyOf": [{"type": "string", "enum": ["agent_task_terminal", "goal_workflow_stalled"]}, {"type": "null"}]},
+                                "workflow_session_id": nullable_schema("string", "Exact explicitly correlated Workflow Session for a Goal workflow stall. Identity grants no Session authority.")
                             },
                             "required": [
-                                "wake_id", "state", "revision", "conversation_id",
-                                "latest_message_id", "queued_delivery_count", "inbox_high_watermark"
+                                "wake_id", "state", "revision", "trigger_kind", "conversation_id",
+                                "latest_message_id", "queued_delivery_count", "inbox_high_watermark",
+                                "task_id", "task_attempt_id", "event_id", "goal_id", "attention_kind", "workflow_session_id"
                             ]
                         },
                         {"type": "null"}
@@ -301,7 +451,7 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "additionalProperties": false,
                     "properties": {
                         "adapter_registered": schema_type("boolean", "Whether this exact Endpoint generation has a current process-local adapter handle."),
-                        "adapter_kind": nullable_string("Bounded adapter kind, if registered."),
+                        "adapter_kind": nullable_schema("string", "Bounded adapter kind, if registered."),
                         "runtime_wake_capable": schema_type("boolean", "Conjunction of current durable Endpoint state and exact process-local adapter registration."),
                         "production_auto_resume_available": schema_type("boolean", "True only for a demonstrated production Host new-model-turn primitive."),
                         "manual_fallback": schema_type("boolean", "True when explicit Host/model activation is required.")
@@ -387,7 +537,7 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("offset", schema_type("integer", "Returned page offset.")),
             (
                 "next_offset",
-                nullable_integer("Next page offset when truncated."),
+                nullable_schema("integer", "Next page offset when truncated."),
             ),
             (
                 "truncated",
@@ -414,7 +564,7 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "next_after_seq",
-                nullable_integer("Continuation cursor when truncated."),
+                nullable_schema("integer", "Continuation cursor when truncated."),
             ),
             (
                 "truncated",
@@ -444,7 +594,7 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "next_after_delivery_order",
-                nullable_integer("Continuation cursor when truncated."),
+                nullable_schema("integer", "Continuation cursor when truncated."),
             ),
             (
                 "truncated",
@@ -460,7 +610,7 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
                             "delivery_id": schema_type("string", "Canonical Delivery id."),
                             "state": {"type": "string", "enum": ["queued"]},
                             "conversation_id": schema_type("string", "Owning Conversation id."),
-                            "conversation_title": nullable_string("Optional Conversation title."),
+                            "conversation_title": nullable_schema("string", "Optional Conversation title."),
                             "message": message_schema()
                         },
                         "required": ["delivery_id", "state", "conversation_id", "conversation_title", "message"]

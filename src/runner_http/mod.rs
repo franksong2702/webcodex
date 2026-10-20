@@ -28,13 +28,16 @@ pub use handlers::{
     runner_job_update, runner_offline, runner_persistent_shell_result, runner_poll,
     runner_register, runner_result,
 };
-pub(crate) use telemetry::registry_with_tool_request_trace;
+pub(crate) use telemetry::{
+    observe_server_stream_disconnect, observe_server_stream_incoming_envelope,
+    observe_server_stream_ingress_processing, observe_server_stream_outgoing_channel,
+    observe_server_stream_writer_send, tool_request_trace_telemetry, RunnerStreamMetricOutcome,
+};
 pub(crate) use webcodex_runner_registry::{
     command_preview, process_preview, recovery_timeout_sweep, script_preview, EnqueueLspError,
-    RunnerFeature, RunnerFeatureSet, RunnerRegistry, RunnerSemanticView, RunnerTransport,
-    ShellJobStartMetadata, ShellJobVisibility, StructuredJobExecution, COMMAND_PREVIEW_MAX_CHARS,
-    DETACHED_IDEMPOTENCY_CONFLICT, DETACHED_IDEMPOTENCY_RECOVERY_PREFIX,
-    RECOVERY_SWEEP_INTERVAL_SECS, RUNNER_ONLINE_WINDOW_SECS,
+    EnqueueRunnerSkillError, RunnerFeature, RunnerFeatureSet, RunnerRegistry, RunnerSemanticView,
+    RunnerTransport, ShellJobStartMetadata, ShellJobVisibility, StructuredJobExecution,
+    COMMAND_PREVIEW_MAX_CHARS, RECOVERY_SWEEP_INTERVAL_SECS, RUNNER_ONLINE_WINDOW_SECS,
 };
 #[cfg(test)]
 pub(crate) use webcodex_runner_registry::{TRANSPORT_POLLING, TRANSPORT_WEBSOCKET};
@@ -300,6 +303,8 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: Some("Runner registry not configured".to_string()),
                 request_dispatched: None,
@@ -324,6 +329,8 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                     exit_code: None,
                     stdout: None,
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: None,
                     error: Some(format!("Invalid JSON: {}", e)),
                     request_dispatched: None,
@@ -353,6 +360,8 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: Some(e),
                 request_dispatched: None,
@@ -378,6 +387,8 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                     exit_code: None,
                     stdout: None,
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: None,
                     error: Some(e),
                     request_dispatched: None,
@@ -402,6 +413,8 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: Some("shell request waiter was dropped".to_string()),
                 request_dispatched: None,
@@ -423,6 +436,8 @@ pub async fn shell_run(req: &mut Request, depot: &mut Depot, res: &mut Response)
                     exit_code: None,
                     stdout: None,
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: None,
                     error: Some(format!(
                         "timed out waiting {} seconds for shell client result",

@@ -1,46 +1,71 @@
 //! Persistent Runner-owned stdio MCP providers for the built-in MCP gateway.
 //!
-//! Each configured provider is initialized lazily at most once for this
-//! Runner process. A protocol/transport failure permanently closes that
-//! provider instance; it is never silently restarted under the same identity.
+//! Each configured provider has one process-lifetime logical identity. Its stdio
+//! connection is initialized lazily and reused while healthy. A fatal protocol/
+//! transport failure retires only that connection: the failed request is never
+//! replayed, while a later explicit request may establish a fresh connection
+//! under the same provider identity and revalidate tool schema before dispatch.
 
 use super::config::{McpGatewayConfig, McpGatewayProviderConfig, MCP_GATEWAY_MAX_CWD_BYTES};
+#[cfg(windows)]
+use super::shell::env_keys_equal;
 use super::shell::is_sensitive_env_key;
-use crate::mcp_gateway::{
-    validate_json_value, validate_request, validate_tool_result, validate_tools, McpGatewayContent,
-    McpGatewayDispatchState, McpGatewayProvider, McpGatewayRequest, McpGatewayResponse,
-    McpGatewayResponsePayload, McpGatewayTool, McpGatewayToolResult, MCP_GATEWAY_MAX_MESSAGE_BYTES,
-};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{mpsc, Mutex, TryLockError};
+use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError};
 use std::time::{Duration, Instant};
+use webcodex_core::mcp_gateway::{
+    validate_json_value, validate_request, validate_tool_result,
+    validate_tools_with_description_limit, McpGatewayContent, McpGatewayDispatchState,
+    McpGatewayProvider, McpGatewayProviderState, McpGatewayRequest, McpGatewayResponse,
+    McpGatewayResponsePayload, McpGatewayTool, McpGatewayToolResult, MCP_GATEWAY_MAX_MESSAGE_BYTES,
+    MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES, MCP_GATEWAY_MAX_RESULT_BYTES,
+    MCP_GATEWAY_MAX_TOOL_COUNT,
+};
 use webcodex_process::ManagedChild;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
-const PROVIDER_AVAILABLE: u8 = 0;
-const PROVIDER_FAILED: u8 = 1;
 const MCP_GATEWAY_MAX_IGNORED_NOTIFICATIONS: usize = 32;
+// Limit bursts, not lifetime totals: an idle provider may ping indefinitely.
+const MCP_GATEWAY_UNSOLICITED_WINDOW: Duration = Duration::from_secs(5);
+const MCP_GATEWAY_MAX_PROVIDER_REQUEST_ID_BYTES: usize = 256;
+const PROVIDER_NEVER_STARTED: u8 = 0;
+const PROVIDER_HEALTHY: u8 = 1;
+const PROVIDER_CONNECTION_RETIRED: u8 = 2;
 
 pub(crate) struct McpGatewayManager {
-    providers: BTreeMap<String, ProviderEntry>,
-    request_timeout: Duration,
+    state: RwLock<McpGatewayState>,
     stopping: AtomicBool,
+}
+
+struct McpGatewayState {
+    providers: BTreeMap<String, Arc<ProviderEntry>>,
+    request_timeout: Duration,
+    max_tool_description_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct McpGatewayReloadSummary {
+    pub(crate) preserved: usize,
+    pub(crate) replaced: usize,
+    pub(crate) added: usize,
+    pub(crate) removed: usize,
 }
 
 struct ProviderEntry {
     config: McpGatewayProviderConfig,
     instance_id: String,
-    failed: AtomicU8,
+    lifecycle: AtomicU8,
+    accepting_requests: AtomicBool,
     session: Mutex<Option<ProviderConnection>>,
 }
 
 struct ProviderConnection {
     child: ManagedChild,
-    stdin: ChildStdin,
+    stdin: Arc<Mutex<ChildStdin>>,
     incoming: mpsc::Receiver<ReaderEvent>,
     next_id: u64,
 }
@@ -55,12 +80,15 @@ enum ReaderFault {
     Malformed,
     TooLarge,
     Io,
+    Stdin,
+    NotificationFlood,
 }
 
 struct ProviderFailure {
     code: &'static str,
     dispatch_state: McpGatewayDispatchState,
     fatal: bool,
+    detail: Option<String>,
 }
 
 impl ProviderFailure {
@@ -69,6 +97,7 @@ impl ProviderFailure {
             code,
             dispatch_state: McpGatewayDispatchState::NotStarted,
             fatal: true,
+            detail: None,
         }
     }
 
@@ -77,6 +106,7 @@ impl ProviderFailure {
             code,
             dispatch_state: McpGatewayDispatchState::OutcomeUnknown,
             fatal: true,
+            detail: None,
         }
     }
 
@@ -89,7 +119,20 @@ impl ProviderFailure {
             // poison the whole provider instance; only transport/protocol
             // failures that lose correlation retire the session.
             fatal: false,
+            detail: None,
         }
+    }
+
+    fn with_detail(mut self, mut detail: String) -> Self {
+        if detail.len() > 512 {
+            let mut end = 512;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        self.detail = Some(detail);
+        self
     }
 
     fn not_started(code: &'static str) -> Self {
@@ -97,6 +140,7 @@ impl ProviderFailure {
             code,
             dispatch_state: McpGatewayDispatchState::NotStarted,
             fatal: false,
+            detail: None,
         }
     }
 
@@ -112,6 +156,7 @@ impl ProviderFailure {
             code: "provider_rpc_error",
             dispatch_state: McpGatewayDispatchState::Completed,
             fatal: false,
+            detail: None,
         }
     }
 }
@@ -121,21 +166,15 @@ impl McpGatewayManager {
         let providers = config
             .providers
             .iter()
-            .map(|provider| {
-                (
-                    provider.id.clone(),
-                    ProviderEntry {
-                        config: provider.clone(),
-                        instance_id: uuid::Uuid::new_v4().simple().to_string(),
-                        failed: AtomicU8::new(PROVIDER_AVAILABLE),
-                        session: Mutex::new(None),
-                    },
-                )
-            })
+            .cloned()
+            .map(|provider| (provider.id.clone(), Arc::new(ProviderEntry::new(provider))))
             .collect();
         Self {
-            providers,
-            request_timeout: Duration::from_secs(config.request_timeout_secs.clamp(1, 120)),
+            state: RwLock::new(McpGatewayState {
+                providers,
+                request_timeout: Duration::from_secs(config.request_timeout_secs.clamp(1, 120)),
+                max_tool_description_bytes: config.max_tool_description_bytes,
+            }),
             stopping: AtomicBool::new(false),
         }
     }
@@ -144,10 +183,85 @@ impl McpGatewayManager {
     /// registration. Reading it does not start a provider process and does not
     /// expose executable, argv, environment, PID, stderr, or secret material.
     pub(crate) fn provider_inventory(&self) -> Vec<McpGatewayProvider> {
-        self.providers
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .providers
             .values()
-            .map(ProviderEntry::advertisement)
+            .map(|provider| provider.advertisement())
             .collect()
+    }
+
+    /// Atomically replace the configured provider set without retargeting any
+    /// exact provider identity. Providers whose complete local config is
+    /// unchanged retain their instance id and live connection. Changed/new
+    /// providers receive fresh instance ids; removed/replaced connections are
+    /// retired after the new routing snapshot is committed.
+    pub(crate) fn apply_config_candidate(
+        &self,
+        config: &McpGatewayConfig,
+    ) -> Result<McpGatewayReloadSummary, &'static str> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err("mcp_gateway_stopping");
+        }
+        let mut retired = Vec::new();
+        let summary;
+        {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.stopping.load(Ordering::SeqCst) {
+                return Err("mcp_gateway_stopping");
+            }
+            let mut current = std::mem::take(&mut state.providers);
+            let mut next = BTreeMap::new();
+            let mut preserved = 0usize;
+            let mut replaced = 0usize;
+            let mut added = 0usize;
+            for provider_config in &config.providers {
+                match current.remove(&provider_config.id) {
+                    Some(existing) if existing.config == *provider_config => {
+                        preserved += 1;
+                        next.insert(provider_config.id.clone(), existing);
+                    }
+                    Some(existing) => {
+                        replaced += 1;
+                        existing.accepting_requests.store(false, Ordering::SeqCst);
+                        retired.push(existing);
+                        next.insert(
+                            provider_config.id.clone(),
+                            Arc::new(ProviderEntry::new(provider_config.clone())),
+                        );
+                    }
+                    None => {
+                        added += 1;
+                        next.insert(
+                            provider_config.id.clone(),
+                            Arc::new(ProviderEntry::new(provider_config.clone())),
+                        );
+                    }
+                }
+            }
+            let removed = current.len();
+            for existing in current.into_values() {
+                existing.accepting_requests.store(false, Ordering::SeqCst);
+                retired.push(existing);
+            }
+            state.providers = next;
+            state.request_timeout = Duration::from_secs(config.request_timeout_secs.clamp(1, 120));
+            state.max_tool_description_bytes = config.max_tool_description_bytes;
+            summary = McpGatewayReloadSummary {
+                preserved,
+                replaced,
+                added,
+                removed,
+            };
+        }
+        for provider in retired {
+            provider.retire_connection_nonblocking();
+        }
+        Ok(summary)
     }
 
     pub(crate) fn handle(&self, request: McpGatewayRequest) -> McpGatewayResponse {
@@ -166,17 +280,32 @@ impl McpGatewayManager {
             );
         }
         match request {
+            McpGatewayRequest::ProviderStatus {
+                provider_id,
+                provider_instance_id,
+            } => {
+                let Some((provider, _, _)) =
+                    self.exact_provider(&provider_id, &provider_instance_id)
+                else {
+                    return stale_provider();
+                };
+                McpGatewayResponse::success(McpGatewayResponsePayload::ProviderStatus {
+                    state: provider.lifecycle_state(),
+                })
+            }
             McpGatewayRequest::ToolsList {
                 provider_id,
                 provider_instance_id,
             } => {
-                let Some(provider) = self.exact_provider(&provider_id, &provider_instance_id)
+                let Some((provider, timeout, max_description_bytes)) =
+                    self.exact_provider(&provider_id, &provider_instance_id)
                 else {
                     return stale_provider();
                 };
                 match provider.with_connection(
-                    provider.request_timeout(self.request_timeout),
-                    |connection, timeout| connection.tools_list(timeout),
+                    timeout,
+                    || self.check_provider_admission(&provider_id, &provider_instance_id),
+                    |connection, timeout| connection.tools_list(timeout, max_description_bytes),
                 ) {
                     Ok(tools) => {
                         McpGatewayResponse::success(McpGatewayResponsePayload::Tools { tools })
@@ -190,17 +319,20 @@ impl McpGatewayManager {
                 name,
                 arguments,
                 expected_schema,
+                allow_resource_links,
             } => {
-                let Some(provider) = self.exact_provider(&provider_id, &provider_instance_id)
+                let Some((provider, timeout, max_description_bytes)) =
+                    self.exact_provider(&provider_id, &provider_instance_id)
                 else {
                     return stale_provider();
                 };
                 match provider.with_connection(
-                    provider.request_timeout(self.request_timeout),
+                    timeout,
+                    || self.check_provider_admission(&provider_id, &provider_instance_id),
                     |connection, timeout| {
                         let started = Instant::now();
                         let tools = connection
-                            .tools_list(timeout)
+                            .tools_list(timeout, max_description_bytes)
                             .map_err(ProviderFailure::preflight)?;
                         let Some(current) = tools.iter().find(|tool| tool.name == name) else {
                             return Err(ProviderFailure::not_started("provider_tool_missing"));
@@ -214,7 +346,8 @@ impl McpGatewayManager {
                         if remaining.is_zero() {
                             return Err(ProviderFailure::not_started("provider_timeout"));
                         }
-                        connection.tools_call(&name, arguments, remaining)
+                        self.commit_provider_dispatch(&provider)?;
+                        connection.tools_call(&name, arguments, remaining, allow_resource_links)
                     },
                 ) {
                     Ok(result) => {
@@ -228,27 +361,67 @@ impl McpGatewayManager {
         }
     }
 
+    fn check_provider_admission(
+        &self,
+        provider_id: &str,
+        provider_instance_id: &str,
+    ) -> Result<(), ProviderFailure> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(ProviderFailure::not_started("runner_stopping"));
+        }
+        self.exact_provider(provider_id, provider_instance_id)
+            .map(|_| ())
+            .ok_or_else(|| ProviderFailure::not_started("stale_provider"))
+    }
+
+    fn commit_provider_dispatch(&self, provider: &ProviderEntry) -> Result<(), ProviderFailure> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(ProviderFailure::not_started("runner_stopping"));
+        }
+        // Config replacement flips this bit while still holding the routing
+        // write lock. This SeqCst load is the effect-dispatch linearization
+        // point: earlier retirement fences the call; later retirement is
+        // ordered after this request was admitted for dispatch.
+        if !provider.accepting_requests.load(Ordering::SeqCst) {
+            return Err(ProviderFailure::not_started("stale_provider"));
+        }
+        Ok(())
+    }
+
     fn exact_provider(
         &self,
         provider_id: &str,
         provider_instance_id: &str,
-    ) -> Option<&ProviderEntry> {
-        self.providers.get(provider_id).filter(|provider| {
-            provider.instance_id == provider_instance_id
-                && provider.failed.load(Ordering::SeqCst) == PROVIDER_AVAILABLE
-        })
+    ) -> Option<(Arc<ProviderEntry>, Duration, usize)> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let provider = state.providers.get(provider_id)?;
+        if provider.instance_id != provider_instance_id {
+            return None;
+        }
+        Some((
+            Arc::clone(provider),
+            provider.request_timeout(state.request_timeout),
+            state.max_tool_description_bytes,
+        ))
     }
 
     pub(crate) fn shutdown(&self) {
         if self.stopping.swap(true, Ordering::SeqCst) {
             return;
         }
-        for provider in self.providers.values() {
-            let mut session = provider
-                .session
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            drop(session.take());
+        let providers = self
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .providers
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for provider in providers {
+            provider.shutdown_connection();
         }
     }
 }
@@ -260,6 +433,44 @@ impl Drop for McpGatewayManager {
 }
 
 impl ProviderEntry {
+    fn new(config: McpGatewayProviderConfig) -> Self {
+        Self {
+            config,
+            instance_id: uuid::Uuid::new_v4().simple().to_string(),
+            lifecycle: AtomicU8::new(PROVIDER_NEVER_STARTED),
+            accepting_requests: AtomicBool::new(true),
+            session: Mutex::new(None),
+        }
+    }
+
+    fn retire_connection_nonblocking(&self) {
+        self.accepting_requests.store(false, Ordering::SeqCst);
+        self.lifecycle
+            .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
+        match self.session.try_lock() {
+            Ok(mut session) => drop(session.take()),
+            Err(TryLockError::WouldBlock) => {
+                // An already-dispatched request owns the connection. Do not
+                // interrupt it or block config reload; once that request drops
+                // the last Arc<ProviderEntry>, the old connection is retired.
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut session = poisoned.into_inner();
+                drop(session.take());
+            }
+        }
+    }
+
+    fn shutdown_connection(&self) {
+        let mut session = self
+            .session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(session.take());
+        self.lifecycle
+            .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
+    }
+
     fn advertisement(&self) -> McpGatewayProvider {
         McpGatewayProvider {
             provider_id: self.config.id.clone(),
@@ -275,38 +486,82 @@ impl ProviderEntry {
             .unwrap_or(default)
     }
 
+    fn lifecycle_state(&self) -> McpGatewayProviderState {
+        let mut session = match self.session.try_lock() {
+            Ok(session) => session,
+            Err(TryLockError::WouldBlock) => return McpGatewayProviderState::Busy,
+            Err(TryLockError::Poisoned(_)) => return McpGatewayProviderState::ConnectionRetired,
+        };
+        if let Some(connection) = session.as_mut() {
+            match connection.child.try_wait() {
+                Ok(None) => {
+                    self.lifecycle.store(PROVIDER_HEALTHY, Ordering::SeqCst);
+                    return McpGatewayProviderState::Healthy;
+                }
+                Ok(Some(_)) | Err(_) => {
+                    // Reap/drop the dead owned connection without starting a
+                    // replacement. A later explicit interaction owns reconnect.
+                    drop(session.take());
+                    self.lifecycle
+                        .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
+                    return McpGatewayProviderState::ConnectionRetired;
+                }
+            }
+        }
+        match self.lifecycle.load(Ordering::SeqCst) {
+            PROVIDER_NEVER_STARTED => McpGatewayProviderState::NeverStarted,
+            PROVIDER_HEALTHY | PROVIDER_CONNECTION_RETIRED => {
+                McpGatewayProviderState::ConnectionRetired
+            }
+            _ => McpGatewayProviderState::ConnectionRetired,
+        }
+    }
+
     fn with_connection<T>(
         &self,
         timeout: Duration,
+        admission_check: impl Fn() -> Result<(), ProviderFailure>,
         operation: impl FnOnce(&mut ProviderConnection, Duration) -> Result<T, ProviderFailure>,
     ) -> Result<T, ProviderFailure> {
-        if self.failed.load(Ordering::SeqCst) == PROVIDER_FAILED {
-            return Err(ProviderFailure::before_send("provider_unavailable"));
-        }
-        let mut session = match self.session.try_lock() {
-            Ok(session) => session,
-            Err(TryLockError::WouldBlock) => {
-                return Err(ProviderFailure {
-                    code: "provider_busy",
-                    dispatch_state: McpGatewayDispatchState::NotStarted,
-                    fatal: false,
-                })
-            }
-            Err(TryLockError::Poisoned(_)) => {
-                self.failed.store(PROVIDER_FAILED, Ordering::SeqCst);
-                return Err(ProviderFailure::before_send("provider_unavailable"));
+        let started = Instant::now();
+        let admission_budget = timeout.min(Duration::from_secs(2));
+        let mut session = loop {
+            admission_check()?;
+            match self.session.try_lock() {
+                Ok(session) => break session,
+                Err(TryLockError::WouldBlock) => {
+                    let Some(remaining) = admission_budget
+                        .checked_sub(started.elapsed())
+                        .filter(|remaining| !remaining.is_zero())
+                    else {
+                        return Err(ProviderFailure::not_started("provider_busy"));
+                    };
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(ProviderFailure::before_send("provider_unavailable"));
+                }
             }
         };
-        let started = Instant::now();
+        admission_check()?;
+        let remaining = timeout
+            .checked_sub(started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| ProviderFailure::not_started("provider_busy"))?;
         if session.is_none() {
-            match ProviderConnection::spawn(&self.config, timeout) {
-                Ok(connection) => *session = Some(connection),
+            match ProviderConnection::spawn(&self.config, remaining) {
+                Ok(connection) => {
+                    self.lifecycle.store(PROVIDER_HEALTHY, Ordering::SeqCst);
+                    *session = Some(connection);
+                }
                 Err(mut error) => {
+                    self.lifecycle
+                        .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
                     // Initialization is provider lifecycle setup, not the
                     // requested tools/list or tools/call. Even if initialize
-                    // reached the child, the caller's operation did not.
+                    // reached the child, the caller's operation did not. A
+                    // later explicit request may attempt a fresh connection.
                     error.dispatch_state = McpGatewayDispatchState::NotStarted;
-                    self.failed.store(PROVIDER_FAILED, Ordering::SeqCst);
                     return Err(error);
                 }
             }
@@ -315,18 +570,24 @@ impl ProviderEntry {
             .checked_sub(started.elapsed())
             .filter(|remaining| !remaining.is_zero())
         else {
-            self.failed.store(PROVIDER_FAILED, Ordering::SeqCst);
+            self.lifecycle
+                .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
             if let Some(mut connection) = session.take() {
                 connection.terminate();
             }
             return Err(ProviderFailure::before_send("provider_timeout"));
         };
+        admission_check()?;
         let result = operation(
             session.as_mut().expect("provider connection initialized"),
             remaining,
         );
         if result.as_ref().is_err_and(|error| error.fatal) {
-            self.failed.store(PROVIDER_FAILED, Ordering::SeqCst);
+            self.lifecycle
+                .store(PROVIDER_CONNECTION_RETIRED, Ordering::SeqCst);
+            // Retire only the desynchronized connection. Never replay the
+            // failed request here; a later explicit request may spawn a fresh
+            // connection under the same logical provider identity.
             if let Some(mut connection) = session.take() {
                 connection.terminate();
             }
@@ -338,7 +599,20 @@ impl ProviderEntry {
 fn resolve_provider_environment(
     config: &McpGatewayProviderConfig,
 ) -> Result<Vec<(String, std::ffi::OsString)>, ProviderFailure> {
-    let mut resolved = Vec::with_capacity(config.env_from_env.len());
+    let mut resolved = Vec::with_capacity(config.env_from_env.len() + usize::from(cfg!(windows)));
+    #[cfg(windows)]
+    if !config
+        .env_from_env
+        .keys()
+        .any(|destination| env_keys_equal(destination, "SYSTEMROOT"))
+    {
+        // Keep Windows process bootstrap usable after env_clear() without
+        // inheriting PATH, user profile data, proxy settings, or credentials.
+        // Operators may still explicitly map SYSTEMROOT to another source.
+        if let Some(system_root) = std::env::var_os("SYSTEMROOT") {
+            resolved.push(("SYSTEMROOT".to_string(), system_root));
+        }
+    }
     for (destination, source) in &config.env_from_env {
         // Keep the Runner transport/account secret invariant authoritative even
         // if a caller constructs config without going through load_config.
@@ -373,6 +647,35 @@ fn resolve_provider_cwd(
     }
 }
 
+fn validate_provider_tool_result_structure(result: &Value) -> Result<(), ProviderFailure> {
+    // Preserve the existing JSON depth/node/string and 512 KiB non-image
+    // defenses while exempting only standard image.data from the generic
+    // JSON-string ceiling. The typed image validator applies its own stricter
+    // base64/decoded aggregate budget below.
+    let mut structural = result.clone();
+    if let Some(items) = structural.get_mut("content").and_then(Value::as_array_mut) {
+        for item in items {
+            let is_image = item.get("type").and_then(Value::as_str) == Some("image");
+            if is_image {
+                if let Some(data) = item
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut("data"))
+                {
+                    if data.is_string() {
+                        *data = Value::String(String::new());
+                    }
+                }
+            }
+        }
+    }
+    validate_json_value(
+        &structural,
+        MCP_GATEWAY_MAX_RESULT_BYTES,
+        "provider tool result",
+    )
+    .map_err(|_| ProviderFailure::completed("invalid_provider_result"))
+}
+
 impl ProviderConnection {
     fn spawn(
         config: &McpGatewayProviderConfig,
@@ -386,8 +689,9 @@ impl ProviderConnection {
         let mut command = Command::new(&config.executable);
         command
             .args(&config.args)
-            // Never inherit the Runner process environment implicitly. Only the
-            // explicit env_from_env mapping below crosses this trust boundary.
+            // Never inherit the Runner process environment implicitly. The
+            // resolved environment below is limited to explicit env_from_env
+            // mappings plus the minimal non-secret Windows OS bootstrap.
             .env_clear();
         for (destination, value) in environment {
             command.env(destination, value);
@@ -417,9 +721,11 @@ impl ProviderConnection {
             .take()
             .ok_or_else(|| ProviderFailure::before_send("provider_stdio_unavailable"))?;
         let (sender, incoming) = mpsc::sync_channel(8);
+        let stdin = Arc::new(Mutex::new(stdin));
+        let reader_stdin = Arc::clone(&stdin);
         std::thread::Builder::new()
             .name(format!("wc-mcp-{}", config.id))
-            .spawn(move || provider_stdout_reader(stdout, sender))
+            .spawn(move || provider_stdout_reader(stdout, sender, reader_stdin))
             .map_err(|_| ProviderFailure::before_send("provider_reader_unavailable"))?;
         std::thread::Builder::new()
             .name(format!("wc-mcp-stderr-{}", config.id))
@@ -453,14 +759,17 @@ impl ProviderConnection {
         Ok(connection)
     }
 
-    fn tools_list(&mut self, timeout: Duration) -> Result<Vec<McpGatewayTool>, ProviderFailure> {
+    fn tools_list(
+        &mut self,
+        timeout: Duration,
+        max_description_bytes: usize,
+    ) -> Result<Vec<McpGatewayTool>, ProviderFailure> {
         let result = self.request("tools/list", json!({}), timeout)?;
-        validate_json_value(
-            &result,
-            MCP_GATEWAY_MAX_MESSAGE_BYTES,
-            "provider tools response",
-        )
-        .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
+        let encoded = serde_json::to_vec(&result)
+            .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
+        if encoded.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
+            return Err(ProviderFailure::completed("invalid_provider_tools"));
+        }
         let object = result
             .as_object()
             .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
@@ -476,8 +785,28 @@ impl ProviderConnection {
             .get("tools")
             .and_then(Value::as_array)
             .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
+        if raw_tools.len() > MCP_GATEWAY_MAX_TOOL_COUNT {
+            return Err(ProviderFailure::completed("invalid_provider_tools"));
+        }
+        // The catalog has an aggregate byte/count bound; each tool gets its own
+        // JSON node budget. Validate other response fields independently too.
+        let mut envelope = object.clone();
+        envelope.insert("tools".to_string(), json!([]));
+        validate_json_value(
+            &Value::Object(envelope),
+            MCP_GATEWAY_MAX_MESSAGE_BYTES,
+            "provider tools response",
+        )
+        .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
         let mut tools = Vec::with_capacity(raw_tools.len());
         for raw in raw_tools {
+            // Keep the tools/list wrapper so the existing depth bound is unchanged.
+            validate_json_value(
+                &json!({"tools": [raw]}),
+                MCP_GATEWAY_MAX_MESSAGE_BYTES,
+                "provider tool",
+            )
+            .map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
             let object = raw
                 .as_object()
                 .ok_or_else(|| ProviderFailure::completed("invalid_provider_tools"))?;
@@ -520,7 +849,9 @@ impl ProviderConnection {
                 meta,
             });
         }
-        validate_tools(&tools).map_err(|_| ProviderFailure::completed("invalid_provider_tools"))?;
+        validate_tools_with_description_limit(&tools, max_description_bytes).map_err(|error| {
+            ProviderFailure::completed("invalid_provider_tools").with_detail(error)
+        })?;
         Ok(tools)
     }
 
@@ -529,17 +860,13 @@ impl ProviderConnection {
         name: &str,
         arguments: Value,
         timeout: Duration,
+        allow_resource_links: bool,
     ) -> Result<McpGatewayToolResult, ProviderFailure> {
         // Outer MCP caller metadata deliberately stops at the WebCodex trust
         // boundary. Provider tools/call receives only gateway-owned fields.
         let params = json!({"name": name, "arguments": arguments});
         let result = self.request("tools/call", params, timeout)?;
-        validate_json_value(
-            &result,
-            MCP_GATEWAY_MAX_MESSAGE_BYTES,
-            "provider tool result",
-        )
-        .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
+        validate_provider_tool_result_structure(&result)?;
         let object = result
             .as_object()
             .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
@@ -552,16 +879,48 @@ impl ProviderConnection {
             let item = item
                 .as_object()
                 .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-            if item.get("type").and_then(Value::as_str) != Some("text") {
-                return Err(ProviderFailure::completed("unsupported_provider_content"));
-            }
-            let text = item
-                .get("text")
+            let content_type = item
+                .get("type")
                 .and_then(Value::as_str)
                 .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
-            content.push(McpGatewayContent::Text {
-                text: text.to_string(),
-            });
+            match content_type {
+                "text" => {
+                    let text = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                    content.push(McpGatewayContent::Text {
+                        text: text.to_string(),
+                    });
+                }
+                "image" => {
+                    let data = item
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                    let mime_type = item
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| ProviderFailure::completed("invalid_provider_result"))?;
+                    content.push(McpGatewayContent::Image {
+                        data: data.to_string(),
+                        mime_type: mime_type.to_string(),
+                    });
+                }
+                "resource_link" => {
+                    if !allow_resource_links {
+                        // An old Server cannot decode this result variant. Since
+                        // tools/call completed, send a deterministic completed error.
+                        return Err(ProviderFailure::completed("unsupported_provider_content"));
+                    }
+                    let link = serde_json::from_value(Value::Object(item.clone()))
+                        .map_err(|_| ProviderFailure::completed("invalid_provider_result"))?;
+                    content.push(link);
+                }
+                _ => {
+                    return Err(ProviderFailure::completed("unsupported_provider_content"));
+                }
+            }
         }
         let result = McpGatewayToolResult {
             content,
@@ -627,14 +986,25 @@ impl ProviderConnection {
                 Ok(ReaderEvent::Message(Err(ReaderFault::TooLarge))) => {
                     return Err(ProviderFailure::before_send("provider_message_too_large"));
                 }
+                Ok(ReaderEvent::Message(Err(ReaderFault::NotificationFlood))) => {
+                    return Err(ProviderFailure::before_send("provider_notification_flood"));
+                }
                 Ok(ReaderEvent::Message(Err(ReaderFault::Io))) => {
                     return Err(ProviderFailure::before_send("provider_stdout_failed"));
+                }
+                Ok(ReaderEvent::Message(Err(ReaderFault::Stdin))) => {
+                    return Err(ProviderFailure::before_send("provider_stdin_failed"));
                 }
             }
         }
 
         let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        self.next_id = id.checked_add(1).ok_or_else(|| {
+            // Reusing a saturated ID would lose request-response correlation.
+            // Retire this connection before writing; only a later explicit
+            // request may reconnect, never replay the exhausted request.
+            ProviderFailure::before_send("provider_request_id_exhausted")
+        })?;
         let message = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -648,8 +1018,9 @@ impl ProviderConnection {
         }
         encoded.push(b'\n');
         self.stdin
+            .lock()
+            .map_err(|_| ProviderFailure::after_send("provider_stdin_failed"))?
             .write_all(&encoded)
-            .and_then(|_| self.stdin.flush())
             .map_err(|_| ProviderFailure::after_send("provider_stdin_failed"))?;
 
         let deadline = Instant::now() + timeout;
@@ -667,8 +1038,14 @@ impl ProviderConnection {
                 Ok(ReaderEvent::Message(Err(ReaderFault::TooLarge))) => {
                     return Err(ProviderFailure::after_send("provider_message_too_large"));
                 }
+                Ok(ReaderEvent::Message(Err(ReaderFault::NotificationFlood))) => {
+                    return Err(ProviderFailure::after_send("provider_notification_flood"));
+                }
                 Ok(ReaderEvent::Message(Err(ReaderFault::Io))) => {
                     return Err(ProviderFailure::after_send("provider_stdout_failed"));
+                }
+                Ok(ReaderEvent::Message(Err(ReaderFault::Stdin))) => {
+                    return Err(ProviderFailure::after_send("provider_stdin_failed"));
                 }
                 Ok(ReaderEvent::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(ProviderFailure::after_send("provider_eof"));
@@ -706,8 +1083,9 @@ impl ProviderConnection {
         }
         encoded.push(b'\n');
         self.stdin
+            .lock()
+            .map_err(|_| ProviderFailure::before_send("provider_stdin_failed"))?
             .write_all(&encoded)
-            .and_then(|_| self.stdin.flush())
             .map_err(|_| ProviderFailure::before_send("provider_stdin_failed"))
     }
 
@@ -742,37 +1120,133 @@ impl Drop for ProviderConnection {
     }
 }
 
+#[derive(Default)]
+struct UnsolicitedWindow {
+    start: Option<Instant>,
+    count: usize,
+}
+
+impl UnsolicitedWindow {
+    fn exceeded(&mut self, now: Instant) -> bool {
+        if self
+            .start
+            .is_none_or(|start| now.duration_since(start) >= MCP_GATEWAY_UNSOLICITED_WINDOW)
+        {
+            self.start = Some(now);
+            self.count = 0;
+        }
+        self.count += 1;
+        self.count > MCP_GATEWAY_MAX_IGNORED_NOTIFICATIONS
+    }
+
+    fn reset(&mut self) {
+        self.start = None;
+        self.count = 0;
+    }
+}
+
 fn provider_stdout_reader(
     stdout: std::process::ChildStdout,
     sender: mpsc::SyncSender<ReaderEvent>,
+    stdin: Arc<Mutex<ChildStdin>>,
 ) {
     let mut reader = BufReader::new(stdout);
+    let mut unsolicited_window = UnsolicitedWindow::default();
     loop {
-        let message = match read_bounded_line(&mut reader) {
-            Ok(Some(message)) => ReaderEvent::Message(
-                serde_json::from_slice(&message).map_err(|_| ReaderFault::Malformed),
-            ),
+        let event = match read_bounded_line(&mut reader) {
+            Ok(Some(line)) => match serde_json::from_slice::<Value>(&line) {
+                Ok(message) => {
+                    if is_provider_notification(&message) {
+                        if unsolicited_window.exceeded(Instant::now()) {
+                            ReaderEvent::Message(Err(ReaderFault::NotificationFlood))
+                        } else {
+                            continue;
+                        }
+                    } else if let Some(request_id) = provider_request_id(&message) {
+                        if unsolicited_window.exceeded(Instant::now()) {
+                            return send_reader_fault(&sender, ReaderFault::NotificationFlood);
+                        }
+                        let reply = if message.get("method").and_then(Value::as_str) == Some("ping")
+                        {
+                            json!({"jsonrpc": "2.0", "id": request_id, "result": {}})
+                        } else {
+                            json!({"jsonrpc": "2.0", "id": request_id,
+                                "error": {"code": -32601, "message": "Method not found"}})
+                        };
+                        let result = serde_json::to_vec(&reply)
+                            .map_err(|_| ReaderFault::Stdin)
+                            .and_then(|mut data| {
+                                data.push(b'\n');
+                                stdin
+                                    .lock()
+                                    .map_err(|_| ReaderFault::Stdin)?
+                                    .write_all(&data)
+                                    .map_err(|_| ReaderFault::Stdin)
+                            });
+                        match result {
+                            Ok(()) => continue,
+                            Err(fault) => ReaderEvent::Message(Err(fault)),
+                        }
+                    } else {
+                        unsolicited_window.reset();
+                        ReaderEvent::Message(Ok(message))
+                    }
+                }
+                Err(_) => ReaderEvent::Message(Err(ReaderFault::Malformed)),
+            },
             Ok(None) => ReaderEvent::Eof,
             Err(fault) => ReaderEvent::Message(Err(fault)),
         };
-        let terminal = !matches!(&message, ReaderEvent::Message(Ok(_)));
-        if sender.send(message).is_err() || terminal {
+        let terminal = !matches!(&event, ReaderEvent::Message(Ok(_)));
+        if sender.send(event).is_err() || terminal {
             return;
         }
+    }
+}
+
+fn send_reader_fault(sender: &mpsc::SyncSender<ReaderEvent>, fault: ReaderFault) {
+    let _ = sender.send(ReaderEvent::Message(Err(fault)));
+}
+
+fn provider_request_id(message: &Value) -> Option<Value> {
+    let object = message.as_object()?;
+    if object.get("jsonrpc")?.as_str()? != "2.0"
+        || object.contains_key("result")
+        || object.contains_key("error")
+    {
+        return None;
+    }
+    let method = object.get("method")?.as_str()?;
+    if method.is_empty() || method.len() > 256 || method.chars().any(char::is_control) {
+        return None;
+    }
+    if object
+        .get("params")
+        .is_some_and(|params| !params.is_object())
+    {
+        return None;
+    }
+    let id = object.get("id")?;
+    match id {
+        Value::String(value) if value.len() <= MCP_GATEWAY_MAX_PROVIDER_REQUEST_ID_BYTES => {
+            Some(id.clone())
+        }
+        Value::Number(value) if value.is_i64() || value.is_u64() => Some(id.clone()),
+        _ => None,
     }
 }
 
 fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, ReaderFault> {
     let mut line = Vec::new();
     let read = (&mut *reader)
-        .take((MCP_GATEWAY_MAX_MESSAGE_BYTES + 2) as u64)
+        .take((MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES + 2) as u64)
         .read_until(b'\n', &mut line)
         .map_err(|_| ReaderFault::Io)?;
     if read == 0 {
         return Ok(None);
     }
     if line.last() != Some(&b'\n') {
-        return Err(if line.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
+        return Err(if line.len() > MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES {
             ReaderFault::TooLarge
         } else {
             ReaderFault::Malformed
@@ -782,8 +1256,8 @@ fn read_bounded_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, Reade
     if line.last() == Some(&b'\r') {
         line.pop();
     }
-    if line.is_empty() || line.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
-        return Err(if line.len() > MCP_GATEWAY_MAX_MESSAGE_BYTES {
+    if line.is_empty() || line.len() > MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES {
+        return Err(if line.len() > MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES {
             ReaderFault::TooLarge
         } else {
             ReaderFault::Malformed
@@ -895,18 +1369,21 @@ fn validate_initialize_result(result: &Value) -> Result<(), ProviderFailure> {
 
 fn provider_failure_response(error: ProviderFailure) -> McpGatewayResponse {
     let state = error.dispatch_state;
-    let message = match state {
-        McpGatewayDispatchState::NotStarted => {
-            "Provider request was not started; no downstream effect was dispatched"
+    let message = error.detail.unwrap_or_else(|| {
+        match state {
+            McpGatewayDispatchState::NotStarted => {
+                "Provider request was not started; no downstream effect was dispatched"
+            }
+            McpGatewayDispatchState::OutcomeUnknown => {
+                "Provider request may have been dispatched; outcome is unknown and must not be retried automatically"
+            }
+            McpGatewayDispatchState::Completed => {
+                "Provider completed the request-response exchange but returned a downstream error or unsupported/invalid bounded result"
+            }
         }
-        McpGatewayDispatchState::OutcomeUnknown => {
-            "Provider request may have been dispatched; outcome is unknown and must not be retried automatically"
-        }
-        McpGatewayDispatchState::Completed => {
-            "Provider completed the request-response exchange but returned a downstream error or unsupported/invalid bounded result"
-        }
-    };
-    bridge_error(state, error.code, message)
+        .to_string()
+    });
+    McpGatewayResponse::error(state, error.code, message)
 }
 
 fn bridge_error(

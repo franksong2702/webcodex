@@ -4,16 +4,19 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[cfg(unix)]
 fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(bytes);
     format!("{:x}", hash.finalize())
 }
 
+#[cfg(unix)]
 fn leaked(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
 
+#[cfg(unix)]
 fn test_asset(bytes: &[u8], gzip_archive: bool) -> CloudflaredAsset {
     let binary_sha256 = if gzip_archive {
         unreachable!("archive tests construct their asset explicitly")
@@ -293,14 +296,10 @@ fn npm_cafile_is_bounded_and_errors_do_not_expose_paths_or_ca_content() {
 async fn npm_config_query_uses_fixed_argv_and_normalizes_null() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp = tempfile::tempdir().unwrap();
-    let npm = temp.path().join("fake-npm");
-    fs::write(
-        &npm,
-        b"#!/bin/sh\n[ \"$1\" = config ] && [ \"$2\" = get ] || exit 9\ncase \"$3\" in\n  proxy) printf '%s\\n' 'http://query-proxy.test:8080' ;;\n  ca) printf '%s\\n' null ;;\n  *) exit 8 ;;\nesac\n",
-    )
-    .unwrap();
-    fs::set_permissions(&npm, fs::Permissions::from_mode(0o700)).unwrap();
+    // Never write the executable in this process: parallel forks can retain a
+    // writer until exec and make a freshly written fixture fail with ETXTBSY.
+    let npm = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/npm-config.sh");
+    assert_ne!(fs::metadata(&npm).unwrap().permissions().mode() & 0o111, 0);
 
     assert_eq!(
         query_npm_config_value_with(npm.as_os_str(), "proxy").await,
@@ -308,6 +307,10 @@ async fn npm_config_query_uses_fixed_argv_and_normalizes_null() {
     );
     assert_eq!(
         query_npm_config_value_with(npm.as_os_str(), "ca").await,
+        None
+    );
+    assert_eq!(
+        query_npm_config_value_with(npm.as_os_str(), "failed").await,
         None
     );
 }
@@ -356,7 +359,7 @@ async fn managed_binary_is_downloaded_verified_and_reused_without_network() {
     let script = format!("#!/bin/sh\necho 'cloudflared version {CLOUDFLARED_VERSION} (test)'\n");
     let bytes = script.into_bytes();
     let asset = test_asset(&bytes, false);
-    let state = tempfile::tempdir().unwrap();
+    let state = crate::test_support::executable_tempdir();
     let (url, requests, server) = serve_once(bytes.clone()).await;
 
     let installed = ensure_managed_cloudflared_at(state.path(), asset, &url)
@@ -434,7 +437,7 @@ async fn verified_darwin_style_archive_extracts_only_before_binary_verification(
         binary_sha256: binary_hash,
         gzip_archive: true,
     };
-    let state = tempfile::tempdir().unwrap();
+    let state = crate::test_support::executable_tempdir();
     let (url, _requests, server) = serve_once(archive_bytes).await;
 
     let installed = ensure_managed_cloudflared_at(state.path(), asset, &url)

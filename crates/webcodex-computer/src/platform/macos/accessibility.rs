@@ -192,27 +192,18 @@ fn element_fingerprint(
         .ok_or_else(|| "accessibility_failed: AX element is missing a string role".to_string())?;
     let protected = inherited_protected
         || optional_ax_bool(deadline, element, "AXProtectedContent")?.unwrap_or(false);
-    Ok(ElementFingerprint {
-        role,
-        subrole: optional_ax_string(deadline, element, "AXSubrole")?,
-        identifier: optional_ax_string(deadline, element, "AXIdentifier")?,
-        title: if protected {
-            None
-        } else {
-            optional_ax_string(deadline, element, "AXTitle")?
+    finish_ax_fingerprint(
+        ElementFingerprint {
+            role,
+            subrole: optional_ax_string(deadline, element, "AXSubrole")?,
+            identifier: optional_ax_string(deadline, element, "AXIdentifier")?,
+            title: None,
+            description: None,
+            placeholder: None,
+            protected,
         },
-        description: if protected {
-            None
-        } else {
-            optional_ax_string(deadline, element, "AXDescription")?
-        },
-        placeholder: if protected {
-            None
-        } else {
-            optional_ax_string(deadline, element, "AXPlaceholderValue")?
-        },
-        protected,
-    })
+        |attribute| optional_ax_string(deadline, element, attribute),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -512,21 +503,99 @@ pub(crate) fn accessibility_tree(
     max_depth: usize,
     max_nodes: usize,
 ) -> Result<AccessibilityTreeResult, String> {
+    accessibility_tree_impl(surface_id, surface, max_depth, max_nodes, None)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn accessibility_tree_scoped(
+    surface_id: &str,
+    surface: &SurfaceRecord,
+    max_depth: usize,
+    max_nodes: usize,
+    root: &ElementRecord,
+) -> Result<AccessibilityTreeResult, String> {
+    // A still-valid child path is not identity evidence for an anonymous group.
+    // Apply the same admission as element_state before touching native state.
+    validate_element_state_target(root)?;
+    accessibility_tree_impl(surface_id, surface, max_depth, max_nodes, Some(root))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod scoped_root_tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_scoped_root_is_rejected_before_native_access() {
+        // Invalid native identity makes this run without Accessibility permission
+        // or a live window. Admission must fail before any native lookup.
+        let surface = SurfaceRecord {
+            native_id: 0,
+            pid: 0,
+            identity_hash: [0; 32],
+            application: "unused".into(),
+            title: "Window".into(),
+            width: 1,
+            height: 1,
+        };
+        for empty in [None, Some(String::new())] {
+            let anonymous = ElementFingerprint {
+                role: "AXGroup".into(),
+                subrole: None,
+                identifier: empty.clone(),
+                title: empty.clone(),
+                description: empty.clone(),
+                placeholder: empty,
+                protected: false,
+            };
+            let mut ancestor = anonymous.clone();
+            ancestor.role = "AXWindow".into();
+            ancestor.title = Some("Window".into());
+            let root = ElementRecord {
+                surface_id: "surface_test".into(),
+                path: vec![0],
+                lineage: vec![ancestor, anonymous.clone()],
+            };
+            // A same-role replacement can collide with this fingerprint. The
+            // scoped entry must reject it rather than attest the old scope ID.
+            ensure_correlated_fingerprint(&anonymous, &anonymous.clone(), false).unwrap();
+            let error = accessibility_tree_scoped("surface_test", &surface, 1, 8, &root)
+                .err()
+                .expect("anonymous subtree root must fail admission");
+            assert_eq!(
+                error,
+                "stale_element: AX element lacks positive correlation evidence for state observation"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn accessibility_tree_impl(
+    surface_id: &str,
+    surface: &SurfaceRecord,
+    max_depth: usize,
+    max_nodes: usize,
+    scope: Option<&ElementRecord>,
+) -> Result<AccessibilityTreeResult, String> {
     if !unsafe { AXIsProcessTrusted() } {
         return Err("permission_denied: macOS Accessibility permission is not granted".to_string());
     }
     let deadline = AxObservationDeadline::new();
-    let root = exact_ax_window(surface, &deadline)?;
+    let (path, lineage, inherited_protected) = ax_accessibility_tree_seed(scope)?;
+    let root = match scope {
+        Some(element) => resolve_correlated_element(surface, element, &deadline)?,
+        None => exact_ax_window(surface, &deadline)?,
+    };
     let mut queue = VecDeque::from([(
         root,
         None::<String>,
         0usize,
-        Vec::<usize>::new(),
-        Vec::<ElementFingerprint>::new(),
-        false,
+        path,
+        lineage,
+        inherited_protected,
     )]);
     let mut nodes = Vec::with_capacity(max_nodes.min(64));
-    let mut elements = Vec::with_capacity(max_nodes.min(64));
+    let mut elements: Vec<(String, ElementRecord)> = Vec::with_capacity(max_nodes.min(64));
     let mut truncated = false;
     while let Some((element, parent_element_id, depth, path, mut lineage, inherited_protected)) =
         queue.pop_front()
@@ -536,7 +605,9 @@ pub(crate) fn accessibility_tree(
             truncated = true;
             break;
         }
-        let element_id = format!("element_{}", Uuid::new_v4().simple());
+        let element_id = crate::allocate_selector("element_", |id| {
+            elements.iter().any(|(existing, _)| existing == id)
+        })?;
         let fingerprint = element_fingerprint(&deadline, &element, inherited_protected)?;
         let role = fingerprint.role.clone();
         let subrole = fingerprint.subrole.clone();
@@ -544,20 +615,15 @@ pub(crate) fn accessibility_tree(
         let description = fingerprint.description.clone();
         let placeholder = fingerprint.placeholder.clone();
         let protected = fingerprint.protected;
+        let value = ax_observed_value(&fingerprint, || {
+            optional_ax_string(&deadline, &element, "AXValue")
+        })?;
         lineage.push(fingerprint);
-        let sensitive = role == "AXSecureTextField"
-            || subrole
-                .as_deref()
-                .is_some_and(|value| value.contains("Secure"));
-        let value = if sensitive || protected {
-            None
-        } else {
-            optional_ax_string(&deadline, &element, "AXValue")?
-        };
         let enabled = optional_ax_bool(&deadline, &element, "AXEnabled")?;
         let focused = optional_ax_bool(&deadline, &element, "AXFocused")?;
         let child_count = ax_array_count(&deadline, &element, "AXChildren")?;
-        if depth < max_depth && child_count > 0 {
+        if depth < max_depth && path.len() < crate::MAX_ACCESSIBILITY_PATH_DEPTH && child_count > 0
+        {
             let reserved = nodes.len() + queue.len() + 1;
             let remaining = max_nodes.saturating_sub(reserved);
             let take = child_count.min(remaining);

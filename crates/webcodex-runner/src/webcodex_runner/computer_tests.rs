@@ -2,6 +2,8 @@ use super::*;
 
 fn request(kind: &str, payload: &str) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: "computer-test".to_string(),
         client_id: "runner".to_string(),
         kind: kind.to_string(),
@@ -83,6 +85,26 @@ fn computer_request_kinds_remain_closed() {
     }
     for kind in ["computer_unknown", "computer_snapshot_extra", "shell"] {
         assert!(!is_computer_request_kind(kind), "{kind}");
+    }
+}
+
+#[test]
+fn computer_subtree_request_rejects_non_string_scope_before_native_work() {
+    for root in [
+        serde_json::json!(null),
+        serde_json::json!(42),
+        serde_json::json!({}),
+    ] {
+        let payload = serde_json::json!({"surface_id":"surface_test", "root_element_id":root, "max_depth":8, "max_nodes":256});
+        let result = handle_computer_request(&request(
+            "computer_accessibility_tree",
+            &payload.to_string(),
+        ));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("root_element_id must be a string"));
     }
 }
 
@@ -199,13 +221,13 @@ fn computer_text_input_payload_is_closed() {
 fn application_request_payloads_remain_closed() {
     assert!(ensure_exact_payload_fields(&serde_json::json!({"limit": 2}), &["limit"]).is_ok());
     assert!(ensure_exact_payload_fields(
-        &serde_json::json!({"application_id": "application_0123456789abcdef0123456789abcdef"}),
+        &serde_json::json!({"application_id": "application_iavN7wEjRWeJq83v"}),
         &["application_id"],
     )
     .is_ok());
     for extra in ["path", "argv", "cwd", "environment", "command", "url"] {
         let mut payload = serde_json::json!({
-            "application_id": "application_0123456789abcdef0123456789abcdef"
+            "application_id": "application_iavN7wEjRWeJq83v"
         });
         payload
             .as_object_mut()
@@ -219,7 +241,7 @@ fn application_request_payloads_remain_closed() {
 fn display_request_payloads_remain_closed() {
     assert!(ensure_exact_payload_fields(&serde_json::json!({"limit": 2}), &["limit"]).is_ok());
     let exact = serde_json::json!({
-        "display_id": "display_0123456789abcdef0123456789abcdef",
+        "display_id": "display_iavN7wEjRWeJq83v",
         "max_width": 800,
         "max_height": null,
     });
@@ -250,7 +272,7 @@ fn display_request_payloads_remain_closed() {
 #[test]
 fn pointer_request_payloads_remain_snapshot_fenced_and_closed() {
     let exact = serde_json::json!({
-        "display_id": "display_0123456789abcdef0123456789abcdef",
+        "display_id": "display_iavN7wEjRWeJq83v",
         "snapshot_generation": 7,
         "x": 10,
         "y": 20,
@@ -367,15 +389,16 @@ fn computer_text_input_uses_the_larger_wire_payload_bound() {
     })
     .to_string();
     assert!(
-        escaped_payload.len() > crate::runner_protocol::SHELL_COMPUTER_REQUEST_PAYLOAD_MAX_BYTES
+        escaped_payload.len()
+            > webcodex_core::runner_protocol::SHELL_COMPUTER_REQUEST_PAYLOAD_MAX_BYTES
     );
     assert!(
         escaped_payload.len()
-            <= crate::runner_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES
+            <= webcodex_core::runner_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES
     );
     assert_eq!(
         shell_computer_request_payload_max_bytes("computer_input_text"),
-        crate::runner_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES
+        webcodex_core::runner_protocol::SHELL_COMPUTER_TEXT_INPUT_PAYLOAD_MAX_BYTES
     );
 }
 

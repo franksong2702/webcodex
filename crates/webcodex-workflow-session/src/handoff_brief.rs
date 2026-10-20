@@ -5,12 +5,14 @@
 //! queries an Agent/Runner, refreshes activity, mutates a Workflow Session,
 //! consumes guidance, or invokes an LLM.
 
+use crate::model::MAX_MESSAGE_SUMMARY_CHARS;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::io::{self, Write};
 
 use crate::{
-    normalize_observed_project_path, redact_and_bound_instruction, SessionSummary,
-    EXPLORATION_CONTINUITY_ACTION,
+    normalize_observed_project_path, redact_and_bound_instruction, SessionDiscussionSummary,
+    SessionMessage, SessionSummary, EXPLORATION_CONTINUITY_ACTION,
 };
 
 pub const HANDOFF_BRIEF_HARD_MAX_BYTES: usize = 8 * 1024;
@@ -19,6 +21,7 @@ pub const HANDOFF_CHANGED_PATHS_MAX_ITEMS: usize = 12;
 pub const HANDOFF_RECENT_FILES_MAX_ITEMS: usize = 8;
 pub const HANDOFF_OPEN_FAILURES_MAX_ITEMS: usize = 5;
 pub const HANDOFF_NEXT_ACTIONS_MAX_ITEMS: usize = 5;
+const HANDOFF_MESSAGE_MAX_ITEMS: usize = 5;
 
 const HANDOFF_FAILURE_NAME_MAX_CHARS: usize = 240;
 const HANDOFF_BRANCH_MAX_CHARS: usize = 256;
@@ -27,16 +30,28 @@ const HANDOFF_BRANCH_MAX_CHARS: usize = 256;
 /// pure projection.
 pub struct HandoffBriefInput<'a> {
     pub session_summary: &'a SessionSummary,
+    /// Explicitly recorded decisions/progress, independent of tool execution
+    /// evidence. These reports never become instructions or completion proof.
+    pub discussion: Option<&'a SessionDiscussionSummary>,
     pub continuation_feedback: &'a Value,
     pub workspace_requested: bool,
     pub workspace: Option<&'a Value>,
     pub validation_requested: bool,
     pub validation: Option<&'a Value>,
     pub jobs: Option<&'a Value>,
+    /// Read-only retained external reports for this exact Session Project.
+    /// They remain separate from native progress, validation, and closeout.
+    pub external_observations: Option<&'a Value>,
     /// The Workflow Session summary carries exact open-message counts. This
     /// flag lets callers report a stable gap if that guidance snapshot was not
     /// available instead of silently treating it as empty.
     pub guidance_available: bool,
+    /// Internal caller fence; the numeric revisions are never projected.
+    pub session_changed_during_snapshot: bool,
+    /// Separate external-evidence fence. External reports intentionally do not
+    /// mutate the native Session revision, so handoff callers must track this
+    /// plane independently when they project it into the same recovery brief.
+    pub external_observations_changed_during_snapshot: bool,
     /// Optional existing deterministic action projection. Only fixed known
     /// templates are reused; arbitrary strings are never copied into the brief.
     pub existing_suggested_actions: Option<&'a Value>,
@@ -59,6 +74,7 @@ struct ValidationProjection {
 #[derive(Debug)]
 struct JobProjection {
     available: bool,
+    active: Option<u64>,
     blocking: Option<u64>,
     terminal_pending: Option<u64>,
     recovering: Option<u64>,
@@ -89,6 +105,23 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
     let workspace = project_workspace(input.workspace_requested, input.workspace);
     let mut validation = project_validation(input.validation_requested, input.validation);
     let jobs = project_jobs(input.jobs);
+    let external_observations = input.external_observations.cloned().unwrap_or_else(|| {
+        json!({
+            "status": "unavailable",
+            "reason_code": "projection_unavailable",
+            "provenance": "external_report",
+            "coverage": {
+                "complete": false,
+                "reason": "read_unavailable",
+                "ordering": "server_recorded_at_then_identity",
+            },
+            "total": null,
+            "returned": null,
+            "truncated": null,
+            "unknown_count": null,
+            "observations": null,
+        })
+    });
 
     let changes = bounded_path_list(
         attempt.and_then(|value| value.pointer("/changes/changed_paths")),
@@ -149,6 +182,12 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
     });
 
     let mut basis_reasons = BTreeSet::new();
+    if input.session_changed_during_snapshot {
+        basis_reasons.insert("session_changed_during_snapshot");
+    }
+    if input.external_observations_changed_during_snapshot {
+        basis_reasons.insert("external_observations_changed_during_snapshot");
+    }
     if !continuation_available {
         basis_reasons.insert("continuation_unavailable");
     }
@@ -179,32 +218,119 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
     if !input.guidance_available {
         basis_reasons.insert("guidance_unavailable");
     }
+    if input.discussion.is_none() {
+        basis_reasons.insert("discussion_unavailable");
+    }
 
-    let progress_state = progress_state(
-        input.session_summary,
-        continuation_available,
-        &workspace,
-        &validation,
-        &jobs,
-        open_risks,
-        input.guidance_available,
-    );
+    let snapshot_changed = input.session_changed_during_snapshot
+        || input.external_observations_changed_during_snapshot;
+    let progress_state = if snapshot_changed && input.session_summary.lifecycle.allows_mutation() {
+        "insufficient_evidence"
+    } else {
+        progress_state(
+            input.session_summary,
+            continuation_available,
+            &workspace,
+            &validation,
+            &jobs,
+            open_risks,
+            input.guidance_available,
+        )
+    };
     let changed_count = changes["returned"].as_u64().unwrap_or(0);
     let recent_count = recent_files["returned"].as_u64().unwrap_or(0);
-    let next_actions = next_actions(
-        &workspace,
-        &validation,
-        &jobs,
-        open_guidance,
-        open_risks,
-        open_questions,
-        open_todos,
-        changed_count,
-        recent_count,
-        continuation,
-        input.existing_suggested_actions,
-    );
+    let mut next_actions = if snapshot_changed {
+        // The other sections remain observations of the captured snapshots,
+        // not a current task verdict. Do not suggest acting on their stale
+        // instruction, validation or Job context before explicit recovery.
+        vec!["re-read read_session_handoff for the exact Session before dependent work".to_string()]
+    } else {
+        next_actions(
+            &workspace,
+            &validation,
+            &jobs,
+            open_guidance,
+            open_risks,
+            open_questions,
+            open_todos,
+            changed_count,
+            recent_count,
+            continuation,
+            input.existing_suggested_actions,
+        )
+    };
 
+    let current_boundary = input
+        .session_summary
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "task_instruction")
+        .map(|event| event.event_id.as_str());
+    let projected_context = continuation.pointer("/attempt/task_context");
+    let mut task_context = projected_context
+        .filter(|context| {
+            context.pointer("/scope/session_id").and_then(Value::as_str)
+                == Some(input.session_summary.session_id.as_str())
+                && context.pointer("/scope/project") == Some(&json!(input.session_summary.project))
+                && context
+                    .pointer("/scope/instruction_event_id")
+                    .and_then(Value::as_str)
+                    == current_boundary
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            crate::task_context::task_context_value(
+                input.session_summary,
+                input.discussion,
+                &Value::Null,
+                None,
+                None,
+            )
+        });
+    // Session notes are the caller's independently fenced snapshot, not a
+    // copied stale continuation projection.
+    task_context["decisions"] = project_message_notes(
+        &input.session_summary.session_id,
+        input.discussion.map(|discussion| {
+            (
+                discussion.counts.decision,
+                discussion.recent_decisions.as_slice(),
+            )
+        }),
+    );
+    task_context["recent_progress"] = project_message_notes(
+        &input.session_summary.session_id,
+        input.discussion.map(|discussion| {
+            (
+                discussion.counts.progress,
+                discussion.recent_progress.as_slice(),
+            )
+        }),
+    );
+    if snapshot_changed {
+        task_context["scope"]["complete"] = json!(false);
+        task_context["stall"] = json!({"status":"unavailable", "reason_code":"snapshot_changed", "scanned_events":0,
+            "event_ids":[], "recommendation":null, "advisory_only":true});
+        task_context["next_steps"] = json!({"items":[{"action":"re-read read_session_handoff for the exact Session before dependent work",
+            "source_refs":[]}], "total":1,"returned":1,"truncated":false});
+    }
+    if !snapshot_changed {
+        if let Some(action) = task_context
+            .pointer("/stall/recommendation")
+            .and_then(Value::as_str)
+        {
+            if task_context
+                .pointer("/stall/status")
+                .and_then(Value::as_str)
+                == Some("reconcile_required")
+            {
+                next_actions.clear();
+            }
+            next_actions.insert(0, action.to_string());
+            next_actions.truncate(HANDOFF_NEXT_ACTIONS_MAX_ITEMS);
+        }
+    }
     let reason_codes = basis_reasons.into_iter().collect::<Vec<_>>();
     let mut brief = json!({
         "version": 1,
@@ -216,6 +342,14 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
         "task": {
             "root_instruction": root_instruction,
             "latest_instruction": latest_instruction,
+            "decisions": task_context["decisions"],
+            "recent_progress": task_context["recent_progress"],
+            "scope": task_context["scope"],
+            "relevant_files": task_context["relevant_files"],
+            "failure_locations": task_context["failure_locations"],
+            "stall": task_context["stall"],
+            "continuation_entry": task_context["continuation_entry"],
+            "next_steps": task_context["next_steps"],
         },
         "workspace": workspace.value,
         "progress": {
@@ -225,8 +359,10 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
             "recent_files": recent_files,
         },
         "validation": validation.value,
+        "external_observations": external_observations,
         "attention": {
             "workspace_conflict": workspace.conflicted,
+            "active_jobs": jobs.active,
             "blocking_jobs": jobs.blocking,
             "terminal_pending_jobs": jobs.terminal_pending,
             "recovering_jobs": jobs.recovering,
@@ -243,14 +379,39 @@ pub fn build_handoff_brief(input: HandoffBriefInput<'_>) -> Value {
         "deterministic": true,
         "llm_summary": false,
     });
-    enforce_hard_limit(&mut brief);
+    enforce_hard_limit(&mut brief, snapshot_changed);
     brief
 }
 
+#[derive(Default)]
+struct JsonByteCounter(usize);
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.checked_add(buf.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "serialized JSON length overflow",
+            )
+        })?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_len<T: serde::Serialize + ?Sized>(
+    value: &T,
+) -> Result<usize, serde_json::Error> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
 pub fn handoff_brief_size(value: &Value) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
+    serialized_json_len(value).unwrap_or(usize::MAX)
 }
 
 fn instruction_projection(instruction: Option<&str>) -> Value {
@@ -266,6 +427,40 @@ fn instruction_projection(instruction: Option<&str>) -> Value {
     json!({
         "excerpt": excerpt,
         "truncated": truncated,
+    })
+}
+
+pub(crate) fn project_message_notes(
+    session_id: &str,
+    source: Option<(usize, &[SessionMessage])>,
+) -> Value {
+    let total = source.map(|(total, _)| total);
+    let items = source
+        .map(|(_, messages)| {
+            messages
+                .iter()
+                .filter(|message| message.session_id == session_id)
+                .take(HANDOFF_MESSAGE_MAX_ITEMS)
+                .map(|message| {
+                    let text = instruction_projection(Some(&message.message));
+                    json!({
+                        "message_id": message.message_id,
+                        "status": message.status,
+                        "created_at": message.created_at,
+                        "excerpt": text["excerpt"],
+                        "truncated": text["truncated"] == true
+                            || message.message.chars().count() > MAX_MESSAGE_SUMMARY_CHARS,
+                        "superseded_by_message_id": message.superseded_by_message_id,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    json!({
+        "total": total,
+        "returned": items.len(),
+        "truncated": total.is_some_and(|total| total > items.len()),
+        "items": items,
     })
 }
 
@@ -296,6 +491,18 @@ fn project_workspace(requested: bool, workspace: Option<&Value>) -> WorkspacePro
         .get("git_available")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let non_git_project = workspace
+        .get("non_git_project")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if non_git_project {
+        return WorkspaceProjection {
+            value: unavailable_workspace("available", "non_git_project"),
+            status: "available",
+            dirty: None,
+            conflicted: None,
+        };
+    }
     let clean = workspace.get("clean").and_then(Value::as_bool);
     let conflicted_count = workspace
         .pointer("/counts/conflicted")
@@ -309,7 +516,7 @@ fn project_workspace(requested: bool, workspace: Option<&Value>) -> WorkspacePro
         };
     }
 
-    let dirty = !clean.unwrap_or(false);
+    let dirty = !clean.expect("workspace clean was checked above");
     let conflicted = conflicted_count.unwrap_or(0) > 0;
     let branch = safe_branch(workspace.get("branch").and_then(Value::as_str));
     let head = safe_head(workspace.get("head"));
@@ -409,7 +616,7 @@ fn project_validation(requested: bool, validation: Option<&Value>) -> Validation
         match status {
             "passed" => "passed",
             "failed" => "failed",
-            "inconclusive" => "inconclusive",
+            "unproven" | "inconclusive" => "inconclusive",
             "stale" => "stale",
             "not_run" => "not_run",
             _ => "unavailable",
@@ -468,6 +675,7 @@ fn project_jobs(jobs: Option<&Value>) -> JobProjection {
     let Some(jobs) = jobs.filter(|value| value.is_object()) else {
         return JobProjection {
             available: false,
+            active: None,
             blocking: None,
             terminal_pending: None,
             recovering: None,
@@ -479,6 +687,7 @@ fn project_jobs(jobs: Option<&Value>) -> JobProjection {
     let available = blocking.is_some() && terminal_pending.is_some() && recovering.is_some();
     JobProjection {
         available,
+        active: jobs.get("active_count").and_then(Value::as_u64),
         blocking: available.then_some(blocking.unwrap_or(0)),
         terminal_pending: available.then_some(terminal_pending.unwrap_or(0)),
         recovering: available.then_some(recovering.unwrap_or(0)),
@@ -563,7 +772,7 @@ fn bounded_failure_list(attempt: Option<&Value>) -> Value {
     })
 }
 
-fn safe_failure_identity(kind: Option<&str>, name: Option<&str>) -> Option<String> {
+pub(crate) fn safe_failure_identity(kind: Option<&str>, name: Option<&str>) -> Option<String> {
     let kind = kind?;
     let name = name?.trim();
     if name.is_empty()
@@ -731,8 +940,18 @@ fn push_unique(actions: &mut Vec<String>, action: &str) {
     }
 }
 
-fn enforce_hard_limit(brief: &mut Value) {
+fn enforce_hard_limit(brief: &mut Value, preserve_recovery_action: bool) {
+    // External claims are lower priority than native task/validation context.
+    // Retain the newest report when the byte budget can hold only one.
+    while handoff_brief_size(brief) >= HANDOFF_BRIEF_HARD_MAX_BYTES
+        && pop_external_observation(brief)
+    {}
     for pointer in [
+        "/task/relevant_files",
+        "/task/failure_locations",
+        "/task/next_steps",
+        "/task/recent_progress",
+        "/task/decisions",
         "/progress/recent_files",
         "/progress/changes",
         "/validation/open_failures",
@@ -741,36 +960,43 @@ fn enforce_hard_limit(brief: &mut Value) {
             && pop_list_item(brief, pointer)
         {}
     }
-    while handoff_brief_size(brief) >= HANDOFF_BRIEF_HARD_MAX_BYTES
+    // A raced snapshot's single recovery action must survive even when escaped
+    // instruction excerpts consume the budget. Trim those excerpts instead.
+    while !preserve_recovery_action
+        && handoff_brief_size(brief) >= HANDOFF_BRIEF_HARD_MAX_BYTES
         && pop_plain_array_item(brief, "/next_actions")
     {}
-    while handoff_brief_size(brief) >= HANDOFF_BRIEF_HARD_MAX_BYTES {
-        let root_len = brief
-            .pointer("/task/root_instruction/excerpt")
-            .and_then(Value::as_str)
-            .map(str::len)
-            .unwrap_or(0);
-        let latest_len = brief
-            .pointer("/task/latest_instruction/excerpt")
-            .and_then(Value::as_str)
-            .map(str::len)
-            .unwrap_or(0);
-        if root_len == 0 && latest_len == 0 {
-            break;
-        }
-        let pointer = if root_len >= latest_len {
-            "/task/root_instruction"
-        } else {
-            "/task/latest_instruction"
-        };
-        if !pop_instruction_char(brief, pointer) {
-            break;
-        }
+    let instruction_phase_size = handoff_brief_size(brief);
+    if instruction_phase_size >= HANDOFF_BRIEF_HARD_MAX_BYTES {
+        reduce_instruction_excerpts_to_fit(brief, instruction_phase_size);
     }
     debug_assert!(
         handoff_brief_size(brief) < HANDOFF_BRIEF_HARD_MAX_BYTES,
         "handoff brief hard-limit reduction must retain a bounded core"
     );
+}
+
+fn pop_external_observation(brief: &mut Value) -> bool {
+    let Some(section) = brief
+        .pointer_mut("/external_observations")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let Some(observations) = section
+        .get_mut("observations")
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    if observations.is_empty() {
+        return false;
+    }
+    observations.remove(0);
+    let returned = observations.len();
+    section.insert("returned".to_string(), json!(returned));
+    section.insert("truncated".to_string(), json!(true));
+    true
 }
 
 fn pop_list_item(brief: &mut Value, pointer: &str) -> bool {
@@ -802,21 +1028,93 @@ fn pop_plain_array_item(brief: &mut Value, pointer: &str) -> bool {
         .is_some()
 }
 
-fn pop_instruction_char(brief: &mut Value, pointer: &str) -> bool {
-    let Some(instruction) = brief.pointer_mut(pointer).and_then(Value::as_object_mut) else {
-        return false;
-    };
-    let Some(mut excerpt) = instruction
-        .get("excerpt")
+fn serialized_json_char_content_len(ch: char) -> usize {
+    let mut buffer = [0_u8; 4];
+    let encoded = ch.encode_utf8(&mut buffer);
+    serialized_json_len(encoded)
+        .expect("one Unicode scalar always serializes as JSON")
+        .saturating_sub(2)
+}
+
+fn instruction_excerpt(brief: &Value, pointer: &str) -> Option<String> {
+    brief
+        .pointer(&format!("{pointer}/excerpt"))
         .and_then(Value::as_str)
         .map(str::to_string)
-    else {
-        return false;
+}
+
+fn instruction_truncated(brief: &Value, pointer: &str) -> bool {
+    brief
+        .pointer(&format!("{pointer}/truncated"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn write_instruction_excerpt(brief: &mut Value, pointer: &str, excerpt: String) {
+    let Some(instruction) = brief.pointer_mut(pointer).and_then(Value::as_object_mut) else {
+        return;
     };
-    if excerpt.pop().is_none() {
-        return false;
+    instruction.insert("excerpt".to_string(), Value::String(excerpt));
+    instruction.insert("truncated".to_string(), Value::Bool(true));
+}
+
+fn reduce_instruction_excerpts_to_fit(brief: &mut Value, mut serialized_size: usize) -> usize {
+    const ROOT: &str = "/task/root_instruction";
+    const LATEST: &str = "/task/latest_instruction";
+
+    let mut root = instruction_excerpt(brief, ROOT);
+    let mut latest = instruction_excerpt(brief, LATEST);
+    let mut root_truncated = instruction_truncated(brief, ROOT);
+    let mut latest_truncated = instruction_truncated(brief, LATEST);
+    let mut root_changed = false;
+    let mut latest_changed = false;
+    let mut removed = 0;
+
+    while serialized_size >= HANDOFF_BRIEF_HARD_MAX_BYTES {
+        let root_len = root.as_deref().map_or(0, str::len);
+        let latest_len = latest.as_deref().map_or(0, str::len);
+        if root_len == 0 && latest_len == 0 {
+            break;
+        }
+
+        let (excerpt, truncated, changed) = if root_len >= latest_len {
+            (&mut root, &mut root_truncated, &mut root_changed)
+        } else {
+            (&mut latest, &mut latest_truncated, &mut latest_changed)
+        };
+        let Some(excerpt) = excerpt.as_mut() else {
+            break;
+        };
+        let Some(ch) = excerpt.pop() else {
+            break;
+        };
+
+        serialized_size = serialized_size.saturating_sub(serialized_json_char_content_len(ch));
+        if !*truncated {
+            // `false` is one serialized byte longer than `true`. The old
+            // one-char reducer flips this marker on the first successful pop.
+            serialized_size = serialized_size.saturating_sub(1);
+            *truncated = true;
+        }
+        *changed = true;
+        removed += 1;
     }
-    instruction.insert("excerpt".to_string(), json!(excerpt));
-    instruction.insert("truncated".to_string(), json!(true));
-    true
+
+    if root_changed {
+        write_instruction_excerpt(brief, ROOT, root.expect("changed root excerpt exists"));
+    }
+    if latest_changed {
+        write_instruction_excerpt(
+            brief,
+            LATEST,
+            latest.expect("changed latest instruction excerpt exists"),
+        );
+    }
+    removed
+}
+
+#[cfg(test)]
+pub(crate) fn reduce_instruction_excerpts_for_test(brief: &mut Value) -> (usize, usize) {
+    let size = handoff_brief_size(brief);
+    (reduce_instruction_excerpts_to_fit(brief, size), 1)
 }

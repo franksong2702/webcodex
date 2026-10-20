@@ -30,7 +30,7 @@ PACKAGE = "@yyjeqhc/webcodex"
 NPM_REGISTRY = "https://registry.npmjs.org/"
 BUILD_WORKFLOW_FILE = "release-build.yml"
 BUILD_WORKFLOW_PATH = f".github/workflows/{BUILD_WORKFLOW_FILE}"
-BUILD_STATE_SCHEMA_VERSION = 1
+BUILD_STATE_SCHEMA_VERSION = 3
 BUILD_REQUEST_RE = re.compile(r"^rb_[0-9a-f]{24}$")
 MAX_STATE_BYTES = 64 * 1024
 MAX_RUN_LIST = 100
@@ -60,6 +60,20 @@ def normalize_version(value: str) -> str:
     if not collector.VERSION_RE.fullmatch(version):
         raise PublicationError(f"invalid release version: {value!r}")
     return version
+
+
+def normalize_release_source_ref(value: str, version: str) -> str:
+    release_version = normalize_version(version)
+    try:
+        source_ref = collector.normalize_source_ref(value)
+    except collector.CollectionError as exc:
+        raise PublicationError(str(exc)) from exc
+    expected_release_ref = f"release/v{release_version}"
+    if source_ref not in {"main", expected_release_ref}:
+        raise PublicationError(
+            f"release source ref must be main or {expected_release_ref}: {source_ref!r}"
+        )
+    return source_ref
 
 
 def _run_capture(argv: list[str], *, cwd: Path | None = None, timeout: float = 30.0) -> str:
@@ -223,15 +237,17 @@ def _fetch_public_json_optional(url: str, timeout: float) -> dict | None:
     return value
 
 
-def _github_main_sha(client: collector.GitHubClient) -> str:
-    payload = client.fetch_json("/branches/main")
+def _github_branch_sha(client: collector.GitHubClient, source_ref: str) -> str:
+    ref = collector.normalize_source_ref(source_ref)
+    encoded = urllib.parse.quote(ref, safe="")
+    payload = client.fetch_json(f"/branches/{encoded}")
     commit = payload.get("commit")
     if not isinstance(commit, dict):
-        raise PublicationError("GitHub main branch response is malformed")
+        raise PublicationError(f"GitHub source branch response is malformed: {ref}")
     try:
         return collector.normalize_source_sha(str(commit.get("sha", "")))
     except collector.CollectionError as exc:
-        raise PublicationError("GitHub main branch SHA is invalid") from exc
+        raise PublicationError(f"GitHub source branch SHA is invalid: {ref}") from exc
 
 
 def _require_origin_repo(root: Path, repo: str) -> str:
@@ -251,18 +267,20 @@ def _require_origin_repo(root: Path, repo: str) -> str:
     return origin
 
 
-def _remote_main_source(root: Path) -> str:
-    output = _run_capture(["git", "ls-remote", "origin", "refs/heads/main"], cwd=root, timeout=30.0)
+def _remote_branch_source(root: Path, source_ref: str) -> str:
+    ref = collector.normalize_source_ref(source_ref)
+    remote_ref = f"refs/heads/{ref}"
+    output = _run_capture(["git", "ls-remote", "origin", remote_ref], cwd=root, timeout=30.0)
     lines = output.splitlines()
     if len(lines) != 1:
-        raise PublicationError("could not resolve exactly one remote main ref")
+        raise PublicationError(f"could not resolve exactly one remote source ref: {ref}")
     fields = lines[0].split("\t", 1)
-    if len(fields) != 2 or fields[1] != "refs/heads/main":
-        raise PublicationError("git ls-remote returned malformed main ref output")
+    if len(fields) != 2 or fields[1] != remote_ref:
+        raise PublicationError(f"git ls-remote returned malformed source ref output: {ref}")
     try:
         return collector.normalize_source_sha(fields[0])
     except collector.CollectionError as exc:
-        raise PublicationError("remote main SHA is invalid") from exc
+        raise PublicationError(f"remote source ref SHA is invalid: {ref}") from exc
 
 
 def _remote_annotated_tag_identity(root: Path, tag: str) -> tuple[str, str] | None:
@@ -319,7 +337,6 @@ def _reclaim_build_history(*, repo: str, tag: str, timeout: float) -> list[dict]
         query = urllib.parse.urlencode(
             {
                 "event": "workflow_dispatch",
-                "branch": "main",
                 "per_page": MAX_RECLAIM_BUILD_RUNS_PER_PAGE,
                 "page": page,
             }
@@ -366,12 +383,14 @@ def reclaim_prepublication_tag(
     *,
     repo: str,
     version: str,
+    source_ref: str = "main",
     root: Path,
     confirm: str,
     timeout: float,
     allow_public_release_check: bool,
 ) -> dict:
     release_version = normalize_version(version)
+    release_source_ref = normalize_release_source_ref(source_ref, release_version)
     tag = f"v{release_version}"
     if confirm != tag:
         raise PublicationError(f"reclaim confirmation must exactly equal {tag}")
@@ -385,9 +404,12 @@ def reclaim_prepublication_tag(
         head = collector.normalize_source_sha(_git(source_root, "rev-parse", "HEAD"))
     except collector.CollectionError as exc:
         raise PublicationError("release recovery HEAD is invalid") from exc
-    remote_main = _remote_main_source(source_root)
-    if head != remote_main:
-        raise PublicationError(f"release recovery source is not exact remote main: head={head} main={remote_main}")
+    remote_source = _remote_branch_source(source_root, release_source_ref)
+    if head != remote_source:
+        raise PublicationError(
+            f"release recovery source is not exact remote {release_source_ref}: "
+            f"head={head} remote={remote_source}"
+        )
     _require_package_versions(source_root, release_version, context="release recovery")
 
     remote_identity = _remote_annotated_tag_identity(source_root, tag)
@@ -447,6 +469,7 @@ def reclaim_prepublication_tag(
     return {
         "version": release_version,
         "tag": tag,
+        "source_ref": release_source_ref,
         "old_tag_object_sha": tag_object_sha,
         "old_source_sha": old_source_sha,
         "github_release_absent": True,
@@ -463,19 +486,24 @@ def preflight_release(
     repo: str,
     version: str,
     source_sha: str,
+    source_ref: str = "main",
     root: Path,
     timeout: float,
 ) -> dict:
     release_version = normalize_version(version)
+    release_source_ref = normalize_release_source_ref(source_ref, release_version)
     source = collector.normalize_source_sha(source_sha)
     source_root = root.absolute()
     _require_exact_clean_root(source_root, source)
     _require_package_versions(source_root, release_version, context="release")
 
     client = collector.GitHubClient(repo, collector.resolve_github_token(), timeout)
-    main_sha = _github_main_sha(client)
-    if main_sha != source:
-        raise PublicationError(f"GitHub main source fence failed: expected={source} current={main_sha}")
+    source_ref_sha = _github_branch_sha(client, release_source_ref)
+    if source_ref_sha != source:
+        raise PublicationError(
+            f"GitHub source ref fence failed: ref={release_source_ref} "
+            f"expected={source} current={source_ref_sha}"
+        )
     tag = f"v{release_version}"
     if _git(source_root, "tag", "--list", tag):
         raise PublicationError(f"local Git tag already exists: {tag}")
@@ -505,8 +533,9 @@ def preflight_release(
     return {
         "version": release_version,
         "tag": tag,
+        "source_ref": release_source_ref,
         "source_sha": source,
-        "github_main_sha": main_sha,
+        "github_source_ref_sha": source_ref_sha,
         "github_user": github_user,
         "npm_user": npm_user,
         "tag_available": True,
@@ -590,10 +619,26 @@ def _load_state(path: Path) -> dict:
         "run_conclusion",
         "last_observed_at",
     }
+    schema_version = value.get("schema_version")
+    if schema_version in (2, BUILD_STATE_SCHEMA_VERSION):
+        required.add("include_unified_installers")
+        if schema_version == BUILD_STATE_SCHEMA_VERSION:
+            required.add("include_runtime_installers")
+    elif schema_version != 1:
+        raise PublicationError("unsupported release-build state schema")
     if set(value) != required:
         raise PublicationError("release-build state fields do not match the supported schema")
-    if value.get("schema_version") != BUILD_STATE_SCHEMA_VERSION or value.get("kind") != "release-build":
-        raise PublicationError("unsupported release-build state schema")
+    if value.get("kind") != "release-build":
+        raise PublicationError("unsupported release-build state kind")
+    if schema_version == 1:
+        value["include_unified_installers"] = False
+    if not isinstance(value["include_unified_installers"], bool):
+        raise PublicationError("release-build unified installer selection must be boolean")
+    if schema_version < BUILD_STATE_SCHEMA_VERSION:
+        value["include_runtime_installers"] = False
+    if type(value["include_runtime_installers"]) is not bool or (value["include_runtime_installers"] and not value["include_unified_installers"]):
+        raise PublicationError("Runtime installer selection requires Full selection and must be boolean")
+    value["schema_version"] = BUILD_STATE_SCHEMA_VERSION
     tag = collector.validate_expected_tag(str(value.get("tag", "")))
     source = collector.normalize_source_sha(str(value.get("source_sha", "")))
     request_id = _validate_build_request_id(str(value.get("request_id", "")))
@@ -638,10 +683,17 @@ def _remote_annotated_tag_source(client: collector.GitHubClient, tag: str) -> st
         raise PublicationError("annotated tag target SHA is invalid") from exc
 
 
-def _post_build_dispatch(client: collector.GitHubClient, tag: str, request_id: str) -> None:
+def _post_build_dispatch(client: collector.GitHubClient, tag: str, request_id: str, *, include_unified_installers: bool = False, include_runtime_installers: bool = False) -> None:
     url = client.api_url(f"/actions/workflows/{BUILD_WORKFLOW_FILE}/dispatches")
+    inputs = {"tag": tag, "request_id": request_id}
+    if include_unified_installers:
+        inputs["include_unified_installers"] = True
+    if include_runtime_installers:
+        inputs["include_runtime_installers"] = True
+    # Core-only low-level retries may target older immutable workflows that do
+    # not declare this optional input. The selected false remains in our state.
     data = json.dumps(
-        {"ref": "main", "inputs": {"tag": tag, "request_id": request_id}},
+        {"ref": tag, "inputs": inputs},
         separators=(",", ":"),
     ).encode("utf-8")
     request = client._request(url)
@@ -672,7 +724,6 @@ def _build_run_identity_matches(run: dict, state: dict) -> bool:
     return (
         run.get("path") == BUILD_WORKFLOW_PATH
         and run.get("event") == "workflow_dispatch"
-        and run.get("head_branch") == "main"
         and run.get("display_title") == state["run_name"]
     )
 
@@ -722,7 +773,7 @@ def _apply_build_run_snapshot(state: dict, run: dict) -> None:
 
 def _list_build_runs(client: collector.GitHubClient) -> dict:
     return client.fetch_json(
-        f"/actions/workflows/{BUILD_WORKFLOW_FILE}/runs?event=workflow_dispatch&branch=main&per_page={MAX_RUN_LIST}"
+        f"/actions/workflows/{BUILD_WORKFLOW_FILE}/runs?event=workflow_dispatch&per_page={MAX_RUN_LIST}"
     )
 
 
@@ -750,16 +801,19 @@ def start_build(
     state_file: Path,
     timeout: float,
     resolve_secs: int,
+    include_unified_installers: bool = False,
+    include_runtime_installers: bool = False,
 ) -> tuple[dict, int]:
+    if not isinstance(include_unified_installers, bool):
+        raise PublicationError("release-build unified installer selection must be boolean")
+    if type(include_runtime_installers) is not bool or (include_runtime_installers and not include_unified_installers):
+        raise PublicationError("Runtime installer selection requires explicit Full selection")
     source = collector.normalize_source_sha(source_sha)
     release_tag = collector.validate_expected_tag(tag)
     if resolve_secs < 0 or resolve_secs > 120:
         raise PublicationError("resolve_secs must be within 0..120")
     state_path = _validate_state_path_for_create(state_file)
     client = collector.GitHubClient(repo, collector.resolve_github_token(), timeout)
-    main_sha = _github_main_sha(client)
-    if main_sha != source:
-        raise PublicationError(f"main source fence failed: expected={source} current={main_sha}")
     tag_source = _remote_annotated_tag_source(client, release_tag)
     if tag_source != source:
         raise PublicationError(f"remote tag source mismatch: expected={source} actual={tag_source}")
@@ -767,6 +821,8 @@ def start_build(
     request_id = f"rb_{secrets.token_hex(12)}"
     state = {
         "schema_version": BUILD_STATE_SCHEMA_VERSION,
+        "include_unified_installers": include_unified_installers,
+        "include_runtime_installers": include_runtime_installers,
         "kind": "release-build",
         "repo": repo,
         "tag": release_tag,
@@ -787,7 +843,7 @@ def start_build(
     }
     _write_state(state_path, state)
     try:
-        _post_build_dispatch(client, release_tag, request_id)
+        _post_build_dispatch(client, release_tag, request_id, include_unified_installers=include_unified_installers, include_runtime_installers=include_runtime_installers)
     except DispatchRejected:
         state["dispatch_state"] = "rejected"
         _write_state(state_path, state)
@@ -852,7 +908,7 @@ def _read_release_build(bundle_dir: Path) -> dict:
     return value
 
 
-def verify_bundle(bundle_dir: Path, repo: str) -> dict:
+def verify_bundle(bundle_dir: Path, repo: str, *, require_unified_installers: bool = False, require_runtime_installers: bool = False) -> dict:
     root = bundle_dir.absolute()
     metadata = _read_release_build(root)
     try:
@@ -872,6 +928,8 @@ def verify_bundle(bundle_dir: Path, repo: str) -> dict:
             expected_source_sha=source,
             expected_tag=tag,
             artifact_name=f"{archive_stem}-bundle",
+            require_unified_installers=require_unified_installers,
+            require_runtime_installers=require_runtime_installers,
         )
     except collector.CollectionError as exc:
         raise PublicationError(str(exc)) from exc
@@ -923,11 +981,13 @@ def stage_npm(
     bundle_dir: Path,
     source_root: Path,
     output_dir: Path,
+    require_unified_installers: bool = False,
+    require_runtime_installers: bool = False,
 ) -> dict:
     bundle = bundle_dir.absolute()
     source = source_root.absolute()
     destination = output_dir.absolute()
-    summary = verify_bundle(bundle, repo)
+    summary = verify_bundle(bundle, repo, require_unified_installers=require_unified_installers, require_runtime_installers=require_runtime_installers)
     if summary.get("build_kind") != "release":
         raise PublicationError("npm staging requires a real release bundle")
     _require_exact_clean_root(source, str(summary["source_sha"]))
@@ -982,16 +1042,18 @@ def _github_asset_digest(asset: dict) -> str:
     return digest
 
 
-def verify_draft_assets(*, repo: str, bundle_dir: Path, timeout: float) -> dict:
+def verify_draft_assets(*, repo: str, bundle_dir: Path, timeout: float, require_unified_installers: bool = False, require_runtime_installers: bool = False) -> dict:
     bundle = bundle_dir.absolute()
-    summary = verify_bundle(bundle, repo)
+    summary = verify_bundle(bundle, repo, require_unified_installers=require_unified_installers, require_runtime_installers=require_runtime_installers)
     if summary.get("build_kind") != "release":
         raise PublicationError("draft verification requires a real release bundle")
     tag = str(summary["tag"])
     client = collector.GitHubClient(repo, collector.resolve_github_token(), timeout)
     release = _find_authenticated_release_by_tag(client, tag)
-    if release.get("tag_name") != tag or release.get("draft") is not True or release.get("prerelease") is not False:
-        raise PublicationError("GitHub Release must be the expected draft, non-prerelease release")
+    expected_prerelease = "-" in str(summary["version"]).split("+", 1)[0]
+    if (release.get("tag_name") != tag or release.get("draft") is not True
+            or release.get("prerelease") is not expected_prerelease):
+        raise PublicationError("GitHub Release must be the expected draft with matching prerelease status")
     release_id = release.get("id")
     release_url = release.get("html_url")
     if not isinstance(release_id, int) or release_id <= 0:
@@ -999,15 +1061,29 @@ def verify_draft_assets(*, repo: str, bundle_dir: Path, timeout: float) -> dict:
     if not isinstance(release_url, str) or not release_url.startswith("https://github.com/"):
         raise PublicationError("GitHub draft release URL is invalid")
     assets = release.get("assets")
-    if not isinstance(assets, list) or len(assets) > 16:
+    if not isinstance(assets, list) or len(assets) > 33:
         raise PublicationError("GitHub draft asset listing is malformed or too large")
 
     expected_files = {"SHA256SUMS"}
+    if summary.get("runtime_manifest") is not None:
+        expected_files.add("webcodex-release-manifest.json")
     expected_files.update(f"{summary['archive_stem']}-{platform}.tar.gz" for platform in collector.PLATFORMS)
+    installer_artifacts = summary.get("installer_artifacts")
+    if "installer_artifacts" in summary:
+        targets = set(collector.INSTALLER_TARGETS)
+        if "installer_manifest_v2" in summary:
+            targets.update(collector.runtime_contract.RUNTIME_TARGETS)
+            expected_files.add("manifest-v2.json")
+        if not isinstance(installer_artifacts, dict) or set(installer_artifacts) != targets:
+            raise PublicationError("retained bundle unified installer summary is invalid")
+        expected_files.add("manifest.json")
+        expected_files.update(item["filename"] for item in installer_artifacts.values())
+        expected_files.update(item["source_manifest_filename"] for item in installer_artifacts.values())
     desktop_artifacts = summary.get("desktop_artifacts")
-    if not isinstance(desktop_artifacts, dict) or set(desktop_artifacts) != set(collector.DESKTOP_PLATFORMS):
+    desktop_platforms = collector.primary_desktop_platforms_for_version(str(summary["version"]))
+    if not isinstance(desktop_artifacts, dict) or set(desktop_artifacts) != set(desktop_platforms):
         raise PublicationError("retained bundle Desktop artifact summary is invalid")
-    for platform in collector.DESKTOP_PLATFORMS:
+    for platform in desktop_platforms:
         item = desktop_artifacts.get(platform)
         if not isinstance(item, dict) or not isinstance(item.get("filename"), str):
             raise PublicationError(f"retained bundle Desktop artifact is invalid: {platform}")

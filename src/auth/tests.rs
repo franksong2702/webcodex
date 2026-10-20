@@ -1,5 +1,4 @@
 use super::*;
-use crate::auth::middleware::enforce_project_connector_surface;
 
 fn bootstrap_ctx() -> AuthContext {
     bootstrap_context()
@@ -80,8 +79,7 @@ fn is_runner_transport_path_allows_only_the_seven_exact_paths() {
     assert!(!is_runner_transport_path("/api/runtime/status"));
     assert!(!is_runner_transport_path("/api/tools/list"));
     assert!(!is_runner_transport_path("/api/tools/call"));
-    assert!(!is_runner_transport_path("/api/projects/list"));
-    assert!(!is_runner_transport_path("/api/jobs/list"));
+    assert!(!is_runner_transport_path("/api/runtime-console/projects"));
     assert!(!is_runner_transport_path("/mcp"));
     assert!(!is_runner_transport_path("/api/audit/sessions"));
     assert!(!is_runner_transport_path("/api/users/list"));
@@ -213,6 +211,7 @@ fn gate_seed_oauth_access_token_with_shared_key_hash(
     let plaintext = generate_oauth_access_token();
     let token_hash = hash_token(&plaintext);
     let record = crate::models::OAuthAccessTokenRecord {
+        admin_authority: false,
         id: uuid::Uuid::new_v4().to_string(),
         token_hash,
         client_id: client.client_id.clone(),
@@ -241,6 +240,7 @@ fn gate_seed_shared_key_oauth_access_token(
     let plaintext = generate_oauth_access_token();
     let token_hash = hash_token(&plaintext);
     let record = crate::models::OAuthAccessTokenRecord {
+        admin_authority: false,
         id: uuid::Uuid::new_v4().to_string(),
         token_hash,
         client_id: client.client_id.clone(),
@@ -285,10 +285,8 @@ fn gate_router(config: Arc<crate::Config>, db: Arc<crate::Database>) -> Router {
                 .push(Router::with_path("tools/list").post(echo_ok))
                 .push(Router::with_path("tools/call").post(echo_ok))
                 .push(Router::with_path("future/authenticated-route").post(echo_ok))
-                .push(Router::with_path("projects/list").post(echo_ok))
-                .push(Router::with_path("projects/read_file").post(echo_ok))
-                .push(Router::with_path("projects/run_job").post(echo_ok))
-                .push(Router::with_path("jobs/list").post(echo_ok))
+                .push(Router::with_path("runtime-console/projects").post(echo_ok))
+                .push(Router::with_path("shell/job").post(echo_ok))
                 .push(Router::with_path("audit/sessions").post(echo_ok))
                 .push(Router::with_path("audit/session").post(echo_ok))
                 .push(Router::with_path("audit/stats").post(echo_ok))
@@ -363,7 +361,7 @@ async fn gate_token_class_route_matrix_preserves_authority_boundaries() {
     for path in [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/mcp",
         "/api/agent-tokens/list",
         "/api/tokens/list",
@@ -385,7 +383,7 @@ async fn gate_token_class_route_matrix_preserves_authority_boundaries() {
     for path in [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
     ] {
         let (status, body) = gate_send(&service, path, Some(&user_token)).await;
         assert_eq!(status, salvo::http::StatusCode::OK, "{path}: {body:?}");
@@ -394,7 +392,7 @@ async fn gate_token_class_route_matrix_preserves_authority_boundaries() {
     for path in [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/api/shell/agent/register",
         "/api/agent-tokens/list",
     ] {
@@ -415,7 +413,7 @@ fn account_control_path_allowlist_is_exact() {
     assert!(is_account_control_path("/api/tokens/revoke"));
     assert!(is_account_control_path("/api/agent-tokens/register_hash"));
     assert!(!is_account_control_path("/api/runtime/status"));
-    assert!(!is_account_control_path("/api/projects/list"));
+    assert!(!is_account_control_path("/api/runtime-console/projects"));
     assert!(!is_account_control_path("/api/tools/list"));
     assert!(!is_account_control_path("/mcp"));
     assert!(!is_account_control_path("/api/users/me/extra"));
@@ -467,7 +465,7 @@ async fn gate_account_credential_cannot_call_runtime_project_tool_or_mcp_paths()
     let service = Service::new(gate_router(config, db));
     for path in [
         "/api/runtime/status",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/api/tools/list",
         "/api/shell/agent/register",
         "/mcp",
@@ -924,6 +922,7 @@ async fn oauth2_verifier_rejects_invalid_access_token_state_matrix() {
                 let now = chrono::Utc::now().timestamp();
                 let plaintext = generate_oauth_access_token();
                 db.insert_oauth_access_token(&crate::models::OAuthAccessTokenRecord {
+                    admin_authority: false,
                     id: uuid::Uuid::new_v4().to_string(),
                     token_hash: hash_token(&plaintext),
                     client_id: client.client_id,
@@ -983,6 +982,7 @@ async fn oauth2_verifier_ignores_non_access_oauth_credential_kinds() {
     let now = chrono::Utc::now().timestamp();
     let refresh = generate_oauth_refresh_token();
     db.insert_oauth_refresh_token(&crate::models::OAuthRefreshTokenRecord {
+        admin_authority: false,
         id: uuid::Uuid::new_v4().to_string(),
         token_hash: hash_token(&refresh),
         client_id: client.client_id.clone(),
@@ -1098,6 +1098,7 @@ async fn oauth2_verifier_accepts_current_project_share_and_preserves_project_ide
     let plaintext = generate_oauth_access_token();
     let now = chrono::Utc::now().timestamp();
     db.insert_oauth_access_token(&crate::models::OAuthAccessTokenRecord {
+        admin_authority: false,
         id: uuid::Uuid::new_v4().to_string(),
         token_hash: hash_token(&plaintext),
         client_id: client.client_id.clone(),
@@ -1128,7 +1129,7 @@ async fn oauth2_verifier_accepts_current_project_share_and_preserves_project_ide
         ctx.token_kind.as_deref(),
         Some(PROJECT_SHARE_OAUTH_TOKEN_KIND)
     );
-    assert!(enforce_project_connector_surface(true, &ctx, "/mcp").is_ok());
+    assert!(crate::auth::middleware::enforce_token_surface(&ctx, "/mcp").is_ok());
     for path in crate::route_metadata::iter_routes()
         .filter(|spec| spec.surface == crate::route_metadata::RouteSurface::RunnerTransport)
         .map(|spec| spec.path)
@@ -1163,6 +1164,7 @@ async fn oauth2_verifier_rejects_stale_project_share_session() {
     let plaintext = generate_oauth_access_token();
     let now = chrono::Utc::now().timestamp();
     db.insert_oauth_access_token(&crate::models::OAuthAccessTokenRecord {
+        admin_authority: false,
         id: uuid::Uuid::new_v4().to_string(),
         token_hash: hash_token(&plaintext),
         client_id: client.client_id,
@@ -1206,7 +1208,7 @@ fn enforce_token_surface_matrix() {
     let runtime_paths = [
         "/api/runtime/status",
         "/api/tools/list",
-        "/api/projects/list",
+        "/api/runtime-console/projects",
         "/mcp",
     ];
     let lightweight_account_rejected: Vec<&str> = crate::route_metadata::iter_routes()
@@ -1241,7 +1243,7 @@ fn enforce_token_surface_matrix() {
             vec![
                 "/api/runtime/status",
                 "/api/tools/list",
-                "/api/projects/list",
+                "/api/runtime-console/projects",
             ],
             runner_transport.to_vec(),
             "",
@@ -1253,7 +1255,7 @@ fn enforce_token_surface_matrix() {
             vec![
                 "/api/runtime/status",
                 "/api/tools/list",
-                "/api/projects/list",
+                "/api/runtime-console/projects",
                 "/mcp",
                 "/api/users/me",
             ],
@@ -1289,7 +1291,7 @@ fn enforce_token_surface_matrix() {
             ],
             vec![
                 "/api/runtime/status",
-                "/api/projects/list",
+                "/api/runtime-console/projects",
                 "/api/tools/list",
                 "/mcp",
                 "/api/shell/agent/register",
@@ -1301,9 +1303,9 @@ fn enforce_token_surface_matrix() {
             oauth2,
             vec![
                 "/api/runtime/status",
-                "/api/projects/list",
+                "/api/runtime-console/projects",
                 "/api/tools/list",
-                "/api/jobs/list",
+                "/api/tools/call",
                 "/mcp",
             ],
             runner_transport.to_vec(),
@@ -1465,8 +1467,14 @@ async fn shared_key_fallback_gated_by_env_and_prefix() {
         "unknown token should be rejected when shared-key disabled"
     );
 
-    // Shared-key enabled: unknown non-wc token → Some (shared-key context).
+    // A remote bind needs an explicit shared-key opt-in.
     env.enable_direct_shared_key();
+    let r = authenticate_bearer(&config, None, Some("my-key")).await;
+    assert!(
+        r.is_none(),
+        "remote shared-key fallback must require opt-in"
+    );
+    env.enable_remote_shared_key();
     let r = authenticate_bearer(&config, None, Some("my-key")).await;
     assert!(r.is_some(), "non-wc token should be accepted as shared-key");
     let ctx = r.unwrap();
@@ -1494,6 +1502,80 @@ async fn shared_key_fallback_gated_by_env_and_prefix() {
 }
 
 #[tokio::test]
+async fn http_shared_key_fallback_requires_remote_opt_in() {
+    let env = crate::auth::AuthEnvGuard::auth_required();
+    env.enable_direct_shared_key();
+    let config = Arc::new(crate::Config {
+        addr: "0.0.0.0:8080".to_string(),
+        data_dir: PathBuf::from("./data"),
+        token: Some("secret".to_string()),
+        max_text_size: 2 * 1024 * 1024,
+        oauth2: crate::OAuth2Config::default(),
+    });
+    let (_tmp, db) = gate_test_db();
+    let service = Service::new(gate_router(config, db));
+
+    let (status, _) = gate_send(&service, "/api/runtime/status", Some("shared-key")).await;
+    assert_eq!(status, salvo::http::StatusCode::UNAUTHORIZED);
+
+    env.enable_remote_shared_key();
+    let (status, _) = gate_send(&service, "/api/runtime/status", Some("shared-key")).await;
+    assert_eq!(status, salvo::http::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn direct_shared_key_policy_is_local_by_default_and_fails_closed_for_public_url() {
+    let env = crate::auth::AuthEnvGuard::auth_required();
+    let local = crate::Config {
+        addr: "127.0.0.1:8080".to_string(),
+        data_dir: PathBuf::from("./data"),
+        token: Some("secret".to_string()),
+        max_text_size: 2 * 1024 * 1024,
+        oauth2: crate::OAuth2Config::default(),
+    };
+    env.enable_direct_shared_key();
+    assert!(direct_shared_key_enabled(&local));
+
+    env.set_public_url("https://example.test");
+    assert!(!direct_shared_key_enabled(&local));
+    assert!(shared_key_requires_remote_opt_in(&local));
+
+    env.enable_remote_shared_key();
+    assert!(direct_shared_key_enabled(&local));
+
+    env.disable_remote_shared_key();
+    env.set_public_url("not a URL");
+    assert!(crate::auth::shared_key::configured_public_url_is_non_loopback());
+    assert!(!direct_shared_key_enabled(&local));
+}
+
+#[test]
+fn direct_shared_key_policy_treats_remote_quic_as_remote_boundary() {
+    let env = crate::auth::AuthEnvGuard::auth_required();
+    let local = crate::Config {
+        addr: "127.0.0.1:8080".to_string(),
+        data_dir: PathBuf::from("./data"),
+        token: Some("secret".to_string()),
+        max_text_size: 2 * 1024 * 1024,
+        oauth2: crate::OAuth2Config::default(),
+    };
+    env.enable_direct_shared_key();
+    assert!(direct_shared_key_enabled(&local));
+
+    env.set_quic_listener("0.0.0.0:8443");
+    assert!(shared_key_requires_remote_opt_in(&local));
+    assert!(!direct_shared_key_enabled(&local));
+
+    let quic = crate::config::QuicServerConfig::from_env();
+    assert!(!crate::auth::direct_shared_key_enabled_with_quic(
+        &local, &quic
+    ));
+
+    env.enable_remote_shared_key();
+    assert!(direct_shared_key_enabled(&local));
+}
+
+#[tokio::test]
 async fn shared_key_fallback_and_oauth_bridge_flags_are_independent() {
     let env = crate::auth::AuthEnvGuard::auth_required();
     let config = crate::Config {
@@ -1514,6 +1596,7 @@ async fn shared_key_fallback_and_oauth_bridge_flags_are_independent() {
 
     env.disable_oauth2_shared_key_bridge();
     env.enable_direct_shared_key();
+    env.enable_remote_shared_key();
     assert!(!crate::OAuth2Config::from_env().shared_key_bridge_enabled);
     let r = authenticate_bearer(&config, None, Some("my-key")).await;
     assert!(
@@ -1872,6 +1955,7 @@ async fn auth_middleware_rejects_refresh_token_as_bearer() {
     let plaintext = generate_oauth_refresh_token();
     let token_hash = hash_token(&plaintext);
     let record = crate::models::OAuthRefreshTokenRecord {
+        admin_authority: false,
         id: uuid::Uuid::new_v4().to_string(),
         token_hash,
         client_id: client.client_id.clone(),
@@ -1969,8 +2053,8 @@ async fn oauth2_scope_gate_matrix() {
     // A granted scope opens exactly its own surface…
     for (scopes, path) in [
         ("runtime:read", "/api/runtime/status"),
-        ("project:read", "/api/projects/read_file"),
-        ("job:run", "/api/projects/run_job"),
+        ("project:read", "/api/runtime-console/projects"),
+        ("job:run", "/api/shell/job"),
     ] {
         let (_tmp, service, token) = gate_oauth2_token_with_scopes(scopes).await;
         let (status, body) = gate_send(&service, path, Some(&token)).await;
@@ -1987,14 +2071,10 @@ async fn oauth2_scope_gate_matrix() {
         ),
         (
             "runtime:read",
-            "/api/projects/read_file",
+            "/api/runtime-console/projects",
             Some(SCOPE_PROJECT_READ),
         ),
-        (
-            "project:write",
-            "/api/projects/run_job",
-            Some(SCOPE_JOB_RUN),
-        ),
+        ("project:write", "/api/shell/job", Some(SCOPE_JOB_RUN)),
         ("runtime:read", "/oauth/authorize", None),
         ("runtime:read", "/api/shell/agent/register", None),
         ("runtime:read", "/api/future/authenticated-route", None),
@@ -2045,8 +2125,8 @@ async fn api_token_obeys_declared_scope_and_unknown_route_policy() {
 
     for path in [
         "/api/runtime/status",
-        "/api/projects/read_file",
-        "/api/projects/run_job",
+        "/api/runtime-console/projects",
+        "/api/shell/job",
     ] {
         let (status, body) = gate_send(&service, path, Some(&user_token)).await;
         assert_eq!(status, StatusCode::OK, "{} body: {:?}", path, body);
@@ -2054,7 +2134,7 @@ async fn api_token_obeys_declared_scope_and_unknown_route_policy() {
 
     let (status, body) = gate_send(
         &service,
-        "/api/projects/read_file",
+        "/api/runtime-console/projects",
         Some(&runtime_only_token),
     )
     .await;
@@ -2199,6 +2279,33 @@ async fn auth_middleware_unauthorized_includes_resource_metadata() {
         "WWW-Authenticate should reference metadata endpoint, got: {}",
         challenge
     );
+}
+
+#[tokio::test]
+async fn invalid_oauth_token_challenges_reauthorization_without_exposing_token() {
+    let _env = crate::auth::AuthEnvGuard::auth_required();
+    let mut config = gate_test_config_oauth2(Some("test-token"));
+    Arc::get_mut(&mut config).unwrap().oauth2.issuer =
+        Some("https://codex.example.com".to_string());
+    let (_tmp, db) = gate_test_db();
+    let service = salvo::Service::new(gate_router(config, db));
+    let resp = salvo::test::TestClient::post("http://localhost/api/runtime/status")
+        .add_header("authorization", "Bearer wc_oat_invalid", true)
+        .send(&service)
+        .await;
+    assert_eq!(resp.status_code, Some(StatusCode::UNAUTHORIZED));
+    let challenge = resp
+        .headers
+        .get("www-authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(challenge.contains(
+        "resource_metadata=\"https://codex.example.com/.well-known/oauth-protected-resource\""
+    ));
+    assert!(challenge.contains("error=\"invalid_token\""));
+    assert!(challenge.contains("error_description=\"Authentication is required\""));
+    assert!(!challenge.contains("wc_oat_invalid"));
 }
 
 #[tokio::test]

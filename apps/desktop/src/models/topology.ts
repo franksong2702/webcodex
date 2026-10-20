@@ -4,7 +4,7 @@ export type ServerTopology =
   | { kind: "local" }
   | { kind: "remote"; url: string };
 
-export type RunnerTopology = { kind: "local" };
+export type RunnerTopology = { kind: "local" } | { kind: "none" };
 
 export type Exposure =
   | { kind: "none" }
@@ -15,7 +15,8 @@ export type Exposure =
 export type Enrollment =
   | { kind: "managed_pairing" }
   | { kind: "shared_key" }
-  | { kind: "existing_profile"; profile: string };
+  | { kind: "existing_profile"; profile: string }
+  | { kind: "user_credential" };
 
 export interface RuntimeTopology {
   experience: Experience;
@@ -55,6 +56,8 @@ export type ProjectReadiness =
 
 export type ReadinessSummaryKind =
   | "ready_for_chat_gpt"
+  | "runtime_stopped"
+  | "runtime_starting"
   | "service_needs_attention"
   | "runner_disconnected"
   | "project_not_ready"
@@ -93,6 +96,11 @@ export interface ProjectSelection {
   runtime_project_id?: string | null;
 }
 
+export interface ProjectInspection {
+  project: ProjectSelection;
+  authorization_required: boolean;
+}
+
 export interface BinaryInfo {
   directory: string;
   version: string;
@@ -109,15 +117,7 @@ export interface QuickShareState {
   ready_for_chatgpt: boolean;
 }
 
-export type RegularTunnelStatus = "starting" | "ready" | "error";
-
-export interface RegularTunnelState {
-  provider: string;
-  status: RegularTunnelStatus;
-  clipboard_state: string;
-  clipboard_contains: string;
-  ready_for_chatgpt: boolean;
-}
+export type { ConnectionsSnapshot, TunnelConnection, McpProvidersSnapshot, McpProviderProfile } from "./connections-tools";
 
 export type RegularConnectionPreference = "no_chat_gpt" | "open_ai_tunnel";
 export type TunnelProxyMode = "auto" | "direct" | "custom";
@@ -126,12 +126,18 @@ export interface TunnelProxySnapshot {
   mode: TunnelProxyMode;
   custom_url?: string | null;
   effective_source: string;
-  effective_url?: string | null;
-  detected_url?: string | null;
+  effective_proxy_present: boolean;
+  system_proxy_detected: boolean;
 }
 
 export type DesktopOperationKind =
+  | "environment_invite"
+  | "desktop_update"
+  | "environment_migration"
+  | "environment_service"
   | "local_setup"
+  | "local_project_activate"
+  | "project_unregister"
   | "remote_setup"
   | "quick_share_start"
   | "quick_share_stop"
@@ -140,7 +146,11 @@ export type DesktopOperationKind =
   | "local_runtime_stop"
   | "runtime_refresh"
   | "runtime_resume"
-  | "tunnel_proxy_update";
+  | "tunnel_proxy_update"
+  | "tunnel_config_update"
+  | "runner_settings_update"
+  | "runner_restart"
+  | "runtime_probe" | "runtime_switch" | "trace_update" | "configuration_restore";
 
 export type DesktopOperationPhase = "running" | "cancelling";
 
@@ -152,9 +162,32 @@ export interface DesktopOperation {
   cancellable: boolean;
 }
 
+export type SetupProgressStep =
+  | "preflight"
+  | "server_configuration"
+  | "server_service_install"
+  | "server_service_start"
+  | "server_reachability"
+  | "user_authentication"
+  | "runner_enrollment"
+  | "runner_configuration"
+  | "project_registration"
+  | "runner_service_install"
+  | "runner_service_start"
+  | "readiness";
+
+export interface SetupProgress {
+  operation_id: string;
+  step: SetupProgressStep;
+  state: "started" | "complete";
+}
+
 export interface OpenAiTunnelConfigSnapshot {
   tunnel_id_present: boolean;
   api_key_present: boolean;
+  source: "file" | "environment" | "invalid";
+  saved_tunnel_id: string | null;
+  effective_tunnel_id?: string | null;
 }
 
 export interface PowerShellRuntimeSnapshot {
@@ -168,15 +201,34 @@ export interface ChatGptActivitySnapshot {
 }
 
 export interface DesktopState {
+  environment_setup?: {
+    environment_id: string;
+    mode: "create" | "join";
+    server_url: string;
+    runner: boolean;
+    runner_display_name?: string | null;
+    project_path: string | null;
+    service_scope: "user" | "system";
+    configured: boolean;
+  } | null;
+  persistent_environment?: string | null;
+  can_repair_runner_credential?: boolean;
+  workspace_runner?: SettingsTarget | null;
+  configuration_issue?: string | null;
+  saved_projects?: ProjectSelection[];
   topology?: RuntimeTopology | null;
   readiness: ReadinessSnapshot;
+  runtime_error?: DesktopError | null;
   project?: ProjectSelection | null;
   binaries?: BinaryInfo | null;
   powershell_runtime?: PowerShellRuntimeSnapshot | null;
   chatgpt_activity?: ChatGptActivitySnapshot | null;
   quick_share?: QuickShareState | null;
-  regular_tunnel?: RegularTunnelState | null;
+  connections?: import("./connections-tools").ConnectionsSnapshot;
+  mcp_providers?: import("./connections-tools").McpProvidersSnapshot;
+  coding_agents?: import("./runner-capabilities").CodingAgentsSnapshot;
   current_operation?: DesktopOperation | null;
+  setup_progress?: SetupProgress | null;
   activity_sequence: number;
   openai_tunnel_configured: boolean;
   openai_tunnel_config: OpenAiTunnelConfigSnapshot;
@@ -197,6 +249,7 @@ export interface ActivityEntry {
   sequence: number;
   timestamp_ms: number;
   source: string;
+  tunnel_profile_id?: string | null;
   level: "info" | "warning" | "error";
   event_kind:
     | "process_started"
@@ -215,6 +268,8 @@ export interface ActivityEntry {
     | "regular_tunnel_ready"
     | "regular_tunnel_stopped"
     | "runtime_stopped"
+    | "project_activated"
+    | "state_recovered"
     | "operation_started"
     | "operation_cancel_requested"
     | "operation_cancelled"
@@ -222,3 +277,11 @@ export interface ActivityEntry {
   message: string;
 }
 
+
+export interface RunnerPaths { instruction_files: string[]; skill_roots: string[] }
+export interface RunnerFileAccess { configured_roots: string[]; default_roots?: string[]; effective_roots: string[]; using_default_roots: boolean; allow_cwd_anywhere: boolean }
+export interface SettingsTarget { config_path: string; client_id: string; server_url: string }
+export interface RunnerSettings { max_concurrent_jobs?: number | null; paths: RunnerPaths; file_access: RunnerFileAccess; plugin_ids: string[]; target: SettingsTarget; can_restart: boolean }
+export interface PluginRegistration { id: string; name: string; command: string; args: string[]; cwd: string | null }
+export type PermissionStatus = "granted" | "denied" | "unknown";
+export interface ComputerPermissions { supported: boolean; foreground: boolean; execution_process: string | null; execution_path: string | null; runner_accessibility: PermissionStatus; runner_screen_recording: PermissionStatus; desktop_accessibility: boolean; desktop_screen_recording: boolean }

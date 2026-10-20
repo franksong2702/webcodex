@@ -1,5 +1,5 @@
 use crate::state::{RunnerRecord, RunnerRegistryInner, ShellJobRecord};
-use crate::{RunnerAccess, RunnerAccessGroup};
+use crate::{ExecutionAdmissionError, RunnerAccess, RunnerAccessGroup};
 
 pub(crate) fn assert_runner_owner(
     access: Option<&RunnerAccess>,
@@ -64,20 +64,37 @@ pub(crate) fn assert_runner_access(
     access: Option<&RunnerAccess>,
     runner: &RunnerRecord,
 ) -> Result<(), String> {
+    assert_runner_access_typed(access, runner).map_err(|error| error.to_string())
+}
+
+pub(crate) fn assert_runner_access_typed(
+    access: Option<&RunnerAccess>,
+    runner: &RunnerRecord,
+) -> Result<(), ExecutionAdmissionError> {
     if !runner_visible_to_access(access, runner) {
-        return Err(format!("unknown shell client: {}", runner.client_id));
+        // Preserve concealment: an inaccessible Runner has the same typed
+        // rejection as an unknown one, regardless of its identifier.
+        return Err(ExecutionAdmissionError::unknown_runner(&runner.client_id));
     }
     if runner.auth_group.is_some() {
         return Ok(());
     }
     assert_runner_owner(access, &runner.client_id, runner.owner.as_deref())
+        .map_err(ExecutionAdmissionError::permission_denied)
 }
 
 pub(crate) fn job_visible_to_access(
     access: Option<&RunnerAccess>,
-    inner: &RunnerRegistryInner,
+    _inner: &RunnerRegistryInner,
     job: &ShellJobRecord,
 ) -> bool {
+    if job
+        .observation
+        .receipt_expires_at
+        .is_some_and(|expires| expires <= crate::now_ts())
+    {
+        return false;
+    }
     let Some(access) = access else {
         return true;
     };
@@ -87,9 +104,8 @@ pub(crate) fn job_visible_to_access(
     if let Some(group) = job.auth_group.as_ref() {
         return lightweight_group_matches(Some(access), Some(group));
     }
-    inner
-        .runners
-        .get(&job.client_id)
-        .map(|runner| assert_runner_access(Some(access), runner).is_ok())
-        .unwrap_or(false)
+    access.group.is_none()
+        && access.username.as_deref().is_some_and(|username| {
+            !username.trim().is_empty() && job.owner_at_admission.as_deref() == Some(username)
+        })
 }

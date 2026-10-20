@@ -1,18 +1,33 @@
-//! Deterministic project-aware plans for the hosted `checks_run` capability.
+//! Deterministic project-aware plans resolved on the owning Runner.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use webcodex_core::runner_protocol::{normalize_rust_test_filter, ShellJobValidationStep};
+use webcodex_workspace::project_recipe::{
+    digest_project_cargo_all_packages_provenance, digest_project_recipe_files,
+    project_recipe_provenance_files, read_project_recipe_file, resolve_project_recipe_root,
+    validate_node_project_marker_chain, ProjectRecipeResolutionError,
+};
+
+pub use webcodex_workspace::project_recipe::ProjectRecipeId as RecipeId;
 
 const RECIPE_VERSION: u32 = 1;
-const RECIPE_NAMES: [&str; 4] = ["rust", "node", "python", "go"];
-const RECIPE_MARKERS: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
 const PYTHON_MANIFESTLESS_DIGEST_SEED: &[u8] = b"webcodex.python.manifestless.recipe.v1";
 const PYTHON_UNITTEST_ARGS: [&str; 5] = ["-B", "-m", "unittest", "discover", "-v"];
+const PYTEST_PROJECT_CONFIG_FILES: [&str; 8] = [
+    "pytest.toml",
+    ".pytest.toml",
+    "pytest.ini",
+    ".pytest.ini",
+    "pyproject.toml",
+    "tox.ini",
+    "setup.cfg",
+    "setup.py",
+];
 const NODE_LOCKFILES: [(&str, &str); 6] = [
     ("pnpm-lock.yaml", "pnpm"),
     ("yarn.lock", "yarn"),
@@ -21,30 +36,6 @@ const NODE_LOCKFILES: [(&str, &str); 6] = [
     ("bun.lock", "bun"),
     ("bun.lockb", "bun"),
 ];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[repr(usize)]
-pub enum RecipeId {
-    Rust,
-    Node,
-    Python,
-    Go,
-}
-
-impl RecipeId {
-    pub fn as_str(self) -> &'static str {
-        RECIPE_NAMES[self as usize]
-    }
-
-    fn marker(self) -> &'static str {
-        RECIPE_MARKERS[self as usize]
-    }
-
-    fn all() -> [Self; 4] {
-        [Self::Rust, Self::Node, Self::Python, Self::Go]
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,6 +103,27 @@ impl RecipeError {
     }
 }
 
+fn map_project_recipe_error(error: ProjectRecipeResolutionError) -> RecipeError {
+    match error {
+        ProjectRecipeResolutionError::ExecutionRootUnavailable
+        | ProjectRecipeResolutionError::NotFound => RecipeError::new("validation_recipe_not_found"),
+        ProjectRecipeResolutionError::CwdMismatch
+        | ProjectRecipeResolutionError::ExplicitNotFound { .. } => {
+            RecipeError::new("validation_recipe_mismatch")
+        }
+        ProjectRecipeResolutionError::ExplicitMismatch {
+            recipe_root,
+            candidates,
+            ..
+        } => RecipeError::new("validation_recipe_mismatch").at(recipe_root, &candidates),
+        ProjectRecipeResolutionError::Ambiguous {
+            recipe_root,
+            candidates,
+        } => RecipeError::new("validation_recipe_ambiguous").at(recipe_root, &candidates),
+        ProjectRecipeResolutionError::SourceFileInvalid => manifest_invalid(),
+    }
+}
+
 pub fn resolve_validation_recipe(
     execution_root: &Path,
     cwd: Option<&str>,
@@ -119,14 +131,363 @@ pub fn resolve_validation_recipe(
     checks: &[SemanticCheck],
     test_filter: Option<&str>,
 ) -> Result<ResolvedValidationRecipe, RecipeError> {
-    let root = execution_root
+    resolve_validation_recipe_with_packages(
+        execution_root,
+        cwd,
+        explicit_recipe,
+        checks,
+        test_filter,
+        None,
+    )
+}
+
+pub fn resolve_validation_recipe_with_packages(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    explicit_recipe: Option<RecipeId>,
+    checks: &[SemanticCheck],
+    test_filter: Option<&str>,
+    package_scope: Option<&[String]>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_validation_recipe_with_project_policy(
+        execution_root,
+        cwd,
+        explicit_recipe,
+        checks,
+        test_filter,
+        package_scope,
+        false,
+        None,
+    )
+}
+
+/// Canonical project gateway planning. Ordinary recipe workflows retain their
+/// existing Python Ruff/mypy/unittest choices. Project Ruff requires a pinned
+/// local manifest; evidence profiles cannot manufacture this command authority.
+pub fn resolve_project_validation_recipe(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    explicit_recipe: Option<RecipeId>,
+    checks: &[SemanticCheck],
+    test_filter: Option<&str>,
+    package_scope: Option<&[String]>,
+    all_packages: bool,
+    dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_project_validation_recipe_with_resolution_policy(
+        execution_root,
+        cwd,
+        explicit_recipe,
+        checks,
+        test_filter,
+        package_scope,
+        all_packages,
+        dependency_policy,
+        None,
+    )
+}
+
+pub fn resolve_project_validation_recipe_with_resolution_policy(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    explicit_recipe: Option<RecipeId>,
+    checks: &[SemanticCheck],
+    test_filter: Option<&str>,
+    package_scope: Option<&[String]>,
+    all_packages: bool,
+    dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
+    resolution_policy: Option<webcodex_core::project_validation::ProjectDependencyResolutionPolicy>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    let resolved = resolve_project_recipe_root(execution_root, cwd, explicit_recipe)
+        .map_err(map_project_recipe_error)?;
+    if resolved.recipe != RecipeId::Python {
+        return resolve_validation_recipe_with_policies(
+            execution_root,
+            cwd,
+            explicit_recipe,
+            checks,
+            test_filter,
+            package_scope,
+            all_packages,
+            dependency_policy,
+            resolution_policy,
+        );
+    }
+    if resolution_policy.is_some() {
+        return Err(RecipeError::new("dependency_resolution_policy_unsupported"));
+    }
+    let ruff_digest = if checks.iter().any(|check| *check != SemanticCheck::Test) {
+        Some(project_ruff_manifest_digest(
+            &resolved.execution_root,
+            &resolved.absolute_root,
+        )?)
+    } else {
+        None
+    };
+    let mut steps = Vec::with_capacity(checks.len());
+    for check in checks {
+        let operation = crate::project_validation_operation(
+            "python",
+            *check,
+            package_scope.map(<[String]>::to_vec),
+            all_packages,
+        )
+        .and_then(|operation| operation.with_dependency_policy(dependency_policy))
+        .and_then(|operation| operation.with_test_filter(test_filter))
+        .map_err(RecipeError::new)?;
+        steps.push(if *check == SemanticCheck::Test {
+            operation
+                .build_readonly_plan()
+                .map_err(|_| check_unavailable())?
+                .structured_step
+        } else {
+            ShellJobValidationStep::python_ruff(check.as_str()).ok_or_else(check_unavailable)?
+        });
+    }
+    let test_filter = test_filter
+        .map(webcodex_core::runner_protocol::normalize_pytest_filter)
+        .transpose()
+        .map_err(|_| filter_unsupported())?
+        .flatten();
+    // pytest searches configuration from the invocation directory through its
+    // ancestors. Bind every candidate inside the registered Project, and fail
+    // closed if that search could escape to an ambient parent configuration.
+    let pytest_digest = if checks.contains(&SemanticCheck::Test) {
+        Some(
+            digest_project_recipe_files(
+                &resolved.execution_root,
+                pytest_project_provenance_files(&resolved.execution_root, &resolved.absolute_root)?,
+            )
+            .map_err(map_project_recipe_error)?,
+        )
+    } else {
+        None
+    };
+    let manifest_digest = match (pytest_digest, ruff_digest) {
+        (Some(pytest), None) => pytest,
+        (None, Some(ruff)) => ruff,
+        (Some(pytest), Some(ruff)) => format!("{:x}", Sha256::digest(format!("{pytest}\0{ruff}"))),
+        (None, None) => return Err(check_unavailable()),
+    };
+    let invocation_digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&steps).map_err(|_| manifest_invalid())?)
+    );
+    Ok(ResolvedValidationRecipe {
+        recipe_id: "python",
+        recipe_root_relative: resolved.relative_root,
+        steps,
+        manifest_digest,
+        invocation_digest,
+        test_filter,
+    })
+}
+
+fn project_ruff_manifest_digest(
+    execution_root: &Path,
+    recipe_root: &Path,
+) -> Result<String, RecipeError> {
+    use std::io::Read;
+    let path = recipe_root
+        .join("pyproject.toml")
         .canonicalize()
-        .map_err(|_| RecipeError::new("validation_recipe_not_found"))?;
-    let cwd = resolve_cwd(&root, cwd)?;
-    let (recipe, recipe_root) = nearest_recipe_root(&root, &cwd, explicit_recipe)?;
-    let root_relative = relative_root(&root, &recipe_root);
-    let marker = recipe.marker();
-    let marker_path = recipe_root.join(marker);
+        .map_err(|_| check_unavailable())?;
+    if !path.starts_with(execution_root) {
+        return Err(manifest_invalid());
+    }
+    if !fs::metadata(&path)
+        .map_err(|_| manifest_invalid())?
+        .is_file()
+    {
+        return Err(manifest_invalid());
+    }
+    // Bound both the parse and digest to the same bytes. Never hash a second
+    // read that could differ from the config whose authority was just checked.
+    let mut bytes = Vec::new();
+    const MAX_BYTES: u64 = 1024 * 1024;
+    let file = fs::File::open(&path).map_err(|_| manifest_invalid())?;
+    if !file.metadata().map_err(|_| manifest_invalid())?.is_file() {
+        return Err(manifest_invalid());
+    }
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| manifest_invalid())?;
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(manifest_invalid());
+    }
+    let value: toml::Value =
+        toml::from_str(std::str::from_utf8(&bytes).map_err(|_| manifest_invalid())?)
+            .map_err(|_| manifest_invalid())?;
+    let ruff = value
+        .get("tool")
+        .and_then(|tool| tool.get("ruff"))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(check_unavailable)?;
+    if ruff.contains_key("extend") {
+        return Err(manifest_invalid());
+    }
+    let target = ruff
+        .get("target-version")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(manifest_invalid)?;
+    if !matches!(
+        target,
+        "py37" | "py38" | "py39" | "py310" | "py311" | "py312" | "py313" | "py314"
+    ) {
+        return Err(manifest_invalid());
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"webcodex-project-ruff-manifest-v1\0");
+    digest.update(
+        path.strip_prefix(execution_root)
+            .map_err(|_| manifest_invalid())?
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn pytest_project_provenance_files(
+    execution_root: &Path,
+    recipe_root: &Path,
+) -> Result<Vec<PathBuf>, RecipeError> {
+    let mut files = Vec::new();
+    let mut directory = recipe_root.to_path_buf();
+    let mut project_config_boundary = false;
+    loop {
+        files.extend(
+            PYTEST_PROJECT_CONFIG_FILES
+                .into_iter()
+                .map(|name| directory.join(name)),
+        );
+        project_config_boundary |= pytest_config_boundary_in_dir(execution_root, &directory)?;
+        if directory == execution_root {
+            break;
+        }
+        directory = directory
+            .parent()
+            .filter(|parent| parent.starts_with(execution_root))
+            .ok_or_else(manifest_invalid)?
+            .to_path_buf();
+    }
+
+    // Without a recognized Project-local config, pytest keeps searching above
+    // cwd before it falls back to setup.py/rootdir. Never let files outside the
+    // registered Project silently select config/rootdir for a structured Job.
+    if !project_config_boundary {
+        for parent in execution_root.ancestors().skip(1) {
+            for name in PYTEST_PROJECT_CONFIG_FILES {
+                match fs::symlink_metadata(parent.join(name)) {
+                    Ok(_) => return Err(manifest_invalid()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(manifest_invalid()),
+                }
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn pytest_config_boundary_in_dir(
+    execution_root: &Path,
+    directory: &Path,
+) -> Result<bool, RecipeError> {
+    for name in ["pytest.ini", ".pytest.ini"] {
+        match fs::symlink_metadata(directory.join(name)) {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Ok(true)
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(manifest_invalid()),
+        }
+    }
+
+    let pyproject = directory.join("pyproject.toml");
+    if pyproject.exists() {
+        let bytes = read_project_recipe_file(execution_root, &pyproject)
+            .map_err(map_project_recipe_error)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| manifest_invalid())?;
+        let value: toml::Value = toml::from_str(text).map_err(|_| manifest_invalid())?;
+        if value
+            .get("tool")
+            .and_then(toml::Value::as_table)
+            .and_then(|tool| tool.get("pytest"))
+            .and_then(toml::Value::as_table)
+            .is_some_and(|pytest| pytest.get("ini_options").is_some())
+        {
+            return Ok(true);
+        }
+    }
+
+    for (name, section) in [("tox.ini", "pytest"), ("setup.cfg", "tool:pytest")] {
+        let path = directory.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let bytes =
+            read_project_recipe_file(execution_root, &path).map_err(map_project_recipe_error)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| manifest_invalid())?;
+        if text
+            .lines()
+            .any(|line| line.trim() == format!("[{section}]"))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn resolve_validation_recipe_with_project_policy(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    explicit_recipe: Option<RecipeId>,
+    checks: &[SemanticCheck],
+    test_filter: Option<&str>,
+    package_scope: Option<&[String]>,
+    all_packages: bool,
+    dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_validation_recipe_with_policies(
+        execution_root,
+        cwd,
+        explicit_recipe,
+        checks,
+        test_filter,
+        package_scope,
+        all_packages,
+        dependency_policy,
+        None,
+    )
+}
+
+pub fn resolve_validation_recipe_with_policies(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    explicit_recipe: Option<RecipeId>,
+    checks: &[SemanticCheck],
+    test_filter: Option<&str>,
+    package_scope: Option<&[String]>,
+    all_packages: bool,
+    dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
+    resolution_policy: Option<webcodex_core::project_validation::ProjectDependencyResolutionPolicy>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    let resolved_root = resolve_project_recipe_root(execution_root, cwd, explicit_recipe)
+        .map_err(map_project_recipe_error)?;
+    let root = &resolved_root.execution_root;
+    let recipe = resolved_root.recipe;
+    if resolution_policy.is_some() && recipe != RecipeId::Rust {
+        return Err(RecipeError::new("dependency_resolution_policy_unsupported"));
+    }
+    let recipe_root = &resolved_root.absolute_root;
+    if (package_scope.is_some() || all_packages) && !matches!(recipe, RecipeId::Rust | RecipeId::Go)
+    {
+        return Err(RecipeError::new("validation_scope_unsupported"));
+    }
+    let root_relative = resolved_root.relative_root.clone();
+    let marker_path = resolved_root.marker_path();
     let manifestless_python = if recipe == RecipeId::Python {
         match fs::symlink_metadata(&marker_path) {
             Ok(_) => false,
@@ -143,22 +504,58 @@ pub fn resolve_validation_recipe(
             format!("{:x}", Sha256::digest(PYTHON_MANIFESTLESS_DIGEST_SEED)),
         )
     } else {
-        let manifest = read_manifest(&root, &marker_path)?;
-        let (steps, extra_digest_files) = match recipe {
-            RecipeId::Rust => rust_steps(checks, test_filter.as_deref()),
-            RecipeId::Node => node_steps(&recipe_root, &manifest, checks)?,
-            RecipeId::Python => python_steps(&manifest, checks)?,
-            RecipeId::Go => go_steps(checks)?,
-        };
-        let manifest_digest = digest_files(
-            &root,
-            std::iter::once(marker_path).chain(
-                extra_digest_files
-                    .into_iter()
-                    .map(|file| recipe_root.join(file)),
-            ),
-        )?;
-        (steps, manifest_digest)
+        let manifest =
+            read_project_recipe_file(root, &marker_path).map_err(map_project_recipe_error)?;
+        match recipe {
+            RecipeId::Rust | RecipeId::Go => {
+                let steps = canonical_adapter_steps(
+                    recipe,
+                    checks,
+                    test_filter.as_deref(),
+                    package_scope,
+                    all_packages,
+                    dependency_policy,
+                    resolution_policy,
+                )?;
+                let manifest_digest = if recipe == RecipeId::Rust && all_packages {
+                    digest_project_cargo_all_packages_provenance(&resolved_root)
+                        .map_err(|_| RecipeError::new("validation_scope_unavailable"))?
+                } else {
+                    let provenance_files = project_recipe_provenance_files(&resolved_root)
+                        .map_err(map_project_recipe_error)?
+                        .expect("canonical project validation adapters are Rust/Go");
+                    digest_project_recipe_files(root, provenance_files)
+                        .map_err(map_project_recipe_error)?
+                };
+                (steps, manifest_digest)
+            }
+            RecipeId::Node => {
+                let (steps, extra_digest_files) = node_steps(&recipe_root, &manifest, checks)?;
+                let provenance_files: Vec<_> = std::iter::once(marker_path.clone())
+                    .chain(
+                        extra_digest_files
+                            .into_iter()
+                            .map(|file| recipe_root.join(file)),
+                    )
+                    .collect();
+                let manifest_digest = digest_project_recipe_files(root, provenance_files)
+                    .map_err(map_project_recipe_error)?;
+                (steps, manifest_digest)
+            }
+            RecipeId::Python => {
+                let (steps, extra_digest_files) = python_steps(&manifest, checks)?;
+                let provenance_files: Vec<_> = std::iter::once(marker_path.clone())
+                    .chain(
+                        extra_digest_files
+                            .into_iter()
+                            .map(|file| recipe_root.join(file)),
+                    )
+                    .collect();
+                let manifest_digest = digest_project_recipe_files(root, provenance_files)
+                    .map_err(map_project_recipe_error)?;
+                (steps, manifest_digest)
+            }
+        }
     };
     let invocation_digest = format!(
         "{:x}",
@@ -167,7 +564,9 @@ pub fn resolve_validation_recipe(
                 .map_err(|_| RecipeError::new("validation_manifest_invalid"))?
         )
     );
-    debug_assert!(steps.iter().all(ShellJobValidationStep::is_canonical));
+    debug_assert!(steps
+        .iter()
+        .all(|step| { step.is_canonical() || (all_packages && step.is_canonical_project_step()) }));
     Ok(ResolvedValidationRecipe {
         recipe_id: recipe.as_str(),
         recipe_root_relative: root_relative,
@@ -178,103 +577,207 @@ pub fn resolve_validation_recipe(
     })
 }
 
-fn resolve_cwd(root: &Path, raw: Option<&str>) -> Result<PathBuf, RecipeError> {
-    let raw = raw.unwrap_or(".");
-    let path = Path::new(raw);
-    if raw.is_empty()
-        || raw.contains('\0')
-        || path.is_absolute()
-        || path.components().any(|part| {
-            matches!(
-                part,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(RecipeError::new("validation_recipe_mismatch"));
-    }
-    let cwd = root
-        .join(path)
-        .canonicalize()
-        .map_err(|_| RecipeError::new("validation_recipe_mismatch"))?;
-    if !cwd.starts_with(root) || !cwd.is_dir() {
-        return Err(RecipeError::new("validation_recipe_mismatch"));
-    }
-    Ok(cwd)
-}
-
-fn nearest_recipe_root(
-    root: &Path,
-    cwd: &Path,
-    explicit: Option<RecipeId>,
-) -> Result<(RecipeId, PathBuf), RecipeError> {
-    let mut directory = cwd.to_path_buf();
-    loop {
-        let candidates = RecipeId::all()
-            .into_iter()
-            .filter(|recipe| directory.join(recipe.marker()).is_file())
-            .collect::<Vec<_>>();
-        if !candidates.is_empty() {
-            let relative = relative_root(root, &directory);
-            if let Some(explicit) = explicit {
-                if candidates.contains(&explicit) {
-                    return Ok((explicit, directory));
-                }
-                if explicit == RecipeId::Python {
-                    return Ok((RecipeId::Python, cwd.to_path_buf()));
-                }
-                return Err(
-                    RecipeError::new("validation_recipe_mismatch").at(relative, &candidates)
-                );
-            }
-            if candidates.len() == 1 {
-                return Ok((candidates[0], directory));
-            }
-            let mut candidates = candidates;
-            candidates.sort_by_key(|recipe| recipe.as_str());
-            return Err(RecipeError::new("validation_recipe_ambiguous").at(relative, &candidates));
-        }
-        if directory == root {
-            break;
-        }
-        let Some(parent) = directory.parent() else {
-            break;
-        };
-        directory = parent.to_path_buf();
-    }
-    if explicit == Some(RecipeId::Python) {
-        return Ok((RecipeId::Python, cwd.to_path_buf()));
-    }
-    let code = if explicit.is_some() {
-        "validation_recipe_mismatch"
-    } else {
-        "validation_recipe_not_found"
-    };
-    Err(RecipeError::new(code))
-}
-
-fn rust_steps(
+/// Shared project recipe resolution supplies filesystem/root facts; validation
+/// owns semantic action planning and canonical Rust/Go executable/argv synthesis.
+fn canonical_adapter_steps(
+    recipe: RecipeId,
     checks: &[SemanticCheck],
-    filter: Option<&str>,
-) -> (Vec<ShellJobValidationStep>, Vec<&'static str>) {
+    test_filter: Option<&str>,
+    package_scope: Option<&[String]>,
+    all_packages: bool,
+    dependency_policy: Option<webcodex_core::project_validation::ProjectDependencyPolicy>,
+    resolution_policy: Option<webcodex_core::project_validation::ProjectDependencyResolutionPolicy>,
+) -> Result<Vec<ShellJobValidationStep>, RecipeError> {
     let mut steps = Vec::with_capacity(checks.len());
     for check in checks {
-        let args = match check {
-            SemanticCheck::Format => {
-                vec!["fmt".to_string(), "--".to_string(), "--check".to_string()]
+        let operation = crate::project_validation_operation(
+            recipe.as_str(),
+            *check,
+            package_scope.map(<[String]>::to_vec),
+            all_packages,
+        )
+        .map_err(|code| {
+            if package_scope.is_none() && code == "validation_action_unsupported" {
+                check_unavailable()
+            } else {
+                RecipeError::new(code)
             }
-            SemanticCheck::Check => vec!["check".to_string(), "--all-targets".to_string()],
-            SemanticCheck::Test => {
-                let mut args = vec!["test".to_string()];
-                if let Some(filter) = filter {
-                    args.push(filter.to_string());
-                }
-                args
+        })?;
+        let operation = operation
+            .with_dependency_policy(dependency_policy)
+            .and_then(|operation| operation.with_dependency_resolution_policy(resolution_policy))
+            .map_err(RecipeError::new)?
+            .with_test_filter(
+                (*check == SemanticCheck::Test)
+                    .then_some(test_filter)
+                    .flatten(),
+            )
+            .map_err(RecipeError::new)?;
+        let plan = operation.build_readonly_plan().map_err(|_| {
+            if package_scope.is_some() || all_packages {
+                RecipeError::new("validation_scope_invalid")
+            } else {
+                check_unavailable()
             }
-        };
-        steps.push(step(*check, "cargo", args));
+        })?;
+        steps.push(plan.structured_step);
     }
-    (steps, vec!["Cargo.lock"])
+    Ok(steps)
+}
+
+/// First production Node project validation: native built-in script runner.
+/// The ordinary package-manager recipe below keeps its established semantics.
+/// Shared strict Node marker guard for auto and explicit project planning.
+pub fn validate_node_project_markers(
+    execution_root: &Path,
+    cwd: Option<&str>,
+) -> Result<(), RecipeError> {
+    validate_node_project_marker_chain(execution_root, cwd).map_err(map_project_recipe_error)
+}
+
+pub fn resolve_node_native_project_check(
+    execution_root: &Path,
+    cwd: Option<&str>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_node_native_project_action(execution_root, cwd, SemanticCheck::Check, None)
+}
+
+/// Explicit Node lint intent: do not silently run check/typecheck instead.
+pub fn resolve_node_native_project_lint(
+    execution_root: &Path,
+    cwd: Option<&str>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_node_native_project_action(execution_root, cwd, SemanticCheck::Check, Some("lint"))
+}
+
+pub fn resolve_node_native_project_test(
+    execution_root: &Path,
+    cwd: Option<&str>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    resolve_node_native_project_action(execution_root, cwd, SemanticCheck::Test, None)
+}
+
+fn resolve_node_native_project_action(
+    execution_root: &Path,
+    cwd: Option<&str>,
+    action: SemanticCheck,
+    selected_script: Option<&'static str>,
+) -> Result<ResolvedValidationRecipe, RecipeError> {
+    const MAX_NODE_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+    validate_node_project_markers(execution_root, cwd)?;
+    let resolved = resolve_project_recipe_root(execution_root, cwd, Some(RecipeId::Node))
+        .map_err(map_project_recipe_error)?;
+    let marker = resolved.marker_path();
+    let manifest = read_node_input(&resolved.execution_root, &marker, MAX_NODE_MANIFEST_BYTES)?
+        .ok_or_else(manifest_invalid)?;
+    let canonical = marker.canonicalize().map_err(|_| manifest_invalid())?;
+    let value: Value = serde_json::from_slice(&manifest).map_err(|_| manifest_invalid())?;
+    let scripts = value
+        .as_object()
+        .ok_or_else(manifest_invalid)?
+        .get("scripts")
+        .map(|value| value.as_object().ok_or_else(manifest_invalid))
+        .transpose()?;
+    let selected = match selected_script {
+        Some(script) => {
+            if !scripts.is_some_and(|scripts| scripts.contains_key(script)) {
+                return Err(check_unavailable());
+            }
+            script
+        }
+        None => select_node_script(scripts, action)?,
+    };
+    if scripts
+        .and_then(|scripts| scripts.get(selected))
+        .and_then(Value::as_str)
+        .is_none_or(|body| body.trim().is_empty())
+    {
+        return Err(manifest_invalid());
+    }
+    let step = if action == SemanticCheck::Test {
+        let body = scripts
+            .and_then(|scripts| scripts.get(selected))
+            .and_then(Value::as_str)
+            .ok_or_else(manifest_invalid)?;
+        match body {
+            "vitest" | "vitest run" => ShellJobValidationStep::node_json_test("vitest").unwrap(),
+            "jest" => ShellJobValidationStep::node_json_test("jest").unwrap(),
+            "node --test" | "node --test --test-reporter=tap" => ShellJobValidationStep {
+                name: "test".into(),
+                program: "node".into(),
+                args: vec!["--test".into(), "--test-reporter=tap".into()],
+                env: Vec::new(),
+            },
+            _ => return Err(RecipeError::new("structured_test_report_unavailable")),
+        }
+    } else {
+        ShellJobValidationStep {
+            name: "check".into(),
+            program: "node".into(),
+            args: vec!["--run".into(), selected.into()],
+            env: Vec::new(),
+        }
+    };
+    debug_assert!(step.is_canonical());
+    let mut hasher = Sha256::new();
+    let relative = canonical
+        .strip_prefix(&resolved.execution_root)
+        .map_err(|_| manifest_invalid())?;
+    hasher.update(relative.as_os_str().as_encoded_bytes());
+    hasher.update((manifest.len() as u64).to_be_bytes());
+    hasher.update(&manifest);
+    let manifest_digest = if step.node_json_framework().is_some() {
+        let mut files = vec![marker];
+        files.extend(
+            NODE_LOCKFILES
+                .iter()
+                .map(|(name, _)| resolved.absolute_root.join(name)),
+        );
+        node_input_digest(&resolved.execution_root, files)?
+    } else {
+        format!("{:x}", hasher.finalize())
+    };
+    let invocation_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(std::slice::from_ref(&step)).map_err(|_| manifest_invalid())?
+        )
+    );
+    Ok(ResolvedValidationRecipe {
+        recipe_id: "node",
+        recipe_root_relative: resolved.relative_root,
+        steps: vec![step],
+        invocation_digest,
+        manifest_digest,
+        test_filter: None,
+    })
+}
+
+/// Shared first-present script selector. Validation of body contents is separate:
+/// ordinary recipes preserve their old string-only rule; native check rejects
+/// empty/whitespace-only bodies without changing the ordinary workflow.
+fn select_node_script(
+    scripts: Option<&serde_json::Map<String, Value>>,
+    check: SemanticCheck,
+) -> Result<&'static str, RecipeError> {
+    let names: &[&str] = match check {
+        SemanticCheck::Format => &["format:check", "format-check", "check:format"],
+        SemanticCheck::Check => &["check", "typecheck", "lint"],
+        SemanticCheck::Test => &["test"],
+    };
+    let name = names
+        .iter()
+        .copied()
+        .find(|name| scripts.is_some_and(|scripts| scripts.contains_key(*name)))
+        .ok_or_else(check_unavailable)?;
+    if !scripts
+        .and_then(|scripts| scripts.get(name))
+        .is_some_and(Value::is_string)
+    {
+        return Err(manifest_invalid());
+    }
+    Ok(name)
 }
 
 fn node_steps(
@@ -288,56 +791,10 @@ fn node_steps(
         .get("scripts")
         .map(|value| value.as_object().ok_or_else(manifest_invalid))
         .transpose()?;
-    let mut managers = BTreeSet::new();
-    if let Some(package_manager) = object.get("packageManager") {
-        let raw = package_manager.as_str().ok_or_else(manifest_invalid)?;
-        let (manager, version) = raw.split_once('@').ok_or_else(manifest_invalid)?;
-        let manager = match manager {
-            "npm" => "npm",
-            "pnpm" => "pnpm",
-            "yarn" => "yarn",
-            "bun" => "bun",
-            _ => return Err(manifest_invalid()),
-        };
-        if version.is_empty() || version.chars().any(char::is_whitespace) {
-            return Err(manifest_invalid());
-        }
-        managers.insert(manager);
-    }
-    let present_locks = NODE_LOCKFILES
-        .iter()
-        .filter(|(file, _)| root.join(file).is_file())
-        .copied()
-        .collect::<Vec<_>>();
-    managers.extend(present_locks.iter().map(|(_, manager)| *manager));
-    if managers.len() != 1 || present_locks.len() > 1 {
-        let mut error = RecipeError::new("package_manager_ambiguous");
-        error.details = Some(json!({
-            "recipe_root": null,
-            "candidate_recipes": managers,
-            "detected_markers": present_locks.iter().map(|(file, _)| *file).collect::<Vec<_>>()
-        }));
-        return Err(error);
-    }
-    let manager = managers.into_iter().next().unwrap();
+    let (manager, present_locks) = node_package_manager(root, object)?;
     let mut steps = Vec::with_capacity(checks.len());
     for check in checks {
-        let names: &[&str] = match check {
-            SemanticCheck::Format => &["format:check", "format-check", "check:format"],
-            SemanticCheck::Check => &["check", "typecheck", "lint"],
-            SemanticCheck::Test => &["test"],
-        };
-        let script = names
-            .iter()
-            .copied()
-            .find(|name| scripts.is_some_and(|scripts| scripts.get(*name).is_some()))
-            .ok_or_else(check_unavailable)?;
-        if !scripts
-            .and_then(|scripts| scripts.get(script))
-            .is_some_and(Value::is_string)
-        {
-            return Err(manifest_invalid());
-        }
+        let script = select_node_script(scripts, *check)?;
         let args = vec![
             "run".to_string(),
             "--silent".to_string(),
@@ -345,10 +802,7 @@ fn node_steps(
         ];
         steps.push(step(*check, manager, args));
     }
-    Ok((
-        steps,
-        present_locks.into_iter().map(|(file, _)| file).collect(),
-    ))
+    Ok((steps, present_locks))
 }
 
 fn python_steps(
@@ -406,25 +860,6 @@ fn python_manifestless_steps(
         .collect()
 }
 
-fn go_steps(
-    checks: &[SemanticCheck],
-) -> Result<(Vec<ShellJobValidationStep>, Vec<&'static str>), RecipeError> {
-    let mut steps = Vec::with_capacity(checks.len());
-    for check in checks {
-        let args = match check {
-            SemanticCheck::Format => return Err(check_unavailable()),
-            SemanticCheck::Check => vec!["vet", "./..."],
-            SemanticCheck::Test => vec!["test", "-json", "./..."],
-        };
-        steps.push(step(
-            *check,
-            "go",
-            args.into_iter().map(str::to_string).collect(),
-        ));
-    }
-    Ok((steps, vec!["go.sum"]))
-}
-
 fn step(check: SemanticCheck, program: &str, args: Vec<String>) -> ShellJobValidationStep {
     ShellJobValidationStep {
         name: check.as_str().to_string(),
@@ -463,6 +898,11 @@ fn normalize_test_filter(
 ) -> Result<Option<String>, RecipeError> {
     match recipe {
         RecipeId::Rust => safe_rust_filter(filter),
+        RecipeId::Go => filter
+            .map(webcodex_core::runner_protocol::normalize_go_test_filter)
+            .transpose()
+            .map(Option::flatten)
+            .map_err(|_| filter_unsupported()),
         _ => {
             reject_filter(filter)?;
             Ok(None)
@@ -491,47 +931,6 @@ fn reject_filter(filter: Option<&str>) -> Result<(), RecipeError> {
     }
 }
 
-fn read_manifest(execution_root: &Path, path: &Path) -> Result<Vec<u8>, RecipeError> {
-    let canonical = path.canonicalize().map_err(|_| manifest_invalid())?;
-    if !canonical.starts_with(execution_root) || !canonical.is_file() {
-        return Err(manifest_invalid());
-    }
-    fs::read(canonical).map_err(|_| manifest_invalid())
-}
-
-fn digest_files<I>(execution_root: &Path, paths: I) -> Result<String, RecipeError>
-where
-    I: IntoIterator<Item = PathBuf>,
-{
-    let mut hasher = Sha256::new();
-    for path in paths {
-        if !path.exists() {
-            continue;
-        }
-        let canonical = path.canonicalize().map_err(|_| manifest_invalid())?;
-        if !canonical.starts_with(execution_root) || !canonical.is_file() {
-            return Err(manifest_invalid());
-        }
-        let content = fs::read(&canonical).map_err(|_| manifest_invalid())?;
-        let relative = canonical
-            .strip_prefix(execution_root)
-            .map_err(|_| manifest_invalid())?;
-        hasher.update(relative.as_os_str().as_encoded_bytes());
-        hasher.update((content.len() as u64).to_be_bytes());
-        hasher.update(content);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn relative_root(root: &Path, recipe_root: &Path) -> String {
-    let relative = recipe_root.strip_prefix(root).unwrap_or(Path::new(""));
-    if relative.as_os_str().is_empty() {
-        ".".to_string()
-    } else {
-        relative.to_string_lossy().replace('\\', "/")
-    }
-}
-
 fn manifest_invalid() -> RecipeError {
     RecipeError::new("validation_manifest_invalid")
 }
@@ -542,4 +941,171 @@ fn check_unavailable() -> RecipeError {
 
 fn filter_unsupported() -> RecipeError {
     RecipeError::new("test_filter_unsupported")
+}
+
+/// Detect using the same nearest-root and ambiguity rules as recipe resolution.
+/// This allows production admission to reject deferred backends before asking
+/// those backends for scripts or installed tooling.
+pub fn detect_validation_recipe(
+    root: &Path,
+    cwd: Option<&str>,
+    hint: Option<RecipeId>,
+) -> Result<RecipeId, RecipeError> {
+    resolve_project_recipe_root(root, cwd, hint)
+        .map(|resolved| resolved.recipe)
+        .map_err(map_project_recipe_error)
+}
+
+fn node_package_manager(
+    root: &Path,
+    object: &serde_json::Map<String, Value>,
+) -> Result<(&'static str, Vec<&'static str>), RecipeError> {
+    let mut managers = BTreeSet::new();
+    if let Some(package_manager) = object.get("packageManager") {
+        let raw = package_manager.as_str().ok_or_else(manifest_invalid)?;
+        let (manager, version) = raw.split_once('@').ok_or_else(manifest_invalid)?;
+        let manager = match manager {
+            "npm" => "npm",
+            "pnpm" => "pnpm",
+            "yarn" => "yarn",
+            "bun" => "bun",
+            _ => return Err(manifest_invalid()),
+        };
+        if version.is_empty() || version.chars().any(char::is_whitespace) {
+            return Err(manifest_invalid());
+        }
+        managers.insert(manager);
+    }
+    let present_locks = NODE_LOCKFILES
+        .iter()
+        .filter(|(file, _)| root.join(file).is_file())
+        .copied()
+        .collect::<Vec<_>>();
+    managers.extend(present_locks.iter().map(|(_, manager)| *manager));
+    if managers.len() != 1 || present_locks.len() > 1 {
+        let mut error = RecipeError::new("package_manager_ambiguous");
+        error.details = Some(json!({
+            "recipe_root": null,
+            "candidate_recipes": managers,
+            "detected_markers": present_locks.iter().map(|(file, _)| *file).collect::<Vec<_>>()
+        }));
+        return Err(error);
+    }
+    let manager = managers.into_iter().next().unwrap();
+    Ok((
+        manager,
+        present_locks.into_iter().map(|(file, _)| file).collect(),
+    ))
+}
+
+/// Manifest-declared build script; no installation or model supplied argv.
+pub fn resolve_node_project_build(
+    execution_root: &Path,
+    cwd: Option<&str>,
+) -> Result<(String, String), RecipeError> {
+    validate_node_project_markers(execution_root, cwd)?;
+    let resolved = resolve_project_recipe_root(execution_root, cwd, Some(RecipeId::Node))
+        .map_err(map_project_recipe_error)?;
+    let manifest = read_node_input(
+        &resolved.execution_root,
+        &resolved.marker_path(),
+        1024 * 1024,
+    )?
+    .ok_or_else(manifest_invalid)?;
+    let value: Value = serde_json::from_slice(&manifest).map_err(|_| manifest_invalid())?;
+    let object = value.as_object().ok_or_else(manifest_invalid)?;
+    if object
+        .get("scripts")
+        .and_then(Value::as_object)
+        .and_then(|scripts| scripts.get("build"))
+        .and_then(Value::as_str)
+        .is_none_or(|body| body.trim().is_empty())
+    {
+        return Err(RecipeError::new("build_script_unavailable"));
+    }
+    let (manager, _) = node_package_manager(&resolved.absolute_root, object)?;
+    let mut files = vec![resolved.marker_path()];
+    // Bind absent locks too, so additions/removals cannot change admission.
+    files.extend(
+        NODE_LOCKFILES
+            .iter()
+            .map(|(name, _)| resolved.absolute_root.join(name)),
+    );
+    let digest = node_input_digest(&resolved.execution_root, files)?;
+    Ok((manager.into(), digest))
+}
+
+fn read_node_input(root: &Path, path: &Path, max: u64) -> Result<Option<Vec<u8>>, RecipeError> {
+    use std::io::Read;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(manifest_invalid()),
+    };
+    if !metadata.file_type().is_file() || metadata.len() > max {
+        return Err(manifest_invalid());
+    }
+    let canonical = path.canonicalize().map_err(|_| manifest_invalid())?;
+    if !canonical.starts_with(root) {
+        return Err(manifest_invalid());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path).map_err(|_| manifest_invalid())?;
+    let opened = file.metadata().map_err(|_| manifest_invalid())?;
+    if !opened.is_file() || opened.len() > max {
+        return Err(manifest_invalid());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            return Err(manifest_invalid());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if opened.file_attributes() & 0x400 != 0
+            || path.canonicalize().ok().as_ref() != Some(&canonical)
+        {
+            return Err(manifest_invalid());
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| manifest_invalid())?;
+    if bytes.len() as u64 > max {
+        return Err(manifest_invalid());
+    }
+    Ok(Some(bytes))
+}
+fn node_input_digest(root: &Path, files: Vec<PathBuf>) -> Result<String, RecipeError> {
+    let mut hasher = Sha256::new();
+    let mut remaining = 8 * 1024 * 1024;
+    for path in files {
+        let relative = path.strip_prefix(root).map_err(|_| manifest_invalid())?;
+        hasher.update(relative.as_os_str().as_encoded_bytes());
+        match read_node_input(root, &path, remaining)? {
+            None => hasher.update([0]),
+            Some(bytes) => {
+                remaining -= bytes.len() as u64;
+                hasher.update([1]);
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(bytes);
+            }
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }

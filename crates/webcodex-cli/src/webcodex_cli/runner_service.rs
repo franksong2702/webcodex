@@ -66,6 +66,7 @@ pub(crate) fn render_runner_systemd_unit(
     unit.push_str("ExecReload=/bin/kill -HUP $MAINPID\n");
     unit.push_str("Restart=always\n");
     unit.push_str("RestartSec=5s\n");
+    unit.push_str("RestartPreventExitStatus=2\n");
     unit.push_str("StandardOutput=journal\n");
     unit.push_str("StandardError=journal\n");
     unit.push_str("Environment=RUST_LOG=info\n");
@@ -107,6 +108,11 @@ pub(crate) fn run_runner_install_service(
             .map_err(|e| e.to_string());
         }
         return Ok(rendered);
+    }
+    // A user installation runs in the same account as its service. Do not run
+    // another account's executable as root just to validate its configuration.
+    if opts.scope == ServiceScope::User {
+        webcodex_environment::preflight_runner_configuration(&opts.bin, &opts.config)?;
     }
     if opts.scope == ServiceScope::User {
         ensure_service_file_parent(&opts.service_file)?;
@@ -243,8 +249,6 @@ struct RunnerStatusConfig {
     transport: Option<String>,
     #[serde(default)]
     project_registry_dir: Option<PathBuf>,
-    #[serde(default, rename = "projects_dir")]
-    legacy_projects_dir: Option<PathBuf>,
     #[serde(default)]
     policy: RunnerStatusPolicy,
 }
@@ -271,17 +275,18 @@ struct RunnerConfigMetadata {
 fn read_runner_config_metadata(path: &Path) -> Result<RunnerConfigMetadata, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read Runner config {}: {}", path.display(), e))?;
+    let raw: toml::Value = toml::from_str(&content)
+        .map_err(|e| format!("failed to parse Runner config {}: {}", path.display(), e))?;
+    if raw.get("projects_dir").is_some() {
+        return Err(
+            "Runner config field 'projects_dir' is retired; use 'project_registry_dir'".to_string(),
+        );
+    }
     let cfg: RunnerStatusConfig = toml::from_str(&content)
         .map_err(|e| format!("failed to parse Runner config {}: {}", path.display(), e))?;
-    let project_registry_dir = match (cfg.project_registry_dir, cfg.legacy_projects_dir) {
-        (Some(_), Some(_)) => {
-            return Err(
-                "project_registry_dir and legacy projects_dir cannot both be configured; keep exactly one Runner project registry setting"
-                    .to_string(),
-            )
-        }
-        (Some(path), None) | (None, Some(path)) => path,
-        (None, None) => {
+    let project_registry_dir = match cfg.project_registry_dir {
+        Some(path) => path,
+        None => {
             let base = webcodex_runner_config::paths::default_client_config_base_dir()?;
             webcodex_runner_config::paths::select_project_registry_dir(&base)?
         }
@@ -298,7 +303,6 @@ fn read_runner_config_metadata(path: &Path) -> Result<RunnerConfigMetadata, Stri
         token: cfg.token,
     })
 }
-
 fn allowed_roots_summary(roots: &[PathBuf]) -> String {
     if roots.is_empty() {
         "0 configured; Runner runtime defaults to $HOME when allowed_roots is omitted".to_string()
@@ -317,7 +321,7 @@ fn allowed_roots_summary(roots: &[PathBuf]) -> String {
 
 fn runtime_client_entry<'a>(output: &'a Value, client_id: &str) -> Option<&'a Value> {
     output
-        .pointer("/agents/clients")
+        .pointer("/runners/clients")
         .and_then(Value::as_array)
         .and_then(|clients| {
             clients
@@ -818,35 +822,34 @@ mod tests {
     }
 
     #[test]
-    fn runner_status_metadata_accepts_legacy_registry_alias_and_rejects_both_fields() {
+    fn runner_status_metadata_rejects_retired_projects_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = tmp.path().join("agent.toml");
-        let legacy = tmp.path().join("projects.d");
+        let config = tmp.path().join("runner.toml");
+        let retired = tmp.path().join("projects.d");
         std::fs::write(
             &config,
             format!(
                 "server_url = \"https://example.test\"\ntoken = \"t\"\nclient_id = \"demo\"\nprojects_dir = {:?}\n",
-                legacy.to_string_lossy()
+                retired.to_string_lossy()
             ),
         )
         .unwrap();
-        let metadata = read_runner_config_metadata(&config).unwrap();
-        assert_eq!(metadata.project_registry_dir, legacy);
+        let error = read_runner_config_metadata(&config).unwrap_err();
+        assert!(error.contains("projects_dir"), "{error}");
+        assert!(error.contains("retired"), "{error}");
 
         let current = tmp.path().join("project-registry");
         std::fs::write(
             &config,
             format!(
-                "server_url = \"https://example.test\"\ntoken = \"t\"\nclient_id = \"demo\"\nproject_registry_dir = {:?}\nprojects_dir = {:?}\n",
-                current.to_string_lossy(),
-                legacy.to_string_lossy()
+                "server_url = \"https://example.test\"\ntoken = \"t\"\nclient_id = \"demo\"\nproject_registry_dir = {:?}\n",
+                current.to_string_lossy()
             ),
         )
         .unwrap();
-        let error = read_runner_config_metadata(&config).unwrap_err();
-        assert!(error.contains("cannot both be configured"), "{error}");
+        let metadata = read_runner_config_metadata(&config).unwrap();
+        assert_eq!(metadata.project_registry_dir, current);
     }
-
     #[test]
     fn service_unit_name_tracks_the_selected_profile_unit() {
         assert_eq!(

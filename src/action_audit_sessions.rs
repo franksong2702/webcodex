@@ -207,7 +207,6 @@ fn sanitize_value_inner(value: &Value, drop_secrets: bool) -> Value {
                         | "stdout_tail"
                         | "stderr_tail"
                         | "diff"
-                        | "openapi_json"
                         | "text"
                         | "base64_content"
                 ) {
@@ -341,9 +340,13 @@ fn new_session_record(session_id: &str, title: Option<&str>, now: i64) -> Action
     }
 }
 
-pub fn record_action_event(db: &Arc<Database>, input: ActionAuditEventInput) {
-    if let Err(e) = record_action_event_inner(db, input) {
-        tracing::warn!("failed to record action event: {}", e);
+pub fn record_action_event(db: &Arc<Database>, input: ActionAuditEventInput) -> bool {
+    match record_action_event_inner(db, input) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("failed to record action event: {}", e);
+            false
+        }
     }
 }
 
@@ -586,7 +589,10 @@ pub fn compute_stats(events: &[ActionEventView]) -> ActionSessionStats {
             }
         }
         use crate::route_metadata::AuditClass;
-        match crate::route_metadata::audit_class_for_path(&event.endpoint) {
+        match crate::route_metadata::audit_class_for_event(
+            &event.endpoint,
+            event.operation.as_deref(),
+        ) {
             Some(AuditClass::Edit) => edit_count += 1,
             Some(AuditClass::Context) => context_count += 1,
             Some(AuditClass::Job) => job_count += 1,

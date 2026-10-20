@@ -19,6 +19,7 @@ pub enum ServerTopology {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunnerTopology {
     Local,
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub enum Enrollment {
     ManagedPairing,
     SharedKey,
     ExistingProfile { profile: String },
+    UserCredential,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +96,8 @@ pub enum ProjectReadiness {
 #[serde(rename_all = "snake_case")]
 pub enum ReadinessSummaryKind {
     ReadyForChatGpt,
+    RuntimeStopped,
+    RuntimeStarting,
     ServiceNeedsAttention,
     RunnerDisconnected,
     ProjectNotReady,
@@ -147,15 +151,31 @@ pub fn aggregate_readiness(
     exposure: ExposureReadiness,
     project: ProjectReadiness,
 ) -> ReadinessSnapshot {
-    let runtime_ready = server == ServerReadiness::Ready
-        && runner == RunnerReadiness::Ready
-        && project == ProjectReadiness::Ready;
-    let ready_for_chatgpt = runtime_ready && exposure == ExposureReadiness::RemoteReady;
+    let runtime_ready = server == ServerReadiness::Ready && runner == RunnerReadiness::Ready;
+    let project_usable = matches!(project, ProjectReadiness::Ready | ProjectReadiness::None);
+    let ready_for_chatgpt =
+        runtime_ready && project_usable && exposure == ExposureReadiness::RemoteReady;
     let (summary_kind, next_action_kind, summary, next_action) = if ready_for_chatgpt {
         (
             ReadinessSummaryKind::ReadyForChatGpt,
             None,
             "Ready to use with ChatGPT".to_string(),
+            None,
+        )
+    } else if server == ServerReadiness::Stopped && runner == RunnerReadiness::Stopped {
+        (
+            ReadinessSummaryKind::RuntimeStopped,
+            Some(ReadinessNextActionKind::StartOrReconnectService),
+            "Runtime stopped".to_string(),
+            Some("Start the runtime to continue.".to_string()),
+        )
+    } else if server == ServerReadiness::Starting
+        || (server == ServerReadiness::Ready && runner == RunnerReadiness::Connecting)
+    {
+        (
+            ReadinessSummaryKind::RuntimeStarting,
+            None,
+            "Runtime starting".to_string(),
             None,
         )
     } else if !matches!(server, ServerReadiness::Ready) {
@@ -172,7 +192,7 @@ pub fn aggregate_readiness(
             "Runner is not connected".to_string(),
             Some("Start the Runner and wait for it to connect.".to_string()),
         )
-    } else if project != ProjectReadiness::Ready {
+    } else if !matches!(project, ProjectReadiness::Ready | ProjectReadiness::None) {
         (
             ReadinessSummaryKind::ProjectNotReady,
             Some(ReadinessNextActionKind::AddOrReloadProject),
@@ -217,6 +237,12 @@ pub struct ProjectSelection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectInspection {
+    pub project: ProjectSelection,
+    pub authorization_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BinaryInfo {
     pub directory: String,
     pub version: String,
@@ -234,27 +260,16 @@ pub struct QuickShareState {
     pub ready_for_chatgpt: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RegularTunnelStatus {
-    Starting,
-    Ready,
-    Error,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RegularTunnelState {
-    pub provider: String,
-    pub status: RegularTunnelStatus,
-    pub clipboard_state: String,
-    pub clipboard_contains: String,
-    pub ready_for_chatgpt: bool,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DesktopOperationKind {
+    EnvironmentInvite,
+    EnvironmentMigration,
+    DesktopUpdate,
+    EnvironmentService,
     LocalSetup,
+    LocalProjectActivate,
+    ProjectUnregister,
     RemoteSetup,
     QuickShareStart,
     QuickShareStop,
@@ -264,12 +279,25 @@ pub enum DesktopOperationKind {
     RuntimeRefresh,
     RuntimeResume,
     TunnelProxyUpdate,
+    TunnelConfigUpdate,
+    RunnerSettingsUpdate,
+    RunnerRestart,
+    RuntimeProbe,
+    RuntimeSwitch,
+    TraceUpdate,
+    ConfigurationRestore,
 }
 
 impl DesktopOperationKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::EnvironmentInvite => "environment_invite",
+            Self::EnvironmentMigration => "environment_migration",
+            Self::DesktopUpdate => "desktop_update",
+            Self::EnvironmentService => "environment_service",
             Self::LocalSetup => "local_setup",
+            Self::LocalProjectActivate => "local_project_activate",
+            Self::ProjectUnregister => "project_unregister",
             Self::RemoteSetup => "remote_setup",
             Self::QuickShareStart => "quick_share_start",
             Self::QuickShareStop => "quick_share_stop",
@@ -279,6 +307,13 @@ impl DesktopOperationKind {
             Self::RuntimeRefresh => "runtime_refresh",
             Self::RuntimeResume => "runtime_resume",
             Self::TunnelProxyUpdate => "tunnel_proxy_update",
+            Self::RunnerSettingsUpdate => "runner_settings_update",
+            Self::RunnerRestart => "runner_restart",
+            Self::RuntimeProbe => "runtime_probe",
+            Self::RuntimeSwitch => "runtime_switch",
+            Self::TraceUpdate => "trace_update",
+            Self::ConfigurationRestore => "configuration_restore",
+            Self::TunnelConfigUpdate => "tunnel_config_update",
         }
     }
 }
@@ -329,14 +364,29 @@ pub struct TunnelProxySnapshot {
     pub mode: TunnelProxyMode,
     pub custom_url: Option<String>,
     pub effective_source: String,
-    pub effective_url: Option<String>,
-    pub detected_url: Option<String>,
+    pub effective_proxy_present: bool,
+    pub system_proxy_detected: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelConfigSource {
+    #[default]
+    Environment,
+    File,
+    Invalid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct OpenAiTunnelConfigSnapshot {
     pub tunnel_id_present: bool,
     pub api_key_present: bool,
+    #[serde(default)]
+    pub source: TunnelConfigSource,
+    #[serde(default)]
+    pub saved_tunnel_id: Option<String>,
+    #[serde(default)]
+    pub effective_tunnel_id: Option<String>,
 }
 
 impl OpenAiTunnelConfigSnapshot {
@@ -360,8 +410,23 @@ pub struct ChatGptActivitySnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DesktopStateSnapshot {
+    /// Read-only projection of the sole authoritative Environment store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_setup: Option<EnvironmentSetupSnapshot>,
+    #[serde(default)]
+    pub can_repair_runner_credential: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_progress: Option<webcodex_environment::SetupProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_environment: Option<String>,
+    pub workspace_runner: Option<crate::webcodex::settings::SettingsTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_issue: Option<String>,
+    pub saved_projects: Vec<ProjectSelection>,
     pub topology: Option<RuntimeTopology>,
     pub readiness: ReadinessSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_error: Option<crate::error::DesktopError>,
     pub project: Option<ProjectSelection>,
     pub binaries: Option<BinaryInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -369,7 +434,12 @@ pub struct DesktopStateSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chatgpt_activity: Option<ChatGptActivitySnapshot>,
     pub quick_share: Option<QuickShareState>,
-    pub regular_tunnel: Option<RegularTunnelState>,
+    #[serde(default)]
+    pub connections: crate::connections::ConnectionsSnapshot,
+    #[serde(default)]
+    pub mcp_providers: crate::mcp_providers::McpProvidersSnapshot,
+    #[serde(default)]
+    pub coding_agents: crate::coding_agents::CodingAgentsSnapshot,
     pub current_operation: Option<DesktopOperationSnapshot>,
     pub activity_sequence: u64,
     pub openai_tunnel_configured: bool,
@@ -383,14 +453,24 @@ pub struct DesktopStateSnapshot {
 impl Default for DesktopStateSnapshot {
     fn default() -> Self {
         Self {
+            environment_setup: None,
+            can_repair_runner_credential: false,
+            setup_progress: None,
+            persistent_environment: None,
+            workspace_runner: None,
+            configuration_issue: None,
+            saved_projects: Vec::new(),
             topology: None,
             readiness: ReadinessSnapshot::default(),
+            runtime_error: None,
             project: None,
             binaries: None,
             powershell_runtime: None,
             chatgpt_activity: None,
             quick_share: None,
-            regular_tunnel: None,
+            connections: Default::default(),
+            mcp_providers: Default::default(),
+            coding_agents: Default::default(),
             current_operation: None,
             activity_sequence: 0,
             openai_tunnel_configured: false,
@@ -402,24 +482,76 @@ impl Default for DesktopStateSnapshot {
                 mode: TunnelProxyMode::Auto,
                 custom_url: None,
                 effective_source: "direct".to_string(),
-                effective_url: None,
-                detected_url: None,
+                effective_proxy_present: false,
+                system_proxy_detected: false,
             },
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredDesktopConfig {
+    #[serde(default = "desktop_config_schema")]
+    pub schema_version: u16,
+    #[serde(default)]
+    pub runtime_binary_source: crate::runtime_selection::RuntimeSource,
+    #[serde(default)]
+    pub runtime_selection_revision: u64,
+    // Last explicitly activated build, for diagnostics and legacy config reads.
+    // Never an across-restart approval gate: custom directories track rebuilds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_binary_fingerprint: Option<String>,
+    #[serde(default)]
+    pub update_cache: crate::updates::UpdateCache,
+    #[serde(default)]
+    pub previous_runtime_source: Option<crate::runtime_selection::RuntimeSource>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub saved_projects: Vec<SavedProject>,
     pub topology: Option<RuntimeTopology>,
     pub project: Option<ProjectSelection>,
     pub runtime: Option<StoredRuntime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_environment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_autostart: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_connection: Option<RegularConnectionPreference>,
     #[serde(default)]
     pub tunnel_proxy: TunnelProxyConfig,
+}
+
+fn desktop_config_schema() -> u16 {
+    1
+}
+
+impl Default for StoredDesktopConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: desktop_config_schema(),
+            runtime_binary_source: Default::default(),
+            runtime_selection_revision: 0,
+            runtime_binary_fingerprint: None,
+            previous_runtime_source: None,
+            update_cache: Default::default(),
+            extra: Default::default(),
+            saved_projects: Vec::new(),
+            topology: None,
+            project: None,
+            runtime: None,
+            persistent_environment: None,
+            runtime_autostart: None,
+            preferred_connection: None,
+            tunnel_proxy: Default::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedProject {
+    pub project: ProjectSelection,
+    pub runner_config: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -432,6 +564,70 @@ pub struct StoredRuntime {
     pub runner_client_id: Option<String>,
     pub project_id: Option<String>,
     pub runtime_project_id: Option<String>,
+}
+
+/// Non-secret projection from the authoritative Environment record or setup journal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentSetupSnapshot {
+    pub environment_id: String,
+    pub mode: String,
+    pub server_url: String,
+    pub runner: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_display_name: Option<String>,
+    pub project_path: Option<String>,
+    pub service_scope: webcodex_environment::service::ServiceScope,
+    pub configured: bool,
+}
+
+/// Transient native IPC input; never persisted or logged.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvironmentInput {
+    /// New personal environments default to user scope; saved/migrated ones keep their namespace.
+    pub service_scope: Option<webcodex_environment::service::ServiceScope>,
+    pub mode: String,
+    pub server_url: Option<String>,
+    pub project_path: Option<String>,
+    /// Missing preserves older callers; normal Desktop setup explicitly enables work.
+    pub runner: Option<bool>,
+    pub runner_display_name: Option<String>,
+    pub pairing_code: Option<String>,
+    pub user_token: Option<String>,
+    #[serde(default)]
+    pub replace_pairing_code: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentServiceComponent {
+    Server,
+    Runner,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentServiceAction {
+    Start,
+    Stop,
+    Restart,
+    RepairCredential,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnvironmentServiceRequest {
+    pub environment_id: String,
+    pub component: EnvironmentServiceComponent,
+    pub action: EnvironmentServiceAction,
+}
+
+// Transient IPC only; never derive Debug or Serialize for credential input.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EnvironmentUserCredentialRequest {
+    pub environment_id: String,
+    pub user_token: String,
 }
 
 #[cfg(test)]
@@ -464,6 +660,37 @@ mod tests {
     }
 
     #[test]
+    fn stopped_starting_and_failed_readiness_are_distinct() {
+        for (server, runner, expected) in [
+            (
+                ServerReadiness::Stopped,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::RuntimeStopped,
+            ),
+            (
+                ServerReadiness::Starting,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::RuntimeStarting,
+            ),
+            (
+                ServerReadiness::Error,
+                RunnerReadiness::Stopped,
+                ReadinessSummaryKind::ServiceNeedsAttention,
+            ),
+        ] {
+            let state = aggregate_readiness(
+                server,
+                runner,
+                ExposureReadiness::LocalReady,
+                ProjectReadiness::Configured,
+            );
+            assert_eq!(state.summary_kind, expected);
+            assert!(!state.runtime_ready);
+            assert!(!state.ready_for_chatgpt);
+        }
+    }
+
+    #[test]
     fn process_alive_is_not_aggregate_readiness() {
         let server_only = aggregate_readiness(
             ServerReadiness::Ready,
@@ -480,8 +707,21 @@ mod tests {
             ExposureReadiness::RemoteReady,
             ProjectReadiness::None,
         );
-        assert!(!missing_project.runtime_ready);
-        assert!(!missing_project.ready_for_chatgpt);
+        assert!(missing_project.runtime_ready);
+        assert!(missing_project.ready_for_chatgpt);
+
+        let stale_project = aggregate_readiness(
+            ServerReadiness::Ready,
+            RunnerReadiness::Ready,
+            ExposureReadiness::RemoteReady,
+            ProjectReadiness::ReloadRequired,
+        );
+        assert!(stale_project.runtime_ready);
+        assert!(!stale_project.ready_for_chatgpt);
+        assert_eq!(
+            stale_project.summary_kind,
+            ReadinessSummaryKind::ProjectNotReady
+        );
 
         let local_only = aggregate_readiness(
             ServerReadiness::Ready,

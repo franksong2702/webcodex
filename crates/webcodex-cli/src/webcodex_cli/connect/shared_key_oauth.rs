@@ -3,6 +3,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use webcodex_admin::build_server_http_client;
+use webcodex_core::authority::profiles::OPTIONAL_BROWSER;
 
 use super::super::http::{post_json_authed, ApiCall};
 use super::profile::{atomic_write, validate_existing_regular_file, ConnectOptions, ResolvedKey};
@@ -16,39 +17,12 @@ const LOCAL_PLUGIN_INSPECT_SCOPE: &str = "plugin:inspect";
 const LOCAL_PLUGIN_INVOKE_SCOPE: &str = "plugin:invoke";
 const LOCAL_SSH_SCOPE: &str = "ssh:local";
 const CODING_AGENT_SCOPE: &str = "coding_agent:run";
-const BRIDGE_BASELINE_SCOPES: &[&str] = &[
-    "runtime:read",
-    "session:collaborate",
-    "project:read",
-    "project:write",
-    "job:run",
-    "computer:read",
-    "computer:control",
-];
-const BRIDGE_OPTIONAL_COMPUTER_SCOPES: &[&str] = &[
-    "computer:launch",
-    "computer:display_read",
-    "computer:pointer_control",
-    "computer:clipboard_read",
-    "computer:clipboard_write",
-];
-// Canonical ceiling for a fresh Computer-enabled client. Existing profiles may
-// retain a narrower non-empty baseline subset plus all optional Computer scopes.
-const BRIDGE_COMPUTER_ENABLED_SCOPES: &[&str] = &[
-    "runtime:read",
-    "session:collaborate",
-    "project:read",
-    "project:write",
-    "job:run",
-    "computer:read",
-    "computer:control",
-    "computer:launch",
-    "computer:display_read",
-    "computer:pointer_control",
-    "computer:clipboard_read",
-    "computer:clipboard_write",
-];
-
+#[cfg(test)]
+use webcodex_core::authority::profiles::OPTIONAL_COMPUTER as BRIDGE_OPTIONAL_COMPUTER_SCOPES;
+use webcodex_core::authority::profiles::{
+    SHARED_KEY_COMPUTER as BRIDGE_COMPUTER_ENABLED_SCOPES,
+    SHARED_KEY_MODEL as BRIDGE_BASELINE_SCOPES,
+};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct SharedKeyOAuthProfile {
     version: u32,
@@ -57,6 +31,8 @@ struct SharedKeyOAuthProfile {
     client_secret: String,
     redirect_uri: String,
     allowed_scopes: Vec<String>,
+    #[serde(default)]
+    browser_permissions_enabled: bool,
     #[serde(default)]
     computer_permissions_enabled: bool,
     #[serde(default)]
@@ -143,65 +119,34 @@ fn without_optional_class_scopes(scopes: &[String]) -> Vec<String> {
     scopes
         .iter()
         .filter(|scope| {
-            !matches!(
-                scope.as_str(),
-                LOCAL_MCP_SCOPE
-                    | LOCAL_PLUGIN_INSPECT_SCOPE
-                    | LOCAL_PLUGIN_INVOKE_SCOPE
-                    | LOCAL_SSH_SCOPE
-                    | CODING_AGENT_SCOPE
-            )
+            !OPTIONAL_BROWSER.contains(&scope.as_str())
+                && !matches!(
+                    scope.as_str(),
+                    LOCAL_MCP_SCOPE
+                        | LOCAL_PLUGIN_INSPECT_SCOPE
+                        | LOCAL_PLUGIN_INVOKE_SCOPE
+                        | LOCAL_SSH_SCOPE
+                        | CODING_AGENT_SCOPE
+                )
         })
         .cloned()
         .collect()
 }
 
 fn baseline_scope_ceiling_is_valid(scopes: &[String]) -> bool {
-    !scopes.is_empty()
-        && scope_list_is_unique(scopes)
-        && scopes
-            .iter()
-            .all(|scope| BRIDGE_BASELINE_SCOPES.contains(&scope.as_str()))
+    webcodex_core::authority::profiles::is_baseline(scopes)
 }
-
 fn computer_enabled_scope_ceiling_is_valid(scopes: &[String]) -> bool {
-    if scopes.is_empty() || !scope_list_is_unique(scopes) {
-        return false;
-    }
-
-    let mut has_baseline_scope = false;
-    for scope in scopes {
-        if BRIDGE_BASELINE_SCOPES.contains(&scope.as_str()) {
-            has_baseline_scope = true;
-        } else if !BRIDGE_OPTIONAL_COMPUTER_SCOPES.contains(&scope.as_str()) {
-            return false;
-        }
-    }
-
-    has_baseline_scope
-        && BRIDGE_OPTIONAL_COMPUTER_SCOPES
-            .iter()
-            .all(|required| scopes.iter().any(|scope| scope == required))
+    webcodex_core::authority::profiles::is_computer(scopes)
 }
-
 fn computer_enabled_scope_ceiling_from_existing(scopes: &[String]) -> Option<Vec<String>> {
-    if computer_enabled_scope_ceiling_is_valid(scopes) {
-        return Some(scopes.to_vec());
-    }
-    if !baseline_scope_ceiling_is_valid(scopes) {
-        return None;
-    }
-
-    let mut expanded = scopes.to_vec();
-    expanded.extend(
-        BRIDGE_OPTIONAL_COMPUTER_SCOPES
-            .iter()
-            .map(|scope| (*scope).to_string()),
-    );
-    Some(expanded)
+    webcodex_core::authority::profiles::with_computer(scopes)
 }
 
 fn profile_scope_ceiling_is_valid(profile: &SharedKeyOAuthProfile) -> bool {
+    if !scope_list_is_unique(&profile.allowed_scopes) {
+        return false;
+    }
     let local_mcp_present = profile
         .allowed_scopes
         .iter()
@@ -234,6 +179,11 @@ fn profile_scope_ceiling_is_valid(profile: &SharedKeyOAuthProfile) -> bool {
         .iter()
         .any(|scope| scope == CODING_AGENT_SCOPE);
     if coding_agent_present != profile.coding_agent_enabled {
+        return false;
+    }
+    if OPTIONAL_BROWSER.iter().any(|scope| {
+        profile.allowed_scopes.iter().any(|s| s == scope) != profile.browser_permissions_enabled
+    }) {
         return false;
     }
     let authority_scopes = without_optional_class_scopes(&profile.allowed_scopes);
@@ -328,6 +278,7 @@ async fn provision_client(
             "redirect_uri": redirect_uri,
             "client_id": existing.map(|profile| profile.client_id.as_str()),
             "previous_allowed_scopes": existing.map(|profile| profile.allowed_scopes.as_slice()),
+            "browser_permissions": opts.oauth_browser_permissions,
             "computer_permissions": opts.oauth_computer_permissions,
             "local_mcp": opts.oauth_local_mcp,
             "local_plugins": opts.oauth_local_plugins,
@@ -359,6 +310,9 @@ async fn provision_client(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if !scope_list_is_unique(&allowed_scopes) {
+        return Err("Server returned duplicate OAuth scopes".to_string());
+    }
     let local_mcp_present = allowed_scopes.iter().any(|scope| scope == LOCAL_MCP_SCOPE);
     if local_mcp_present != opts.oauth_local_mcp {
         return Err(
@@ -393,6 +347,15 @@ async fn provision_client(
     if coding_agent_present != opts.oauth_coding_agent {
         return Err(
             "Server changed coding-agent OAuth authority without matching the explicit connect opt-in"
+                .to_string(),
+        );
+    }
+    if OPTIONAL_BROWSER
+        .iter()
+        .any(|scope| allowed_scopes.iter().any(|s| s == scope) != opts.oauth_browser_permissions)
+    {
+        return Err(
+            "Server changed Browser OAuth authority without matching the explicit connect opt-in"
                 .to_string(),
         );
     }
@@ -460,6 +423,7 @@ async fn provision_client(
         }
         let mut updated = existing.clone();
         updated.allowed_scopes = allowed_scopes;
+        updated.browser_permissions_enabled = opts.oauth_browser_permissions;
         updated.computer_permissions_enabled = opts.oauth_computer_permissions;
         updated.local_mcp_enabled = opts.oauth_local_mcp;
         updated.local_plugins_enabled = opts.oauth_local_plugins;
@@ -482,6 +446,7 @@ async fn provision_client(
             client_secret,
             redirect_uri: redirect_uri.to_string(),
             allowed_scopes,
+            browser_permissions_enabled: opts.oauth_browser_permissions,
             computer_permissions_enabled: opts.oauth_computer_permissions,
             local_mcp_enabled: opts.oauth_local_mcp,
             local_plugins_enabled: opts.oauth_local_plugins,
@@ -562,6 +527,9 @@ pub(super) async fn finish_shared_key_oauth_connect(
                 "shared-key OAuth profile belongs to a different Server or redirect URI"
                     .to_string(),
             );
+        }
+        if existing.browser_permissions_enabled && !opts.oauth_browser_permissions {
+            return Err("this shared-key OAuth profile is Browser-enabled; reconnect with --oauth-browser-permissions".to_string());
         }
         if existing.computer_permissions_enabled && !opts.oauth_computer_permissions {
             return Err(
@@ -657,6 +625,7 @@ mod tests {
             key_file: None,
             auth: super::super::ConnectAuth::SharedKeyOAuth,
             oauth_redirect_uri: Some("https://chatgpt.example/callback".to_string()),
+            oauth_browser_permissions: false,
             oauth_computer_permissions: false,
             oauth_local_mcp: false,
             oauth_local_plugins: false,
@@ -700,15 +669,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_connect_oauth_provisions_then_reuses_same_shared_key_client() {
-        let scopes = vec![
-            "runtime:read",
-            "session:collaborate",
-            "project:read",
-            "project:write",
-            "job:run",
-            "computer:read",
-            "computer:control",
-        ];
+        let scopes = BRIDGE_BASELINE_SCOPES;
         let (server, handle) = json_responses(vec![
             json!({
                 "success": true,
@@ -726,15 +687,7 @@ mod tests {
                 "client": {
                     "client_id": "wc_client_bridge_created",
                     "redirect_uri": "https://chatgpt.example/callback",
-                    "allowed_scopes": [
-                        "runtime:read",
-                        "session:collaborate",
-                        "project:read",
-                        "project:write",
-                        "job:run",
-                        "computer:read",
-                        "computer:control"
-                    ]
+                    "allowed_scopes": scopes
                 }
             }),
         ]);
@@ -797,6 +750,7 @@ mod tests {
             client_secret: "wc_csec_existing_secret".to_string(),
             redirect_uri: "https://chatgpt.example/callback".to_string(),
             allowed_scopes: vec!["runtime:read".to_string(), "project:read".to_string()],
+            browser_permissions_enabled: false,
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
             local_plugins_enabled: false,
@@ -931,6 +885,7 @@ mod tests {
             client_secret: "wc_csec_baseline".to_string(),
             redirect_uri: "https://chatgpt.example/callback".to_string(),
             allowed_scopes: vec!["runtime:read".to_string(), "project:read".to_string()],
+            browser_permissions_enabled: false,
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
             local_plugins_enabled: false,
@@ -943,6 +898,9 @@ mod tests {
         local_mcp.local_mcp_enabled = true;
         local_mcp.allowed_scopes.push(LOCAL_MCP_SCOPE.to_string());
         assert!(profile_scope_ceiling_is_valid(&local_mcp));
+        let mut duplicated = local_mcp.clone();
+        duplicated.allowed_scopes.push(LOCAL_MCP_SCOPE.into());
+        assert!(!profile_scope_ceiling_is_valid(&duplicated));
         let mut mismatched_local_mcp = local_mcp.clone();
         mismatched_local_mcp.local_mcp_enabled = false;
         assert!(!profile_scope_ceiling_is_valid(&mismatched_local_mcp));
@@ -1063,6 +1021,7 @@ mod tests {
             client_secret: "wc_csec_test_once".to_string(),
             redirect_uri: "https://chatgpt.example/callback".to_string(),
             allowed_scopes: vec!["runtime:read".to_string()],
+            browser_permissions_enabled: false,
             computer_permissions_enabled: false,
             local_mcp_enabled: false,
             local_plugins_enabled: false,
@@ -1120,5 +1079,83 @@ mod tests {
             profile_path(root, "https://chatgpt.example/a"),
             profile_path(root, "https://chatgpt.example/b")
         );
+    }
+    #[tokio::test]
+    async fn browser_opt_in_validates_server_authority_and_preserves_narrow_profiles() {
+        for computer in [false, true] {
+            for browser in [false, true] {
+                for returned_browser_count in [0, 1, 3] {
+                    let mut prior = vec!["runtime:read".to_string()];
+                    if computer {
+                        prior.extend(
+                            BRIDGE_OPTIONAL_COMPUTER_SCOPES
+                                .iter()
+                                .map(|s| s.to_string()),
+                        );
+                    }
+                    let mut returned = prior.clone();
+                    returned.extend(
+                        OPTIONAL_BROWSER[..returned_browser_count]
+                            .iter()
+                            .map(|s| s.to_string()),
+                    );
+                    let (server, handle) = json_responses(vec![json!({
+                        "reused": true, "client": {
+                            "client_id": "wc_client_existing",
+                            "redirect_uri": "https://chatgpt.example/callback",
+                            "allowed_scopes": returned
+                        }
+                    })]);
+                    let mut opts = options(server.clone());
+                    opts.oauth_browser_permissions = browser;
+                    opts.oauth_computer_permissions = computer;
+                    let existing = SharedKeyOAuthProfile {
+                        version: BRIDGE_PROFILE_VERSION,
+                        server_url: server.clone(),
+                        client_id: "wc_client_existing".into(),
+                        client_secret: "wc_csec_existing".into(),
+                        redirect_uri: "https://chatgpt.example/callback".into(),
+                        allowed_scopes: prior,
+                        browser_permissions_enabled: false,
+                        computer_permissions_enabled: computer,
+                        local_mcp_enabled: false,
+                        local_plugins_enabled: false,
+                        local_ssh_enabled: false,
+                        coding_agent_enabled: false,
+                    };
+                    let result = provision_client(
+                        &opts,
+                        &server,
+                        "ordinary-connect-shared-key",
+                        &existing.redirect_uri,
+                        Some(&existing),
+                    )
+                    .await;
+                    assert_eq!(
+                        result.is_ok(),
+                        returned_browser_count == if browser { 3 } else { 0 }
+                    );
+                    if let Ok((profile, _)) = result {
+                        assert_eq!(profile.allowed_scopes, returned);
+                        assert!(profile_scope_ceiling_is_valid(&profile));
+                        assert_eq!(profile.browser_permissions_enabled, browser);
+                        assert_eq!(
+                            bridge_scope_output(&profile).contains("browser:launch"),
+                            browser
+                        );
+                        let legacy = toml::to_string(&profile)
+                            .unwrap()
+                            .lines()
+                            .filter(|line| !line.starts_with("browser_permissions_enabled"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let decoded: SharedKeyOAuthProfile = toml::from_str(&legacy).unwrap();
+                        assert!(!decoded.browser_permissions_enabled);
+                        assert_eq!(profile_scope_ceiling_is_valid(&decoded), !browser);
+                    }
+                    handle.join().unwrap();
+                }
+            }
+        }
     }
 }

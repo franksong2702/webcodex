@@ -1,4 +1,3 @@
-use crate::capabilities::RunnerFeatureInference;
 use crate::projects::RunnerLookupError;
 use crate::protocol::AcceptedRunnerProtocol;
 use crate::registry::{MAX_SHARED_KEY_RUNNERS_PER_GROUP, SHARED_KEY_OFFLINE_TTL_SECS};
@@ -53,6 +52,8 @@ fn project_summary(id: &str, path: &str) -> RunnerProjectSummary {
         hooks: vec!["doctor".to_string(), "precommit".to_string()],
         disabled: false,
         revision: None,
+        root_fingerprint: None,
+        lineage: None,
         git_branch: Some("codex".to_string()),
         git_head: Some("9a7d3ce".to_string()),
         git_dirty: Some(false),
@@ -67,6 +68,7 @@ fn runner_registration(
     _projects: Vec<RunnerProjectSummary>,
 ) -> RunnerRegisterRequest {
     RunnerRegisterRequest {
+        computer_session_availability: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -85,13 +87,20 @@ fn runner_registration(
     }
 }
 
-fn v2_baseline_capabilities() -> RunnerCapabilities {
-    let mut value = serde_json::Map::new();
-    value.insert("shell".to_string(), serde_json::Value::Bool(false));
-    for capability in RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
-        value.insert((*capability).to_string(), serde_json::Value::Bool(true));
+fn all_enabled_capabilities() -> RunnerCapabilities {
+    let mut capabilities = RunnerCapabilities::default();
+    for feature in RunnerFeature::all() {
+        capabilities.set(*feature, true);
     }
-    serde_json::from_value(serde_json::Value::Object(value)).unwrap()
+    capabilities
+}
+
+fn v2_baseline_capabilities() -> RunnerCapabilities {
+    let mut capabilities = RunnerCapabilities::default();
+    for feature in RunnerFeature::all() {
+        capabilities.set(*feature, feature.is_v2_baseline());
+    }
+    capabilities
 }
 
 fn current_runner_registration(registration: RunnerRegisterRequest) -> RunnerRegisterRequest {
@@ -116,8 +125,8 @@ fn file_request(op: &str) -> ShellFileOpRequest {
         pattern: None,
         expected_sha256: None,
         expected_prefix: None,
-        start_line: None,
-        end_line: None,
+        start_line: (op == "read").then_some(1),
+        end_line: (op == "read").then_some(1),
         line: None,
         create_dirs: false,
         wait_timeout_secs: 0,
@@ -135,6 +144,7 @@ async fn register_computer_test_runner(
 ) {
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -167,6 +177,7 @@ async fn register_computer_test_runner(
 async fn register_quic_v1_runner(registry: &RunnerRegistry, client_id: &str) {
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -199,6 +210,7 @@ async fn register_instance_with_capabilities(
 ) -> Result<RunnerView, String> {
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -237,6 +249,7 @@ async fn register_with_instance(
 ) -> RunnerView {
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -295,10 +308,14 @@ mod abandoned_sync;
 mod apply_patch;
 #[path = "tests/apply_text_edit_line_scope.rs"]
 mod apply_text_edit_line_scope;
+#[path = "tests/apply_text_edit_local_guard.rs"]
+mod apply_text_edit_local_guard;
 #[path = "tests/apply_text_edit_occurrence.rs"]
 mod apply_text_edit_occurrence;
 #[path = "tests/artifact_export.rs"]
 mod artifact_export;
+#[path = "tests/browser.rs"]
+mod browser;
 #[path = "tests/capabilities.rs"]
 mod capabilities;
 #[path = "tests/computer_accessibility.rs"]
@@ -315,24 +332,40 @@ mod computer_text_input;
 mod connection_lease;
 #[path = "tests/disconnect_reconciliation.rs"]
 mod disconnect_reconciliation;
+#[path = "tests/execution_admission.rs"]
+mod execution_admission;
 #[path = "tests/file_validation.rs"]
 mod file_validation;
 #[path = "tests/instance_lease.rs"]
 mod instance_lease;
 #[path = "tests/internal_posix.rs"]
 mod internal_posix;
+#[path = "tests/job_handoff.rs"]
+mod job_handoff;
+#[path = "tests/job_index.rs"]
+mod job_index;
 #[path = "tests/job_lifecycle.rs"]
 mod job_lifecycle;
 #[path = "tests/job_log_wait.rs"]
 mod job_log_wait;
 #[path = "tests/lsp.rs"]
 mod lsp;
+#[path = "tests/maintenance.rs"]
+mod maintenance;
 #[path = "tests/mcp_gateway.rs"]
 mod mcp_gateway;
 #[path = "tests/plugin_gateway.rs"]
 mod plugin_gateway;
 #[path = "tests/polling.rs"]
 mod polling;
+#[path = "tests/project_build.rs"]
+mod project_build;
+#[path = "tests/project_dependency_policy.rs"]
+mod project_dependency_policy;
+#[path = "tests/project_file_read.rs"]
+mod project_file_read;
+#[path = "tests/project_format.rs"]
+mod project_format;
 #[path = "tests/project_inventory.rs"]
 mod project_inventory;
 #[path = "tests/project_projection.rs"]
@@ -349,6 +382,8 @@ mod quic_queueing;
 mod raw_shell;
 #[path = "tests/registration_projection.rs"]
 mod registration_projection;
+#[path = "tests/request_cleanup.rs"]
+mod request_cleanup;
 #[path = "tests/run_enqueue.rs"]
 mod run_enqueue;
 #[path = "tests/runner_config.rs"]
@@ -359,9 +394,11 @@ mod runner_liveness;
 mod shared_key_limits;
 #[path = "tests/shared_key_ttl.rs"]
 mod shared_key_ttl;
-#[path = "tests/skill_store.rs"]
-mod skill_store;
+#[path = "tests/skills.rs"]
+mod skills;
 #[path = "tests/ssh_resource.rs"]
 mod ssh_resource;
 #[path = "tests/structured_file_delete.rs"]
 mod structured_file_delete;
+#[path = "tests/throughput_telemetry.rs"]
+mod throughput_telemetry;

@@ -10,6 +10,7 @@ import secrets
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 from pathlib import Path
 
 if __package__:
@@ -25,7 +26,9 @@ READINESS_WORKFLOW_PATH = f".github/workflows/{READINESS_WORKFLOW_FILE}"
 CI_WORKFLOW_FILE = "ci.yml"
 CI_WORKFLOW_PATH = f".github/workflows/{CI_WORKFLOW_FILE}"
 LEGACY_STATE_SCHEMA_VERSION = 1
-STATE_SCHEMA_VERSION = 2
+CI_PROOF_STATE_SCHEMA_VERSION = 2
+SOURCE_REF_STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
 REQUEST_ID_RE = re.compile(r"^rr_[0-9a-f]{24}$")
 MAX_STATE_BYTES = 64 * 1024
 MAX_RUN_LIST = 100
@@ -126,11 +129,23 @@ def _load_state(path: Path) -> dict:
         "ci_run_head_sha",
         "ci_run_conclusion",
     }
+    source_ref_fields = {"source_ref"}
+    source_evidence_fields = {
+        "evidence_run_id",
+        "evidence_run_attempt",
+        "evidence_run_url",
+        "evidence_run_head_sha",
+        "evidence_run_conclusion",
+    }
     schema_version = value.get("schema_version")
     if schema_version == LEGACY_STATE_SCHEMA_VERSION:
         required = legacy_required
-    elif schema_version == STATE_SCHEMA_VERSION:
+    elif schema_version == CI_PROOF_STATE_SCHEMA_VERSION:
         required = legacy_required | ci_proof_fields
+    elif schema_version == SOURCE_REF_STATE_SCHEMA_VERSION:
+        required = legacy_required | ci_proof_fields | source_ref_fields
+    elif schema_version == STATE_SCHEMA_VERSION:
+        required = legacy_required | ci_proof_fields | source_ref_fields | source_evidence_fields
     else:
         raise ReadinessError("unsupported readiness state schema")
     if set(value) != required:
@@ -138,6 +153,7 @@ def _load_state(path: Path) -> dict:
     if value.get("kind") != "release-readiness":
         raise ReadinessError("unsupported readiness state kind")
     source_sha = collector.normalize_source_sha(str(value.get("source_sha", "")))
+    source_ref = collector.normalize_source_ref(str(value.get("source_ref", "main")))
     request_id = _validate_request_id(str(value.get("request_id", "")))
     if value.get("workflow_file") != READINESS_WORKFLOW_FILE or value.get("workflow_path") != READINESS_WORKFLOW_PATH:
         raise ReadinessError("readiness state references an unexpected workflow")
@@ -147,7 +163,11 @@ def _load_state(path: Path) -> dict:
         raise ReadinessError("readiness state repository is invalid")
     if not isinstance(value.get("created_at"), int) or value["created_at"] <= 0:
         raise ReadinessError("readiness state created_at is invalid")
-    if schema_version == STATE_SCHEMA_VERSION:
+    if schema_version in {
+        CI_PROOF_STATE_SCHEMA_VERSION,
+        SOURCE_REF_STATE_SCHEMA_VERSION,
+        STATE_SCHEMA_VERSION,
+    }:
         ci_run_id = value.get("ci_run_id")
         ci_run_attempt = value.get("ci_run_attempt")
         ci_run_url = value.get("ci_run_url")
@@ -167,6 +187,31 @@ def _load_state(path: Path) -> dict:
             raise ReadinessError("readiness state CI proof does not match release source")
         if ci_run_conclusion != "success":
             raise ReadinessError("readiness state CI proof is not successful")
+    if schema_version == STATE_SCHEMA_VERSION:
+        evidence_values = {
+            "id": value.get("evidence_run_id"),
+            "attempt": value.get("evidence_run_attempt"),
+            "url": value.get("evidence_run_url"),
+            "head_sha": value.get("evidence_run_head_sha"),
+            "conclusion": value.get("evidence_run_conclusion"),
+        }
+        if source_ref.startswith("release/"):
+            if not isinstance(evidence_values["id"], int) or evidence_values["id"] <= 0:
+                raise ReadinessError("readiness state source-evidence run id is invalid")
+            if not isinstance(evidence_values["attempt"], int) or evidence_values["attempt"] <= 0:
+                raise ReadinessError("readiness state source-evidence run attempt is invalid")
+            if not isinstance(evidence_values["url"], str) or not evidence_values["url"].startswith("https://github.com/"):
+                raise ReadinessError("readiness state source-evidence run URL is invalid")
+            try:
+                normalized_evidence_source = collector.normalize_source_sha(str(evidence_values["head_sha"]))
+            except collector.CollectionError as exc:
+                raise ReadinessError("readiness state source-evidence run head SHA is invalid") from exc
+            if normalized_evidence_source != source_sha:
+                raise ReadinessError("readiness state source evidence does not match release source")
+            if evidence_values["conclusion"] != "success":
+                raise ReadinessError("readiness state source evidence is not successful")
+        elif any(item is not None for item in evidence_values.values()):
+            raise ReadinessError("main-source readiness state must not bind release-branch source evidence")
     run_id = value.get("run_id")
     if run_id is not None and (not isinstance(run_id, int) or run_id <= 0):
         raise ReadinessError("readiness state run id is invalid")
@@ -191,27 +236,36 @@ def _load_state(path: Path) -> dict:
     last_observed_at = value.get("last_observed_at")
     if last_observed_at is not None and (not isinstance(last_observed_at, int) or last_observed_at <= 0):
         raise ReadinessError("readiness state last_observed_at is invalid")
+    if schema_version in {SOURCE_REF_STATE_SCHEMA_VERSION, STATE_SCHEMA_VERSION} and value.get("source_ref") != source_ref:
+        raise ReadinessError("readiness state source_ref is not canonical")
     return value
 
 
-def _main_sha(client: collector.GitHubClient) -> str:
-    payload = client.fetch_json("/branches/main")
+def _state_source_ref(state: dict) -> str:
+    return collector.normalize_source_ref(str(state.get("source_ref", "main")))
+
+
+def _branch_sha(client: collector.GitHubClient, source_ref: str) -> str:
+    ref = collector.normalize_source_ref(source_ref)
+    encoded = urllib.parse.quote(ref, safe="")
+    payload = client.fetch_json(f"/branches/{encoded}")
     commit = payload.get("commit")
     if not isinstance(commit, dict):
-        raise ReadinessError("GitHub main branch response is malformed")
+        raise ReadinessError(f"GitHub source branch response is malformed: {ref}")
     try:
         return collector.normalize_source_sha(str(commit.get("sha", "")))
     except collector.CollectionError as exc:
-        raise ReadinessError("GitHub main branch SHA is invalid") from exc
+        raise ReadinessError(f"GitHub source branch SHA is invalid: {ref}") from exc
 
 
-def select_successful_main_ci_run(payload: dict, source_sha: str) -> dict:
+def select_successful_source_ci_run(payload: dict, source_sha: str, source_ref: str) -> dict:
     source = collector.normalize_source_sha(source_sha)
+    ref = collector.normalize_source_ref(source_ref)
     runs = payload.get("workflow_runs")
     if not isinstance(runs, list):
-        raise ReadinessError("GitHub main CI run listing is malformed")
+        raise ReadinessError("GitHub source CI run listing is malformed")
     if len(runs) > MAX_RUN_LIST:
-        raise ReadinessError("GitHub main CI run listing exceeds its bound")
+        raise ReadinessError("GitHub source CI run listing exceeds its bound")
     matches = []
     for run in runs:
         if not isinstance(run, dict):
@@ -219,52 +273,113 @@ def select_successful_main_ci_run(payload: dict, source_sha: str) -> dict:
         if (
             run.get("path") != CI_WORKFLOW_PATH
             or run.get("event") != "push"
-            or run.get("head_branch") != "main"
+            or run.get("head_branch") != ref
             or run.get("head_sha") != source
         ):
             continue
         matches.append(run)
     if len(matches) != 1:
-        raise ReadinessError(f"expected exactly one exact-source main CI run, found {len(matches)}")
+        raise ReadinessError(
+            f"expected exactly one exact-source CI run for {ref}, found {len(matches)}"
+        )
     run = matches[0]
     run_id = run.get("id")
     run_attempt = run.get("run_attempt")
     run_url = run.get("html_url")
     if not isinstance(run_id, int) or run_id <= 0:
-        raise ReadinessError("GitHub main CI run id is invalid")
+        raise ReadinessError("GitHub source CI run id is invalid")
     if not isinstance(run_attempt, int) or run_attempt <= 0:
-        raise ReadinessError("GitHub main CI run attempt is invalid")
+        raise ReadinessError("GitHub source CI run attempt is invalid")
     if not isinstance(run_url, str) or not run_url.startswith("https://github.com/"):
-        raise ReadinessError("GitHub main CI run URL is invalid")
+        raise ReadinessError("GitHub source CI run URL is invalid")
     if run.get("status") != "completed" or run.get("conclusion") != "success":
-        raise ReadinessError("exact-source main CI has not completed successfully")
+        raise ReadinessError("exact-source CI has not completed successfully")
     return run
 
 
-def _successful_main_ci_run(client: collector.GitHubClient, source_sha: str) -> dict:
+def _successful_source_ci_run(
+    client: collector.GitHubClient, source_sha: str, source_ref: str
+) -> dict:
     source = collector.normalize_source_sha(source_sha)
-    payload = client.fetch_json(
-        f"/actions/workflows/{CI_WORKFLOW_FILE}/runs?event=push&branch=main&head_sha={source}&per_page={MAX_RUN_LIST}"
+    ref = collector.normalize_source_ref(source_ref)
+    query = urllib.parse.urlencode(
+        {"event": "push", "branch": ref, "head_sha": source, "per_page": MAX_RUN_LIST}
     )
-    return select_successful_main_ci_run(payload, source)
+    payload = client.fetch_json(f"/actions/workflows/{CI_WORKFLOW_FILE}/runs?{query}")
+    return select_successful_source_ci_run(payload, source, ref)
+
+
+def select_successful_source_evidence_run(payload: dict, source_sha: str, source_ref: str) -> dict:
+    source = collector.normalize_source_sha(source_sha)
+    ref = collector.normalize_source_ref(source_ref)
+    runs = payload.get("workflow_runs")
+    if not isinstance(runs, list):
+        raise ReadinessError("GitHub source-evidence run listing is malformed")
+    if len(runs) > MAX_RUN_LIST:
+        raise ReadinessError("GitHub source-evidence run listing exceeds its bound")
+    matches = [
+        run
+        for run in runs
+        if isinstance(run, dict)
+        and run.get("path") == READINESS_WORKFLOW_PATH
+        and run.get("event") == "push"
+        and run.get("head_branch") == ref
+        and run.get("head_sha") == source
+    ]
+    if len(matches) != 1:
+        raise ReadinessError(
+            f"expected exactly one exact-source release evidence run for {ref}, found {len(matches)}"
+        )
+    run = matches[0]
+    run_id = run.get("id")
+    run_attempt = run.get("run_attempt")
+    run_url = run.get("html_url")
+    if not isinstance(run_id, int) or run_id <= 0:
+        raise ReadinessError("GitHub source-evidence run id is invalid")
+    if not isinstance(run_attempt, int) or run_attempt <= 0:
+        raise ReadinessError("GitHub source-evidence run attempt is invalid")
+    if not isinstance(run_url, str) or not run_url.startswith("https://github.com/"):
+        raise ReadinessError("GitHub source-evidence run URL is invalid")
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise ReadinessError("exact-source release evidence has not completed successfully")
+    return run
+
+
+def _successful_source_evidence_run(
+    client: collector.GitHubClient, source_sha: str, source_ref: str
+) -> dict:
+    source = collector.normalize_source_sha(source_sha)
+    ref = collector.normalize_source_ref(source_ref)
+    query = urllib.parse.urlencode(
+        {"event": "push", "branch": ref, "head_sha": source, "per_page": MAX_RUN_LIST}
+    )
+    payload = client.fetch_json(f"/actions/workflows/{READINESS_WORKFLOW_FILE}/runs?{query}")
+    return select_successful_source_evidence_run(payload, source, ref)
 
 
 def _post_dispatch(
     client: collector.GitHubClient,
+    source_ref: str,
     source_sha: str,
     request_id: str,
     ci_run_id: int,
     ci_run_attempt: int,
+    evidence_run_id: int | None = None,
+    evidence_run_attempt: int | None = None,
 ) -> None:
+    ref = collector.normalize_source_ref(source_ref)
     url = client.api_url(f"/actions/workflows/{READINESS_WORKFLOW_FILE}/dispatches")
     data = json.dumps(
         {
-            "ref": "main",
+            "ref": ref,
             "inputs": {
+                "source_ref": ref,
                 "source_sha": source_sha,
                 "request_id": request_id,
                 "ci_run_id": str(ci_run_id),
                 "ci_run_attempt": str(ci_run_attempt),
+                "evidence_run_id": "" if evidence_run_id is None else str(evidence_run_id),
+                "evidence_run_attempt": "" if evidence_run_attempt is None else str(evidence_run_attempt),
             },
         },
         separators=(",", ":"),
@@ -297,7 +412,7 @@ def _run_identity_matches(run: dict, state: dict) -> bool:
     return (
         run.get("path") == READINESS_WORKFLOW_PATH
         and run.get("event") == "workflow_dispatch"
-        and run.get("head_branch") == "main"
+        and run.get("head_branch") == _state_source_ref(state)
         and run.get("display_title") == state["run_name"]
     )
 
@@ -322,10 +437,12 @@ def select_readiness_run(payload: dict, state: dict) -> dict | None:
     return run
 
 
-def _list_runs(client: collector.GitHubClient) -> dict:
-    return client.fetch_json(
-        f"/actions/workflows/{READINESS_WORKFLOW_FILE}/runs?event=workflow_dispatch&branch=main&per_page={MAX_RUN_LIST}"
+def _list_runs(client: collector.GitHubClient, state: dict) -> dict:
+    ref = _state_source_ref(state)
+    query = urllib.parse.urlencode(
+        {"event": "workflow_dispatch", "branch": ref, "per_page": MAX_RUN_LIST}
     )
+    return client.fetch_json(f"/actions/workflows/{READINESS_WORKFLOW_FILE}/runs?{query}")
 
 
 def _apply_run_snapshot(state: dict, run: dict) -> None:
@@ -361,7 +478,7 @@ def _apply_run_snapshot(state: dict, run: dict) -> None:
 
 
 def _recover_run(client: collector.GitHubClient, state: dict) -> dict | None:
-    run = select_readiness_run(_list_runs(client), state)
+    run = select_readiness_run(_list_runs(client, state), state)
     if run is not None:
         _apply_run_snapshot(state, run)
     return run
@@ -380,23 +497,35 @@ def start_readiness(
     *,
     repo: str,
     source_sha: str,
+    source_ref: str = "main",
     state_file: Path,
     timeout: float,
     resolve_secs: int,
 ) -> tuple[dict, int]:
     source = collector.normalize_source_sha(source_sha)
+    ref = collector.normalize_source_ref(source_ref)
     if resolve_secs < 0 or resolve_secs > 120:
         raise ReadinessError("resolve_secs must be within 0..120")
     state_path = _validate_state_path_for_create(state_file)
     client = collector.GitHubClient(repo, collector.resolve_github_token(), timeout)
-    main_sha = _main_sha(client)
-    if main_sha != source:
-        raise ReadinessError(f"main source fence failed: expected={source} current={main_sha}")
+    source_ref_sha = _branch_sha(client, ref)
+    if source_ref_sha != source:
+        raise ReadinessError(
+            f"source ref fence failed: ref={ref} expected={source} current={source_ref_sha}"
+        )
 
-    ci_run = _successful_main_ci_run(client, source)
+    ci_run = _successful_source_ci_run(client, source, ref)
     ci_run_id = ci_run["id"]
     ci_run_attempt = ci_run["run_attempt"]
     ci_run_url = ci_run["html_url"]
+    evidence_run_id = None
+    evidence_run_attempt = None
+    evidence_run_url = None
+    if ref.startswith("release/"):
+        evidence_run = _successful_source_evidence_run(client, source, ref)
+        evidence_run_id = evidence_run["id"]
+        evidence_run_attempt = evidence_run["run_attempt"]
+        evidence_run_url = evidence_run["html_url"]
 
     request_id = f"rr_{secrets.token_hex(12)}"
     now = int(time.time())
@@ -404,6 +533,7 @@ def start_readiness(
         "schema_version": STATE_SCHEMA_VERSION,
         "kind": "release-readiness",
         "repo": repo,
+        "source_ref": ref,
         "source_sha": source,
         "workflow_file": READINESS_WORKFLOW_FILE,
         "workflow_path": READINESS_WORKFLOW_PATH,
@@ -416,6 +546,11 @@ def start_readiness(
         "ci_run_url": ci_run_url,
         "ci_run_head_sha": source,
         "ci_run_conclusion": "success",
+        "evidence_run_id": evidence_run_id,
+        "evidence_run_attempt": evidence_run_attempt,
+        "evidence_run_url": evidence_run_url,
+        "evidence_run_head_sha": source if evidence_run_id is not None else None,
+        "evidence_run_conclusion": "success" if evidence_run_id is not None else None,
         "run_id": None,
         "run_head_sha": None,
         "source_matches": None,
@@ -427,7 +562,16 @@ def start_readiness(
     _write_state(state_path, state)
 
     try:
-        _post_dispatch(client, source, request_id, ci_run_id, ci_run_attempt)
+        _post_dispatch(
+            client,
+            ref,
+            source,
+            request_id,
+            ci_run_id,
+            ci_run_attempt,
+            evidence_run_id,
+            evidence_run_attempt,
+        )
     except DispatchRejected:
         state["dispatch_state"] = "rejected"
         _write_state(state_path, state)

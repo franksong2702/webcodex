@@ -1,0 +1,435 @@
+use super::*;
+use crate::tool_runtime::control_sidecar::{AfterSuccessControl, ControlSidecars};
+use crate::tool_runtime::kernel::{HostFileImportTrust, ToolTransport};
+use crate::tool_runtime::ToolCall;
+use serde_json::json;
+
+fn context(transport: ToolTransport) -> ToolCallContext<'static> {
+    ToolCallContext {
+        transport,
+        session_id: None,
+        auth: None,
+        window: None,
+        record_oauth_scope_denials: false,
+        host_file_import_trust: HostFileImportTrust::default(),
+    }
+}
+
+#[tokio::test]
+async fn post_record_store_contention_omits_only_optional_sidecars_without_consuming_delivery() {
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Arc::new(crate::Database::open(&tmp.path().join("post-result.db")).unwrap());
+    let mut runtime = ToolRuntime::new_for_tests();
+    runtime.communication_db = Some(db.clone());
+    runtime.window_activity_db = Some(db.clone());
+    let auth = crate::auth::shared_key_context("optional-post-result");
+    let window = crate::client_window::ClientWindow::for_test("optional-post-result");
+    let (kind, principal) =
+        crate::tool_runtime::runtime_observation_principal(Some(&auth)).unwrap();
+    db.post_peer_message(webcodex_store::NewPeerMessage {
+        principal_kind: kind,
+        principal_id: principal,
+        sender_window_key: "a".repeat(64),
+        recipient_window_key: window.key().into(),
+        sender_peer_id: format!("wc_peer_{}", "a".repeat(32)),
+        recipient_peer_id: window.peer_id(),
+        kind: "note".into(),
+        priority: "normal".into(),
+        message: "retained peer".into(),
+        tags: vec![],
+        requires_ack: false,
+        sender_session_id: None,
+        sender_project: None,
+        created_at_ms: 1,
+    })
+    .unwrap();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let held = db.clone();
+    let writer = std::thread::spawn(move || {
+        let _guard = held.conn_for_tests();
+        locked_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(3)).is_ok()
+    });
+    locked_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let recorder = ToolCallRecorderMetadata::default();
+    let correlation = ToolCallCorrelation {
+        resolved_project: Some("agent:runner:project".into()),
+        ..Default::default()
+    };
+    let call = ToolCall::from_tool_name(
+        "read_files",
+        json!({"project":"agent:runner:project","items":[{"path":"test.txt"}]}),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let completed = PostRecordResponse {
+        compact_execution: false,
+        tool_name: "read_files",
+        context: ToolCallContext {
+            auth: Some(&auth),
+            window: Some(&window),
+            ..context(ToolTransport::Mcp)
+        },
+        capabilities: ToolProtocolCapabilities::default(),
+        recorder: &recorder,
+        correlation: &correlation,
+        business_session_id: None,
+        window_reply: None,
+        control: None,
+    }
+    .finish(
+        &runtime,
+        ToolResult::ok(json!({"payload":"primary read result"})),
+        ModelFacingProjectionPlan::capture(&call),
+        None,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let _ = release_tx.send(());
+    assert!(
+        writer.join().unwrap(),
+        "post-result queued behind the deliberately held writer"
+    );
+    assert!(completed.result.success);
+    assert_eq!(completed.result.output["payload"], "primary read result");
+    assert!(completed.result.output.get("peer_messages").is_none());
+    let mut next = ToolResult::ok(json!({}));
+    runtime.add_peer_collaboration_projection(&mut next, Some(&auth), Some(&window), None, &[]);
+    assert_eq!(
+        next.output["peer_messages"]["messages"][0]["projection_count"],
+        1
+    );
+    eprintln!("POST_RESULT_CONTENTION budget_ms=40 completed_before_writer_release=true elapsed_ms={:.3} next_delivery_count=1",elapsed.as_secs_f64()*1000.);
+}
+
+fn process_result() -> ToolResult {
+    ToolResult::ok(json!({
+        "duration_ms":1,"exit_code":0,"stdout_tail":"PRIVATE_OUTPUT","stderr_tail":"",
+        "stdout_lines":1,"stderr_lines":0,"stdout_truncated":false,"stderr_truncated":false,
+        "command_started":true,"command_completed":true,"command_ok":true,
+        "failure_kind":null,"tool_failure":false,"purpose":"diagnostic",
+        "process_summary":"PRIVATE_COMMAND","cwd":".","executor":"agent",
+        "execution_source":"run_process","execution_state":"completed",
+        "promoted_to_job":false,"terminal":true,"job_id":null,"job_status":null,
+        "observation_token":null,"effective_timeout_secs":60,"sync_wait_secs":10,
+        "async_handoff_available":true,"permission":{"status":"auto_approved"},
+        "session_recorded":true,"session_event_id":"ledger-only"
+    }))
+}
+
+fn plan() -> ModelFacingProjectionPlan {
+    ModelFacingProjectionPlan::capture(
+        &ToolCall::from_tool_name(
+            "run_process",
+            json!({"project":"agent:runner:project","executable":"tool","args":[]}),
+        )
+        .unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn post_record_captures_canonical_audit_and_telemetry_before_model_compaction() {
+    let runtime = ToolRuntime::new_for_tests();
+    let recorder = ToolCallRecorderMetadata::default();
+    let correlation = ToolCallCorrelation {
+        resolved_project: Some("agent:runner:project".into()),
+        recorder_gap_session_id: Some("wc_sess_1234567890abcdef".into()),
+        ..Default::default()
+    };
+    let mut previous = None;
+    for transport in [ToolTransport::Api, ToolTransport::Mcp] {
+        let mut telemetry =
+            ModelErgonomicsTimer::start_with_arguments("run_process", &json!({})).unwrap();
+        let completed = PostRecordResponse {
+            compact_execution: false,
+            tool_name: "run_process",
+            context: context(transport),
+            capabilities: ToolProtocolCapabilities::default(),
+            recorder: &recorder,
+            correlation: &correlation,
+            business_session_id: None,
+            window_reply: None,
+            control: None,
+        }
+        .finish(&runtime, process_result(), plan(), Some(&mut telemetry))
+        .await;
+        let audit = completed.canonical_audit_output.unwrap();
+        assert_eq!(audit["execution_state"], "completed");
+        assert_eq!(audit["command_ok"], true);
+        assert!(!audit.to_string().contains("PRIVATE"));
+        assert!(audit.get("workflow_recording_attention").is_none());
+        let output = &completed.result.output;
+        assert_eq!(output["stdout_tail"], "PRIVATE_OUTPUT");
+        assert!(output.get("execution_state").is_none());
+        assert!(output.get("permission").is_none());
+        assert!(output.get("session_recorded").is_none());
+        assert_eq!(
+            output["workflow_recording_attention"]["candidate_session_id"],
+            "wc_sess_1234567890abcdef"
+        );
+        let record = telemetry
+            .finish()
+            .record_for_tool_result(&completed.result)
+            .unwrap();
+        assert_eq!(record.execution_state.as_deref(), Some("completed"));
+        if let Some(previous) = &previous {
+            assert_eq!(output, previous);
+        }
+        previous = Some(completed.result.output);
+    }
+}
+
+#[tokio::test]
+async fn post_record_preserves_effect_uncertainty_and_retry_identity() {
+    let runtime = ToolRuntime::new_for_tests();
+    let recorder = ToolCallRecorderMetadata::default();
+    let correlation = ToolCallCorrelation::default();
+    for state in ["outcome_unknown", "timed_out", "not_started"] {
+        let mut result = process_result();
+        result.success = false;
+        result.error = Some("execution uncertain".into());
+        result.output["execution_state"] = json!(state);
+        result.output["command_ok"] = json!(false);
+        result.output["failure_kind"] = json!(state);
+        result.output["job_id"] = json!("wc_job_exact-existing");
+        result.output["direct_retry_safe"] = json!(false);
+        let completed = PostRecordResponse {
+            compact_execution: false,
+            tool_name: "run_process",
+            context: context(ToolTransport::Mcp),
+            capabilities: ToolProtocolCapabilities::default(),
+            recorder: &recorder,
+            correlation: &correlation,
+            business_session_id: None,
+            window_reply: None,
+            control: None,
+        }
+        .finish(&runtime, result, plan(), None)
+        .await;
+        assert!(!completed.result.success);
+        assert_eq!(
+            completed.result.error.as_deref(),
+            Some("execution uncertain")
+        );
+        assert_eq!(completed.result.output["execution_state"], state);
+        assert_eq!(completed.result.output["failure_kind"], state);
+        assert_eq!(completed.result.output["job_id"], "wc_job_exact-existing");
+        assert_eq!(completed.result.output["direct_retry_safe"], false);
+        assert_eq!(
+            completed.canonical_audit_output.unwrap()["execution_state"],
+            state
+        );
+    }
+}
+
+#[tokio::test]
+async fn post_record_omits_redundant_or_over_budget_gap_without_changing_business_result() {
+    let runtime = ToolRuntime::new_for_tests();
+    let recorder = ToolCallRecorderMetadata::default();
+    let correlation = ToolCallCorrelation {
+        resolved_project: Some("agent:runner:project".into()),
+        recorder_gap_session_id: Some("wc_sess_1234567890abcdef".into()),
+        ..Default::default()
+    };
+    for oversized in [false, true] {
+        let payload = if oversized {
+            "x".repeat(webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES)
+        } else {
+            "business".into()
+        };
+        let result = ToolResult::ok(json!({"payload":payload}));
+        let completed = PostRecordResponse {
+            compact_execution: false,
+            tool_name: "list_tools",
+            context: context(ToolTransport::Mcp),
+            capabilities: ToolProtocolCapabilities::default(),
+            recorder: &recorder,
+            correlation: &correlation,
+            business_session_id: if oversized {
+                None
+            } else {
+                correlation.recorder_gap_session_id.as_deref()
+            },
+            window_reply: None,
+            control: None,
+        }
+        .finish(
+            &runtime,
+            result,
+            ModelFacingProjectionPlan::capture(
+                &ToolCall::from_tool_name("list_tools", json!({})).unwrap(),
+            ),
+            None,
+        )
+        .await;
+        assert!(completed.result.success);
+        assert_eq!(completed.result.output, json!({"payload":payload}));
+        assert!(completed.canonical_audit_output.is_none());
+    }
+}
+
+#[tokio::test]
+async fn final_read_result_keeps_explicit_reply_receipt_inside_inspection_hard_cap() {
+    let runtime = ToolRuntime::new_for_tests();
+    let recorder = ToolCallRecorderMetadata::default();
+    let correlation = ToolCallCorrelation::default();
+    let hard_cap = webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES;
+    let project = "agent:runner:project";
+    let line_count = 2_000;
+    let text = vec!["x".repeat(32); line_count].join("\n");
+    let items = (0..8)
+        .map(|index| {
+            let path = format!("part-{index}.txt");
+            json!({
+                "index": index, "path": path, "success": true, "error": null,
+                "output": {
+                    "path": path, "text": text, "format": "plain",
+                    "sha256": "a".repeat(64), "read_revision": index + 1,
+                    "start_line": 1, "limit": line_count, "total_lines": line_count,
+                    "returned_lines": line_count, "end_line": line_count,
+                    "has_more": false, "next_start_line": null
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let canonical = json!({
+        "project": project, "requested_count": 8, "returned_count": 8,
+        "succeeded_count": 8, "failed_count": 0, "items": items,
+        "output_truncated": false,
+        "session_attention": {"messages": [
+            {"message_id": "first", "message": "\\".repeat(1_536)},
+            {"message_id": "second", "message": "\"".repeat(1_536)}
+        ]}
+    });
+    let call = ToolCall::from_tool_name(
+        "read_files",
+        json!({
+            "project": project, "max_result_bytes": hard_cap,
+            "items": (0..8).map(|index| json!({
+                "path": format!("part-{index}.txt"), "limit": line_count
+            })).collect::<Vec<_>>()
+        }),
+    )
+    .unwrap();
+    let reply = ToolCallWindowReply {
+        reply_to_message_id: "unavailable-test-message".into(),
+        message: "fixture only; no communication store or authority".into(),
+    };
+    // Both messages obey the 3,072-byte attention body limit. Printable JSON
+    // escape characters expand to 6,144 bytes after serialization, so the
+    // canonical Session overlay can legitimately exhaust the envelope reserve.
+    for (with_reply, with_control) in [(false, false), (true, false), (false, true), (true, true)] {
+        let control = if with_control {
+            let mut control = ControlExecution::new(ControlSidecars {
+                before: None,
+                communication: None,
+                after_success: Some(AfterSuccessControl::SessionClose {
+                    session_id: "wc_sess_0000000000000000".into(),
+                }),
+            });
+            control.main_dispatched = true;
+            // An exact missing Session yields a real canonical error receipt.
+            // The fixture has no database or live communication target.
+            control
+                .after(
+                    &runtime,
+                    "read_files",
+                    &ToolResult::ok(canonical.clone()),
+                    context(ToolTransport::Mcp),
+                )
+                .await;
+            Some(control)
+        } else {
+            None
+        };
+        let completed = PostRecordResponse {
+            compact_execution: false,
+            tool_name: "read_files",
+            context: context(ToolTransport::Mcp),
+            capabilities: ToolProtocolCapabilities::default(),
+            recorder: &recorder,
+            correlation: &correlation,
+            business_session_id: None,
+            window_reply: with_reply.then_some(&reply),
+            control,
+        }
+        .finish(
+            &runtime,
+            ToolResult::ok(canonical.clone()),
+            ModelFacingProjectionPlan::capture(&call),
+            None,
+        )
+        .await;
+        assert!(completed.result.success);
+        if with_reply {
+            assert_eq!(
+                completed.result.output["window_reply"]["failure_kind"],
+                "insufficient_scope"
+            );
+            assert_eq!(
+                completed.result.output["window_reply"]["state_changed"],
+                false
+            );
+        }
+        if with_control {
+            assert_eq!(
+                completed.result.output["control"]["main"]["execution_state"],
+                "succeeded"
+            );
+            assert_eq!(
+                completed.result.output["control"]["after_success"]["kind"],
+                "session_close"
+            );
+            assert_eq!(
+                completed.result.output["control"]["after_success"]["success"],
+                false
+            );
+        }
+        let audit = completed.canonical_audit_output.unwrap();
+        assert!(audit.get("window_reply").is_none());
+        assert!(audit.get("control").is_none());
+        let bytes = serde_json::to_vec(&completed.result).unwrap().len();
+        assert!(
+            bytes <= hard_cap,
+            "final ToolResult with_reply={with_reply} with_control={with_control} is {bytes} bytes, hard cap is {hard_cap}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn execution_control_is_captured_before_compaction_without_changing_audit() {
+    let runtime = ToolRuntime::new_for_tests();
+    let recorder = ToolCallRecorderMetadata::default();
+    let correlation = ToolCallCorrelation::default();
+    let mut ordinary_audit = None;
+    for compact_execution in [false, true] {
+        let completed = PostRecordResponse {
+            compact_execution,
+            tool_name: "run_process",
+            context: context(ToolTransport::Mcp),
+            capabilities: ToolProtocolCapabilities::default(),
+            recorder: &recorder,
+            correlation: &correlation,
+            business_session_id: None,
+            window_reply: None,
+            control: None,
+        }
+        .finish(&runtime, process_result(), plan(), None)
+        .await;
+        if compact_execution {
+            assert_eq!(completed.canonical_audit_output, ordinary_audit);
+            let mut result = completed.result;
+            crate::tool_runtime::execution_control::split_result(&mut result);
+            assert_eq!(result.output["execution"]["outcome"], "passed");
+            assert_eq!(result.output["execution"]["exit_code"], 0);
+            assert_eq!(result.output["details"]["stdout_tail"], "PRIVATE_OUTPUT");
+        } else {
+            ordinary_audit = completed.canonical_audit_output;
+            assert!(completed.result.output.get("execution").is_none());
+            assert_eq!(completed.result.output["stdout_tail"], "PRIVATE_OUTPUT");
+        }
+    }
+}

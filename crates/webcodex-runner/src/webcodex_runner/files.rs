@@ -1,14 +1,14 @@
 use super::config::RunnerPolicy;
 use super::output::CommandResult;
 use super::shell::cwd_allowed;
-use crate::project_overview::build_project_overview;
-use crate::runner_config::DEFAULT_MAX_OUTPUT_BYTES;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use webcodex_core::runner_operation::{RunnerFileOperation, RunnerFilePayload};
+use webcodex_runner_config::DEFAULT_MAX_OUTPUT_BYTES;
 use webcodex_workspace::file_read_range::{self, ReadFileReason};
+use webcodex_workspace::project_overview::build_project_overview;
 
 pub(crate) fn sha256_hex_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -58,6 +58,7 @@ pub(crate) fn is_basic_file_request_kind(kind: &str) -> bool {
         "file_read"
             | "file_write"
             | "file_list"
+            | "file_list_page"
             | "file_project_overview"
             | "file_delete_project_files"
             | "file_skill_list_packages"
@@ -78,6 +79,7 @@ pub(crate) fn handle_basic_file_request(
             handle_file_write_request(policy, request, resolved, start)
         }
         RunnerFileOperation::List(_) => handle_file_list_request(resolved, start),
+        RunnerFileOperation::ListPage(_) => directory_page::handle(request, resolved, start),
         RunnerFileOperation::SkillListPackages(_) => {
             handle_skill_list_packages_request(request, resolved, start)
         }
@@ -111,7 +113,7 @@ fn validate_delete_project_file_path(path: &str) -> bool {
         return false;
     }
     let raw = Path::new(path);
-    if raw.is_absolute() || crate::apply_edits_shared::is_sensitive_edit_path(path) {
+    if raw.is_absolute() || webcodex_core::apply_edits_shared::is_sensitive_edit_path(path) {
         return false;
     }
     raw.components()
@@ -362,46 +364,16 @@ fn handle_file_read_request(
         .max_bytes
         .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
         .min(policy.max_output_bytes);
-    if let (Some(start_line), Some(end_line)) = (request.start_line, request.end_line) {
-        return handle_file_read_range_request(resolved, start_line, end_line, max, start);
-    }
-
-    // Legacy non-range path: read the whole file under the transport cap. This
-    // is only reached by older callers that omit the line range; the server's
-    // read_file tool always requests a range. No absolute path leaks: the error
-    // carries a stable code, not `resolved.display()`.
-    match std::fs::read(resolved) {
-        Ok(bytes) => {
-            if bytes.len() > max {
-                CommandResult {
-                    exit_code: None,
-                    stdout: None,
-                    stderr: None,
-                    duration_ms: Some(start.elapsed().as_millis() as u64),
-                    error: Some(format!(
-                        "file too large: {} bytes exceeds max_bytes {}",
-                        bytes.len(),
-                        max
-                    )),
-                }
-            } else {
-                CommandResult {
-                    exit_code: Some(0),
-                    stdout: Some(String::from_utf8_lossy(&bytes).to_string()),
-                    stderr: Some(String::new()),
-                    duration_ms: Some(start.elapsed().as_millis() as u64),
-                    error: None,
-                }
-            }
-        }
-        Err(e) => CommandResult {
+    let (Some(start_line), Some(end_line)) = (request.start_line, request.end_line) else {
+        return CommandResult {
             exit_code: None,
             stdout: None,
             stderr: None,
             duration_ms: Some(start.elapsed().as_millis() as u64),
-            error: Some(file_read_error_message(&e)),
-        },
-    }
+            error: Some("invalid line range for file_read".to_string()),
+        };
+    };
+    handle_file_read_range_request(resolved, start_line, end_line, max, start)
 }
 
 #[derive(Serialize)]
@@ -803,12 +775,6 @@ fn handle_skill_read_file_request(
     }
 }
 
-/// Map a raw IO error from the legacy whole-file read path to a stable
-/// path-free message.
-fn file_read_error_message(error: &std::io::Error) -> String {
-    read_file_reason_message(read_file_reason_from_io(error))
-}
-
 fn handle_file_write_request(
     policy: &RunnerPolicy,
     request: &RunnerFilePayload,
@@ -928,3 +894,5 @@ fn handle_file_list_request(resolved: &Path, start: Instant) -> CommandResult {
         },
     }
 }
+
+mod directory_page;

@@ -3,17 +3,21 @@
 //! All durable session-map mutations flow through `SessionStoreInner` helpers.
 //! Callers outside this module use `SessionStore` methods only.
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_core::validation_identity::{
     assertion_validation_identity, is_validation_execution_identity,
 };
 use webcodex_core::workflow_session_contract::{is_safe_job_id, PermissionDecision, SessionMode};
-use webcodex_tool_contracts::{runtime_tool_session_evidence_policy, ToolSessionLifecycleEffect};
+use webcodex_tool_contracts::{
+    runtime_tool_activity_semantics, runtime_tool_session_evidence_policy, ToolActivityKind,
+    ToolSessionLifecycleEffect,
+};
 
 use super::assignment::{
     assignment_fence_fingerprint, assignment_fence_from_state, current_assignment_state,
@@ -21,39 +25,43 @@ use super::assignment::{
 };
 use super::console::{
     build_detail as build_console_detail, build_list_item as build_console_list_item,
-    normalize_console_activity_limit, normalize_console_session_limit, ConsoleValidationHooks,
-    WorkflowSessionConsoleDetail, WorkflowSessionConsoleList,
+    normalize_console_activity_limit, normalize_console_session_limit, CachedConsoleList,
+    ConsoleValidationHooks, WorkflowSessionConsoleDetail, WorkflowSessionConsoleList,
+    WorkflowSessionConsoleListItem,
 };
 use super::events::{
     actual_failure_kind_for_tool_result, changed_paths_for_tool_call,
-    changed_paths_for_tool_result, classify_failure_expectation,
+    changed_paths_for_tool_result, classify_error_message, classify_failure_expectation,
     context_result_summary_for_tool_result, diff_review_like_for_tool, extract_job_id,
     extract_project, is_valid_session_id, observed_input_paths_for_tool,
     observed_paths_for_successful_result, persistent_shell_event_evidence_for_tool_result,
     sanitize_tool_execution_state, session_input_summary_for_tool,
     validation_output_summary_for_tool_result, SessionToolContract,
 };
+use super::incarnation::workflow_session_incarnation_fingerprint;
 use super::model::{
     CodingSessionError, CodingSessionOutcome, CodingSessionRequest, ColdSessionRecord,
-    CompleteSessionMessageInput, CompleteSessionMessageOutcome, PersistedSessionLedger,
-    PersistedSessionRecord, PersistedSessionSnapshot, PersistentShellEventEvidence,
-    PostSessionMessageInput, RecordedModelFacingToolCall, ReplaceSessionMessageInput,
-    ReplaceSessionMessageOutcome, SessionCloseError, SessionCloseOutcome,
-    SessionContextRevisionAck, SessionCounts, SessionCreateOptions, SessionEvent,
+    CompleteSessionMessageInput, CompleteSessionMessageOutcome, PersistedRetentionTombstoneRow,
+    PersistedSessionLedger, PersistedSessionRecord, PersistedSessionSnapshot,
+    PersistentShellEventEvidence, PostSessionMessageInput, ReplaceSessionMessageInput,
+    ReplaceSessionMessageOutcome, SessionCloseError, SessionCloseOutcome, SessionCounts,
+    SessionCreateOptions, SessionDiscoveryItem, SessionDiscoveryPage, SessionEvent,
     SessionExecutionContext, SessionExecutionContextUpdateError,
     SessionExecutionContextUpdateOutcome, SessionGuardDenial, SessionGuards, SessionLifecycle,
-    SessionLifecycleDenial, SessionMessage, SessionMessageClosureKind, SessionMessageError,
-    SessionMessageStatus, SessionRecord, SessionStoreStatus, SessionSummary, SessionTransport,
-    StoredSession, ToolCallExpectation, ToolCallRecorderMetadata, ToolCallStart,
-    ToolEffectEventEvidence, WithdrawSessionMessageOutcome, CALL_ID_PREFIX,
-    DEFAULT_MAX_EVENTS_PER_SESSION, DEFAULT_MAX_MESSAGES_PER_SESSION, DEFAULT_MAX_SESSIONS,
-    DEFAULT_SUMMARY_LIMIT, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS,
-    MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX, SESSION_ID_PREFIX,
-    SESSION_LEDGER_VERSION,
+    SessionLifecycleDenial, SessionMessage, SessionMessageClosureKind, SessionMessageDelivery,
+    SessionMessageDeliveryOutcome, SessionMessageDeliveryReplay, SessionMessageError,
+    SessionMessagePriority, SessionMessageStatus, SessionRecord, SessionRetentionTombstone,
+    SessionStoreStatus, SessionSummary, SessionTransport, StoredSession, ToolCallExpectation,
+    ToolCallRecorderMetadata, ToolCallStart, ToolEffectEventEvidence,
+    WithdrawSessionMessageOutcome, CALL_ID_PREFIX, DEFAULT_MAX_EVENTS_PER_SESSION,
+    DEFAULT_MAX_MESSAGES_PER_SESSION, DEFAULT_MAX_RETAINED_CLOSED_SESSIONS, DEFAULT_MAX_SESSIONS,
+    DEFAULT_SUMMARY_LIMIT, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS,
+    MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_DELIVERY_KEY_CHARS, MAX_SUMMARY_LIMIT,
+    MESSAGE_ID_PREFIX, SESSION_ID_PREFIX, SESSION_LEDGER_VERSION,
 };
 use super::persistence::{
-    cold_session_from_persisted, load_persisted_ledger, materialize_cold_session,
-    write_ledger_atomic,
+    cold_session_from_persisted, is_lower_hex_sha256, load_persisted_ledger,
+    materialize_cold_session, write_ledger_atomic,
 };
 use super::query::{
     build_messages_summary, is_valid_completion_id, validate_message_tags, validate_message_text,
@@ -63,6 +71,22 @@ use super::util::{
     bound_event_error_summary, bound_summary_string, now_ts, redact_and_bound_instruction,
     redact_and_bound_value,
 };
+
+#[cfg(test)]
+#[path = "identifier_tests.rs"]
+mod identifier_tests;
+
+mod recency;
+mod residency;
+
+use recency::SessionRecency;
+mod writer;
+use writer::LedgerWriterGuard;
+
+#[cfg(test)]
+mod borrowed_projection_tests;
+#[cfg(test)]
+mod scale_tests;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -82,217 +106,19 @@ pub struct SessionStore {
     fail_next_coding_continuity_precommit: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Coordinates a dedicated OS thread that owns session-ledger serialize +
-/// atomic disk write. Callers only mark dirty (or flush); they never block
-/// async Tokio workers on full-store JSON + `fs::write`.
-///
-/// Why this exists: every `push_event` used to call `persist_after_mutation`
-/// synchronously on the request path, holding a global write mutex while
-/// cloning/serializing up to max_sessions×max_events and renaming on disk.
-/// Under concurrent MCP tools/call traffic that saturates the async runtime
-/// and surfaces as intermittent "no reply" hangs.
-struct LedgerWriterGuard {
-    shared: Arc<LedgerWriterShared>,
-    join: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-struct LedgerWriterShared {
-    state: Mutex<LedgerWriterState>,
-    cvar: Condvar,
-}
-
-struct LedgerWriterState {
-    /// Set by mutation paths; cleared when the writer begins a snapshot.
-    dirty: bool,
-    /// Monotonic counter advanced every time `dirty` is set. Flush waiters
-    /// wait until `writes_completed` reaches the generation they observed.
-    dirty_generation: u64,
-    /// Generation of the last completed write cycle.
-    writes_completed: u64,
-    shutdown: bool,
-}
-
-impl std::fmt::Debug for LedgerWriterGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LedgerWriterGuard").finish_non_exhaustive()
-    }
-}
-
-impl LedgerWriterGuard {
-    fn spawn(
-        store_inner: Arc<Mutex<SessionStoreInner>>,
-        write_mutex: Arc<Mutex<()>>,
-    ) -> Option<Arc<Self>> {
-        let shared = Arc::new(LedgerWriterShared {
-            state: Mutex::new(LedgerWriterState {
-                dirty: false,
-                dirty_generation: 0,
-                writes_completed: 0,
-                shutdown: false,
-            }),
-            cvar: Condvar::new(),
-        });
-        let shared_thread = Arc::clone(&shared);
-        let join = std::thread::Builder::new()
-            .name("session-ledger-writer".to_string())
-            .spawn(move || ledger_writer_loop(shared_thread, store_inner, write_mutex))
-            .ok()?;
-        Some(Arc::new(Self {
-            shared,
-            join: Mutex::new(Some(join)),
-        }))
-    }
-
-    fn mark_dirty(&self) -> u64 {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("session ledger writer state poisoned");
-        state.dirty = true;
-        state.dirty_generation = state.dirty_generation.saturating_add(1);
-        let generation = state.dirty_generation;
-        self.shared.cvar.notify_one();
-        generation
-    }
-
-    /// Block until the exact generation requested by the caller has been
-    /// written. Later concurrent dirty marks do not extend this fence.
-    fn flush_through(&self, generation: u64) {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("session ledger writer state poisoned");
-        while state.writes_completed < generation {
-            state = self
-                .shared
-                .cvar
-                .wait(state)
-                .expect("session ledger writer state poisoned");
-        }
-    }
-
-    /// Test/closeout barrier for every dirty mark observed at call time.
-    #[cfg(any(test, feature = "root-test-support"))]
-    fn flush(&self) {
-        let generation = self
-            .shared
-            .state
-            .lock()
-            .expect("session ledger writer state poisoned")
-            .dirty_generation;
-        self.flush_through(generation);
-    }
-}
-
-impl Drop for LedgerWriterGuard {
-    fn drop(&mut self) {
-        {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .expect("session ledger writer state poisoned");
-            // Keep dirty as-is so the loop performs one final write before exit.
-            state.shutdown = true;
-            self.shared.cvar.notify_one();
-        }
-        if let Some(join) = self
-            .join
-            .lock()
-            .expect("session ledger writer join mutex poisoned")
-            .take()
-        {
-            let _ = join.join();
-        }
-    }
-}
-
-fn ledger_writer_loop(
-    shared: Arc<LedgerWriterShared>,
-    store_inner: Arc<Mutex<SessionStoreInner>>,
-    write_mutex: Arc<Mutex<()>>,
-) {
-    loop {
-        let generation = {
-            let mut state = shared
-                .state
-                .lock()
-                .expect("session ledger writer state poisoned");
-            while !state.dirty && !state.shutdown {
-                state = shared
-                    .cvar
-                    .wait(state)
-                    .expect("session ledger writer state poisoned");
-            }
-            if !state.dirty {
-                // shutdown with nothing pending
-                break;
-            }
-            let generation = state.dirty_generation;
-            state.dirty = false;
-            generation
-        };
-
-        // Snapshot + write under the same write mutex used by the synchronous
-        // test hook (`persist_after_mutation_with`), so a custom delayed write
-        // cannot race an older snapshot past a newer background write without
-        // the lock ordering the two.
-        let _write_guard = write_mutex
-            .lock()
-            .expect("session persistence mutex poisoned");
-        let snapshot = {
-            let inner = store_inner.lock().expect("session store mutex poisoned");
-            let path = inner
-                .persistence
-                .as_ref()
-                .map(|persistence| persistence.path.clone());
-            path.map(|path| (path, inner.to_persisted_ledger()))
-        };
-        let result = match snapshot {
-            Some((path, ledger)) => write_ledger_atomic(&path, &ledger).map_err(|err| {
-                bound_summary_string(&format!("persist_failed: {}: {err}", path.display()))
-            }),
-            None => Ok(()),
-        };
-        {
-            let mut inner = store_inner.lock().expect("session store mutex poisoned");
-            if let Some(persistence) = inner.persistence.as_mut() {
-                match &result {
-                    Ok(()) => persistence.last_persist_error = None,
-                    Err(error) => {
-                        tracing::warn!("session ledger persistence failed: {}", error);
-                        persistence.last_persist_error = Some(error.clone());
-                    }
-                }
-            }
-        }
-        {
-            let mut state = shared
-                .state
-                .lock()
-                .expect("session ledger writer state poisoned");
-            state.writes_completed = generation;
-            // Wake flush waiters; if dirty was re-set during the write the
-            // loop body runs again without waiting.
-            shared.cvar.notify_all();
-            if state.shutdown && !state.dirty {
-                break;
-            }
-        }
-        // Drop write_guard at end of iteration so a concurrent
-        // persist_after_mutation_with can interleave between cycles.
-        drop(_write_guard);
-    }
-}
-
 #[derive(Debug)]
 pub(super) struct SessionStoreInner {
     /// Durable workflow sessions. Mutated only via the helpers below.
     sessions: HashMap<String, StoredSession>,
-    lru: VecDeque<String>,
-    max_sessions: usize,
+    lru: SessionRecency,
+    hot_session_capacity_target: usize,
+    historical_session_retention_limit: usize,
+    capacity_evictions: u64,
+    /// Closed-session retention identities, keyed by monotonic expiry ordinal.
+    tombstones: BTreeMap<u64, SessionRetentionTombstone>,
+    tombstone_ids: HashMap<String, u64>,
+    next_expiry_ordinal: u64,
+    expiry_ordinal_exhausted: bool,
     max_events_per_session: usize,
     persistence: Option<SessionPersistence>,
 }
@@ -306,7 +132,11 @@ struct SessionPersistence {
 
 impl Default for SessionStore {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_SESSIONS, DEFAULT_MAX_EVENTS_PER_SESSION)
+        Self::new_in_memory_with_limits(
+            DEFAULT_MAX_SESSIONS,
+            DEFAULT_MAX_RETAINED_CLOSED_SESSIONS,
+            DEFAULT_MAX_EVENTS_PER_SESSION,
+        )
     }
 }
 
@@ -316,12 +146,26 @@ impl SessionStore {
     }
 
     pub fn new_in_memory(max_sessions: usize, max_events_per_session: usize) -> Self {
+        Self::new_in_memory_with_limits(max_sessions, max_sessions, max_events_per_session)
+    }
+
+    pub fn new_in_memory_with_limits(
+        hot_session_capacity_target: usize,
+        historical_session_retention_limit: usize,
+        max_events_per_session: usize,
+    ) -> Self {
         let (message_observation_notify, _) = tokio::sync::watch::channel(0_u64);
         Self {
             inner: Arc::new(Mutex::new(SessionStoreInner {
                 sessions: HashMap::<String, StoredSession>::new(),
-                lru: VecDeque::new(),
-                max_sessions,
+                lru: SessionRecency::default(),
+                hot_session_capacity_target,
+                historical_session_retention_limit,
+                capacity_evictions: 0,
+                tombstones: BTreeMap::new(),
+                tombstone_ids: HashMap::new(),
+                next_expiry_ordinal: 1,
+                expiry_ordinal_exhausted: false,
                 max_events_per_session,
                 persistence: None,
             })),
@@ -340,19 +184,48 @@ impl SessionStore {
         max_sessions: usize,
         max_events_per_session: usize,
     ) -> Self {
+        Self::with_persistence_limits(path, max_sessions, max_sessions, max_events_per_session)
+    }
+
+    pub fn with_persistence_limits(
+        path: impl Into<PathBuf>,
+        hot_session_capacity_target: usize,
+        historical_session_retention_limit: usize,
+        max_events_per_session: usize,
+    ) -> Self {
         let path = path.into();
-        let restored = load_persisted_ledger(&path, max_sessions, max_events_per_session);
-        let inner = Arc::new(Mutex::new(SessionStoreInner {
+        let restored = load_persisted_ledger(&path, max_events_per_session);
+        let mut lru = SessionRecency::default();
+        for id in &restored.lru {
+            if let Some(record) = restored.sessions.get(id) {
+                lru.touch(id, record.lifecycle() == SessionLifecycle::Closed);
+            }
+        }
+        let mut state = SessionStoreInner {
             sessions: restored.sessions,
-            lru: restored.lru,
-            max_sessions,
+            lru,
+            hot_session_capacity_target,
+            historical_session_retention_limit,
+            capacity_evictions: 0,
+            tombstones: restored.tombstones,
+            tombstone_ids: restored.tombstone_ids,
+            next_expiry_ordinal: restored.next_expiry_ordinal,
+            expiry_ordinal_exhausted: restored.expiry_ordinal_exhausted,
             max_events_per_session,
             persistence: Some(SessionPersistence {
                 path,
-                restored_sessions: restored.restored_sessions,
+                restored_sessions: 0,
                 last_persist_error: restored.last_persist_error,
             }),
-        }));
+        };
+        // One prune path covers ordinary mutation and restore. Count Closed-row
+        // removal here, then publish the post-prune session count.
+        state.enforce_historical_retention_bound();
+        state.enforce_tombstone_bound();
+        if let Some(persistence) = state.persistence.as_mut() {
+            persistence.restored_sessions = state.sessions.len();
+        }
+        let inner = Arc::new(Mutex::new(state));
         let persistence_write_mutex = Arc::new(Mutex::new(()));
         // Prefer the background writer so mutation paths never park a Tokio
         // worker on full-ledger serialize + disk I/O. If the OS thread cannot
@@ -392,10 +265,40 @@ impl SessionStore {
             ),
             None => ("disabled".to_string(), 0, None),
         };
+        let active_sessions = inner
+            .sessions
+            .values()
+            .filter(|session| session.lifecycle() == SessionLifecycle::Active)
+            .count();
+        let closed_sessions = inner.sessions.len().saturating_sub(active_sessions);
+        let hot_sessions = inner
+            .sessions
+            .values()
+            .filter(|session| matches!(session, StoredSession::Hot(_)))
+            .count();
+        let cold_sessions = inner.sessions.len().saturating_sub(hot_sessions);
         SessionStoreStatus {
             persistence,
             restored_sessions,
-            max_sessions: inner.max_sessions,
+            max_sessions: inner.hot_session_capacity_target,
+            retained_sessions: inner.sessions.len(),
+            active_sessions,
+            closed_sessions,
+            hot_sessions,
+            cold_sessions,
+            active_cold_sessions: inner.sessions.values().filter(|entry| {
+                matches!(entry, StoredSession::Cold(cold) if cold.lifecycle.allows_mutation())
+            }).count(),
+            cold_payload_bytes: inner.sessions.values().filter_map(|entry| {
+                match entry {
+                    StoredSession::Cold(cold) => Some(cold.raw.get().len()),
+                    StoredSession::Hot(_) => None,
+                }
+            }).sum(),
+            hot_session_capacity_target: inner.hot_session_capacity_target,
+            historical_session_retention_limit: inner.historical_session_retention_limit,
+            capacity_evictions: inner.capacity_evictions,
+            retention_tombstones: inner.tombstones.len(),
             max_events_per_session: inner.max_events_per_session,
             max_messages_per_session: DEFAULT_MAX_MESSAGES_PER_SESSION,
             last_persist_error,
@@ -484,40 +387,46 @@ impl SessionStore {
                     .to_string(),
             );
         }
-        let session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
-        let now = now_ts();
-        let guards = SessionGuards::effective(opts.mode, opts.guards);
-        let owner_authority_fingerprint = opts.owner_authority_fingerprint.ok_or_else(|| {
-            "Workflow Session creation requires a canonical authority fingerprint".to_string()
-        })?;
-        let record = SessionRecord {
-            session_id: session_id.clone(),
-            project: opts.project,
-            owner_authority_fingerprint,
-            title: opts.title,
-            mode: opts.mode,
-            guards,
-            execution_context: opts.execution_context,
-            // Create always yields Active; only explicit close transitions later.
-            lifecycle: SessionLifecycle::Active,
-            created_at: now,
-            updated_at: now,
-            messages: VecDeque::new(),
-            events: VecDeque::new(),
-            events_observed: 0,
-            context_revision: 0,
-            materialized_validation_job_ids: VecDeque::new(),
-            message_observation_revision: 0,
-            message_observation_floor: 0,
-            message_observation_revisions: Default::default(),
-            assignment_history_floors: Default::default(),
-            assignment_history_tracking_complete: true,
-            completion_assignment_fence_fingerprints: Default::default(),
-            completion_assignment_fence_tracking_complete: true,
-            project_instructions: opts.project_instructions,
-        };
         let summary = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            let session_id = inner
+                .allocate_session_id(webcodex_core::compact::random_suffix::<12>)
+                .ok_or_else(|| "session_id_allocation_exhausted".to_string())?;
+            let now = now_ts();
+            let guards = SessionGuards::effective(opts.mode, opts.guards);
+            let owner_authority_fingerprint =
+                opts.owner_authority_fingerprint.ok_or_else(|| {
+                    "Workflow Session creation requires a canonical authority fingerprint"
+                        .to_string()
+                })?;
+            let record = SessionRecord {
+                session_id: session_id.clone(),
+                project: opts.project,
+                owner_authority_fingerprint,
+                title: opts.title,
+                mode: opts.mode,
+                guards,
+                execution_context: opts.execution_context,
+                // Create always yields Active; only explicit close transitions later.
+                lifecycle: SessionLifecycle::Active,
+                created_at: now,
+                updated_at: now,
+                messages: VecDeque::new(),
+                message_delivery_replays: Default::default(),
+                events: VecDeque::new(),
+                events_observed: 0,
+                git_baseline_tree: None,
+                repository_edit_observed: false,
+                materialized_validation_job_ids: VecDeque::new(),
+                message_observation_revision: 0,
+                message_observation_floor: 0,
+                message_observation_revisions: Default::default(),
+                assignment_history_floors: Default::default(),
+                assignment_history_tracking_complete: true,
+                completion_assignment_fence_fingerprints: Default::default(),
+                completion_assignment_fence_tracking_complete: true,
+                project_instructions: opts.project_instructions,
+            };
             inner.insert_session(record)
         };
         self.persist_after_mutation();
@@ -535,6 +444,17 @@ impl SessionStore {
         &self,
         request: CodingSessionRequest,
     ) -> Result<CodingSessionOutcome, CodingSessionError> {
+        self.ensure_coding_session_with_git_baseline(request, None)
+    }
+
+    /// Coding bootstrap variant used by `work_on_project` to bind one fresh
+    /// startup Git tree. Exact continuation ignores the supplied candidate and
+    /// preserves the durable Session baseline already recorded at creation.
+    pub fn ensure_coding_session_with_git_baseline(
+        &self,
+        request: CodingSessionRequest,
+        git_baseline_tree: Option<String>,
+    ) -> Result<CodingSessionOutcome, CodingSessionError> {
         let explicit_resume_session_id = match request.resume_session_id.as_deref() {
             Some(session_id)
                 if session_id != session_id.trim() || !is_valid_session_id(session_id) =>
@@ -546,7 +466,6 @@ impl SessionStore {
         };
         let explicit_resume = explicit_resume_session_id.is_some();
         let now = now_ts();
-        let new_session_id = format!("{SESSION_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let new_event_id = format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let requested_guards = SessionGuards::effective(request.mode, request.guards);
         let requested_execution_context = request
@@ -566,6 +485,15 @@ impl SessionStore {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
             let reusable_session_id = if let Some(session_id) = explicit_resume_session_id {
                 let Some(stored) = inner.sessions.get(&session_id) else {
+                    if inner
+                        .owned_retention_incarnation(
+                            &session_id,
+                            request.authority_fingerprint.as_str(),
+                        )
+                        .is_some()
+                    {
+                        return Err(CodingSessionError::ResumeRetentionExpired { session_id });
+                    }
                     return Err(CodingSessionError::UnknownResumeSession { session_id });
                 };
                 let lifecycle = stored.lifecycle();
@@ -608,6 +536,10 @@ impl SessionStore {
             }
 
             if let Some(session_id) = reusable_session_id {
+                if !inner.prepare_active_session(&session_id) {
+                    return Err(CodingSessionError::CommitFailed);
+                }
+
                 let (previous_mode, previous_guards, previous_execution_context) = {
                     let record = inner
                         .sessions
@@ -686,15 +618,10 @@ impl SessionStore {
                     record.execution_context = next_execution_context;
                     record.updated_at = now;
                     if let Some(project_instructions) = request.project_instructions {
-                        // A transient runner/read failure must not erase the
-                        // last complete in-memory rules snapshot. Fresh
-                        // sessions may still retain a partial/unavailable
-                        // snapshot so startup can report it conservatively.
-                        if project_instructions.scan_complete
-                            || record.project_instructions.is_none()
-                        {
-                            record.project_instructions = Some(project_instructions);
-                        }
+                        record.project_instructions = Some(
+                            project_instructions
+                                .retain_unavailable_scopes(record.project_instructions.as_ref()),
+                        );
                     }
                     record.events.push_back(Arc::new(event));
                     record.events_observed = record.events_observed.saturating_add(1);
@@ -707,6 +634,11 @@ impl SessionStore {
                     .summary(&session_id, Some(DEFAULT_SUMMARY_LIMIT))
                     .expect("continued session must summarize");
                 CodingSessionOutcome {
+                    project_instructions: inner
+                        .sessions
+                        .get(&session_id)
+                        .and_then(StoredSession::hot)
+                        .and_then(|record| record.project_instructions.clone()),
                     summary,
                     pre_instruction_summary: Some(pre_instruction_summary),
                     reused: true,
@@ -719,6 +651,9 @@ impl SessionStore {
                 if self.take_coding_continuity_fault() {
                     return Err(CodingSessionError::CommitFailed);
                 }
+                let new_session_id = inner
+                    .allocate_session_id(webcodex_core::compact::random_suffix::<12>)
+                    .ok_or(CodingSessionError::CommitFailed)?;
                 let execution_context = requested_execution_context.clone().unwrap_or_default();
                 let execution_context_changed = !execution_context.is_empty();
                 let event = coding_instruction_event(
@@ -754,9 +689,11 @@ impl SessionStore {
                     created_at: now,
                     updated_at: now,
                     messages: VecDeque::new(),
+                    message_delivery_replays: Default::default(),
                     events: VecDeque::from([Arc::new(event)]),
                     events_observed: 1,
-                    context_revision: 0,
+                    git_baseline_tree,
+                    repository_edit_observed: false,
                     materialized_validation_job_ids: VecDeque::new(),
                     message_observation_revision: 0,
                     message_observation_floor: 0,
@@ -767,8 +704,10 @@ impl SessionStore {
                     completion_assignment_fence_tracking_complete: true,
                     project_instructions: request.project_instructions,
                 };
+                let project_instructions = record.project_instructions.clone();
                 let summary = inner.insert_session(record);
                 CodingSessionOutcome {
+                    project_instructions,
                     summary,
                     pre_instruction_summary: None,
                     reused: false,
@@ -808,6 +747,140 @@ impl SessionStore {
         })
     }
 
+    /// Exact retained changed-path evidence for recovery attribution. Unlike
+    /// `summary`, this scans the full bounded durable event ledger instead of the
+    /// model-facing 200-event tail, so ordinary presentation truncation does not
+    /// masquerade as history loss. The boolean is true only when the retained
+    /// ledger and each event's changed-path projection are known complete.
+    pub fn retained_changed_path_evidence(&self, session_id: &str) -> Option<(Vec<String>, bool)> {
+        self.with_record_for_query(session_id, |record, _cold| {
+            let mut paths = BTreeSet::new();
+            let mut complete = record.events_observed <= record.events.len() as u64;
+            // Every persisted event sanitizes changed_paths to MAX_INPUT_ARRAY_ITEMS,
+            // and runtime audit arguments can already be bounded before the Store
+            // observes them. Equality to that durable bound therefore cannot prove
+            // the original path set was complete, even while the Session is hot.
+            for event in super::events::canonical_tool_call_finished_event_refs(
+                record.events.iter().map(Arc::as_ref),
+            ) {
+                // Path attribution is consequence evidence, not an attempted-write
+                // list. A failed/no-op edit can name the same path without proving
+                // that this Session caused the current dirty state.
+                if !event_observes_repository_edit(event) {
+                    continue;
+                }
+                if event.changed_paths.len() >= MAX_INPUT_ARRAY_ITEMS {
+                    complete = false;
+                }
+                paths.extend(event.changed_paths.iter().cloned());
+            }
+            (paths.into_iter().collect(), complete)
+        })
+    }
+
+    /// Latest retained task-instruction identity at an exact Session event-count
+    /// snapshot. Unlike `summary`, this scans the full bounded durable ledger so
+    /// the model-facing 200-event tail cannot erase the current attempt identity.
+    /// `through_events_total` fences the lookup against a later instruction racing
+    /// the caller's already-observed Session snapshot. Durable eviction remains
+    /// fail-closed and therefore returns `None`.
+    pub fn retained_task_instruction_event_id_at(
+        &self,
+        session_id: &str,
+        through_events_total: usize,
+    ) -> Option<String> {
+        self.with_record_for_query(session_id, |record, _cold| {
+            let observed_total = usize::try_from(record.events_observed).unwrap_or(usize::MAX);
+            if through_events_total > observed_total {
+                return None;
+            }
+            let retained_len = record.events.len();
+            let first_retained_sequence = observed_total.saturating_sub(retained_len);
+            if through_events_total <= first_retained_sequence {
+                return None;
+            }
+            let retained_end = through_events_total
+                .saturating_sub(first_retained_sequence)
+                .min(retained_len);
+            record
+                .events
+                .iter()
+                .take(retained_end)
+                .rev()
+                .find(|event| event.kind == "task_instruction")
+                .map(|event| event.event_id.clone())
+        })
+        .flatten()
+    }
+
+    /// Discover only identities in the already-authorized exact Project and
+    /// creation-time authority group. Filter before counting/pagination; foreign
+    /// Sessions cannot affect totals or hide authorized rows behind a page limit.
+    /// Inventory ordering is presentation only, never an implicit resume rule.
+    pub fn discover_sessions(
+        &self,
+        project: &str,
+        owner_authority_fingerprint: &str,
+        lifecycle: Option<SessionLifecycle>,
+        offset: usize,
+        limit: usize,
+    ) -> SessionDiscoveryPage {
+        let limit = limit.clamp(1, 20);
+        let mut candidates = {
+            let inner = self.inner.lock().expect("session store mutex poisoned");
+            inner
+                .sessions
+                .values()
+                .filter(|record| {
+                    record.project() == Some(project)
+                        && record.owner_authority_fingerprint() == owner_authority_fingerprint
+                        && lifecycle.is_none_or(|state| record.lifecycle() == state)
+                })
+                .map(|record| (record.session_id().to_string(), record.updated_at()))
+                .collect::<Vec<_>>()
+        };
+        candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+        let total = candidates.len();
+        let end = offset.saturating_add(limit).min(total);
+        let sessions = candidates
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .filter_map(|(session_id, _)| {
+                self.with_record_for_query(&session_id, |record, _| {
+                    if record.project.as_deref() != Some(project)
+                        || record.owner_authority_fingerprint != owner_authority_fingerprint
+                        || lifecycle.is_some_and(|state| record.lifecycle != state)
+                    {
+                        return None;
+                    }
+                    let title = record.title.as_deref().map(|title| {
+                        redact_and_bound_instruction(title, 240)
+                            .chars()
+                            .take(240)
+                            .collect::<String>()
+                    });
+                    let title_truncated = title.as_deref() != record.title.as_deref();
+                    Some(SessionDiscoveryItem {
+                        session_id: record.session_id.clone(),
+                        title,
+                        title_truncated,
+                        lifecycle: record.lifecycle,
+                        created_at: record.created_at,
+                        updated_at: record.updated_at,
+                    })
+                })
+                .flatten()
+            })
+            .collect();
+        SessionDiscoveryPage {
+            total,
+            offset,
+            next_offset: (end < total).then_some(end),
+            sessions,
+        }
+    }
+
     /// Bounded, read-only Workflow Session rows for one exact runtime project.
     /// The project is authoritative caller context, never request-controlled UI state.
     pub fn console_list_for_project(
@@ -816,37 +889,122 @@ impl SessionStore {
         limit: Option<usize>,
         validation: ConsoleValidationHooks,
     ) -> WorkflowSessionConsoleList {
+        self.console_lists_for_projects(&[project], limit, validation)
+            .remove(project)
+            .expect("requested project has a console list")
+    }
+
+    /// Scan retained identities once for an already-authorized set of projects.
+    /// Each project keeps its own ordering and limit. Only immutable Closed
+    /// records may reuse a small base Console projection across repeated reads.
+    pub fn console_lists_for_projects(
+        &self,
+        projects: &[&str],
+        limit: Option<usize>,
+        validation: ConsoleValidationHooks,
+    ) -> HashMap<String, WorkflowSessionConsoleList> {
         let limit = normalize_console_session_limit(limit);
-        let (candidates, total) = {
-            let inner = self.inner.lock().expect("session store mutex poisoned");
-            let mut candidates = inner
-                .sessions
-                .values()
-                .filter(|session| session.project() == Some(project))
-                .map(|session| (session.session_id().to_string(), session.updated_at()))
-                .collect::<Vec<_>>();
-            candidates
-                .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
-            let total = candidates.len();
-            candidates.truncate(limit);
-            (candidates, total)
-        };
-        let sessions = candidates
-            .into_iter()
-            .filter_map(|(session_id, _)| {
-                self.with_record_for_query(&session_id, |record, _| {
-                    (record.project.as_deref() == Some(project))
-                        .then(|| build_console_list_item(record, project, validation))
-                })
-                .flatten()
-            })
-            .collect::<Vec<_>>();
-        WorkflowSessionConsoleList {
-            returned: sessions.len(),
-            truncated: total > limit,
-            total,
-            sessions,
+        let mut candidates: HashMap<&str, Vec<(String, i64)>> = projects
+            .iter()
+            .map(|project| (*project, Vec::new()))
+            .collect();
+        if candidates.is_empty() {
+            return HashMap::new();
         }
+        {
+            let inner = self.inner.lock().expect("session store mutex poisoned");
+            for session in inner.sessions.values() {
+                if let Some(rows) = session
+                    .project()
+                    .and_then(|project| candidates.get_mut(project))
+                {
+                    rows.push((session.session_id().to_string(), session.updated_at()));
+                }
+            }
+        }
+        // Sort and materialize outside the inventory lock. Cold records retain
+        // their ordinary query path, including the exact-project recheck.
+        candidates
+            .into_iter()
+            .map(|(project, mut candidates)| {
+                candidates
+                    .sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+                let total = candidates.len();
+                candidates.truncate(limit);
+                let sessions = candidates
+                    .into_iter()
+                    .filter_map(|(session_id, _)| {
+                        self.console_list_item_for_project(&session_id, project, validation)
+                    })
+                    .collect::<Vec<_>>();
+                (
+                    project.to_string(),
+                    WorkflowSessionConsoleList {
+                        returned: sessions.len(),
+                        truncated: total > limit,
+                        total,
+                        sessions,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Reuse only a Closed Session's immutable base row (never a live Job
+    /// overlay). Cache identity includes the cold raw allocation and both
+    /// validation hooks, so replacements and alternate validation projections
+    /// cannot return stale evidence. One row maximum per retained Closed identity.
+    fn console_list_item_for_project(
+        &self,
+        session_id: &str,
+        project: &str,
+        validation: ConsoleValidationHooks,
+    ) -> Option<WorkflowSessionConsoleListItem> {
+        let (cold, max_events_per_session) = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.touch(session_id);
+            let max_events_per_session = inner.max_events_per_session;
+            match inner.sessions.get(session_id)? {
+                StoredSession::Hot(record) => {
+                    return (record.project.as_deref() == Some(project))
+                        .then(|| build_console_list_item(record, project, validation));
+                }
+                StoredSession::Cold(record) => (record.clone(), max_events_per_session),
+            }
+        };
+
+        if cold.project.as_deref() != Some(project) {
+            return None;
+        }
+        let immutable = cold.lifecycle == SessionLifecycle::Closed;
+        if immutable {
+            let cache = cold
+                .console_list_cache
+                .lock()
+                .expect("cold Console projection cache mutex poisoned");
+            if let Some(cached) = cache.as_ref() {
+                if Arc::ptr_eq(&cached.raw, &cold.raw) && cached.hooks.same_callbacks(validation) {
+                    return Some(cached.row.clone());
+                }
+            }
+        }
+
+        let record = materialize_cold_session(&cold, max_events_per_session)?;
+        if record.project.as_deref() != Some(project) {
+            return None;
+        }
+        let row = build_console_list_item(&record, project, validation);
+        if immutable {
+            *cold
+                .console_list_cache
+                .lock()
+                .expect("cold Console projection cache mutex poisoned") = Some(CachedConsoleList {
+                raw: cold.raw.clone(),
+                hooks: validation,
+                row: row.clone(),
+            });
+        }
+        Some(row)
     }
 
     /// Bounded, read-only human timeline for one exact project-scoped Session.
@@ -938,12 +1096,43 @@ impl SessionStore {
         inner.contains_session(session_id)
     }
 
-    pub fn context_revision(&self, session_id: &str) -> Option<u64> {
-        let inner = self.inner.lock().expect("session store mutex poisoned");
-        inner
-            .sessions
-            .get(session_id)
-            .map(StoredSession::context_revision)
+    /// Internal consistency fence for assembling recovery evidence. Event mutations
+    /// advance events_observed; collaboration mutations advance
+    /// message_observation_revision. Never serialized or accepted from a caller.
+    pub fn handoff_revision(&self, session_id: &str) -> Option<(u64, u64)> {
+        self.retained_revisions(session_id)
+    }
+
+    /// Cold JSON is canonical and immutable after admission, so scalar
+    /// revisions need not materialize its entire (up to 2,000-event) body.
+    /// Keep the same LRU read touch as with_record_for_query. If an internal
+    /// repair/test replaced raw bytes, fall through to the original checked
+    /// materialization path rather than returning stale revision metadata.
+    pub(super) fn retained_revisions(&self, session_id: &str) -> Option<(u64, u64)> {
+        {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.touch(session_id);
+            match inner.sessions.get(session_id)? {
+                StoredSession::Hot(record) => {
+                    return Some((record.events_observed, record.message_observation_revision));
+                }
+                StoredSession::Cold(cold)
+                    if std::ptr::eq(
+                        std::sync::Weak::as_ptr(&cold.revision_raw),
+                        Arc::as_ptr(&cold.raw),
+                    ) =>
+                {
+                    return Some((
+                        cold.retained_events_observed,
+                        cold.retained_message_revision,
+                    ));
+                }
+                StoredSession::Cold(_) => {}
+            }
+        }
+        self.with_record_for_query(session_id, |record, _| {
+            (record.events_observed, record.message_observation_revision)
+        })
     }
 
     pub fn session_project(&self, session_id: &str) -> Option<Option<String>> {
@@ -956,6 +1145,28 @@ impl SessionStore {
         inner.session_target_authority(session_id)
     }
 
+    /// Synchronous revalidation boundary for an already authorized current-work
+    /// target. Identity and creation authority remain explicit; this closure
+    /// cannot close/reassign a Session or confer authority through a Window.
+    /// The callback must not reenter SessionStore or perform asynchronous work.
+    pub fn with_active_session_authority_fence<T>(
+        &self,
+        session_id: &str,
+        expected_project: &str,
+        expected_owner_authority_fingerprint: &str,
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let inner = self.inner.lock().ok()?;
+        let record = inner.sessions.get(session_id)?;
+        if !record.lifecycle().allows_mutation()
+            || record.project() != Some(expected_project)
+            || record.owner_authority_fingerprint() != expected_owner_authority_fingerprint
+        {
+            return None;
+        }
+        Some(commit())
+    }
+
     /// Return inherited defaults only for an active Session whose registered
     /// project exactly matches the already-resolved request project.
     pub fn execution_context_for_project(
@@ -963,10 +1174,12 @@ impl SessionStore {
         session_id: &str,
         resolved_project: &str,
     ) -> Option<SessionExecutionContext> {
-        let inner = self.inner.lock().expect("session store mutex poisoned");
-        let record = inner.sessions.get(session_id)?.hot()?;
-        (record.lifecycle.allows_mutation() && record.project.as_deref() == Some(resolved_project))
+        self.with_record_for_query(session_id, |record, _| {
+            (record.lifecycle.allows_mutation()
+                && record.project.as_deref() == Some(resolved_project))
             .then(|| record.execution_context.clone())
+        })
+        .flatten()
     }
 
     pub fn guard_state(&self, session_id: &str) -> Option<(SessionMode, SessionGuards)> {
@@ -977,6 +1190,34 @@ impl SessionStore {
     pub fn lifecycle_state(&self, session_id: &str) -> Option<SessionLifecycle> {
         let inner = self.inner.lock().expect("session store mutex poisoned");
         inner.lifecycle_state(session_id)
+    }
+
+    /// Incarnation fingerprint of a retention tombstone owned by this principal.
+    /// A different principal and a missing tombstone are both `None`.
+    pub fn owned_retention_incarnation(
+        &self,
+        session_id: &str,
+        owner_authority_fingerprint: &str,
+    ) -> Option<String> {
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        inner.owned_retention_incarnation(session_id, owner_authority_fingerprint)
+    }
+
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn retention_tombstone_for_test(
+        &self,
+        session_id: &str,
+    ) -> Option<SessionRetentionTombstone> {
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        let ordinal = inner.tombstone_ids.get(session_id).copied()?;
+        inner.tombstones.get(&ordinal).cloned()
+    }
+
+    /// Try one fixed suffix sixteen times. A retained tombstone occupies that id.
+    #[cfg(any(test, feature = "root-test-support"))]
+    pub fn allocate_fixed_session_suffix_for_test(&self, suffix: &str) -> Option<String> {
+        let inner = self.inner.lock().expect("session store mutex poisoned");
+        inner.allocate_session_id(|| suffix.to_string())
     }
 
     /// Explicit close: `Active → Closed`. Idempotent for already-closed sessions.
@@ -1002,6 +1243,10 @@ impl SessionStore {
             already_closed: true,
         });
         self.coldify_closed_session(session_id);
+        {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.enforce_historical_retention_bound();
+        }
         self.persist_after_mutation();
         Ok(outcome)
     }
@@ -1021,6 +1266,9 @@ impl SessionStore {
         }
         let outcome = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            if !inner.prepare_active_session(session_id) {
+                return Err(SessionExecutionContextUpdateError::UnknownSession);
+            }
             let stored = inner
                 .sessions
                 .get(session_id)
@@ -1176,7 +1424,11 @@ impl SessionStore {
         if !is_valid_session_id(session_id) {
             return None;
         }
-        let pre_call_context_revision = self.context_revision(session_id)?;
+        // Preserve the existing fail-closed Session boundary. Evicted or unknown
+        // Sessions cannot be revived by appending a tool event.
+        if !self.contains_session(session_id) {
+            return None;
+        }
         let now = now_ts();
         let event_id = format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let project = extract_project(arguments);
@@ -1188,11 +1440,6 @@ impl SessionStore {
         let diff_review_like = diff_review_like_for_tool(tool_name, arguments);
         let input_summary = Some(session_input_summary_for_tool(tool_name, arguments));
         let expectation = metadata.expectation;
-        let ack_session_context_revision = if contract.accepts_context_ack {
-            metadata.ack_session_context_revision
-        } else {
-            SessionContextRevisionAck::Unsupported
-        };
         let start = ToolCallStart {
             event_id: event_id.clone(),
             call_id: call_id.clone(),
@@ -1216,15 +1463,12 @@ impl SessionStore {
             started_instant: Instant::now(),
             permission: None,
             expectation: expectation.clone(),
-            pre_call_context_revision,
-            advances_context_checkpoint: contract.advances_context_checkpoint,
-            ack_session_context_revision,
         };
         self.push_event(SessionEvent {
             event_id,
             session_id: session_id.to_string(),
             kind: "tool_call_started".to_string(),
-            context_revision: None,
+            legacy_context_revision: None,
             context_result_summary: None,
             call_id: Some(call_id),
             logical_invocation_id: metadata.logical_invocation_id,
@@ -1349,108 +1593,7 @@ impl SessionStore {
         })
     }
 
-    fn push_model_facing_event(
-        &self,
-        mut event: SessionEvent,
-        pre_call_context_revision: u64,
-        ack_session_context_revision: SessionContextRevisionAck,
-        advances_context_checkpoint: bool,
-    ) -> Option<RecordedModelFacingToolCall> {
-        let session_id = event.session_id.clone();
-        let outcome = {
-            let mut inner = self.inner.lock().expect("session store mutex poisoned");
-            let max_events = inner.max_events_per_session;
-            let stored = inner.sessions.get_mut(&session_id)?;
-            let project_instructions = match stored {
-                StoredSession::Cold(cold) => cold.project_instructions.clone(),
-                StoredSession::Hot(_) => None,
-            };
-            let mut materialized = match stored {
-                StoredSession::Hot(_) => None,
-                StoredSession::Cold(cold) => materialize_cold_session(cold, max_events),
-            };
-            let record = match stored {
-                StoredSession::Hot(record) => record,
-                StoredSession::Cold(_) => materialized.as_mut()?,
-            };
-            if record.context_revision < pre_call_context_revision {
-                return None;
-            }
-            // Recover only the checkpoint prefix that existed immediately before
-            // this result. Non-checkpoint model-facing events stay in the ledger
-            // without consuming a context revision.
-            let pre_response_context_revision = record.context_revision;
-            let context_revision = if advances_context_checkpoint {
-                pre_response_context_revision.checked_add(1)?
-            } else {
-                pre_response_context_revision
-            };
-            let recovery_start = match ack_session_context_revision {
-                SessionContextRevisionAck::Revision(revision)
-                    if revision <= pre_call_context_revision =>
-                {
-                    revision
-                }
-                // Missing, malformed, and future ACKs prove no caller-held
-                // prefix. They recover from a compact current-state handoff at
-                // response projection time instead of replaying retained history
-                // as though revision zero had been explicitly acknowledged.
-                _ => pre_response_context_revision,
-            };
-            let recovery_events = record
-                .events
-                .iter()
-                .filter_map(|candidate| {
-                    let candidate_revision = candidate.context_revision?;
-                    (candidate_revision > recovery_start
-                        && candidate_revision <= pre_response_context_revision)
-                        .then(|| candidate.as_ref().clone())
-                })
-                .collect::<Vec<_>>();
-            let expected_recovery_count = match ack_session_context_revision {
-                SessionContextRevisionAck::Revision(revision)
-                    if revision <= pre_call_context_revision =>
-                {
-                    pre_response_context_revision.saturating_sub(revision)
-                }
-                _ => 0,
-            };
-            let history_lost = expected_recovery_count > recovery_events.len() as u64;
-            event.context_revision = advances_context_checkpoint.then_some(context_revision);
-            if advances_context_checkpoint {
-                record.context_revision = context_revision;
-            }
-            record.updated_at = record.updated_at.max(event.timestamp);
-            record.events.push_back(Arc::new(event));
-            record.events_observed = record.events_observed.saturating_add(1);
-            while record.events.len() > max_events {
-                record.events.pop_front();
-            }
-            let outcome = RecordedModelFacingToolCall {
-                session_id: session_id.clone(),
-                context_revision,
-                pre_response_context_revision,
-                checkpoint_advanced: advances_context_checkpoint,
-                pre_call_context_revision,
-                ack_session_context_revision,
-                recovery_events,
-                history_lost,
-            };
-            if let Some(record) = materialized.as_ref() {
-                let persisted = PersistedSessionRecord::from_record(record, max_events);
-                let cold = cold_session_from_persisted(&persisted, project_instructions).ok()?;
-                *stored = StoredSession::Cold(cold);
-            }
-            inner.touch(&session_id);
-            outcome
-        };
-        self.persist_after_mutation();
-        Some(outcome)
-    }
-
-    /// Append a finished ledger event that is not itself returned as a model-facing
-    /// ToolResult (for example a pre-kernel parsing/scope failure or an internal
-    /// nested operation). It deliberately does not advance model context continuity.
+    /// Append a finished tool-call ledger event through the canonical event path.
     pub fn record_tool_call_finished(
         &self,
         start: Option<ToolCallStart>,
@@ -1459,35 +1602,10 @@ impl SessionStore {
         error: Option<&str>,
         error_kind: Option<&str>,
     ) -> Option<String> {
-        let (event, _, _, _) =
-            Self::tool_call_finished_event(start, success, output, error, error_kind)?;
+        let event = Self::tool_call_finished_event(start, success, output, error, error_kind)?;
         let event_id = event.event_id.clone();
         self.push_event(event);
         Some(event_id)
-    }
-
-    /// Append a finished model-facing ToolResult and atomically advance the
-    /// Session-local context revision only for a ToolDefinition checkpoint.
-    pub fn record_model_facing_tool_call_finished(
-        &self,
-        start: Option<ToolCallStart>,
-        success: bool,
-        output: &Value,
-        error: Option<&str>,
-        error_kind: Option<&str>,
-    ) -> Option<RecordedModelFacingToolCall> {
-        let (
-            event,
-            pre_call_context_revision,
-            ack_session_context_revision,
-            advances_context_checkpoint,
-        ) = Self::tool_call_finished_event(start, success, output, error, error_kind)?;
-        self.push_model_facing_event(
-            event,
-            pre_call_context_revision,
-            ack_session_context_revision,
-            advances_context_checkpoint,
-        )
     }
 
     fn tool_call_finished_event(
@@ -1496,11 +1614,8 @@ impl SessionStore {
         output: &Value,
         error: Option<&str>,
         error_kind: Option<&str>,
-    ) -> Option<(SessionEvent, u64, SessionContextRevisionAck, bool)> {
+    ) -> Option<SessionEvent> {
         let start = start?;
-        let pre_call_context_revision = start.pre_call_context_revision;
-        let ack_session_context_revision = start.ack_session_context_revision;
-        let advances_context_checkpoint = start.advances_context_checkpoint;
         let finished_at = now_ts();
         let duration_ms = start
             .started_instant
@@ -1512,9 +1627,15 @@ impl SessionStore {
             .get("failure_kind")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // A caller-supplied kind or output failure_kind stays authoritative.
+        // Only a retention-expired identity replaces the generic runtime_error
+        // default, so evidence on another live Session keeps that exact kind.
+        let classified_retention = error
+            .map(classify_error_message)
+            .filter(|kind| kind == "session_retention_expired");
         let error_kind = error_kind
             .or_else(|| error.and_then(|_| output.get("failure_kind").and_then(Value::as_str)))
-            .or_else(|| error.map(|_| "runtime_error"));
+            .or(classified_retention.as_deref());
         let actual_failure_kind = actual_failure_kind_for_tool_result(output, error, error_kind);
         let failure_expectation_result = classify_failure_expectation(
             success,
@@ -1560,7 +1681,7 @@ impl SessionStore {
             event_id,
             session_id: start.session_id,
             kind: "tool_call_finished".to_string(),
-            context_revision: None,
+            legacy_context_revision: None,
             context_result_summary: context_result_summary_for_tool_result(
                 &start.tool_name,
                 output,
@@ -1617,12 +1738,7 @@ impl SessionStore {
             previous_execution_context: None,
             execution_context_changed: None,
         };
-        Some((
-            event,
-            pre_call_context_revision,
-            ack_session_context_revision,
-            advances_context_checkpoint,
-        ))
+        Some(event)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1664,12 +1780,11 @@ impl SessionStore {
             || retained_terminal_job_ids
                 .iter()
                 .any(|candidate| *candidate != candidate.trim() || !is_safe_job_id(candidate))
-            || !retained_terminal_job_ids
-                .iter()
-                .any(|candidate| *candidate == job_id)
+            || !retained_terminal_job_ids.contains(&job_id)
             || !matches!(
                 tool_name,
-                "cargo_fmt"
+                "project_validate"
+                    | "cargo_fmt"
                     | "cargo_check"
                     | "cargo_test"
                     | "go_test"
@@ -1768,7 +1883,7 @@ impl SessionStore {
             kind: "validation_job_terminal".to_string(),
             logical_invocation_id: None,
             logical_invocation_role: None,
-            context_revision: None,
+            legacy_context_revision: None,
             context_result_summary: None,
             timestamp,
             transport: "job_terminal".to_string(),
@@ -1822,6 +1937,10 @@ impl SessionStore {
 
         let (cold, hot_closed, recorded) = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            if !inner.prepare_active_session(session_id) {
+                return false;
+            }
+
             let max_events = inner.max_events_per_session;
             let Some(stored) = inner.sessions.get_mut(session_id) else {
                 return false;
@@ -1897,9 +2016,7 @@ impl SessionStore {
                     .materialized_validation_job_ids
                     .iter()
                     .position(|materialized| {
-                        !retained_terminal_job_ids
-                            .iter()
-                            .any(|candidate| *candidate == materialized.as_str())
+                        !retained_terminal_job_ids.contains(&materialized.as_str())
                     })
             else {
                 // A complete valid terminal snapshot cannot name more than the
@@ -1966,6 +2083,10 @@ impl SessionStore {
         let mut event = Some(event);
         let (cold, hot_closed) = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            if !inner.prepare_active_session(&session_id) {
+                return;
+            }
+
             let max_events_per_session = inner.max_events_per_session;
             let Some(stored) = inner.sessions.get_mut(&session_id) else {
                 return;
@@ -1973,7 +2094,11 @@ impl SessionStore {
             match stored {
                 StoredSession::Hot(record) => {
                     record.updated_at = now_ts();
-                    record.events.push_back(Arc::new(event.take().unwrap()));
+                    let event = event.take().unwrap();
+                    if event_observes_repository_edit(&event) {
+                        record.repository_edit_observed = true;
+                    }
+                    record.events.push_back(Arc::new(event));
                     record.events_observed = record.events_observed.saturating_add(1);
                     while record.events.len() > max_events_per_session {
                         record.events.pop_front();
@@ -2069,47 +2194,18 @@ impl SessionStore {
         event_id: &str,
         permission: PermissionDecision,
     ) -> bool {
-        let mut permission = Some(permission);
-        let (cold, hot_closed, found) = {
-            let mut inner = self.inner.lock().expect("session store mutex poisoned");
-            let Some(stored) = inner.sessions.get_mut(session_id) else {
+        self.update_retained_record(session_id, permission, |record, permission| {
+            let Some(event) = record
+                .events
+                .iter_mut()
+                .rev()
+                .find(|event| event.event_id == event_id)
+            else {
                 return false;
             };
-            match stored {
-                StoredSession::Hot(record) => {
-                    let found = record
-                        .events
-                        .iter_mut()
-                        .rev()
-                        .find(|event| event.event_id == event_id)
-                        .map(|event| {
-                            Arc::make_mut(event).permission = Some(permission.take().unwrap());
-                        })
-                        .is_some();
-                    (None, !record.lifecycle.allows_mutation(), found)
-                }
-                StoredSession::Cold(record) => (Some(record.clone()), false, true),
-            }
-        };
-        let found = match cold {
-            Some(cold) => self.rewrite_cold_record(session_id, cold, false, |record, _| {
-                let Some(event) = record
-                    .events
-                    .iter_mut()
-                    .rev()
-                    .find(|event| event.event_id == event_id)
-                else {
-                    return false;
-                };
-                Arc::make_mut(event).permission = Some(permission.as_ref().unwrap().clone());
-                true
-            }),
-            None => found,
-        };
-        if found && hot_closed {
-            self.coldify_closed_session(session_id);
-        }
-        found
+            Arc::make_mut(event).permission = Some(permission);
+            true
+        })
     }
 
     fn set_session_close_persistent_shell_evidence(
@@ -2117,47 +2213,18 @@ impl SessionStore {
         session_id: &str,
         evidence: PersistentShellEventEvidence,
     ) -> bool {
-        let mut evidence = Some(evidence);
-        let (cold, hot_closed, found) = {
-            let mut inner = self.inner.lock().expect("session store mutex poisoned");
-            let Some(stored) = inner.sessions.get_mut(session_id) else {
+        self.update_retained_record(session_id, evidence, |record, evidence| {
+            let Some(event) =
+                record.events.iter_mut().rev().find(|event| {
+                    event.kind == "session_closed" && event.tool_name == "close_session"
+                })
+            else {
                 return false;
             };
-            match stored {
-                StoredSession::Hot(record) => {
-                    let found = if let Some(event) = record.events.iter_mut().rev().find(|event| {
-                        event.kind == "session_closed" && event.tool_name == "close_session"
-                    }) {
-                        Arc::make_mut(event).persistent_shell = Some(evidence.take().unwrap());
-                        true
-                    } else {
-                        false
-                    };
-                    if found {
-                        record.updated_at = now_ts();
-                    }
-                    (None, !record.lifecycle.allows_mutation(), found)
-                }
-                StoredSession::Cold(record) => (Some(record.clone()), false, true),
-            }
-        };
-        let found = match cold {
-            Some(cold) => self.rewrite_cold_record(session_id, cold, false, |record, _| {
-                let Some(event) = record.events.iter_mut().rev().find(|event| {
-                    event.kind == "session_closed" && event.tool_name == "close_session"
-                }) else {
-                    return false;
-                };
-                Arc::make_mut(event).persistent_shell = Some(evidence.as_ref().unwrap().clone());
-                record.updated_at = now_ts();
-                true
-            }),
-            None => found,
-        };
-        if found && hot_closed {
-            self.coldify_closed_session(session_id);
-        }
-        found
+            Arc::make_mut(event).persistent_shell = Some(evidence);
+            record.updated_at = now_ts();
+            true
+        })
     }
 
     pub(super) fn persist_after_mutation(&self) {
@@ -2279,7 +2346,7 @@ fn coding_instruction_event(
         event_id: event_id.to_string(),
         session_id: session_id.to_string(),
         kind: "task_instruction".to_string(),
-        context_revision: None,
+        legacy_context_revision: None,
         context_result_summary: None,
         call_id: None,
         timestamp: now,
@@ -2370,14 +2437,14 @@ fn coding_agent_lifecycle_event(
         event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
         session_id: session_id.to_string(),
         kind: bound_summary_string(kind),
-        context_revision: None,
+        legacy_context_revision: None,
         context_result_summary: None,
         call_id: None,
         timestamp: now,
         logical_invocation_id: None,
         logical_invocation_role: None,
         transport: "system".to_string(),
-        tool_name: "coding_agent_start".to_string(),
+        tool_name: "start_coding_agent".to_string(),
         project: Some(project.to_string()),
         resolved_project: Some(project.to_string()),
         risk_class: "job_run".to_string(),
@@ -2431,7 +2498,7 @@ fn session_closed_system_event(session_id: &str, now: i64) -> SessionEvent {
         event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
         session_id: session_id.to_string(),
         kind: "session_closed".to_string(),
-        context_revision: None,
+        legacy_context_revision: None,
         context_result_summary: None,
         call_id: None,
         timestamp: now,
@@ -2500,7 +2567,7 @@ fn session_execution_context_updated_event(
         event_id: format!("{EVENT_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
         session_id: session_id.to_string(),
         kind: "session_execution_context_updated".to_string(),
-        context_revision: None,
+        legacy_context_revision: None,
         context_result_summary: None,
         call_id: None,
         timestamp: now,
@@ -2560,6 +2627,17 @@ fn session_execution_context_updated_event(
     }
 }
 
+fn event_observes_repository_edit(event: &SessionEvent) -> bool {
+    event.kind == "tool_call_finished"
+        && event.status.as_deref() == Some("succeeded")
+        && event
+            .effect_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.state_changed)
+            == Some(true)
+        && runtime_tool_activity_semantics(&event.tool_name).kind == ToolActivityKind::Edit
+}
+
 fn summarize_record(
     record: &SessionRecord,
     limit: Option<usize>,
@@ -2568,12 +2646,9 @@ fn summarize_record(
     let limit = limit
         .unwrap_or(DEFAULT_SUMMARY_LIMIT)
         .clamp(0, MAX_SUMMARY_LIMIT);
-    let retained_events = record
-        .events
-        .iter()
-        .map(|event| event.as_ref().clone())
-        .collect::<Vec<_>>();
-    let finished_events = super::events::canonical_tool_call_finished_events(&retained_events);
+    let finished_events = super::events::canonical_tool_call_finished_event_refs(
+        record.events.iter().map(Arc::as_ref),
+    );
     let counts = SessionCounts {
         tool_calls: finished_events.len(),
         succeeded: finished_events
@@ -2630,11 +2705,17 @@ fn summarize_record(
         guards: record.guards,
         execution_context: record.execution_context.clone(),
         lifecycle: record.lifecycle,
+        git_baseline_tree: record.git_baseline_tree.clone(),
+        repository_edit_observed: record.repository_edit_observed,
         created_at: record.created_at,
         updated_at: record.updated_at,
         counts,
         events,
         events_total: observed_total,
+        events_retained: retained_total,
+        events_evicted: observed_total.saturating_sub(retained_total),
+        retention_truncated: observed_total > retained_total,
+        ledger_first_retained_sequence: observed_total.saturating_sub(retained_total),
         events_returned,
         events_truncated: observed_total > events_returned,
         first_retained_sequence: observed_total.saturating_sub(events_returned),
@@ -2643,16 +2724,86 @@ fn summarize_record(
     }
 }
 
+fn session_message_delivery_identity(
+    delivery: &SessionMessageDelivery,
+    kind: super::model::SessionMessageKind,
+    message: &str,
+    tags: &[String],
+    reply_to: Option<&str>,
+    priority: SessionMessagePriority,
+    requires_ack: bool,
+) -> Result<(String, String), SessionMessageError> {
+    if delivery.sender_scope.len() != 64
+        || !delivery
+            .sender_scope
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SessionMessageError::InvalidInput(
+            "message delivery sender scope is unavailable".to_string(),
+        ));
+    }
+    let delivery_key = delivery.delivery_key.trim();
+    if delivery_key.is_empty() || delivery_key.chars().count() > MAX_MESSAGE_DELIVERY_KEY_CHARS {
+        return Err(SessionMessageError::InvalidInput(format!(
+            "delivery_key must contain 1..={MAX_MESSAGE_DELIVERY_KEY_CHARS} characters"
+        )));
+    }
+    let mut key_hasher = Sha256::new();
+    key_hasher.update(b"webcodex.session-message-delivery-key.v1\0");
+    key_hasher.update(delivery_key.as_bytes());
+    let scope_key = format!("{}:{:x}", delivery.sender_scope, key_hasher.finalize());
+
+    fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    let mut payload = Sha256::new();
+    payload.update(b"webcodex.session-message-delivery-payload.v1\0");
+    hash_field(&mut payload, kind.as_str().as_bytes());
+    hash_field(&mut payload, message.as_bytes());
+    payload.update((tags.len() as u64).to_be_bytes());
+    for tag in tags {
+        hash_field(&mut payload, tag.as_bytes());
+    }
+    hash_field(&mut payload, reply_to.unwrap_or_default().as_bytes());
+    let priority = match priority {
+        SessionMessagePriority::Low => "low",
+        SessionMessagePriority::Normal => "normal",
+        SessionMessagePriority::High => "high",
+    };
+    hash_field(&mut payload, priority.as_bytes());
+    payload.update([u8::from(requires_ack)]);
+    Ok((scope_key, format!("{:x}", payload.finalize())))
+}
+
 impl SessionStoreInner {
     // --- create / lifecycle ---
 
     /// Sole map-insert path for a newly created session.
+    // Called under the store mutex; every fresh-session path uses this allocator.
+    pub(super) fn allocate_session_id(&self, mut suffix: impl FnMut() -> String) -> Option<String> {
+        for _ in 0..16 {
+            let id = format!("{SESSION_ID_PREFIX}{}", suffix());
+            if !self.session_id_occupied(&id) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     pub(super) fn insert_session(&mut self, record: SessionRecord) -> SessionSummary {
+        assert!(
+            !self.session_id_occupied(&record.session_id),
+            "Session allocation must not replace an existing ledger"
+        );
         let session_id = record.session_id.clone();
         self.sessions
             .insert(session_id.clone(), StoredSession::Hot(record));
         self.touch(&session_id);
-        self.enforce_session_bound();
+        self.enforce_historical_retention_bound();
+        self.compact_hot_sessions(&session_id);
+
         self.summary(&session_id, Some(DEFAULT_SUMMARY_LIMIT))
             .expect("newly inserted session must summarize")
     }
@@ -2663,6 +2814,10 @@ impl SessionStoreInner {
         session_id: &str,
     ) -> Result<Option<SessionCloseOutcome>, SessionCloseError> {
         self.touch(session_id);
+        if !self.prepare_active_session(session_id) {
+            return Err(SessionCloseError::UnknownSession);
+        }
+
         let lifecycle = self
             .sessions
             .get(session_id)
@@ -2697,6 +2852,8 @@ impl SessionStoreInner {
                         record.events.pop_front();
                     }
                 }
+                // Update eviction eligibility in the same locked lifecycle commit.
+                self.touch(session_id);
                 let record = self
                     .sessions
                     .get(session_id)
@@ -2716,8 +2873,12 @@ impl SessionStoreInner {
         &mut self,
         input: PostSessionMessageInput,
         requires_ack: bool,
-    ) -> Result<(SessionMessage, bool), SessionMessageError> {
+        delivery: Option<SessionMessageDelivery>,
+    ) -> Result<SessionMessageDeliveryOutcome, SessionMessageError> {
         self.touch(&input.session_id);
+        if !self.prepare_active_session(&input.session_id) {
+            return Err(SessionMessageError::InvalidObservationState);
+        }
         let Some(stored) = self.sessions.get_mut(&input.session_id) else {
             return Err(SessionMessageError::UnknownSession);
         };
@@ -2727,15 +2888,7 @@ impl SessionStoreInner {
         }
         let record = stored
             .hot_mut()
-            .expect("active session message mutation must stay hot");
-        if requires_ack
-            && (input.kind != super::model::SessionMessageKind::Guidance
-                || input.priority != super::model::SessionMessagePriority::High)
-        {
-            return Err(SessionMessageError::InvalidInput(
-                "requires_ack is only valid for high-priority guidance".to_string(),
-            ));
-        }
+            .expect("active touched session message mutation must stay hot");
         let message = validate_message_text(input.message)?;
         let tags = validate_message_tags(input.tags)?;
         if let Some(reply_to) = input.reply_to.as_deref() {
@@ -2747,9 +2900,43 @@ impl SessionStoreInner {
                 return Err(SessionMessageError::UnknownMessage);
             }
         }
+        let delivery_identity = delivery
+            .as_ref()
+            .map(|delivery| {
+                session_message_delivery_identity(
+                    delivery,
+                    input.kind,
+                    &message,
+                    &tags,
+                    input.reply_to.as_deref(),
+                    input.priority,
+                    requires_ack,
+                )
+            })
+            .transpose()?;
+        if let Some((scope_key, payload_fingerprint)) = delivery_identity.as_ref() {
+            if let Some(replay) = record.message_delivery_replays.get(scope_key) {
+                if replay.payload_fingerprint != *payload_fingerprint {
+                    return Err(SessionMessageError::DeliveryKeyConflict);
+                }
+                let Some(message) = record
+                    .messages
+                    .iter()
+                    .find(|message| message.message_id == replay.message_id)
+                else {
+                    return Err(SessionMessageError::DeliveryKeyConflict);
+                };
+                return Ok(SessionMessageDeliveryOutcome {
+                    message: message.as_ref().clone(),
+                    replayed: true,
+                    state_changed: false,
+                });
+            }
+        }
         let now = now_ts();
+        let message_id = allocate_message_id(record, webcodex_core::compact::random_suffix::<12>)?;
         let message = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: input.kind,
@@ -2775,12 +2962,28 @@ impl SessionStoreInner {
         record
             .message_observation_revisions
             .insert(message.message_id.clone(), revision);
+        if let Some((scope_key, payload_fingerprint)) = delivery_identity {
+            record.message_delivery_replays.insert(
+                scope_key,
+                SessionMessageDeliveryReplay {
+                    payload_fingerprint,
+                    message_id: message.message_id.clone(),
+                },
+            );
+        }
         while record.messages.len() > DEFAULT_MAX_MESSAGES_PER_SESSION {
             if let Some(evicted) = record.messages.pop_front() {
+                record
+                    .message_delivery_replays
+                    .retain(|_, replay| replay.message_id != evicted.message_id);
                 Self::note_evicted_message_observation(record, evicted.as_ref());
             }
         }
-        Ok((message, true))
+        Ok(SessionMessageDeliveryOutcome {
+            message,
+            replayed: false,
+            state_changed: true,
+        })
     }
 
     pub(super) fn observe_message_acks(
@@ -2788,6 +2991,13 @@ impl SessionStoreInner {
         session_id: &str,
         message_ids: &[String],
     ) -> super::model::SessionAckObservation {
+        if !self.prepare_active_session(session_id) {
+            return super::model::SessionAckObservation {
+                ignored_count: message_ids.len(),
+                ..Default::default()
+            };
+        }
+
         let Some(stored) = self.sessions.get_mut(session_id) else {
             return super::model::SessionAckObservation {
                 ignored_count: message_ids.len(),
@@ -2810,8 +3020,6 @@ impl SessionStoreInner {
             let Some(index) = record.messages.iter().position(|message| {
                 message.message_id == *message_id
                     && message.status == SessionMessageStatus::Open
-                    && message.kind == super::model::SessionMessageKind::Guidance
-                    && message.priority == super::model::SessionMessagePriority::High
                     && message.requires_ack
             }) else {
                 outcome.ignored_count += 1;
@@ -2844,6 +3052,9 @@ impl SessionStoreInner {
         message_id: &str,
     ) -> Result<WithdrawSessionMessageOutcome, SessionMessageError> {
         self.touch(session_id);
+        if !self.prepare_active_session(session_id) {
+            return Err(SessionMessageError::InvalidObservationState);
+        }
         let Some(stored) = self.sessions.get_mut(session_id) else {
             return Err(SessionMessageError::UnknownSession);
         };
@@ -2910,6 +3121,9 @@ impl SessionStoreInner {
         input: ReplaceSessionMessageInput,
     ) -> Result<ReplaceSessionMessageOutcome, SessionMessageError> {
         self.touch(&input.session_id);
+        if !self.prepare_active_session(&input.session_id) {
+            return Err(SessionMessageError::InvalidObservationState);
+        }
         let Some(stored) = self.sessions.get_mut(&input.session_id) else {
             return Err(SessionMessageError::UnknownSession);
         };
@@ -2977,6 +3191,7 @@ impl SessionStoreInner {
             return Err(SessionMessageError::MessageNotOpen);
         }
 
+        let message_id = allocate_message_id(record, webcodex_core::compact::random_suffix::<12>)?;
         let original_revision = record
             .message_observation_revision
             .checked_add(1)
@@ -2987,7 +3202,7 @@ impl SessionStoreInner {
         record.message_observation_revision = replacement_revision;
         let now = now_ts();
         let replacement = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: original_snapshot.kind,
@@ -3058,6 +3273,9 @@ impl SessionStoreInner {
         resolution: Option<String>,
     ) -> Result<(SessionMessage, bool), SessionMessageError> {
         self.touch(session_id);
+        if !self.prepare_active_session(session_id) {
+            return Err(SessionMessageError::InvalidObservationState);
+        }
         let Some(stored) = self.sessions.get_mut(session_id) else {
             return Err(SessionMessageError::UnknownSession);
         };
@@ -3116,6 +3334,9 @@ impl SessionStoreInner {
         current_request_acknowledged: bool,
     ) -> Result<(SessionMessage, bool), SessionMessageError> {
         self.touch(session_id);
+        if !self.prepare_active_session(session_id) {
+            return Err(SessionMessageError::InvalidObservationState);
+        }
         let Some(stored) = self.sessions.get_mut(session_id) else {
             return Err(SessionMessageError::UnknownSession);
         };
@@ -3157,7 +3378,7 @@ impl SessionStoreInner {
         }
         if snapshot.requires_ack && !current_request_acknowledged {
             return Err(SessionMessageError::InvalidInput(
-                "requires_ack guidance must be acknowledged on the same request before wrapper resolution"
+                "requires_ack message must be acknowledged on the same request before wrapper resolution"
                     .to_string(),
             ));
         }
@@ -3180,6 +3401,9 @@ impl SessionStoreInner {
         input: CompleteSessionMessageInput,
     ) -> Result<CompleteSessionMessageOutcome, SessionMessageError> {
         self.touch(&input.session_id);
+        if !self.prepare_active_session(&input.session_id) {
+            return Err(SessionMessageError::InvalidObservationState);
+        }
         let Some(stored) = self.sessions.get_mut(&input.session_id) else {
             return Err(SessionMessageError::UnknownSession);
         };
@@ -3301,6 +3525,7 @@ impl SessionStoreInner {
             });
         }
 
+        let message_id = allocate_message_id(record, webcodex_core::compact::random_suffix::<12>)?;
         let todo_revision = record
             .message_observation_revision
             .checked_add(1)
@@ -3312,7 +3537,7 @@ impl SessionStoreInner {
 
         let now = now_ts();
         let answer = SessionMessage {
-            message_id: format!("{MESSAGE_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            message_id,
             session_id: input.session_id.clone(),
             created_at: now,
             kind: super::model::SessionMessageKind::Answer,
@@ -3459,7 +3684,7 @@ impl SessionStoreInner {
     }
 
     fn to_persisted_ledger(&self) -> PersistedSessionLedger {
-        let sessions = self
+        let mut sessions: Vec<PersistedSessionSnapshot> = self
             .lru
             .iter()
             .filter_map(|session_id| self.sessions.get(session_id))
@@ -3472,6 +3697,11 @@ impl SessionStoreInner {
                 }
             })
             .collect();
+        sessions.extend(self.tombstones.values().cloned().map(|tombstone| {
+            PersistedSessionSnapshot::Tombstone(PersistedRetentionTombstoneRow {
+                retention_tombstone: tombstone,
+            })
+        }));
         PersistedSessionLedger {
             version: SESSION_LEDGER_VERSION,
             sessions,
@@ -3479,18 +3709,170 @@ impl SessionStoreInner {
     }
 
     pub(super) fn touch(&mut self, session_id: &str) {
-        self.lru.retain(|id| id != session_id);
-        if self.sessions.contains_key(session_id) {
-            self.lru.push_back(session_id.to_string());
+        if let Some(session) = self.sessions.get(session_id) {
+            self.lru
+                .touch(session_id, session.lifecycle() == SessionLifecycle::Closed);
         }
     }
 
-    fn enforce_session_bound(&mut self) {
-        while self.sessions.len() > self.max_sessions {
-            let Some(oldest) = self.lru.pop_front() else {
+    fn session_id_occupied(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id) || self.tombstone_ids.contains_key(session_id)
+    }
+
+    fn owned_retention_incarnation(
+        &self,
+        session_id: &str,
+        owner_authority_fingerprint: &str,
+    ) -> Option<String> {
+        let ordinal = self.tombstone_ids.get(session_id).copied()?;
+        let tombstone = self.tombstones.get(&ordinal)?;
+        if tombstone.session_id != session_id
+            || tombstone.owner_authority_fingerprint != owner_authority_fingerprint
+        {
+            return None;
+        }
+        Some(tombstone.incarnation_fingerprint.clone())
+    }
+
+    /// `expiry_ordinal` is relative order. A restored `u64::MAX` must not
+    /// permanently stop later tombstones, and it must not wrap.
+    fn needs_ordinal_compaction(&self) -> bool {
+        if self.expiry_ordinal_exhausted {
+            return true;
+        }
+        self.tombstones
+            .keys()
+            .next_back()
+            .is_some_and(|max| self.next_expiry_ordinal <= *max)
+    }
+
+    fn compact_expiry_ordinals(&mut self) {
+        let ordered: Vec<SessionRetentionTombstone> = self.tombstones.values().cloned().collect();
+        let Some(count) = u64::try_from(ordered.len())
+            .ok()
+            .filter(|count| *count < u64::MAX)
+        else {
+            self.next_expiry_ordinal = u64::MAX;
+            self.expiry_ordinal_exhausted = true;
+            return;
+        };
+        self.tombstones.clear();
+        self.tombstone_ids.clear();
+        for (index, mut tombstone) in ordered.into_iter().enumerate() {
+            let ordinal = u64::try_from(index).expect("compacted tombstone index fits in u64") + 1;
+            tombstone.expiry_ordinal = ordinal;
+            self.tombstone_ids
+                .insert(tombstone.session_id.clone(), ordinal);
+            self.tombstones.insert(ordinal, tombstone);
+        }
+        self.next_expiry_ordinal = count + 1;
+        self.expiry_ordinal_exhausted = false;
+    }
+
+    fn allocate_expiry_ordinal(&mut self) -> Option<u64> {
+        if self.needs_ordinal_compaction() {
+            self.compact_expiry_ordinals();
+        }
+        if self.expiry_ordinal_exhausted {
+            return None;
+        }
+        let ordinal = self.next_expiry_ordinal;
+        if self
+            .tombstones
+            .keys()
+            .next_back()
+            .is_some_and(|max| ordinal <= *max)
+        {
+            self.expiry_ordinal_exhausted = true;
+            return None;
+        }
+        match ordinal.checked_add(1) {
+            Some(next) => self.next_expiry_ordinal = next,
+            None => self.expiry_ordinal_exhausted = true,
+        }
+        Some(ordinal)
+    }
+
+    fn insert_tombstone(&mut self, tombstone: SessionRetentionTombstone) {
+        if self.sessions.contains_key(&tombstone.session_id) {
+            return;
+        }
+        if let Some(existing) = self.tombstone_ids.get(&tombstone.session_id).copied() {
+            if tombstone.expiry_ordinal <= existing {
+                return;
+            }
+            self.tombstones.remove(&existing);
+        }
+        if self.tombstones.contains_key(&tombstone.expiry_ordinal) {
+            return;
+        }
+        self.tombstone_ids
+            .insert(tombstone.session_id.clone(), tombstone.expiry_ordinal);
+        self.tombstones.insert(tombstone.expiry_ordinal, tombstone);
+        self.enforce_tombstone_bound();
+    }
+
+    fn enforce_tombstone_bound(&mut self) {
+        while self.tombstones.len() > self.historical_session_retention_limit {
+            let Some((ordinal, tombstone)) = self.tombstones.pop_first() else {
                 break;
             };
-            self.sessions.remove(&oldest);
+            if self.tombstone_ids.get(&tombstone.session_id) == Some(&ordinal) {
+                self.tombstone_ids.remove(&tombstone.session_id);
+            }
+        }
+    }
+
+    fn tombstone_from_closed_session(
+        &mut self,
+        session_id: &str,
+    ) -> Option<SessionRetentionTombstone> {
+        let (id, created_at, project, owner) = {
+            let stored = self.sessions.get(session_id)?;
+            incarnation_inputs(stored, self.max_events_per_session)?
+        };
+        if id != session_id {
+            return None;
+        }
+        let expiry_ordinal = self.allocate_expiry_ordinal()?;
+        Some(SessionRetentionTombstone {
+            incarnation_fingerprint: workflow_session_incarnation_fingerprint(
+                &id,
+                created_at,
+                project.as_deref(),
+                &owner,
+            ),
+            session_id: id,
+            owner_authority_fingerprint: owner,
+            expiry_ordinal,
+        })
+    }
+
+    fn enforce_historical_retention_bound(&mut self) {
+        while self.lru.closed_count() > self.historical_session_retention_limit {
+            let session_id = self
+                .lru
+                .oldest_closed()
+                .expect("closed count has an oldest entry")
+                .to_owned();
+            // Lifecycle remains authoritative; a recency index cannot authorize
+            // deleting an Active identity even if an internal invariant regresses.
+            if !self
+                .sessions
+                .get(&session_id)
+                .is_some_and(|session| session.lifecycle() == SessionLifecycle::Closed)
+            {
+                self.lru.remove(&session_id);
+                self.touch(&session_id);
+                continue;
+            }
+            let tombstone = self.tombstone_from_closed_session(&session_id);
+            self.sessions.remove(&session_id);
+            self.lru.remove(&session_id);
+            self.capacity_evictions = self.capacity_evictions.saturating_add(1);
+            if let Some(tombstone) = tombstone {
+                self.insert_tombstone(tombstone);
+            }
         }
     }
 
@@ -3498,4 +3880,81 @@ impl SessionStoreInner {
         let record = self.sessions.get(session_id)?.hot()?;
         Some(summarize_record(record, limit, None))
     }
+}
+
+/// Fingerprint inputs for a Closed row that can still prove its incarnation.
+/// A corrupt Cold payload that cannot be checked against its metadata yields
+/// no tombstone.
+fn incarnation_inputs(
+    stored: &StoredSession,
+    max_events: usize,
+) -> Option<(String, i64, Option<String>, String)> {
+    match stored {
+        StoredSession::Hot(record) => {
+            if record.lifecycle != SessionLifecycle::Closed {
+                return None;
+            }
+            validated_incarnation_inputs(
+                &record.session_id,
+                record.created_at,
+                record.project.clone(),
+                &record.owner_authority_fingerprint,
+            )
+        }
+        StoredSession::Cold(record) => {
+            if record.lifecycle != SessionLifecycle::Closed {
+                return None;
+            }
+            let materialized = materialize_cold_session(record, max_events)?;
+            if materialized.session_id != record.session_id
+                || materialized.owner_authority_fingerprint != record.owner_authority_fingerprint
+                || materialized.lifecycle != SessionLifecycle::Closed
+            {
+                return None;
+            }
+            validated_incarnation_inputs(
+                &materialized.session_id,
+                materialized.created_at,
+                materialized.project,
+                &materialized.owner_authority_fingerprint,
+            )
+        }
+    }
+}
+
+fn validated_incarnation_inputs(
+    session_id: &str,
+    created_at: i64,
+    project: Option<String>,
+    owner: &str,
+) -> Option<(String, i64, Option<String>, String)> {
+    if !is_valid_session_id(session_id) || !is_lower_hex_sha256(owner) {
+        return None;
+    }
+    Some((
+        session_id.to_string(),
+        created_at,
+        project,
+        owner.to_string(),
+    ))
+}
+
+// No retained identity or historical retained link may silently retarget.
+pub(super) fn allocate_message_id(
+    record: &SessionRecord,
+    mut suffix: impl FnMut() -> String,
+) -> Result<String, SessionMessageError> {
+    for _ in 0..16 {
+        let id = format!("{MESSAGE_ID_PREFIX}{}", suffix());
+        if !record.messages.iter().any(|m| {
+            m.message_id == id
+                || m.reply_to.as_deref() == Some(&id)
+                || m.resolved_by_message_id.as_deref() == Some(&id)
+                || m.superseded_by_message_id.as_deref() == Some(&id)
+                || m.supersedes_message_id.as_deref() == Some(&id)
+        }) {
+            return Ok(id);
+        }
+    }
+    Err(SessionMessageError::InvalidObservationState)
 }

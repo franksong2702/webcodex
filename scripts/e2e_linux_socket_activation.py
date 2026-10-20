@@ -34,7 +34,7 @@ from typing import Dict, Optional
 HTTP_FD_NAME = "webcodex-http"
 LISTEN_FD = 3
 HOST = "127.0.0.1"
-PROBE_PATH = "/openapi.json"
+PROBE_PATH = "/healthz"
 TOKEN = "linux-socket-activation-e2e-token"
 RUNNER_CLIENT_ID = "linux-graceful-drain-e2e"
 RUNNER_PROJECT_ID = "graceful-drain"
@@ -134,7 +134,7 @@ def wait_agent_online(port: int, proc: subprocess.Popen[bytes], timeout: float =
             raise RuntimeError(f"runner exited before online with code {proc.returncode}")
         try:
             status, body = api_post_json(port, "/api/runtime/status", {}, 1.0)
-            online = body.get("output", {}).get("agents", {}).get("online_count") if status == 200 else None
+            online = body.get("output", {}).get("runners", {}).get("online_count") if status == 200 else None
             last = f"status={status} online={online!r}"
             if online == 1:
                 return

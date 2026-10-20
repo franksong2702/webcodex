@@ -5,7 +5,6 @@ use super::super::kernel::{
 };
 use super::super::permissions::{AuthorityMode, PermissionEvaluator};
 use super::super::project_resolution::ResolvedProject;
-use super::super::sessions::SessionContextRevisionAck;
 use super::super::{ToolResult, ToolRuntime};
 use super::support::*;
 use crate::db::{memory_catalog_revision, MemoryPriority, MAX_MEMORY_BOOTSTRAP_BYTES};
@@ -24,6 +23,8 @@ fn resolved(id: &str, client: &str, root: &str) -> ResolvedProject {
             client_id: client.to_string(),
             allow_patch: true,
         },
+        root_fingerprint: None,
+        knowledge_association: None,
     }
 }
 
@@ -43,15 +44,11 @@ async fn list_files_with_session_context(
     client_id: &str,
     project: &str,
     session_id: &str,
-    ack_revision: Option<u64>,
     context_request: Vec<&str>,
 ) -> ToolResult {
     let arguments = json!({"project": project, "path": ".", "limit": 20});
     let invocation_metadata = ToolInvocationMetadata {
         context_request: context_request.into_iter().map(str::to_string).collect(),
-        ack_session_context_revision: ack_revision
-            .map(SessionContextRevisionAck::Revision)
-            .unwrap_or(SessionContextRevisionAck::Unacknowledged),
         ..Default::default()
     };
     let task = tokio::spawn({
@@ -75,7 +72,6 @@ async fn list_files_with_session_context(
                     },
                     invocation_metadata,
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         memory_surface: true,
                         ..Default::default()
@@ -287,7 +283,10 @@ fn memory_runtime_search_read_cas_pagination_and_project_scope_are_explicit() {
     let stale_read = runtime.memory_read(
         &project_a,
         "architecture-decisions".to_string(),
-        Some(format!("wc_memrev_{}", "0".repeat(64))),
+        Some(format!(
+            "wc_memrev_{}",
+            webcodex_core::compact::encode([0_u8; 32])
+        )),
     );
     assert!(!stale_read.success);
     assert_eq!(stale_read.output["error_kind"], "memory_changed");
@@ -571,11 +570,6 @@ async fn memory_bootstrap_is_lightweight_explicit_bounded_and_post_tool() {
             },
         )
         .await;
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        result.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     assert!(result.output["context_projection"]["materials"]
         .as_array()
         .unwrap()
@@ -769,10 +763,10 @@ async fn context_material_registry_enforces_scope_and_surface_before_provider() 
         .to_string()
         .contains("PRIVATE_MEMORY_BODY_MUST_NOT_LEAK_ON_DENIAL"));
 
-    let mut skill_surface_denied = ToolResult::ok(json!({"main": true}));
+    let mut skill_capability_denied = ToolResult::ok(json!({"main": true}));
     runtime
         .add_requested_context_projection(
-            &mut skill_surface_denied,
+            &mut skill_capability_denied,
             &["skills.catalog".to_string()],
             Some(&project),
             Some(&full),
@@ -783,14 +777,14 @@ async fn context_material_registry_enforces_scope_and_surface_before_provider() 
         )
         .await;
     assert_eq!(
-        skill_surface_denied.output["context_projection"]["materials"][0]["reason_code"],
+        skill_capability_denied.output["context_projection"]["materials"][0]["reason_code"],
         "context_material_surface_unavailable"
     );
 
-    let mut memory_surface_denied = ToolResult::ok(json!({"main": true}));
+    let mut memory_capability_denied = ToolResult::ok(json!({"main": true}));
     runtime
         .add_requested_context_projection(
-            &mut memory_surface_denied,
+            &mut memory_capability_denied,
             &["memory.bootstrap".to_string()],
             Some(&project),
             Some(&read_memory),
@@ -798,7 +792,7 @@ async fn context_material_registry_enforces_scope_and_surface_before_provider() 
         )
         .await;
     assert_eq!(
-        memory_surface_denied.output["context_projection"]["materials"][0]["reason_code"],
+        memory_capability_denied.output["context_projection"]["materials"][0]["reason_code"],
         "context_material_surface_unavailable"
     );
 
@@ -815,11 +809,6 @@ async fn context_material_registry_enforces_scope_and_surface_before_provider() 
     assert_eq!(
         public.output["context_projection"]["materials"][0]["status"],
         "available"
-    );
-    assert_eq!(public.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        public.output["context_projection"]["applies_to_current_effect"],
-        false
     );
 }
 
@@ -850,45 +839,29 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
     );
     let session = runtime.sessions.start_session(
         Some(project_id.clone()),
-        Some("memory ACK separation".to_string()),
+        Some("memory sidecar isolation".to_string()),
     );
 
-    let missing_ack = list_files_with_session_context(
+    let ordinary = list_files_with_session_context(
         &runtime,
         "memory-ack",
         &project_id,
         &session.session_id,
-        None,
         Vec::new(),
     )
     .await;
-    assert!(missing_ack.success);
-    assert!(missing_ack.output["session_context_revision"].is_u64());
-    assert!(missing_ack.output.get("context_projection").is_none());
-    assert!(!missing_ack.output.to_string().contains(private_summary));
-
-    let exact = list_files_with_session_context(
-        &runtime,
-        "memory-ack",
-        &project_id,
-        &session.session_id,
-        Some(0),
-        Vec::new(),
-    )
-    .await;
-    assert!(exact.success);
-    assert!(exact.output.get("session_context_revision").is_none());
-    assert!(exact.output.get("session_continuity").is_none());
-    assert!(exact.output.get("session_recovery").is_none());
-    assert!(exact.output.get("context_projection").is_none());
-    assert!(!exact.output.to_string().contains(private_summary));
+    assert!(ordinary.success);
+    assert!(ordinary.output.get("session_context_revision").is_none());
+    assert!(ordinary.output.get("session_continuity").is_none());
+    assert!(ordinary.output.get("session_recovery").is_none());
+    assert!(ordinary.output.get("context_projection").is_none());
+    assert!(!ordinary.output.to_string().contains(private_summary));
 
     let explicit = list_files_with_session_context(
         &runtime,
         "memory-ack",
         &project_id,
         &session.session_id,
-        Some(0),
         vec!["memory.bootstrap"],
     )
     .await;
@@ -901,13 +874,12 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
         .unwrap();
     assert_eq!(material["status"], "available");
     assert!(material.to_string().contains(private_summary));
-    assert_eq!(explicit.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        explicit.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
-    assert!(!explicit.output["session_recovery"]
-        .to_string()
+    let ledger = runtime
+        .sessions
+        .summary(&session.session_id, Some(100))
+        .unwrap();
+    assert!(!serde_json::to_string(&ledger)
+        .unwrap()
         .contains(private_summary));
 }
 
@@ -937,7 +909,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
         ..Default::default()
     };
     let set_request = |key: &str| ToolCallRequest {
-        tool_name: "memory_set".to_string(),
+        tool_name: "set_memory".to_string(),
         arguments: json!({
             "project": project,
             "memory_key": key,
@@ -946,7 +918,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
         }),
     };
     let read_request = || ToolCallRequest {
-        tool_name: "memory_read".to_string(),
+        tool_name: "read_memory".to_string(),
         arguments: json!({"project": project, "memory_key": "authority-test"}),
     };
 
@@ -976,7 +948,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
     let private_marker = runtime
         .call_tool_with_invocation_metadata(
             ToolCallRequest {
-                tool_name: "memory_set".to_string(),
+                tool_name: "set_memory".to_string(),
                 arguments: json!({
                     "project": project,
                     "memory_key": "private-marker",
@@ -1017,13 +989,13 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
         crate::auth::SCOPE_MEMORY_MANAGE,
     ]);
 
-    for tool in ["memory_search", "memory_read"] {
+    for tool in ["search_memory", "read_memory"] {
         assert!(check_runtime_tool_scope(Some(&project_read_only), tool).is_err());
         assert!(check_runtime_tool_scope(Some(&memory_read_only), tool).is_err());
         assert!(check_runtime_tool_scope(Some(&read_both), tool).is_ok());
         assert!(check_runtime_tool_scope(Some(&manage_both), tool).is_err());
     }
-    for tool in ["memory_set", "memory_delete"] {
+    for tool in ["set_memory", "delete_memory"] {
         assert!(check_runtime_tool_scope(Some(&project_write_only), tool).is_err());
         assert!(check_runtime_tool_scope(Some(&memory_manage_only), tool).is_err());
         assert!(check_runtime_tool_scope(Some(&manage_both), tool).is_ok());
@@ -1095,7 +1067,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
             surface,
         )
         .await;
-    let allowed_result = allowed.result.expect("memory_set result");
+    let allowed_result = allowed.result.expect("set_memory result");
     assert!(allowed_result.success, "{}", allowed_result.output);
     assert!(
         allowed_result.output.get("permission").is_none(),
@@ -1107,7 +1079,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
         .call_tool_with_protocol_capabilities(read_request(), context(Some(&read_both)), surface)
         .await
         .result
-        .expect("memory_read result");
+        .expect("read_memory result");
     assert!(read_allowed.success);
     assert!(read_allowed.output["body"]
         .as_str()
@@ -1117,7 +1089,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
     let manage_with_bootstrap = runtime
         .call_tool_with_invocation_metadata(
             ToolCallRequest {
-                tool_name: "memory_set".to_string(),
+                tool_name: "set_memory".to_string(),
                 arguments: json!({
                     "project": project,
                     "memory_key": "management-without-read",
@@ -1137,7 +1109,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
         )
         .await
         .result
-        .expect("memory_set result with denied bootstrap sidecar");
+        .expect("set_memory result with denied bootstrap sidecar");
     assert!(manage_with_bootstrap.success);
     let denied_bootstrap = manage_with_bootstrap.output["context_projection"]["materials"]
         .as_array()
@@ -1155,7 +1127,7 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
     let mutation_with_bootstrap = runtime
         .call_tool_with_invocation_metadata(
             ToolCallRequest {
-                tool_name: "memory_set".to_string(),
+                tool_name: "set_memory".to_string(),
                 arguments: json!({
                     "project": project,
                     "memory_key": "post-tool-proof",
@@ -1176,23 +1148,15 @@ async fn memory_surface_scopes_and_permission_are_independent_authority() {
         )
         .await
         .result
-        .expect("memory_set sidecar result");
+        .expect("set_memory sidecar result");
     assert!(mutation_with_bootstrap.success);
-    assert_eq!(
-        mutation_with_bootstrap.output["context_projection"]["timing"],
-        "post_tool"
-    );
-    assert_eq!(
-        mutation_with_bootstrap.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     assert_eq!(
         mutation_with_bootstrap.output["context_projection"]["materials"][0]["status"],
         "available"
     );
 
     let restricted = PermissionEvaluator::with_mode(AuthorityMode::Restricted)
-        .evaluate("apply_text_edits", None)
+        .evaluate("edit_project_files", None)
         .expect("mutation remains permission-bearing");
     assert!(!restricted.allows_execution());
 }
@@ -1551,6 +1515,7 @@ async fn memory_scope_missing_or_incomplete_inventory_is_unknown_until_complete(
         .runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -1788,7 +1753,7 @@ async fn memory_scope_lifecycle_authority_surface_and_permission_are_independent
     let (runtime, _tmp) = runtime_with_memory();
     let admin = bootstrap_auth_context();
     let non_admin = shared_key_auth_context("memory-lifecycle-nonadmin");
-    for tool in ["memory_scope_list", "memory_scope_purge"] {
+    for tool in ["list_memory_scopes", "purge_memory_scope"] {
         assert!(matches!(
             check_runtime_tool_scope(None, tool),
             Err(ToolCallErrorStatus::InsufficientScope {
@@ -1816,7 +1781,7 @@ async fn memory_scope_lifecycle_authority_surface_and_permission_are_independent
     let hidden = runtime
         .call_tool_with_protocol_capabilities(
             ToolCallRequest {
-                tool_name: "memory_scope_list".to_string(),
+                tool_name: "list_memory_scopes".to_string(),
                 arguments: json!({}),
             },
             context(Some(&admin)),
@@ -1830,7 +1795,7 @@ async fn memory_scope_lifecycle_authority_surface_and_permission_are_independent
     let denied = runtime
         .call_tool_with_protocol_capabilities(
             ToolCallRequest {
-                tool_name: "memory_scope_list".to_string(),
+                tool_name: "list_memory_scopes".to_string(),
                 arguments: json!({}),
             },
             context(Some(&non_admin)),
@@ -1850,7 +1815,7 @@ async fn memory_scope_lifecycle_authority_surface_and_permission_are_independent
     let allowed = runtime
         .call_tool_with_protocol_capabilities(
             ToolCallRequest {
-                tool_name: "memory_scope_list".to_string(),
+                tool_name: "list_memory_scopes".to_string(),
                 arguments: json!({}),
             },
             context(Some(&admin)),
@@ -1901,7 +1866,7 @@ async fn memory_scope_lifecycle_authority_surface_and_permission_are_independent
     let outcome = restricted
         .call_tool_with_protocol_capabilities(
             ToolCallRequest {
-                tool_name: "memory_scope_purge".to_string(),
+                tool_name: "purge_memory_scope".to_string(),
                 arguments: json!({
                     "memory_scope_id": scope_id,
                     "expected_catalog_revision": catalog_revision,
@@ -1967,7 +1932,7 @@ async fn session_and_skill_observations_do_not_automatically_create_memory() {
             runtime
                 .call_tool_with_protocol_capabilities(
                     ToolCallRequest {
-                        tool_name: "skill_list".to_string(),
+                        tool_name: "list_skills".to_string(),
                         arguments: json!({"project": project_id}),
                     },
                     ToolCallContext {
@@ -1990,7 +1955,7 @@ async fn session_and_skill_observations_do_not_automatically_create_memory() {
     while !task.is_finished() {
         assert!(
             std::time::Instant::now() < deadline,
-            "skill_list fixture timed out"
+            "list_skills fixture timed out"
         );
         if let Some(request) = probe_patch_agent_request(&runtime, "memory-no-auto").await {
             let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&request);
@@ -2010,7 +1975,7 @@ async fn session_and_skill_observations_do_not_automatically_create_memory() {
     let skill_outcome = task.await.unwrap();
     let skill_result = skill_outcome
         .result
-        .unwrap_or_else(|| panic!("skill_list failed: {:?}", skill_outcome.error_status));
+        .unwrap_or_else(|| panic!("list_skills failed: {:?}", skill_outcome.error_status));
     assert!(skill_result.success, "{}", skill_result.output);
     assert_eq!(skill_result.output["total_count"], 0);
     assert_eq!(
@@ -2059,7 +2024,7 @@ fn memory_catalog_revision_depends_only_on_key_revision_pairs() {
     let tags = vec!["tag".to_string()];
     let records = [
         crate::db::ProjectMemoryRecord {
-            memory_id: "wc_mem_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            memory_id: "wc_mem_qqqqqqqqqqqqqqqq".to_string(),
             memory_key: "b".to_string(),
             summary: "summary".to_string(),
             body: "body".to_string(),
@@ -2072,12 +2037,12 @@ fn memory_catalog_revision_depends_only_on_key_revision_pairs() {
             updated_by_kind: "test".to_string(),
             updated_by_principal_digest: Some(format!("wc_memprincipal_{}", "1".repeat(64))),
             generation: 1,
-            revision: format!("wc_memrev_{}", "b".repeat(64)),
+            revision: format!("wc_memrev_{}", webcodex_core::compact::encode([0xbb; 32])),
             created_at_unix_ms: 1,
             updated_at_unix_ms: 99,
         },
         crate::db::ProjectMemoryRecord {
-            memory_id: "wc_mem_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            memory_id: "wc_mem_u7u7u7u7u7u7u7u7".to_string(),
             memory_key: "a".to_string(),
             summary: "other".to_string(),
             body: "different".to_string(),
@@ -2090,7 +2055,7 @@ fn memory_catalog_revision_depends_only_on_key_revision_pairs() {
             updated_by_kind: "test".to_string(),
             updated_by_principal_digest: Some(format!("wc_memprincipal_{}", "2".repeat(64))),
             generation: 1,
-            revision: format!("wc_memrev_{}", "a".repeat(64)),
+            revision: format!("wc_memrev_{}", webcodex_core::compact::encode([0xaa; 32])),
             created_at_unix_ms: 2,
             updated_at_unix_ms: 3,
         },

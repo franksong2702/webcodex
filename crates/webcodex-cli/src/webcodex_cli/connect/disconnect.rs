@@ -1,9 +1,9 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use webcodex_admin::{build_server_http_client, ServerHttpOptions};
+use webcodex_admin::ServerHttpOptions;
 
 use super::super::connections::{canonical_server_url, ensure_real_directory_tree};
-use super::super::http::{post_json_authed, ApiCall};
+use super::super::http::call_runtime_tool_status;
 use super::super::profiles::{
     client_output_dir_for_profile, client_state_dir_for_profile, default_client_base_dir,
     default_client_state_base_dir, validate_client_profile,
@@ -332,15 +332,26 @@ async fn unregister_live_project(
 ) -> Result<String, LiveUnregisterError> {
     let server =
         canonical_server_url(&config.server_url).map_err(LiveUnregisterError::NoUnregister)?;
-    let list = post_json_authed(ApiCall {
-        server_url: &server.url,
+    let (list_status, list_content_type, list_body) = call_runtime_tool_status(
+        &server.url,
         server_http,
-        token: observer_token,
-        path: "/api/projects/list",
-        body: json!({}),
-    })
+        Some(observer_token),
+        "list_projects",
+        json!({}),
+    )
     .await
     .map_err(LiveUnregisterError::NoUnregister)?;
+    if !(200..300).contains(&list_status) {
+        return Err(LiveUnregisterError::NoUnregister(format!(
+            "canonical list_projects failed before unregister dispatch: HTTP {list_status} ({list_content_type})"
+        )));
+    }
+    let list = list_body.ok_or_else(|| {
+        LiveUnregisterError::NoUnregister(
+            "canonical list_projects returned no JSON body; unregister was not dispatched"
+                .to_string(),
+        )
+    })?;
     let projects = list
         .pointer("/output/projects")
         .or_else(|| list.get("projects"))
@@ -400,40 +411,44 @@ async fn post_live_unregister(
     runtime_project_id: &str,
     expected_revision: &str,
 ) -> Result<Value, LiveUnregisterError> {
-    let url = format!(
-        "{}/api/projects/unregister",
-        server_url.trim_end_matches('/')
-    );
-    let client = build_server_http_client(server_http).map_err(|_| {
-        LiveUnregisterError::NoUnregister(
-            "failed to configure Server HTTP client; unregister was not dispatched".to_string(),
-        )
-    })?;
-    let response = client
-        .post(url)
-        .bearer_auth(token)
-        .json(&json!({
+    let (status, _content_type, parsed) = call_runtime_tool_status(
+        server_url,
+        server_http,
+        Some(token),
+        "unregister_project",
+        json!({
             "project": runtime_project_id,
             "expected_revision": expected_revision,
-        }))
-        .send()
-        .await
-        .map_err(|_| {
-            LiveUnregisterError::OutcomeUnknown(
-                "Server transport did not return an unregister response",
-            )
-        })?;
-    let status = response.status();
-    let text = response.text().await.map_err(|_| {
-        LiveUnregisterError::OutcomeUnknown("Server unregister response could not be read")
+        }),
+    )
+    .await
+    .map_err(|_| {
+        LiveUnregisterError::OutcomeUnknown(
+            "Server transport did not return an unregister response",
+        )
     })?;
-    if !status.is_success() {
-        let parsed = serde_json::from_str::<Value>(&text).ok();
-        let code = parsed
-            .as_ref()
-            .and_then(|value| value.pointer("/error/code"))
-            .and_then(Value::as_str);
-        if matches!(code, Some("operation_indeterminate" | "operation_failed")) {
+    let Some(parsed) = parsed else {
+        return Err(LiveUnregisterError::OutcomeUnknown(
+            "Server unregister response was not valid JSON",
+        ));
+    };
+    if !(200..300).contains(&status) || parsed.get("success").and_then(Value::as_bool) != Some(true)
+    {
+        let output = parsed.get("output").unwrap_or(&Value::Null);
+        let code = output
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .or_else(|| output.get("error_code").and_then(Value::as_str))
+            .or_else(|| output.get("error_kind").and_then(Value::as_str));
+        let execution_state = output.get("execution_state").and_then(Value::as_str);
+        let error = parsed
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if execution_state == Some("outcome_unknown")
+            || matches!(code, Some("operation_indeterminate" | "operation_failed"))
+            || error.contains("operation_indeterminate")
+        {
             return Err(LiveUnregisterError::OutcomeUnknown(
                 "Server could not prove a terminal unregister outcome",
             ));
@@ -443,18 +458,17 @@ async fn post_live_unregister(
                 "Server rejected unregister without a project removal outcome: {code}"
             )));
         }
-        if matches!(status.as_u16(), 400 | 401 | 403) {
+        if matches!(status, 400 | 401 | 403) {
             return Err(LiveUnregisterError::NoUnregister(format!(
-                "Server rejected unregister before Runner dispatch: HTTP {}",
-                status.as_u16()
+                "Server rejected unregister before Runner dispatch: HTTP {status}"
             )));
         }
         return Err(LiveUnregisterError::OutcomeUnknown(
             "Server returned an unclassified unregister failure",
         ));
     }
-    serde_json::from_str(&text).map_err(|_| {
-        LiveUnregisterError::OutcomeUnknown("Server unregister response was not valid JSON")
+    parsed.get("output").cloned().ok_or({
+        LiveUnregisterError::OutcomeUnknown("canonical unregister_project response omitted output")
     })
 }
 
@@ -539,6 +553,8 @@ fn remove_exact_registration(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::webcodex_cli::test_support::canonical_test_tempdir;
+    #[cfg(unix)]
+    use crate::webcodex_cli::test_support::executable_test_tempdir;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -595,34 +611,6 @@ mod tests {
         assert!(error.contains("one, two"), "{error}");
         let explicit = resolve_registration(&config, &state, &canonical, Some("two")).unwrap();
         assert_eq!(explicit.project.id, "different-id");
-    }
-
-    #[test]
-    fn resolve_registration_accepts_a_single_legacy_registry_layout() {
-        let tmp = canonical_test_tempdir();
-        let config = tmp.path().join("config");
-        let state = tmp.path().join("state");
-        let project = tmp.path().join("repo");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(config.join("clients")).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
-        let (profile_dir, _) = write_profile(&config, &state, "one", &project, "repo");
-        std::fs::rename(
-            profile_dir.join("project-registry"),
-            profile_dir.join("projects.d"),
-        )
-        .unwrap();
-
-        let resolved = resolve_registration(
-            &config,
-            &state,
-            &project.canonicalize().unwrap(),
-            Some("one"),
-        )
-        .unwrap();
-        assert_eq!(resolved.project.id, "repo");
-        assert_eq!(resolved.profile_dir, profile_dir);
-        assert!(profile_dir.join("projects.d/repo.toml").is_file());
     }
 
     #[cfg(unix)]
@@ -704,7 +692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_disconnect_accepts_legacy_agent_toml_only() {
+    async fn offline_disconnect_does_not_discover_retired_agent_toml() {
         let tmp = canonical_test_tempdir();
         let config = tmp.path().join("config");
         let state = tmp.path().join("state");
@@ -712,38 +700,8 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(config.join("clients")).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        let (profile_dir, _) = write_profile(&config, &state, "legacy", &project, "repo");
+        let (profile_dir, _) = write_profile(&config, &state, "retired", &project, "repo");
         std::fs::rename(
-            profile_dir.join("runner.toml"),
-            profile_dir.join("agent.toml"),
-        )
-        .unwrap();
-
-        let result = run_disconnect(DisconnectOptions {
-            project,
-            profile: Some("legacy".to_string()),
-            config_base: Some(config),
-            state_base: Some(state),
-            server_http: ServerHttpOptions::default(),
-        })
-        .await
-        .unwrap();
-        assert_eq!(result.outcome, "local_unregistered");
-        assert!(profile_dir.join("agent.toml").is_file());
-        assert!(!profile_dir.join("runner.toml").exists());
-    }
-
-    #[tokio::test]
-    async fn offline_disconnect_rejects_dual_runner_config_names() {
-        let tmp = canonical_test_tempdir();
-        let config = tmp.path().join("config");
-        let state = tmp.path().join("state");
-        let project = tmp.path().join("repo");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(config.join("clients")).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
-        let (profile_dir, _) = write_profile(&config, &state, "dual", &project, "repo");
-        std::fs::copy(
             profile_dir.join("runner.toml"),
             profile_dir.join("agent.toml"),
         )
@@ -751,19 +709,48 @@ mod tests {
 
         let error = run_disconnect(DisconnectOptions {
             project,
-            profile: Some("dual".to_string()),
+            profile: Some("retired".to_string()),
             config_base: Some(config),
             state_base: Some(state),
             server_http: ServerHttpOptions::default(),
         })
         .await
         .unwrap_err();
-        assert!(error.contains("runner.toml"));
-        assert!(error.contains("agent.toml"));
-        assert!(error.contains("refusing to guess"));
+        assert!(error.contains("has no Runner config"), "{error}");
+        assert!(profile_dir.join("agent.toml").is_file());
         assert!(profile_dir.join("project-registry/repo.toml").is_file());
     }
 
+    #[tokio::test]
+    async fn offline_disconnect_ignores_retired_agent_toml_next_to_canonical() {
+        let tmp = canonical_test_tempdir();
+        let config = tmp.path().join("config");
+        let state = tmp.path().join("state");
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(config.join("clients")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let (profile_dir, _) = write_profile(&config, &state, "canonical", &project, "repo");
+        std::fs::copy(
+            profile_dir.join("runner.toml"),
+            profile_dir.join("agent.toml"),
+        )
+        .unwrap();
+
+        let result = run_disconnect(DisconnectOptions {
+            project,
+            profile: Some("canonical".to_string()),
+            config_base: Some(config),
+            state_base: Some(state),
+            server_http: ServerHttpOptions::default(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.outcome, "local_unregistered");
+        assert_eq!(result.runner_action, "not_running");
+        assert!(profile_dir.join("agent.toml").is_file());
+        assert!(!profile_dir.join("project-registry/repo.toml").exists());
+    }
     #[tokio::test]
     async fn offline_oauth_unregister_does_not_require_managed_login() {
         let tmp = canonical_test_tempdir();
@@ -812,18 +799,20 @@ mod tests {
                 let read = stream.read(&mut request).unwrap();
                 let text = String::from_utf8_lossy(&request[..read]);
                 let (path, body) = if index == 0 {
-                    assert!(text.starts_with("POST /api/projects/list "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"list_projects""#), "{text}");
                     (
-                        "/api/projects/list",
+                        "/api/tools/call",
                         json!({"success":true,"output":{"projects":[{"id":"agent:client:repo","revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}),
                     )
                 } else {
-                    assert!(text.starts_with("POST /api/projects/unregister "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"unregister_project""#), "{text}");
                     assert!(text.contains("agent:client:repo"), "{text}");
                     assert!(text.contains("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "{text}");
                     (
-                        "/api/projects/unregister",
-                        json!({"operation":"unregister","project":"agent:client:repo","outcome":"unregistered","changed":true}),
+                        "/api/tools/call",
+                        json!({"success":true,"output":{"operation":"unregister","project":"agent:client:repo","outcome":"unregistered","changed":true}}),
                     )
                 };
                 let _ = path;
@@ -863,7 +852,7 @@ mod tests {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = canonical_test_tempdir();
+        let tmp = executable_test_tempdir();
         let config_base = tmp.path().join("config");
         let state_base = tmp.path().join("state");
         let project = tmp.path().join("repo");
@@ -884,12 +873,17 @@ mod tests {
         let registration = profile_dir.join("project-registry/repo.toml");
 
         let runner = tmp.path().join("webcodex-runner");
+        // Publish the stub atomically: a plain in-place write leaves a window
+        // where a concurrent writer of the same path makes execve fail with
+        // ETXTBSY under parallel test load.
+        let runner_stub = tmp.path().join("webcodex-runner.stub");
         std::fs::write(
-            &runner,
+            &runner_stub,
             "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
         )
         .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&runner_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&runner_stub, &runner).unwrap();
         assert_eq!(
             super::super::process::ensure_runner_unlocked(
                 &runner,
@@ -909,12 +903,14 @@ mod tests {
                 let read = stream.read(&mut request).unwrap();
                 let text = String::from_utf8_lossy(&request[..read]);
                 let payload = if index == 0 {
-                    assert!(text.starts_with("POST /api/projects/list "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"list_projects""#), "{text}");
                     json!({"success":true,"output":{"projects":[{"id":"agent:client:repo","revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}).to_string()
                 } else {
-                    assert!(text.starts_with("POST /api/projects/unregister "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"unregister_project""#), "{text}");
                     std::fs::remove_file(&registration_for_server).unwrap();
-                    json!({"operation":"unregister","project":"agent:client:repo","outcome":"unregistered","changed":true}).to_string()
+                    json!({"success":true,"output":{"operation":"unregister","project":"agent:client:repo","outcome":"unregistered","changed":true}}).to_string()
                 };
                 write!(
                     stream,
@@ -956,7 +952,7 @@ mod tests {
     async fn lost_unregister_response_reobserves_runner_removed_registration_as_absent() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = canonical_test_tempdir();
+        let tmp = executable_test_tempdir();
         let config_base = tmp.path().join("config");
         let state_base = tmp.path().join("state");
         let project = tmp.path().join("repo");
@@ -977,12 +973,17 @@ mod tests {
         let registration = profile_dir.join("project-registry/repo.toml");
 
         let runner = tmp.path().join("webcodex-runner");
+        // Publish the stub atomically: a plain in-place write leaves a window
+        // where a concurrent writer of the same path makes execve fail with
+        // ETXTBSY under parallel test load.
+        let runner_stub = tmp.path().join("webcodex-runner.stub");
         std::fs::write(
-            &runner,
+            &runner_stub,
             "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
         )
         .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&runner_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&runner_stub, &runner).unwrap();
         assert_eq!(
             super::super::process::ensure_runner_unlocked(
                 &runner,
@@ -1002,7 +1003,8 @@ mod tests {
                 let read = stream.read(&mut request).unwrap();
                 let text = String::from_utf8_lossy(&request[..read]);
                 if index == 0 {
-                    assert!(text.starts_with("POST /api/projects/list "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"list_projects""#), "{text}");
                     let payload = json!({"success":true,"output":{"projects":[{"id":"agent:client:repo","revision":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}}).to_string();
                     write!(
                         stream,
@@ -1012,7 +1014,8 @@ mod tests {
                     )
                     .unwrap();
                 } else {
-                    assert!(text.starts_with("POST /api/projects/unregister "), "{text}");
+                    assert!(text.starts_with("POST /api/tools/call "), "{text}");
+                    assert!(text.contains(r#""tool":"unregister_project""#), "{text}");
                     assert!(text.contains("agent:client:repo"), "{text}");
                     std::fs::remove_file(&registration_for_server).unwrap();
                     // Simulate Runner authoritative removal followed by a lost
@@ -1064,7 +1067,8 @@ mod tests {
             let mut request = vec![0u8; 16 * 1024];
             let read = stream.read(&mut request).unwrap();
             let text = String::from_utf8_lossy(&request[..read]);
-            assert!(text.starts_with("POST /api/projects/list "), "{text}");
+            assert!(text.starts_with("POST /api/tools/call "), "{text}");
+            assert!(text.contains(r#""tool":"list_projects""#), "{text}");
             let payload = json!({"success":true,"output":{"projects":[]}}).to_string();
             write!(
                 stream,
@@ -1108,14 +1112,19 @@ mod tests {
     fn last_project_disconnect_stops_managed_runner() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = canonical_test_tempdir();
+        let tmp = executable_test_tempdir();
         let runner = tmp.path().join("webcodex-runner");
+        // Publish the stub atomically: a plain in-place write leaves a window
+        // where a concurrent writer of the same path makes execve fail with
+        // ETXTBSY under parallel test load.
+        let runner_stub = tmp.path().join("webcodex-runner.stub");
         std::fs::write(
-            &runner,
+            &runner_stub,
             "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
         )
         .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&runner_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&runner_stub, &runner).unwrap();
         let config = tmp.path().join("runner.toml");
         std::fs::write(&config, "server_url='http://example.test'\n").unwrap();
         let state = tmp.path().join("state");

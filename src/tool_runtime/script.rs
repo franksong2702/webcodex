@@ -1,15 +1,13 @@
 use serde_json::json;
-use std::time::Duration;
 
 use super::helpers::{command_rejected_message, project_relative_runner_cwd, resolve_runner_cwd};
 use super::process::{
-    add_structured_continuation_facts, classify_process_failure, command_failure_result,
-    outcome_unknown_result, process_tool_failure_result, success_output,
-    terminal_structured_job_result,
+    add_structured_continuation_facts, execution_admission_failure_result,
+    process_tool_failure_result,
 };
-use super::shell::{dispatch_uncertainty_lifecycle, runner_command_lifecycle};
 use super::structured_execution::{
-    await_hidden_structured_job, HiddenStructuredJobWait, StructuredExecutionBudget,
+    await_structured_job_result, await_structured_request_result, StructuredExecutionBudget,
+    StructuredRequestKind,
 };
 use super::tool_audit::{assertion_validation_identity, run_script_validation_identity};
 use super::{ExecutionPurpose, ToolResult, ToolRuntime};
@@ -57,13 +55,13 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         let budget =
-            match StructuredExecutionBudget::resolve_with_sync_wait(timeout_secs, sync_wait_secs) {
+            match StructuredExecutionBudget::resolve_script_with_sync_wait(timeout_secs, sync_wait_secs) {
             Ok(budget) => budget,
             Err(error) => {
                 return process_tool_failure_result(
                     command_rejected_message(
                         format!("run_script {error}"),
-                        "pass timeout_secs between 1 and 3600 and sync_wait_secs between 1 and 60 without exceeding timeout_secs; both may be omitted for their defaults.",
+                        "pass positive timeout_secs/sync_wait_secs values or omit them for defaults; oversized values are clamped to the supported runtime and synchronous-wait ceilings.",
                     ),
                     "invalid_arguments",
                     ShellCommandExecutionState::NotStarted,
@@ -149,8 +147,9 @@ impl ToolRuntime {
         if async_handoff_available && timeout > budget.sync_wait_secs {
             let job = self
                 .runner_registry
-                .start_job_with_metadata_for_access(
+                .start_job_with_metadata_for_access_typed(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: Some(effective_cwd),
@@ -192,14 +191,10 @@ impl ToolRuntime {
             let job = match job {
                 Ok(job) => job,
                 Err(error) => {
-                    let mut result = process_tool_failure_result(
-                            command_rejected_message(
-                                &error,
-                                "confirm the Runner is connected and advertises structured_execution_jobs, then retry only if target state proves no script started.",
-                            ),
-                            classify_process_failure(&error),
-                            ShellCommandExecutionState::NotStarted,
-                        );
+                    let mut result = execution_admission_failure_result(
+                        error,
+                        "confirm the Runner is connected and advertises structured_execution_jobs, then retry only if target state proves no script started.",
+                    );
                     decorate(
                         &mut result.output,
                         declared_purpose,
@@ -217,81 +212,20 @@ impl ToolRuntime {
                     return result;
                 }
             };
-            let wait = self
-                .structured_execution_sync_wait
-                .min(Duration::from_secs(budget.sync_wait_secs));
-            let handoff = await_hidden_structured_job(
+            let mut result = match await_structured_job_result(
                 self.runner_registry.clone(),
-                job.job_id.clone(),
-                wait,
-                auth.cloned(),
+                job.job_id,
+                self.structured_execution_sync_wait,
+                auth,
+                budget,
+                &summary,
+                declared_purpose,
             )
-            .await;
-            let mut result = match handoff {
-                Ok(HiddenStructuredJobWait::Terminal {
-                    job,
-                    stdout,
-                    stderr,
-                }) => {
-                    let result = terminal_structured_job_result(&job, stdout, stderr, timeout);
-                    self.runner_registry
-                        .remove_projected_hidden_structured_job_record(&job.job_id)
-                        .await;
-                    result
-                }
-                Ok(HiddenStructuredJobWait::Continued {
-                    observation,
-                    execution_state,
-                    command_started,
-                }) => {
-                    let detected_summary =
-                        crate::tool_runtime::jobs::detected_job_summary_with_activity(
-                            Some(&summary),
-                            Some(declared_purpose.as_str()),
-                            &observation.job.status,
-                            observation.job.exit_code.map(i64::from),
-                            &observation.stdout_tail,
-                            &observation.stderr_tail,
-                            observation.job.activity.as_ref(),
-                        );
-                    ToolResult::ok(json!({
-                        "execution_state": execution_state,
-                        "command_started": command_started,
-                        "command_completed": false,
-                        "command_ok": false,
-                        "exit_code": null,
-                        "failure_kind": null,
-                        "tool_failure": false,
-                        "promoted_to_job": true,
-                        "terminal": false,
-                        "job_id": observation.job.job_id,
-                        "job_status": observation.job.status,
-                        "observation_token": observation.job.observation_token,
-                        "activity": observation.job.activity,
-                        "effective_timeout_secs": timeout,
-                        "sync_wait_secs": budget.sync_wait_secs,
-                        "async_handoff_available": true,
-                        "stdout_tail": observation.stdout_tail,
-                        "stderr_tail": observation.stderr_tail,
-                        "stdout_lines": observation.stdout_lines,
-                        "stderr_lines": observation.stderr_lines,
-                        "stdout_truncated": observation.stdout_truncated,
-                        "stderr_truncated": observation.stderr_truncated,
-                        "detected_summary": detected_summary,
-                    }))
-                }
-                Err(error) => outcome_unknown_result(format!(
-                    "the durable script Job could not be observed during handoff: {error}"
-                )),
+            .await
+            {
+                Ok(result) => result,
+                Err(failure) => return failure.into_tool_result(&project, budget),
             };
-            if result.output["promoted_to_job"] != json!(true) {
-                add_structured_continuation_facts(
-                    &mut result,
-                    timeout,
-                    budget.sync_wait_secs,
-                    true,
-                );
-            }
             decorate(
                 &mut result.output,
                 declared_purpose,
@@ -304,126 +238,39 @@ impl ToolRuntime {
         }
         let wait_timeout = timeout;
         let (request_id, receiver) = match self
-                .runner_registry
-                .enqueue_script(
-                    client_id,
-                    Some(effective_cwd),
-                    payload,
-                    stdin,
-                    timeout,
-                    wait_timeout,
-                    "tool_runtime".to_string(),
-                )
-                .await
-            {
-                Ok(enqueued) => enqueued,
-                Err(error) => {
-                    return process_tool_failure_result(
-                        command_rejected_message(
-                            &error,
-                            "confirm the Runner is connected and advertises structured_script_payload, then retry only if target state proves no script started.",
-                        ),
-                        classify_process_failure(&error),
-                        ShellCommandExecutionState::NotStarted,
-                    )
-                }
-            };
-        let mut result = match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), receiver)
+            .runner_registry
+            .enqueue_script_typed(
+                client_id,
+                Some(effective_cwd),
+                payload,
+                stdin,
+                timeout,
+                wait_timeout,
+                "tool_runtime".to_string(),
+            )
             .await
         {
-            Ok(Ok(response)) => {
-                let state = runner_command_lifecycle(&response, timeout);
-                let exit_code = response.exit_code;
-                let stdout = response.stdout.unwrap_or_default();
-                let stderr = response.stderr.unwrap_or_default();
-                match state {
-                    ShellCommandExecutionState::NotStarted => {
-                        let reason = response
-                            .error
-                            .as_deref()
-                            .unwrap_or("Runner rejected the script before spawn");
-                        process_tool_failure_result(
-                                    command_rejected_message(
-                                        reason,
-                                        "inspect the rejection, correct language/script/args/cwd, then retry.",
-                                    ),
-                                    classify_process_failure(reason),
-                                    state,
-                                )
-                    }
-                    ShellCommandExecutionState::OutcomeUnknown => outcome_unknown_result(
-                        response
-                            .error
-                            .as_deref()
-                            .unwrap_or("the Runner did not return a trustworthy terminal result"),
-                    ),
-                    ShellCommandExecutionState::TimedOut => command_failure_result(
-                        exit_code,
-                        stdout,
-                        stderr,
-                        response.duration_ms,
-                        timeout,
-                        state,
-                    ),
-                    ShellCommandExecutionState::Completed
-                        if response.error.is_none() && exit_code == Some(0) =>
-                    {
-                        ToolResult::ok(success_output(0, stdout, stderr, response.duration_ms))
-                    }
-                    ShellCommandExecutionState::Completed => command_failure_result(
-                        exit_code,
-                        stdout,
-                        stderr,
-                        response.duration_ms,
-                        timeout,
-                        state,
-                    ),
-                }
-            }
-            Ok(Err(_)) => {
-                let dispatch = self
-                    .runner_registry
-                    .cancel_request_dispatch_state(&request_id)
-                    .await;
-                if dispatch == Some(false) {
-                    process_tool_failure_result(
-                        command_rejected_message(
-                            "script request waiter was dropped before Runner dispatch",
-                            "check Runner connectivity, then retry.",
-                        ),
-                        "runtime_error",
-                        ShellCommandExecutionState::NotStarted,
+            Ok(enqueued) => enqueued,
+            Err(error) => {
+                return execution_admission_failure_result(
+                        error,
+                        match language {
+                            ShellScriptLanguage::Javascript => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_javascript, then retry only if target state proves no script started.",
+                            ShellScriptLanguage::Typescript => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_typescript, then retry only if target state proves no script started.",
+                            ShellScriptLanguage::Python => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_python, then retry only if target state proves no script started.",
+                            _ => "confirm the Runner is connected and advertises structured_script_payload, then retry only if target state proves no script started.",
+                        },
                     )
-                } else {
-                    outcome_unknown_result(
-                        "script request waiter was dropped after dispatch may have occurred",
-                    )
-                }
-            }
-            Err(_) => {
-                let dispatch = self
-                    .runner_registry
-                    .cancel_request_dispatch_state(&request_id)
-                    .await;
-                let state = dispatch_uncertainty_lifecycle(dispatch);
-                if state == ShellCommandExecutionState::NotStarted {
-                    process_tool_failure_result(
-                        command_rejected_message(
-                            format!(
-                                "timed out waiting {wait_timeout} seconds before Runner dispatch"
-                            ),
-                            "check Runner connectivity and availability, then retry.",
-                        ),
-                        "timeout",
-                        state,
-                    )
-                } else {
-                    outcome_unknown_result(format!(
-                        "timed out waiting {wait_timeout} seconds for the Runner script result"
-                    ))
-                }
             }
         };
+        let mut result = await_structured_request_result(
+            &self.runner_registry,
+            &request_id,
+            receiver,
+            wait_timeout,
+            StructuredRequestKind::Script,
+        )
+        .await;
         decorate(
             &mut result.output,
             declared_purpose,

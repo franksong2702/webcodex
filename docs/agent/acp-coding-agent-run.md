@@ -32,21 +32,39 @@ no production `codex-acp` default. The provider child is always spawned after
 `env_clear()` and receives only configured mappings. Missing source variables
 fail before provider process start.
 
-P1 exposes exactly three model tools: `coding_agent_start`,
-`coding_agent_observe`, and `coding_agent_cancel`. They require the independent
+The P1 Run primitive exposes three model tools: `start_coding_agent`,
+`observe_coding_agent`, and `cancel_coding_agent`. The managed AgentTask entry
+below adds durable attempt ownership over this same primitive. These Run tools
+require the independent
 `coding_agent:run` OAuth scope. Direct shared-key, open-anonymous, project
 credentials, existing OAuth clients, `project:write`, `job:run`, and `mcp:local`
 do not imply it. The hosted shared-key OAuth bridge can add this scope only via
 an explicit client-provisioning opt-in; existing clients are never widened on
 Server upgrade.
 
-`recording_session_id` is carried by the existing generic stateless recorder
-wrapper rather than duplicated as CodingAgentRun business input. It can attach
+On Stateless MCP 2026, the recorder selector is `_wc.record` in the outer
+invocation envelope, not CodingAgentRun business input. When using
+`call_runtime_tool`, put `_wc` beside `tool` and `arguments`, never inside the
+target business arguments. The old root-level `recording_session_id` is rejected
+on this surface; legacy/non-stateless adapters retain their own contracts.
+See [MCP invocation metadata](../MCP.md#adaptive-runtime-extensions). The authorized
+recorder can attach
 bounded `coding_agent_started`, `coding_agent_waiting_permission`, and
 `coding_agent_terminal` lifecycle evidence to an exact Project-matching
 Workflow Session. Recorder provenance never crosses the Server/Runner execution
 request, never grants Run authority, and never stores prompt/reasoning/tool
 bodies or the private ACP session id.
+
+`start_coding_agent.context_session_id` is a separate explicit recovery source.
+It requires independent `runtime:read`, Session ownership and exact Project
+matching before dispatch. It quotes the bounded handoff and separately authorized
+Goal context into the prompt without resuming the source, inferring a recorder,
+granting authority, or fetching current files/Git. The combined prompt retains
+the 64 KiB input bound. The frozen snapshot participates in the intent fingerprint;
+changed context under the same key conflicts. After an uncertain start, observe
+the original Run instead of regenerating context and dispatching replacement
+work. The [model API adapter](../../integrations/model_gateway/README.md) is an
+operator-configured text-only ACP provider using the same Run contract.
 
 The Runner durable record intentionally retains only recovery identity and
 certainty metadata. Immediately before writing `session/prompt`, it durably
@@ -70,13 +88,61 @@ the registered ACP worktree. The Run produced normalized agent/activity events
 and correlated `stopReason=end_turn`; no global package install or credential
 mutation was performed.
 
+## Managed AgentTask binding
+
+The current managed path layers durable TaskAttempt ownership over the same
+`CodingAgentRun`; it does not introduce another provider lifecycle. Use it when
+WebCodex assigns an explicit bounded task to a durable Agent. An external Codex
+that only consumes WebCodex MCP tools does not need an AgentTask, attempt, Goal,
+or Workflow Session; see [MCP access](../MCP.md).
+
+The Host retains the exact Task, Attempt and assignee identities from
+`create_agent_task` and `start_agent_task_attempt`. It then calls
+`start_agent_task_coding_run` with the exact registered Project, logical provider
+id and `attempt_ref` returned by that attempt claim. The reference is a compact
+selector for the existing claim, not independent authority. The explicit
+Task/Attempt/assignee/fence/controller-generation form is also admitted by the
+same contract. The task supplies the instruction; the Server derives the Run
+initiation key from the Attempt instead of accepting a second task instruction
+or a caller-created replacement key.
+
+Before any provider dispatch, the Server rechecks Project/provider authority and
+the current attempt claim, persists the unique Attempt-to-Run binding, and
+commits an `outcome_unknown` barrier. With a still-valid attempt claim, repeating
+the start call reconciles the original Run when its binding no longer permits
+dispatch. After lease expiry, use the explicit reconciliation entry below. The
+binding retains the provider instance and authority/intent
+fingerprints; a provider-instance change is not permission to retarget a Run
+whose execution may already have started.
+
+Observe execution with `observe_coding_agent(run_id)`. Recover task ownership
+with `reconcile_agent_task_coding_run(task_id, attempt_id)`, which reads the
+stored original Run and applies authoritative backend state to that same
+Attempt. Keep all three identities across a Host interruption or Server restart.
+A normal attempt-lease expiry does not make an active or uncertain external
+execution safe to replace. An external report, process log, native Job exit, or
+model assertion cannot supply this backend terminal authority.
+
+Run completion and task execution success are separate from business
+acceptance. The Host still inspects the actual diff and runs independent fixed
+acceptance tests. Workflow Session handoff is optional bounded context and
+evidence provenance; it neither owns this attempt nor supplies its fence.
+Conversation/Participant presence and typing, generic foreign-executor binding,
+and scheduling are separate contracts.
+
+The owning implementation is [the AgentTask runtime](../../src/tool_runtime/agent_task.rs)
+and [the AgentTask store](../../crates/webcodex-store/src/agent_task/operations.rs).
+The [runtime reconciliation test](../../src/tool_runtime/tests/agent_tasks.rs)
+covers a reopened database and fresh runtime with the original Run identity;
+that deterministic test is not real-model or real-Server-restart acceptance.
+
 ## 1. Product model
 
 The intended user flow is:
 
 ```text
 ChatGPT / API client
-  -> coding_agent_start
+  -> start_coding_agent
   -> exact WebCodex Project + Runner + configured ACP provider
   -> CodingAgentRun R
   -> Runner-owned ACP child
@@ -388,7 +454,7 @@ be treated as uncertain unless exact protocol recovery proves otherwise.
 
 ## 5. Configuration semantics
 
-### `config` omitted or `{}` means no WebCodex override
+### `config` omitted or `{}` means no caller run-level override
 
 P0 corrects an important earlier assumption. For WebCodex:
 
@@ -398,7 +464,10 @@ or
 config = {}
 ```
 
-means **send no `session/set_config_option` calls**.
+means **send no caller-requested `session/set_config_option` calls**. If the Runner
+has a non-empty `[acp.forced_config]` policy, it may still send
+`session/set_config_option` calls to enforce that operator-owned policy before
+prompt dispatch.
 
 It does not mean "the ACP adapter behaves exactly like a bare local Codex CLI".
 The adapter itself may have defaults. In real dogfood, `codex-acp 1.6.2`
@@ -407,8 +476,7 @@ WebCodex override.
 
 Therefore the precise inheritance contract is:
 
-> WebCodex inherits the selected Runner-owned ACP provider's effective defaults
-> by abstaining from run-level ACP config overrides.
+> Without Runner-global forced policy, WebCodex inherits the selected Runner-owned ACP provider's effective defaults by abstaining from caller run-level ACP config overrides. A configured global forced policy is operator-owned policy and is enforced separately.
 
 The Run should record a bounded sanitized snapshot of the effective advertised
 config ids/current values needed for diagnosis. It must not claim that those
@@ -416,17 +484,23 @@ values came directly from `~/.codex`, an account, or organization policy.
 
 ### Explicit run-level overrides
 
-For a non-empty caller `config` object P1 must perform this order:
+For a non-empty caller `config` object, Runner-global forced policy remains
+independent and takes precedence. P1 must perform this order:
 
 1. start/initialize the exact configured provider;
 2. create the private ACP session;
 3. obtain the session's advertised config options;
-4. reject any caller key not currently advertised;
-5. reject any value not legal for that advertised option;
-6. apply Runner/operator allow/deny policy for remotely overridable options;
-7. call `session/set_config_option` only for approved explicit overrides;
-8. validate the returned refreshed config options;
-9. only then dispatch the prompt.
+4. reject any caller value that conflicts with a forced key;
+5. validate and apply every forced key/value against the live options, requiring
+   each refreshed response to reflect the forced value;
+6. for each non-forced caller key, require both live legality and the
+   Runner/operator allowlist before applying the explicit override;
+7. validate each returned refreshed config option set;
+8. re-check and re-assert forced values after caller overrides in case a provider
+   changed another option as a side effect;
+9. require every forced value to be legal and current immediately before prompt
+   dispatch;
+10. only then dispatch the prompt.
 
 An invalid override is `not_started` with `recovery_kind=fix_input`; it must not
 partially begin the coding prompt.
@@ -440,7 +514,7 @@ concrete need rather than pretending P1 already has per-value policy.
 
 ### Fields remote callers never control
 
-`coding_agent_start` must not accept:
+`start_coding_agent` must not accept:
 
 - executable or argv;
 - arbitrary environment or secret/API-key material;
@@ -473,8 +547,27 @@ args = []
 
 [acp.agents.env_from_env]
 # Explicit operator mappings only. Values never go to the Server.
-HTTPS_PROXY = "HTTPS_PROXY"
+PATH = "PATH"
+HOME = "HOME"
 ```
+
+The child environment remains cleared before explicit mappings. For an npm
+adapter, Runner's mapped `PATH` must include the real Node executable, including
+its Homebrew/NVM directory when applicable. `PATH` and `HOME` alone are not a
+complete-environment guarantee: explicitly map user state via `HOME` and, when
+used, `CODEX_HOME`, plus required proxy/certificate variables. Map only sources
+that exist in Runner's environment; missing configured sources fail before
+launch. Restart Runner after configuration or launch-environment changes.
+Desktop exposes a user-selected PATH/HOME shortcut, never implicit inheritance.
+
+The npm `codex-acp` adapter normally launches its bundled Codex rather than the
+system `codex` executable. A `CODEX_PATH` override requires an explicit
+`CODEX_PATH = "CODEX_PATH"` mapping and the corresponding Runner source.
+A Linux equivalent reproduction of `codex-acp` 2.1.1 with bundled Codex 0.159.3
+exited 127 before `initialize` without `PATH`; explicit mapping of a Runner
+`PATH` containing Node passed initialization. The original reporter's
+environment is unknown and macOS is unverified; this evidence alone does not
+close the reported issue. See [Runner setup](../RUNNER.md#acp-coding-agents-explicit-startup-environment) for the operator checklist.
 
 The exact executable example is operator-specific; WebCodex must not prescribe
 `npx -y` as a production default or download packages at request time.
@@ -506,6 +599,17 @@ model input. A new Runner/provider instance makes an already-bound request stale
 before Run start. The Server must never receive executable path, argv, PID,
 environment values, credential material, stderr, local config contents, or raw
 ACP auth data.
+
+Startup diagnostics retain the existing initialize, session/new, and
+session/set_config_option error codes, with fixed summaries distinguishing
+process exit, stdout closure, malformed JSON, oversized messages, I/O failure,
+timeout, and provider rejection. Total-deadline summaries name the active setup
+stage. Only the Runner's local structured log contains observed pre-cleanup exit
+codes/signals, numeric RPC codes, and controlled I/O kinds. Raw provider error
+message/data, stderr, environment values, and private paths never become terminal
+diagnostics sent to the Server or retained in Run state. stderr continues to be
+drained and discarded. Prompt-dispatch uncertainty and cancellation semantics
+remain authoritative; improved diagnostics never authorize redispatch.
 
 `env_from_env` is resolved only on the Runner immediately before spawn. The
 caller supplies neither source names nor values. The ACP child must follow the
@@ -542,12 +646,12 @@ configuration, but it must not translate that into a claim of WebCodex Project
 isolation unless WebCodex separately enforces such isolation.
 
 The P1 product description should therefore say **operator-configured delegated
-local coding agent**. It must not promise parity with WebCodex `read_file` /
-`apply_text_edits` filesystem isolation.
+local coding agent**. It must not promise parity with WebCodex `read_files` /
+`edit_project_files` filesystem isolation.
 
 ## 8. Permission-request exceptional path
 
-The normal WebCodex authority decision happens once at `coding_agent_start`:
+The normal WebCodex authority decision happens once at `start_coding_agent`:
 
 ```text
 caller auth + exact Project + provider fence + config override policy
@@ -565,7 +669,7 @@ P1 nevertheless must implement the callback. The minimum safe behavior is:
 - emit a bounded sanitized `permission_request` Run event;
 - enter `waiting_permission` while a bounded response deadline is active;
 - never choose an allow option automatically;
-- if `coding_agent_cancel` cancels the prompt while a permission request is
+- if `cancel_coding_agent` cancels the prompt while a permission request is
   outstanding, answer that request with ACP `Cancelled` as required by v1 and
   then continue the cancel path;
 - if only the permission-response deadline expires, answer ACP `Cancelled`.
@@ -635,7 +739,7 @@ that is distinct from replaying the old initiation.
 
 ## 10. Initiation and retry safety
 
-`coding_agent_start` is consequential autonomous execution. It needs a required
+`start_coding_agent` is consequential autonomous execution. It needs a required
 bounded caller-chosen `idempotency_key`, using the same semantic pattern as
 `run_detached_process` but a separate CodingAgentRun namespace.
 
@@ -706,14 +810,14 @@ in-flight prompt completed, partially acted, or never ran.
 The planned model surface is:
 
 ```text
-coding_agent_start
-coding_agent_observe
-coding_agent_cancel
+start_coding_agent
+observe_coding_agent
+cancel_coding_agent
 ```
 
 P0 does not implement these tools.
 
-`coding_agent_observe` should accept:
+`observe_coding_agent` should accept:
 
 ```text
 run_id
@@ -771,7 +875,7 @@ content.
 
 ### Cancel
 
-`coding_agent_cancel` requires exact Run authorization and should be idempotent.
+`cancel_coding_agent` requires exact Run authorization and should be idempotent.
 For an active prompt the Runner sends `session/cancel` once, then observes the
 same prompt toward terminal state. It must not launch a replacement session or
 prompt.
@@ -928,12 +1032,12 @@ Add a `CodingAgentRun` registry/runtime path separate from `jobs.rs`, with:
 Only after the internal vertical slice is typed and tested, add exactly:
 
 ```text
-coding_agent_start
-coding_agent_observe
-coding_agent_cancel
+start_coding_agent
+observe_coding_agent
+cancel_coding_agent
 ```
 
-`coding_agent_start` inputs should be limited to Project, logical provider id,
+`start_coding_agent` inputs should be limited to Project, logical provider id,
 required idempotency key, prompt/instruction, optional explicit validated
 `config`, timeout, and optional Workflow Session provenance as appropriate. The
 Server resolves and fences the exact Runner/provider instance internally. The
@@ -973,6 +1077,44 @@ coverage and one opt-in real Codex ACP smoke for compatibility. Cover at least:
 - terminal child-process cleanup;
 - durable audit/telemetry privacy for prompt, message, reasoning, and tool bodies.
 
+### Opt-in coding acceptance for #978
+
+The ignored Runner tests pin `@agentclientprotocol/codex-acp@2.1.1`. Run them
+explicitly with existing local authentication and a working provider sandbox:
+
+```bash
+cargo test --locked -p webcodex-runner real_codex_acp_opt_in -- --ignored --test-threads=1
+```
+
+By default `npx` resolves the pinned package. To use an existing installation,
+set `WEBCODEX_TEST_CODEX_ACP_SCRIPT` to its absolute `dist/index.js` and optionally
+`WEBCODEX_TEST_CODEX_ACP_NODE` to its Node executable. The test verifies adapter
+package metadata. It maps existing `PATH`, `HOME`, `CODEX_HOME`, `USER`, `SHELL`,
+uppercase/lowercase HTTP/HTTPS/ALL/NO proxy variables, and `SSL_CERT_FILE` /
+`SSL_CERT_DIR`; it does not forward `CODEX_PATH`, so this exercises the package's
+bundled Codex. Production mappings remain explicitly operator-selected.
+
+The coding case creates a temporary Git project with a failing Python function
+and fixed acceptance tests. It requires normalized message/activity progress,
+an implemented function, a separate added test, unchanged fixed tests,
+`end_turn`, and independently passing standard-library tests. Separate cases
+require cancellation during observable progress and real adapter failure before
+prompt dispatch. All cases drain owned workers, including on assertion failure;
+permission requests remain fail-closed. Provider messages and raw diagnostics
+are never printed in assertions.
+
+On 2026-10-08, Linux probes with Node 24.20.0, codex-acp 2.1.1, and bundled
+Codex 0.159.3 passed initialization with explicit PATH mapping, cancellation,
+and startup failure exit. Coding acceptance remained blocked: the turn returned
+text and `end_turn` without tool activity or file edits. A separate no-model
+`codex sandbox linux -- /bin/true` probe exited 1, with a controlled diagnostic
+identifying denied Bubblewrap loopback initialization. Session metadata confirmed
+`agent` mode, `default` collaboration mode, and an advertised model. These facts
+identify a host sandbox limitation but do not establish the original reporter's
+root cause. Re-run all three cases on a sandbox-capable Linux host to complete
+end-to-end acceptance. macOS and the original unknown reporter environment remain
+unverified; this evidence does not justify closing #978.
+
 ## 15. Explicitly deferred
 
 P0/P1 do not imply:
@@ -985,7 +1127,8 @@ P0/P1 do not imply:
 - hot ACP provider reload/generic provider framework;
 - ACP v2 or experimental extensions;
 - scheduler, worker pool, automatic worker spawning, or orchestration;
-- integration with durable Agent/Conversation/Participant state, presence, or typing;
+- Conversation/Participant presence or typing integration; durable AgentTask
+  execution binding is implemented as described above;
 - durable Operation DAG;
 - unification of Workflow Session, Job, ACP Session, and CodingAgentRun;
 - a claim that Project cwd is a filesystem sandbox;
@@ -999,8 +1142,10 @@ The P0 architecture baseline is therefore:
 1. `CodingAgentRun` is a separate protocol execution primitive, not a Job alias.
 2. Workflow Session is optional evidence provenance, never Run authority.
 3. Raw ACP session ids stay Runner-private.
-4. Default WebCodex config inheritance means **no ACP config override calls**;
-   effective behavior is whatever the configured provider advertises.
+4. Without Runner-global forced policy, default WebCodex config inheritance means
+   **no ACP config override calls**; effective behavior is whatever the configured
+   provider advertises. A configured forced policy is separate operator-owned
+   admission policy and is enforced before prompt dispatch.
 5. Explicit config is validated against live advertised options and Runner policy
    before prompt dispatch.
 6. ACP permission callbacks are real and exceptional; never auto-allow them and
@@ -1024,3 +1169,36 @@ The P0 architecture baseline is therefore:
     prompt/reasoning/tool bodies out of ordinary durable telemetry/audit.
 14. P1 is one exact Codex vertical slice with typed closed Server<->Runner
     protocol and three eventual model tools, not a generic agent framework.
+
+
+## Runner-global forced ACP configuration
+
+Runner configuration may define a provider-neutral global forced policy:
+
+    [acp.forced_config]
+    model = "provider-model"
+    feature_flag = true
+
+The map is empty by default. Keys and values are provider-defined live ACP
+configuration, not WebCodex model or effort enums.
+
+This policy is admission policy, not best-effort configuration. For every new
+ACP session the Runner validates every forced key/value against that session's
+live session/new configOptions, applies it with session/set_config_option, and
+requires the returned configuration state to reflect the requested value. A
+globally forced key may not also appear in any provider's
+allowed_config_options.
+
+A caller may repeat the exact forced value. A conflicting caller value fails
+closed before prompt dispatch. After caller-allowed options are applied, the
+Runner re-checks and re-asserts forced values in case another setting changed
+them as a provider-side effect, then performs one final forced-current check
+immediately before the prompt-dispatch path.
+
+The policy applies to every configured ACP provider on the Runner. If a provider
+does not advertise a forced key/value, a Run targeting that provider fails
+before prompt dispatch; the policy is never silently ignored for that provider.
+
+The first version accepts stable ACP string/select and boolean values. Integer
+forced values are rejected. The ACP section remains Runner
+startup/restart-owned; forced-policy changes do not hot-reload.

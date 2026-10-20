@@ -1,7 +1,7 @@
-use super::RunnerCapabilityRequirement::{GitOrShell, OwnerOnly};
+use super::RunnerCapabilityRequirement::{GitOrShell, InternalPosixScript, OwnerOnly};
 use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
-    adaptive_runtime_direct, context_recovery_only, def, model_spec, permission_risk,
+    adaptive_runtime_direct, def, model_spec, permission_risk, require_all_scopes,
     requires_explicit_business_session, ToolDefinition, PERMISSION_RISK_WRITE,
     TOOL_CATEGORY_SESSION, TOOL_CATEGORY_VALIDATION,
 };
@@ -9,17 +9,85 @@ use crate::metadata::{
     ToolPathHint::None as NoPath, ToolRisk::Read, PROJECT_READ, PROJECT_WRITE, RUNTIME_READ,
     SESSION_COLLABORATE, TOOL_PROVIDER_CONTROL,
 };
-use crate::registry::input_schemas::{
-    close_session_input_schema, complete_session_message_input_schema,
-    finish_coding_task_input_schema, get_session_assignment_input_schema,
-    list_session_messages_input_schema, observe_session_messages_input_schema,
-    post_session_message_input_schema, resolve_session_message_input_schema,
-    session_discussion_summary_input_schema, session_handoff_summary_input_schema,
-    session_summary_input_schema, update_session_context_input_schema,
-    validation_summary_input_schema, work_on_project_input_schema,
-};
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
+    requires_explicit_business_session(
+        def(
+            "record_external_observation",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelHidden,
+            TOOL_CATEGORY_SESSION,
+            None,
+            TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Mutate,
+                risk: super::ToolRisk::SessionCollaborate,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::FencedReplay,
+            },
+            Some(SESSION_COLLABORATE),
+            true,
+            NoPath,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE
+                .lifecycle(super::ToolSessionLifecycleEffect::Mutation),
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        ),
+    ),
+
+    require_all_scopes(model_spec(
+        def(
+            "list_sessions",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("project"),
+                super::ToolAuditResultField::value("total"),
+                super::ToolAuditResultField::array_len("returned", "sessions"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelVisible, TOOL_CATEGORY_SESSION, None, TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ), true, NoPath, false, false,
+            super::ToolSessionEvidencePolicy::NONE,
+        ).with_activity(super::ToolActivityPresentation::Support, super::ToolActivityInteraction::NonMeaningful),
+        "Read-only recovery discovery when the exact Session id is missing, including a new Host window or account using the same WebCodex authority. Requires an authorized exact Project and lists only that caller's creation-time Session authority group, including retained Closed history. Lifecycle filter is optional; offset defaults to 0, limit to 10 and is normalized to 1..20. Titles are redacted/bounded and output is capped at 32 KiB. Counts exclude foreign authority groups. Inventory pagination is not a frozen snapshot. Explicitly choose a returned session_id/session_ref, then read read_session_handoff. Active work needs explicit bootstrap with the selected Session; Closed is historical only. Discovery never infers current/recent work, resumes a Session, grants authority, or restores hidden chat context.",
+    ), &[RUNTIME_READ, PROJECT_READ]),
+
+    requires_explicit_business_session(model_spec(
+        def(
+            "list_external_observations",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelVisible, TOOL_CATEGORY_SESSION, None, TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ), true, NoPath, false, false,
+            super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        ),
+        "Read all retained external reports for an exact Session/Project (at most 256). Reports are untrusted adapter claims, separate from native Job and validation evidence. They never establish task completion or authorize replaying work. coverage remains incomplete until a durable source sequence can prove gaps/order.",
+    )),
+
     def(
         "start_session",
         super::ToolAuditPolicy::TYPED_CANONICAL,
@@ -41,7 +109,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         super::ToolSessionEvidencePolicy::NONE,
     ),
     adaptive_runtime_direct(
-        context_recovery_only(model_spec(
+        model_spec(
             def(
                 "work_on_project",
                 super::ToolAuditPolicy::TYPED_CANONICAL,
@@ -61,42 +129,201 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Support,
+                super::ToolActivityInteraction::Meaningful,
             ),
-            "Canonical model entry for ordinary coding/review via an existing Project or Runner path; Git not required for checkout mode. Omitted/checkout preserves the existing path flow. mode=worktree with client_id + path asks the Runner to resolve an exact Git base, bootstrap or re-observe an isolated managed worktree, register it as an ordinary Project, and then start or exactly resume the Workflow Session. This hides registration/worktree plumbing without bypassing Project authority and returns compact workflow plus project instructions.",
-            work_on_project_input_schema,
-        )),
+            "Canonical bootstrap for ordinary coding/review. Fresh Session: project or client_id+path; prefer principal-scoped project_ref. Omit session_id for fresh Session, not fresh model context. Exact checkout resume: session_id alone reauthorizes the bound Project. An explicit Project must match. Use an active accessible Session; never guess: workflow.resume/list_sessions, then handoff. mode=worktree requires an explicit source, exact Git base and Project authority; creates managed Project/ref + fresh Session, never retargets. Re-observes instructions; reuse workspace state. Fresh/uncertain model context: _wc.context=[\"project.instructions\",\"webcodex.workflow\"]. First entry to another Project: request its instructions; reuse current workflow across Projects. Keep include_extension_catalog=true/default in fresh cases. With complete/current context retained, omit those context keys later; include_extension_catalog=false only with its complete/sufficient retained Skills/Plugins. Refresh changed/incomplete/lost context or on user request; ClientWindow does not prove retention. Complete bodies: do not immediately reread; follow read_more if truncated. guidance_profile advises; goal_context grants no authority. checkout does not require Git.",
+        ),
         10,
+        super::ToolDirectReason::CoreWorkflow,
     ),
+    requires_explicit_business_session(model_spec(
+        def(
+            "finish_coding_task",
+            super::ToolAuditPolicy::TYPED_CANONICAL
+                .context(super::ToolAuditContextPolicy::TaskOutputs),
+            ModelVisible,
+            "workflow",
+            Some(GitOrShell),
+            TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ),
+            true,
+            NoPath,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity_kind(super::ToolActivityKind::Review),
+        "Review task closeout evidence for code or ordinary file work. Optional outputs name up to 16 project-relative files; the Runner independently observes size/SHA/MIME, and missing or unavailable files block closeout. Presence does not prove content, counts or format: verify these for the task. Git and tests remain relevant to code work. This advisory snapshot supports model judgment; it does not decide task completion or generate the user-facing final report.",
+    )),
     adaptive_runtime_direct(
-        requires_explicit_business_session(model_spec(
+        model_spec(
             def(
-                "finish_coding_task",
-                super::ToolAuditPolicy::TYPED_CANONICAL,
+                "present_work_result",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("project", "/work_result/project"),
+                    super::ToolAuditResultField::pointer("session_id", "/work_result/session_id"),
+                    super::ToolAuditResultField::pointer("state_version", "/work_result/state_version"),
+                    super::ToolAuditResultField::pointer("snapshot_id", "/work_result/final_changes/snapshot_id"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ]),
                 ModelVisible,
                 "workflow",
-                Some(GitOrShell),
+                Some(InternalPosixScript),
                 TOOL_PROVIDER_CONTROL,
                 super::ToolSemanticContract {
                     effect: super::ToolEffect::Observe,
                     risk: Read,
                     approval: super::ToolApprovalPolicy::None,
-                    idempotency: super::ToolIdempotency::PureRead,
+                    idempotency: super::ToolIdempotency::NonIdempotent,
                 },
-                Some(RUNTIME_READ),
+                Some(PROJECT_READ),
                 true,
                 NoPath,
                 false,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
-            "Return an optional deterministic evidence snapshot for model review, including workspace, validation, jobs, and recorded tool events. The result is advisory: it does not decide task completion, replace direct diff or test review, or generate the user-facing final report.",
-            finish_coding_task_input_schema,
-        )),
-        150,
+            "Present one persistent user-facing WebCodex card for the current client Window. Use present_pdf to view PDFs. For substantial coding work, call it once immediately after the first successful project-scoped WebCodex action; do not wait for Workflow Session creation, mutation, validation, or closeout. project is an exact canonical id or issued principal-scoped project_ref; resource identity stays canonical. session_id is optional; supply the exact business Workflow Session to show its authorized Server Job states on normal refresh. Without it the card does not infer Job ownership from Window or Project activity. Changed-file views follow fresh workspace observations by default; users can pin a working-tree snapshot for stable review. The card self-refreshes the same bounded Window ActionAudit activity used by WebUI, including observe/diagnostic actions, and may surface linked Session collaboration or sealed final changes only when those later exist. It creates no work, Session, validation, review, lifecycle change, or authority. Never repeat presentation in the same Window because another invocation may create another Host card.",
+        ),
+        155,
+        super::ToolDirectReason::Presentation,
+    ),
+    def(
+        "get_work_result_state",
+        super::ToolAuditPolicy::typed_fields(&[
+            super::ToolAuditResultField::pointer("project", "/work_result/project"),
+            super::ToolAuditResultField::pointer("session_id", "/work_result/session_id"),
+            super::ToolAuditResultField::pointer("state_version", "/work_result/state_version"),
+            super::ToolAuditResultField::value("error_kind"),
+        ]),
+        ModelHidden,
+        "workflow",
+        Some(GitOrShell),
+        TOOL_PROVIDER_CONTROL,
+        super::ToolSemanticContract {
+            effect: super::ToolEffect::Observe,
+            risk: Read,
+            approval: super::ToolApprovalPolicy::None,
+            idempotency: super::ToolIdempotency::PureRead,
+        },
+        Some(PROJECT_READ),
+        true,
+        NoPath,
+        false,
+        false,
+        super::ToolSessionEvidencePolicy::NONE,
+    )
+    .with_activity(
+        super::ToolActivityPresentation::Transport,
+        super::ToolActivityInteraction::NonMeaningful,
+    ),
+    def(
+        "read_work_result_activity_detail",
+        super::ToolAuditPolicy::typed_fields(&[
+            super::ToolAuditResultField::pointer(
+                "server_trace_id",
+                "/activity_detail/server_trace_id",
+            ),
+            super::ToolAuditResultField::value("error_kind"),
+        ]),
+        ModelHidden,
+        "workflow",
+        None,
+        TOOL_PROVIDER_CONTROL,
+        super::ToolSemanticContract {
+            effect: super::ToolEffect::Observe,
+            risk: Read,
+            approval: super::ToolApprovalPolicy::None,
+            idempotency: super::ToolIdempotency::PureRead,
+        },
+        Some(RUNTIME_READ),
+        true,
+        NoPath,
+        false,
+        false,
+        super::ToolSessionEvidencePolicy::NONE,
+    )
+    .with_activity(
+        super::ToolActivityPresentation::Transport,
+        super::ToolActivityInteraction::NonMeaningful,
+    ),
+    def(
+        "send_work_result_message",
+        super::ToolAuditPolicy::typed_fields(&[
+            super::ToolAuditResultField::value("success"),
+            super::ToolAuditResultField::value("session_id"),
+            super::ToolAuditResultField::value("message_id"),
+            super::ToolAuditResultField::value("replayed"),
+            super::ToolAuditResultField::value("state_changed"),
+            super::ToolAuditResultField::value("error_kind"),
+        ]),
+        ModelHidden,
+        "workflow",
+        None,
+        TOOL_PROVIDER_CONTROL,
+        super::ToolSemanticContract {
+            effect: super::ToolEffect::Mutate,
+            risk: super::ToolRisk::SessionCollaborate,
+            approval: super::ToolApprovalPolicy::None,
+            idempotency: super::ToolIdempotency::Keyed,
+        },
+        Some(SESSION_COLLABORATE),
+        true,
+        NoPath,
+        false,
+        false,
+        super::ToolSessionEvidencePolicy::NONE,
+    )
+    .with_activity(
+        super::ToolActivityPresentation::Transport,
+        super::ToolActivityInteraction::NonMeaningful,
+    ),
+    def(
+        "read_changed_file_diff",
+        super::ToolAuditPolicy::typed_fields(&[
+            super::ToolAuditResultField::pointer("project", "/changes_file_diff/project"),
+            super::ToolAuditResultField::pointer("session_id", "/changes_file_diff/session_id"),
+            super::ToolAuditResultField::pointer("snapshot_id", "/changes_file_diff/snapshot_id"),
+            super::ToolAuditResultField::pointer("path", "/changes_file_diff/path"),
+            super::ToolAuditResultField::value("error_kind"),
+        ]),
+        ModelHidden,
+        "workflow",
+        Some(InternalPosixScript),
+        TOOL_PROVIDER_CONTROL,
+        super::ToolSemanticContract {
+            effect: super::ToolEffect::Observe,
+            risk: Read,
+            approval: super::ToolApprovalPolicy::None,
+            idempotency: super::ToolIdempotency::PureRead,
+        },
+        Some(PROJECT_READ),
+        true,
+        NoPath,
+        false,
+        false,
+        super::ToolSessionEvidencePolicy::NONE,
+    )
+    .with_activity(
+        super::ToolActivityPresentation::Transport,
+        super::ToolActivityInteraction::NonMeaningful,
     ),
     requires_explicit_business_session(model_spec(
         def(
-            "session_summary",
+            "read_session_summary",
             super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_SESSION,
@@ -116,7 +343,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE,
         ),
         "Return a bounded structured summary from the session ledger for an explicit session_id: recorded events, message-board summary, task mode, guards, and lifecycle. Uses durable ledger data where session persistence is configured.",
-        session_summary_input_schema,
     )),
     requires_explicit_business_session(permission_risk(
         model_spec(
@@ -140,8 +366,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
             ),
-            "Update Session defaults. Binding execution_context.resource selects an already active Runner-local named SSH resource; for a new explicit target use ssh_resource list/register and restart the Runner first, then list and bind the active name. open_session_shell uses that Session binding. Requires an authorized project matching the exact Session project; cross-project escape is not supported. Context and event commit under the store lock; the background writer persists, so success does not mean disk flush. Never falls back and never creates unknown Sessions.",
-            update_session_context_input_schema,
+            "Update Session defaults. Binding execution_context.resource selects an already active Runner-local named SSH resource; for a new explicit target use manage_ssh_resource list/register and restart the Runner first, then list and bind the active name. open_session_shell uses that Session binding. Requires an authorized project matching the exact Session project; cross-project escape is not supported. Context and event commit under the store lock; the background writer persists, so success does not mean disk flush. Never falls back and never creates unknown Sessions.",
         ),
         PERMISSION_RISK_WRITE,
     )),
@@ -168,13 +393,12 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE.persistent_shell(super::PersistentShellEvidenceAction::Close).lifecycle(super::ToolSessionLifecycleEffect::IdempotentClose),
             ),
             "Explicitly close a workflow session (Active to Closed) for a required session_id. Query remains available; write/shell/mutation tools are denied. Idempotent when already closed; unknown ids fail without create. finish_coding_task does not close.",
-            close_session_input_schema,
         ),
         PERMISSION_RISK_WRITE,
     )),
     requires_explicit_business_session(model_spec(
         def(
-            "validation_summary",
+            "read_validation_summary",
             super::ToolAuditPolicy::TYPED_CANONICAL,
             ModelVisible,
             TOOL_CATEGORY_VALIDATION,
@@ -192,9 +416,12 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             false,
             super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::Meaningful,
         ),
         "Read bounded structured validation evidence already recorded in an explicit project-scoped session ledger. Does not run Cargo or shell commands, enqueue a Runner request, read project files, mutate the workspace, or replace finish_coding_task.",
-        validation_summary_input_schema,
     )),
     requires_explicit_business_session(model_spec(
         def(
@@ -225,9 +452,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
         ),
-        "Post a bounded collaboration message (todo, question, progress, guidance, risk, or decision). High-priority guidance may require request-scoped ACK; ACK neither resolves nor gates work. Use complete_session_message to atomically answer and resolve a finished todo.",
-        post_session_message_input_schema,
+        "Post a bounded collaboration message (todo, question, progress, guidance, risk, or decision). Optional delivery_key provides bounded restart-safe sender-scoped replay while the keyed message metadata remains retained; exact retries return the original message and conflicting retained key reuse fails closed. Any message may request request-scoped ACK; ACK proves only current model-context retention and neither resolves nor gates work. Use complete_session_message to atomically answer and resolve a finished todo.",
     )),
+
     requires_explicit_business_session(model_spec(
         def(
             "list_session_messages",
@@ -254,7 +481,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE,
         ),
         "Read bounded session-local messages with exact filters. For an executable todo, prefer get_session_assignment so the todo, all retained direct replies, and its completion fence come from one store snapshot.",
-        list_session_messages_input_schema,
     )),
     requires_explicit_business_session(model_spec(
         def(
@@ -285,7 +511,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE,
         ),
         "Atomically read one exact open todo plus all retained direct replies and return the opaque assignment_fence required by complete_session_message. Unrelated Session traffic and ACK bookkeeping do not stale it; incomplete retained assignment history fails closed.",
-        get_session_assignment_input_schema,
     )),
     requires_explicit_business_session(model_spec(
         def(
@@ -317,7 +542,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE,
         ),
         "Observe Session message-state delta after an opaque durable cursor. No token establishes the current baseline and returns no history; token calls may wait once for change. Reports retention loss; never a subscription, delivery receipt, or model-context proof.",
-        observe_session_messages_input_schema,
     )),
     requires_explicit_business_session(permission_risk(
         model_spec(
@@ -348,7 +572,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
             ),
             "Mark a session-local ledger message resolved. Idempotent when the message is already resolved; metadata-only and never modifies project files.",
-            resolve_session_message_input_schema,
         ),
         PERMISSION_RISK_WRITE,
     )),
@@ -383,14 +606,13 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
             ),
             "Atomically answer and resolve one exact open todo. expected_assignment_fence is required and must be the exact opaque fence from get_session_assignment; completion_key separately keeps uncertain-result retries idempotent.",
-            complete_session_message_input_schema,
         ),
         PERMISSION_RISK_WRITE,
     )),
     adaptive_runtime_direct(
         requires_explicit_business_session(model_spec(
             def(
-                "session_discussion_summary",
+                "read_session_discussion_summary",
                 super::ToolAuditPolicy::typed_fields(&[
                     super::ToolAuditResultField::value("success"),
                     super::ToolAuditResultField::value("session_id"),
@@ -417,13 +639,13 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE,
         ),
         "Return a bounded structured aggregate of session-local discussion from the recorded session ledger. Does not call an LLM or generate natural-language summaries.",
-            session_discussion_summary_input_schema,
         )),
         15,
+        super::ToolDirectReason::CoreWorkflow,
     ),
     requires_explicit_business_session(model_spec(
-        def(
-            "session_handoff_summary",
+            def(
+                "read_session_handoff",
             super::ToolAuditPolicy::typed_fields(&[
                 super::ToolAuditResultField::value("session_id"),
                 super::ToolAuditResultField::value("project"),
@@ -432,7 +654,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolAuditResultField::array_len("open_todo_count", "open_todos"),
                 super::ToolAuditResultField::array_len("recent_answer_count", "recent_answers"),
                 super::ToolAuditResultField::array_len("recent_completion_count", "recent_completions"),
-                super::ToolAuditResultField::value("summary_only"),
+                super::ToolAuditResultField::value("diagnostic"),
                 super::ToolAuditResultField::value("error_kind"),
             ]),
             ModelVisible,
@@ -451,8 +673,41 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             false,
             super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::Meaningful,
         ),
-        "Read-only handoff for multi-step tasks, explicit session_id. Reads session ledger collaboration and ledger-derived validation. Diagnostics use bounded tails or safe result metadata; validation.parser.available is false if absent. Worker/coordinator read.",
-        session_handoff_summary_input_schema,
-    )),
+            "Explicit read-only recovery for missing task context or an explicit handoff; requires exact session_id/session_ref and is not routine status polling. Returns deterministic 8 KiB handoff_brief with task, workspace, progress, validation, Jobs, collaboration/external-report evidence, next actions and basis completeness. If the same owner has active Goals explicitly correlated to the Session, optional bounded goal_context is returned separately: zero omit it and multiple remain selection_required. Goal context is read-only: no inference, Goal mutation, liveness refresh, scheduling or authority grant. External reports retain unknown outcomes/incomplete coverage and are not native execution/validation. Omitted project uses the authorized Session Project; diagnostic=true adds ledger/closeout evidence. Concurrent Session change makes basis incomplete; re-observe before dependent work.",
+        )),
+    requires_explicit_business_session(
+        def(
+            "get_session_handoff_state",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("project"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelHidden,
+            TOOL_CATEGORY_SESSION,
+            None,
+            TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ),
+            true,
+            NoPath,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        ),
+    ),
 ];

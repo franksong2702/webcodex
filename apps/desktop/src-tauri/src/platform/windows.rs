@@ -8,6 +8,8 @@ use webcodex_process::SpawnOptions;
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
+pub(super) mod session_shutdown;
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn managed_spawn_options(silent_child_breakaway: bool) -> SpawnOptions {
@@ -48,12 +50,15 @@ pub fn system_http_proxy_candidate() -> Option<SystemProxyCandidate> {
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
         .ok()?;
     let value: String = internet_settings.get_value("ProxyServer").ok()?;
-    let url = normalize_proxy_server(&value)?;
     let enabled = internet_settings
         .get_value::<u32, _>("ProxyEnable")
         .ok()
         .is_some_and(|value| value != 0);
-    Some(SystemProxyCandidate { url, enabled })
+    if !enabled {
+        return None;
+    }
+    let url = normalize_proxy_server(&value)?;
+    Some(SystemProxyCandidate { url })
 }
 
 #[cfg(test)]

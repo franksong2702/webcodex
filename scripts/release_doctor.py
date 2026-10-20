@@ -30,7 +30,8 @@ EXPECTED_PLATFORMS = (
     "win32-x64",
     "win32-arm64",
 )
-EXPECTED_DESKTOP_PLATFORMS = ("darwin-x64", "darwin-arm64", "win32-x64")
+EXPECTED_DESKTOP_PLATFORMS = ("darwin-arm64", "win32-x64", "win32-arm64")
+EXPECTED_SUPPLEMENTAL_DESKTOP_PLATFORMS = ("darwin-x64",)
 REQUIRED_TOOLS = ("git", "gh", "npm", "node", "python3", "bash")
 
 
@@ -61,7 +62,12 @@ def _platform_contract(root: Path) -> str:
         )
     if tuple(collector.DESKTOP_PLATFORMS) != EXPECTED_DESKTOP_PLATFORMS:
         raise DoctorError(
-            f"Desktop release platform contract drift: actual={tuple(collector.DESKTOP_PLATFORMS)}"
+            f"primary Desktop release platform contract drift: actual={tuple(collector.DESKTOP_PLATFORMS)}"
+        )
+    if tuple(collector.SUPPLEMENTAL_DESKTOP_PLATFORMS) != EXPECTED_SUPPLEMENTAL_DESKTOP_PLATFORMS:
+        raise DoctorError(
+            "supplemental Desktop release platform contract drift: "
+            f"actual={tuple(collector.SUPPLEMENTAL_DESKTOP_PLATFORMS)}"
         )
     manifest_path = root / "npm/webcodex/manifest.example.json"
     try:
@@ -74,8 +80,9 @@ def _platform_contract(root: Path) -> str:
             f"npm manifest platform contract drift: expected={EXPECTED_PLATFORMS} actual={tuple(artifacts) if isinstance(artifacts, dict) else None}"
         )
     return (
-        "six-platform npm runtime contract plus Desktop "
-        f"{', '.join(EXPECTED_DESKTOP_PLATFORMS)}: {', '.join(EXPECTED_PLATFORMS)}"
+        "six-platform npm runtime contract plus primary Desktop "
+        f"{', '.join(EXPECTED_DESKTOP_PLATFORMS)} and supplemental Desktop "
+        f"{', '.join(EXPECTED_SUPPLEMENTAL_DESKTOP_PLATFORMS)}: {', '.join(EXPECTED_PLATFORMS)}"
     )
 
 
@@ -90,13 +97,14 @@ def _version_contract(root: Path, version: str) -> str:
 
 def _workflow_contract(root: Path) -> str:
     ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    extended = (root / ".github/workflows/extended-native.yml").read_text(encoding="utf-8")
     readiness_workflow = (root / ".github/workflows/release-readiness.yml").read_text(encoding="utf-8")
     build = (root / ".github/workflows/release-build.yml").read_text(encoding="utf-8")
+    intel_desktop = (root / ".github/workflows/release-desktop-darwin-x64.yml").read_text(encoding="utf-8")
+    release_image = (root / ".github/workflows/release-image.yml").read_text(encoding="utf-8")
+    download_page = (root / ".github/workflows/download-page.yml").read_text(encoding="utf-8")
     required = {
         "ci.yml": (
-            ("macos-15-intel", ci),
-            ("windows-11-arm", ci),
-            ("ubuntu-24.04-arm", ci),
             ("apps/desktop/package-lock.json", ci),
             ("test-windows-desktop:", ci),
             ("DESKTOP_RESULT", ci),
@@ -105,10 +113,32 @@ def _workflow_contract(root: Path) -> str:
             ("prepare_desktop_bundle_macos.py", ci),
             ("desktop_install_macos_smoke.sh", ci),
             ("darwin-arm64", ci),
-            ("darwin-x64", ci),
+            ("test-docker-server:", ci),
+            ("needs_docker", ci),
+            ("linux/amd64", ci),
+            ("'release/**'", ci),
+        ),
+        "extended-native.yml": (
+            ("workflow_call:", extended),
+            ("workflow_dispatch:", extended),
+            ("ubuntu-24.04-arm", extended),
+            ("macos-15-intel", extended),
+            ("windows-11-arm", extended),
+            ("darwin-x64", extended),
+            ("win32-arm64", extended),
+            ("prepare_desktop_bundle.ps1", extended),
+            ("desktop_install_windows_smoke.ps1", extended),
+            ("prepare_desktop_bundle_macos.py", extended),
+            ("desktop_install_macos_smoke.sh", extended),
         ),
         "release-readiness.yml": (
             ("ci_run_id", readiness_workflow),
+            ("evidence_run_id", readiness_workflow),
+            ("- 'release/v*'", readiness_workflow),
+            ("source_ref:", readiness_workflow),
+            ('refs/heads/$INPUT_SOURCE_REF', readiness_workflow),
+            ("uses: ./.github/workflows/extended-native.yml", readiness_workflow),
+            ("if: github.event_name == 'push' || inputs.source_ref == 'main'", readiness_workflow),
             ("linux/amd64", readiness_workflow),
             ("linux/arm64", readiness_workflow),
         ),
@@ -122,7 +152,8 @@ def _workflow_contract(root: Path) -> str:
             ("prepare_desktop_bundle_macos.py", build),
             ("desktop_install_macos_smoke.sh", build),
             ("desktop_artifacts", build),
-            ("webcodex-desktop-v$env:VERSION-win32-x64-setup.exe", build),
+            ('refs/tags/$tag', build),
+            ("webcodex-desktop-v$env:VERSION-$env:WEBCODEX_RELEASE_PLATFORM-setup.exe", build),
             ("webcodex-desktop-v$VERSION-$WEBCODEX_RELEASE_PLATFORM.dmg", build),
             ('desktop_dist="$GITHUB_WORKSPACE/dist"', build),
             ('$installerPath = Join-Path $desktopDist $installerName', build),
@@ -130,9 +161,49 @@ def _workflow_contract(root: Path) -> str:
             ('--dmg "${{ steps.desktop_dmg.outputs.path }}"', build),
             ("-Installer $env:DESKTOP_INSTALLER_PATH", build),
             ("dist/webcodex-desktop-*.dmg", build),
-            ("dist/webcodex-desktop-*-win32-x64-setup.exe", build),
-            ("signing_mode=adhoc", build),
-            ('export APPLE_SIGNING_IDENTITY="-"', build),
+            ("dist/webcodex-desktop-*-${{ matrix.platform }}-setup.exe", build),
+            ('bash scripts/macos_sign_runner.sh target/release/webcodex-runner "$APPLE_SIGNING_IDENTITY" "$WEBCODEX_MACOS_SIGNING_MODE"', build),
+            ("macos_finalize_desktop.sh", build),
+            ("macos_ci_signing_setup.sh", build),
+            ("macos_finalize_dmg.sh", build),
+            ("public release requires persistent signing identity", build),
+            ('expected_notarized = expected_signing == "developer-id"', build),
+            ("  preflight:", build),
+            ("Fail fast on deterministic release contracts", build),
+            ("bash scripts/release_check.sh --static-only", build),
+            ("include_unified_installers:", build),
+            ("if: inputs.include_unified_installers", build),
+            ("!inputs.include_unified_installers || needs.unified-native.result == 'success'", build),
+            ("export CARGO_TARGET_DIR=/work/target", build),
+            ('export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"', build),
+            ('desktop="$CARGO_TARGET_DIR/release/webcodex-desktop"', build),
+        ),
+        "release-desktop-darwin-x64.yml": (
+            ("types: [published]", intel_desktop),
+            ("workflow_dispatch:", intel_desktop),
+            ("macos-15-intel", intel_desktop),
+            ("contents: write", intel_desktop),
+            ("webcodex-v$VERSION-$PLATFORM.tar.gz", intel_desktop),
+            ("SHA256SUMS", intel_desktop),
+            ("gh release upload", intel_desktop),
+            ("desktop_install_macos_smoke.sh", intel_desktop),
+            ("desktop_install_macos_smoke.sh", intel_desktop),
+            ("macos_ci_signing_setup.sh", intel_desktop),
+            ("macos_finalize_dmg.sh", intel_desktop),
+            ("Treat an already-published DMG as immutable authority", intel_desktop),
+            ("--build-info-json", intel_desktop),
+            ("source_sha.startswith(commit)", intel_desktop),
+            ("immutable runtime binaries disagree on commit identity", intel_desktop),
+        ),
+        "release-image.yml": (
+            ("WEBCODEX_GIT_COMMIT=${{ needs.resolve.outputs.source_short }}", release_image),
+            ("--build-info-json", release_image),
+            ("source_sha.startswith(commit)", release_image),
+        ),
+        "download-page.yml": (
+            ("Resolve optional installer manifest", download_page),
+            ('echo "has_installers=false" >> "$GITHUB_OUTPUT"', download_page),
+            ("if: steps.manifest.outputs.has_installers == 'true'", download_page),
         ),
     }
     missing = []
@@ -142,18 +213,32 @@ def _workflow_contract(root: Path) -> str:
                 missing.append(f"{filename}:{token}")
     if missing:
         raise DoctorError(f"release workflow contract is missing: {', '.join(missing)}")
+    forbidden_daily = ("macos-15-intel", "windows-11-arm", "ubuntu-24.04-arm", "test-windows-arm64:", "test-linux-arm64:")
+    leaked = [token for token in forbidden_daily if token in ci]
+    if leaked:
+        raise DoctorError(f"ordinary CI regained extended-native lanes: {', '.join(leaked)}")
     if "packages: write" in readiness_workflow or "actions/upload-artifact" in readiness_workflow:
         raise DoctorError("release-readiness gained publication/upload authority")
     if "prepare_desktop_bundle.ps1" in readiness_workflow or "tauri" in readiness_workflow.lower():
         raise DoctorError("release-readiness gained Desktop candidate build responsibility")
-    if "secrets.APPLE_" in build:
-        raise DoctorError("release-build unexpectedly depends on paid Apple signing credentials")
-    return "CI, readiness, and authoritative build workflow contracts are consistent"
+    apple_secret_surfaces = {
+        "ci.yml": ci,
+        "extended-native.yml": extended,
+        "release-readiness.yml": readiness_workflow,
+    }
+    leaked_apple_secrets = [name for name, body in apple_secret_surfaces.items() if "secrets.APPLE_" in body]
+    if leaked_apple_secrets:
+        raise DoctorError(
+            "disposable CI unexpectedly depends on Apple release-signing credentials: "
+            + ", ".join(leaked_apple_secrets)
+        )
+    return "main/release-branch CI, precomputed release-source evidence, persistent macOS release signing, and tag-bound authoritative build contracts are consistent"
 
 
 def _compile_verifiers(root: Path) -> str:
     for relative in (
         "scripts/collect_release_bundle.py",
+        "scripts/prepare_release_metadata.py",
         "scripts/verify_public_release.py",
         "scripts/prepare_server_deployment_assets.py",
         "scripts/release_publication.py",
@@ -161,7 +246,7 @@ def _compile_verifiers(root: Path) -> str:
     ):
         source = (root / relative).read_text(encoding="utf-8")
         compile(source, relative, "exec")
-    return "collector, public verifier, deployment metadata, publication, and readiness Python parse cleanly"
+    return "collector, release metadata, public verifier, deployment metadata, publication, and readiness Python parse cleanly"
 
 
 def _actionlint(root: Path) -> str:
@@ -175,9 +260,11 @@ def _actionlint(root: Path) -> str:
         [
             executable,
             str(root / ".github/workflows/ci.yml"),
+            str(root / ".github/workflows/extended-native.yml"),
             str(root / ".github/workflows/release-readiness.yml"),
             str(root / ".github/workflows/release-build.yml"),
             str(root / ".github/workflows/release-image.yml"),
+            str(root / ".github/workflows/release-desktop-darwin-x64.yml"),
         ],
         cwd=root,
         stdout=subprocess.PIPE,
@@ -197,12 +284,14 @@ def run_doctor(
     repo: str,
     version: str,
     source_sha: str,
+    source_ref: str = "main",
     root: Path,
     timeout: float,
 ) -> dict:
     source_root = root.absolute()
     source = collector.normalize_source_sha(source_sha)
     release_version = publication.normalize_version(version)
+    release_source_ref = publication.normalize_release_source_ref(source_ref, release_version)
     checks: list[dict] = []
 
     _record(checks, "required-tools", _require_tools)
@@ -220,6 +309,7 @@ def run_doctor(
             repo=repo,
             version=release_version,
             source_sha=source,
+            source_ref=release_source_ref,
             root=source_root,
             timeout=timeout,
         )
@@ -232,10 +322,28 @@ def run_doctor(
     def ci_check() -> str:
         nonlocal ci_result
         client = collector.GitHubClient(repo, collector.resolve_github_token(), timeout)
-        ci_result = readiness._successful_main_ci_run(client, source)
-        return f"exact-main CI run {ci_result['id']} attempt {ci_result['run_attempt']} is successful"
+        ci_result = readiness._successful_source_ci_run(client, source, release_source_ref)
+        return (
+            f"exact-source CI run {ci_result['id']} attempt {ci_result['run_attempt']} "
+            f"is successful for {release_source_ref}"
+        )
 
-    _record(checks, "exact-main-ci", ci_check)
+    _record(checks, "exact-source-ci", ci_check)
+
+    evidence_result: dict | None = None
+
+    def evidence_check() -> str:
+        nonlocal evidence_result
+        if not release_source_ref.startswith("release/"):
+            return "main-source release uses readiness-dispatch evidence fallback"
+        client = collector.GitHubClient(repo, collector.resolve_github_token(), timeout)
+        evidence_result = readiness._successful_source_evidence_run(client, source, release_source_ref)
+        return (
+            f"exact-source release evidence run {evidence_result['id']} attempt "
+            f"{evidence_result['run_attempt']} is successful for {release_source_ref}"
+        )
+
+    _record(checks, "exact-source-release-evidence", evidence_check)
 
     def release_list_check() -> str:
         client = collector.GitHubClient(repo, collector.resolve_github_token(), timeout)
@@ -249,13 +357,23 @@ def run_doctor(
         "status": "passed" if not failures else "failed",
         "repo": repo,
         "version": release_version,
+        "source_ref": release_source_ref,
         "source_sha": source,
         "checks": checks,
         "failed_checks": [check["name"] for check in failures],
         "preflight": preflight_result,
-        "main_ci": (
+        "source_ci": (
             {"run_id": ci_result["id"], "run_attempt": ci_result["run_attempt"], "url": ci_result["html_url"]}
             if ci_result is not None
+            else None
+        ),
+        "source_evidence": (
+            {
+                "run_id": evidence_result["id"],
+                "run_attempt": evidence_result["run_attempt"],
+                "url": evidence_result["html_url"],
+            }
+            if evidence_result is not None
             else None
         ),
         "mutations_performed": False,

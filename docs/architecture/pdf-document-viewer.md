@@ -1,0 +1,148 @@
+# Dedicated PDF document viewer
+
+`present_pdf(project, path)` binds a direct model tool to the self-contained
+`src/mcp_pdf_app.html` resource, `ui://webcodex/pdf/v7`. It selects one
+authorized project-relative `.pdf`, independent of Git changes, a Work Result
+card, or a Workflow Session. The App contains only document controls and the
+reading area; the Host owns the surrounding chrome and display mode.
+
+## Authority and version selection
+
+`present_pdf` is a read-only `project:read` observation. It validates the
+project-relative path, bounds PDFs to 20 MiB, reads the first five bytes, and
+pins the selected file by exact size and SHA-256. The size/digest pair is a
+version fence, never a bearer credential or replacement for current Project
+authority.
+
+The dedicated reader uses the model-hidden, App-only
+`read_app_artifact_chunk` transport. The tool is format-neutral so later
+DOCX/PPTX/XLSX renderers can share the same transport. Every read:
+
+- re-resolves and reauthorizes the Project;
+- revalidates the project-relative artifact path and exact size/SHA-256;
+- reuses the authenticated Runner artifact-export path and its capability
+  checks;
+- reads through the canonical internal artifact transport but bounds each Host-facing segment to 512 KiB;
+- fails closed with `snapshot_changed` if the selected bytes change.
+
+The adapter removes `content_base64` from model-visible structured/text
+framing and places bytes only in private
+`_meta["webcodex/artifactChunk"].content_base64`. The App accepts the Host
+wrapper aliases observed for both structured results and private metadata
+(`result`, `result.result`, `result.toolResult`, and
+`result.tool_result`) before validating the chunk identity and continuation.
+
+The PDF-specific `read_pdf_chunk` existed only on unreleased v0.5 revisions and
+has been removed. The dedicated reader uses only the generic artifact transport.
+An older mounted App must be reopened from the current descriptor; there is no
+old-tool alias. See the [compatibility policy](../compatibility-policy.md).
+
+## Reader behavior
+
+The reader reconstructs the selected byte stream under one absolute, size-aware
+transfer deadline. The budget is at least 120 seconds and scales with the number
+of bounded 512 KiB Host round trips, capped at 15 minutes. Each App-originated
+chunk request uses the remaining document budget as its Host timeout, so a
+separate shorter timer cannot terminate a transfer before the document deadline.
+Every continuation is validated, SHA-256 is recomputed, and the `%PDF-` header is
+checked before PDF.js receives the document.
+Replacing or invalidating the selection, retrying, and teardown abort outstanding
+local chunk waits and remove their Host timeouts and cancellation listeners. This
+ends the old transfer without waiting for the document deadline; late Host
+responses are ignored. Repeated delivery of the same identity keeps the live
+transfer. Cancellation is local and does not cancel a dispatched Host tool call.
+
+Rendering uses PDF.js 6.4.299 core parsing, page rendering, and `TextLayer`
+rather than the full `pdf_viewer.mjs` application layer. A small App shell
+provides:
+
+- continuous vertical page scrolling;
+- current-page tracking with `IntersectionObserver`;
+- nearby-page lazy rendering instead of eagerly painting the full document;
+- a serial render queue with at most six retained pages and 24 million total
+  canvas pixels; remote pages release their canvas, text layer and page resources;
+- first-page display without fetching every PageProxy: other page shells use
+  estimated geometry until their actual page is needed;
+- Previous/Next scroll navigation;
+- fit-width and bounded zoom;
+- page-local text search and selection.
+
+Prefetching uses a separate 900-pixel-margin observer. Current-page tracking uses
+the actual viewport and all currently visible pages, including scroll updates;
+prefetch notifications cannot select a page. An explicitly selected short page
+stays current while it remains fully visible. Fit width is computed independently
+for each page, and its canvas and text layer share that page's scale.
+Zoom, fit-width and container-width changes preserve the current page and the
+relative vertical position within it while page heights are recalculated.
+
+A page render failure keeps its actionable error and Retry visible through page
+navigation, other pages finishing, zoom and container resize. Incomplete canvas
+and text output is released, and that failed page is not retried by background
+viewport scheduling. Other pages can still render. Explicit Retry or a new
+source creates a fresh preview; late work from the old preview cannot replace it.
+
+Offline fonts/CMaps, the 8-million-pixel canvas cap, disabled scripting/eval,
+XFA/Wasm/external fetches, the 16-million-pixel embedded-image limit, and
+bounded Worker cleanup remain in place. Work Result keeps its compact
+single-page PDF preview; the dedicated reader is a separate presentation
+surface.
+
+The current transport assembles the complete file before PDF.js starts
+rendering. Progressive first-page display therefore requires a separate
+range-transport design; continuous rendering improves navigation and render
+boundedness but does not change initial byte-transfer latency.
+
+## Host compatibility
+
+The tested ChatGPT MCP App bridge supports App-originated `tools/call` for the
+private reader. It did not accept the earlier App-originated
+`resources/read` experiment. The production design therefore keeps binary
+reads on the admitted App-only tool while leaving generic MCP artifact export
+unchanged.
+
+Live dogfood also showed that Host tool-result wrapper shape is not stable
+enough to assume top-level `_meta`. Private metadata is normalized with the
+same wrapper policy as structured results. The evidence and rejected
+alternatives are recorded in
+[PDF document viewer dogfood](../experiments/pdf-document-viewer-dogfood.md).
+
+A final 1 MiB live probe after metadata normalization still stopped after the
+first ~1.4 MiB serialized tool response. The production App therefore uses a
+512 KiB Host-facing segment even though the internal artifact transport
+supports 1 MiB chunks.
+
+## Build and validation
+
+The common asset builder creates the closed PDF HTML bundle and normalizes
+gzip's OS header so native platform metadata cannot change checked-in bytes.
+Git attributes retain LF line endings for generated frontend assets. Resource
+identity is version-fenced so incompatible App changes receive a fresh Host
+cache identity.
+
+Run:
+
+```sh
+npm --prefix frontend run build:work-result
+node --test frontend/test/pdf-document-reader.test.mjs frontend/test/pdf-continuous-preview.test.mjs
+cargo test --locked -p webcodex --lib pdf_document
+cargo test --locked -p webcodex --lib pdf_document_app
+npm --prefix scripts/ui-smoke ci
+npm --prefix scripts/ui-smoke exec -- playwright install chromium
+npm --prefix scripts/ui-smoke run test:pdf
+```
+
+`frontend/scripts/build-pdf-document.mjs --check` is part of distribution
+freshness validation. Runtime and MCP authority/framing tests remain in the
+existing PDF document test modules.
+
+The Playwright check loads the shipped HTML and real PDF.js Blob Worker through
+an isolated MCP Host fixture. Original, deterministic PDF samples cover mixed
+page sizes, rotation, embedded Type3 Chinese glyphs with ToUnicode mapping, a
+scan-only image, a 32-page document, oversized pages at DPR 2, a valid document
+with one page exceeding the image limit, and invalid PDF bytes. Assertions check image pixels, glyph painting, text selection/alignment,
+page navigation, reading-position preservation, zoom/resize cancellation, lazy
+loading, cache limits, duplicate delivery, version changes, cancellation on
+replacement/invalid selection, and teardown during transfer. It blocks external
+network fetches. Screenshots and the result report are local ignored artifacts
+under `artifacts/pdf-reader/`; it does not exercise a real MCP Host or native
+Server/Runner authority. See [UI smoke instructions](../../scripts/ui-smoke/README.md).

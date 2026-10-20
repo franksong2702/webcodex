@@ -1,6 +1,5 @@
 //! Runtime dispatch adapters for file, artifact, and text-edit tool calls.
 
-use super::files::SearchRequest;
 use super::project_resolution::{ProjectResolverError, ResolvedProject};
 use super::{sessions::SessionTransport, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
@@ -19,24 +18,6 @@ impl ToolRuntime {
                 paths,
                 session_id: _,
             } => self.delete_project_files(project, paths).await,
-            ToolCall::ReadFile {
-                project,
-                path,
-                session_id: _,
-                start_line,
-                limit,
-                with_line_numbers,
-            } => match project_resolution {
-                Some(Ok(resolved)) => {
-                    self.read_file_resolved(&resolved, path, start_line, limit, with_line_numbers)
-                        .await
-                }
-                Some(Err(error)) => error.into_tool_result(),
-                None => {
-                    self.read_file(project, path, start_line, limit, with_line_numbers)
-                        .await
-                }
-            },
             ToolCall::ReadFiles {
                 project,
                 items,
@@ -56,8 +37,10 @@ impl ToolRuntime {
                 session_id: _,
                 path,
                 limit,
-            } => self.list_project_files(project, path, limit).await,
+                offset,
+            } => self.list_project_files(project, path, limit, offset).await,
             ToolCall::ListProjectTrackedFiles {
+                query,
                 project,
                 session_id: _,
                 path,
@@ -66,7 +49,7 @@ impl ToolRuntime {
                 limit,
                 offset,
             } => {
-                self.list_project_tracked_files(project, path, globs, depth, limit, offset)
+                self.list_project_tracked_files(project, path, globs, query, depth, limit, offset)
                     .await
             }
             ToolCall::ProjectOverview {
@@ -76,57 +59,6 @@ impl ToolRuntime {
                 max_depth,
                 limit,
             } => self.project_overview(project, path, max_depth, limit).await,
-            ToolCall::SearchProjectText {
-                project,
-                pattern,
-                pattern_mode,
-                session_id: _,
-                path,
-                limit,
-                context_before,
-                context_after,
-                include_globs,
-                exclude_globs,
-                result_mode,
-                timeout_secs,
-            } => match project_resolution {
-                Some(Ok(resolved)) => {
-                    self.search_project_text_resolved(
-                        &resolved,
-                        &project,
-                        SearchRequest {
-                            pattern,
-                            path,
-                            limit,
-                            context_before,
-                            context_after,
-                            include_globs,
-                            exclude_globs,
-                            result_mode,
-                            timeout_secs,
-                        },
-                        pattern_mode,
-                    )
-                    .await
-                }
-                Some(Err(error)) => error.into_tool_result(),
-                None => {
-                    self.search_project_text(
-                        project,
-                        pattern,
-                        pattern_mode,
-                        path,
-                        limit,
-                        context_before,
-                        context_after,
-                        include_globs,
-                        exclude_globs,
-                        result_mode,
-                        timeout_secs,
-                    )
-                    .await
-                }
-            },
             ToolCall::SearchProjectTexts {
                 project,
                 queries,
@@ -137,15 +69,67 @@ impl ToolRuntime {
                 Some(Err(error)) => error.into_tool_result(),
                 None => self.search_project_texts(project, queries).await,
             },
+            ToolCall::SearchAndRead {
+                project,
+                query,
+                queries,
+                session_id,
+                read_before,
+                read_after,
+                max_reads,
+                with_line_numbers,
+            } => {
+                let queries = match (query, queries) {
+                    (Some(query), None) => vec![query],
+                    (None, Some(queries)) if !queries.is_empty() && queries.len() <= 8 => queries,
+                    (Some(_), Some(_)) => {
+                        return ToolResult::err(
+                            "search_file_context accepts query or queries, not both",
+                        )
+                    }
+                    _ => {
+                        return ToolResult::err(
+                            "search_file_context requires query or 1..8 queries",
+                        )
+                    }
+                };
+                match project_resolution {
+                    Some(Ok(resolved)) => {
+                        self.search_and_read_resolved(
+                            &resolved,
+                            queries,
+                            session_id,
+                            read_before,
+                            read_after,
+                            max_reads,
+                            with_line_numbers,
+                        )
+                        .await
+                    }
+                    Some(Err(error)) => error.into_tool_result(),
+                    None => {
+                        self.search_and_read(
+                            project,
+                            queries,
+                            session_id,
+                            read_before,
+                            read_after,
+                            max_reads,
+                            with_line_numbers,
+                        )
+                        .await
+                    }
+                }
+            }
             ToolCall::WriteProjectFile {
                 project,
                 path,
                 content,
                 session_id: _,
                 overwrite,
-                expected_sha256,
+                expected_read_revision,
             } => {
-                self.write_project_file(project, path, content, overwrite, expected_sha256)
+                self.write_project_file(project, path, content, overwrite, expected_read_revision)
                     .await
             }
             ToolCall::SaveProjectArtifact {
@@ -159,28 +143,159 @@ impl ToolRuntime {
                 self.save_project_artifact(project, path, content_base64, mime_type, overwrite)
                     .await
             }
-            ToolCall::ExportProjectArtifact {
-                project: _,
-                path,
-                session_id: _,
+            ToolCall::TransferProjectArtifact {
+                source_project,
+                source_path,
+                destination_project,
+                destination_path,
+                overwrite,
             } => {
+                self.transfer_project_artifact(
+                    source_project,
+                    source_path,
+                    destination_project,
+                    destination_path,
+                    overwrite,
+                    auth,
+                    transport,
+                )
+                .await
+            }
+            ToolCall::AcceptArtifactHandoff {
+                grant_id,
+                destination_project,
+                destination_path,
+                overwrite,
+                idempotency_key,
+            } => {
+                self.accept_artifact_handoff(
+                    grant_id,
+                    destination_project,
+                    destination_path,
+                    overwrite,
+                    idempotency_key,
+                    auth,
+                    transport,
+                )
+                .await
+            }
+            ToolCall::PresentSpreadsheet { project: _, path } => {
                 if !matches!(transport, SessionTransport::Mcp) {
-                    ToolResult::err(
-                        "export_project_artifact is MCP-only; use read_project_artifact for bounded inspection outside MCP",
+                    ToolResult::err_with_output(
+                        "present_spreadsheet requires MCP resource presentation transport",
+                        serde_json::json!({"error_kind": "unsupported_transport", "required_transport": "mcp"}),
                     )
                 } else {
                     match project_resolution {
-                        Some(Ok(resolved)) => {
-                            self.export_project_artifact_metadata_resolved(&resolved, path, auth)
-                                .await
-                        }
+                        Some(Ok(resolved)) => self.present_spreadsheet(&resolved, path, auth).await,
                         Some(Err(error)) => error.into_tool_result(),
                         None => ToolResult::err(
-                            "export_project_artifact requires an exact resolved Runner project",
+                            "present_spreadsheet requires an exact resolved Runner project",
                         ),
                     }
                 }
             }
+            ToolCall::ProjectArtifact {
+                project,
+                path,
+                action,
+                session_id,
+                allow_missing,
+                offset,
+                length,
+                expected_sha256,
+            } => match action {
+                super::ProjectArtifactAction::Metadata => {
+                    self.read_project_artifact_metadata(project, path, allow_missing)
+                        .await
+                }
+                super::ProjectArtifactAction::Inspect => {
+                    let mut result = self
+                        .read_project_artifact(
+                            project,
+                            path,
+                            None,
+                            offset,
+                            length,
+                            expected_sha256,
+                            session_id,
+                            None,
+                        )
+                        .await;
+                    if let Some(suggested_call) = result
+                        .output
+                        .get_mut("suggested_call")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        if suggested_call
+                            .get("tool")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("read_project_artifact_chunk")
+                        {
+                            suggested_call.insert(
+                                "tool".to_string(),
+                                serde_json::json!("inspect_project_artifact"),
+                            );
+                            if let Some(arguments) = suggested_call
+                                .get_mut("arguments")
+                                .and_then(serde_json::Value::as_object_mut)
+                            {
+                                arguments.remove("encoding");
+                                arguments
+                                    .insert("action".to_string(), serde_json::json!("inspect"));
+                            }
+                        }
+                    }
+                    result
+                }
+                super::ProjectArtifactAction::Image => {
+                    if !matches!(transport, SessionTransport::Mcp) {
+                        ToolResult::err_with_output(
+                            "inspect_project_artifact action=image requires MCP native-image transport",
+                            serde_json::json!({
+                                "error_kind": "unsupported_transport",
+                                "action": "image",
+                                "required_transport": "mcp",
+                            }),
+                        )
+                    } else {
+                        self.read_project_artifact(
+                            project,
+                            path,
+                            None,
+                            None,
+                            None,
+                            None,
+                            session_id,
+                            Some(true),
+                        )
+                        .await
+                    }
+                }
+                super::ProjectArtifactAction::Export => {
+                    if !matches!(transport, SessionTransport::Mcp) {
+                        ToolResult::err_with_output(
+                            "inspect_project_artifact action=export requires Stateless MCP 2026 ResourceLink transport",
+                            serde_json::json!({
+                                "error_kind": "unsupported_transport",
+                                "action": "export",
+                                "required_transport": "mcp",
+                            }),
+                        )
+                    } else {
+                        match project_resolution {
+                            Some(Ok(resolved)) => {
+                                self.export_project_artifact_metadata_resolved(&resolved, path, auth)
+                                    .await
+                            }
+                            Some(Err(error)) => error.into_tool_result(),
+                            None => ToolResult::err(
+                                "inspect_project_artifact action=export requires an exact resolved Runner project",
+                            ),
+                        }
+                    }
+                }
+            },
             ToolCall::ReadProjectArtifactMetadata {
                 project,
                 path,
@@ -193,10 +308,11 @@ impl ToolRuntime {
             ToolCall::ReadProjectArtifact {
                 project,
                 path,
-                session_id: _,
+                session_id,
                 encoding,
                 offset,
                 length,
+                expected_sha256,
                 as_image,
             } => {
                 if as_image == Some(true) && !matches!(transport, SessionTransport::Mcp) {
@@ -204,8 +320,17 @@ impl ToolRuntime {
                         "as_image is only supported over MCP; omit it to use the existing chunked artifact response",
                     )
                 } else {
-                    self.read_project_artifact(project, path, encoding, offset, length, as_image)
-                        .await
+                    self.read_project_artifact(
+                        project,
+                        path,
+                        encoding,
+                        offset,
+                        length,
+                        expected_sha256,
+                        session_id,
+                        as_image,
+                    )
+                    .await
                 }
             }
             ToolCall::ArtifactUploadBegin {

@@ -8,7 +8,7 @@ set -uo pipefail
 # runs three scripted cases through /api/tools/call, and emits a final JSON
 # summary as the last stdout line.
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
 
@@ -348,20 +348,6 @@ print(json.dumps({
 PY
 }
 
-params_start_session() {
-    local title="$1"
-    python3 - "$RUNTIME_PROJECT_ID" "$title" <<'PY'
-import json
-import sys
-
-print(json.dumps({
-    "project": sys.argv[1],
-    "title": sys.argv[2],
-    "mode": "normal",
-}, separators=(",", ":")))
-PY
-}
-
 params_finish_task() {
     local session_id="$1"
     python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
@@ -391,6 +377,7 @@ print(json.dumps({
     "include_workspace": True,
     "include_checkpoints": False,
     "include_validation": True,
+    "diagnostic": True,
     "limit": 50,
 }, separators=(",", ":")))
 PY
@@ -431,7 +418,7 @@ call_tool() {
             ;;
     esac
     case "$tool" in
-        apply_text_edits)
+        edit_project_files)
             CASE_STRUCTURED_EDIT_CALLS=$((CASE_STRUCTURED_EDIT_CALLS + 1))
             ;;
     esac
@@ -662,15 +649,12 @@ start_case_session() {
     local title="$2"
     local params
 
-    if [ "$flow_kind" = "guided" ]; then
-        params="$(params_work_on_project "$title")"
-        call_tool "work_on_project" "$params"
-        assert_session_created "work_on_project" "$LAST_BODY" "output.session_id"
-    else
-        params="$(params_start_session "$title")"
-        call_tool "start_session" "$params"
-        assert_session_created "start_session" "$LAST_BODY" "output.session_id"
-    fi
+    # Both flows now use the supported exact bootstrap. The historical
+    # start_session entry was retired; baseline still uses manual closeout while
+    # guided uses finish_coding_task. Do not compare old startup counts as peers.
+    params="$(params_work_on_project "$title")"
+    call_tool "work_on_project" "$params"
+    assert_session_created "work_on_project" "$LAST_BODY" "output.session_id"
 }
 
 assert_handoff_available() {
@@ -745,7 +729,7 @@ recent = handoff.get("recent_failed_tools") or []
 ok = (
     data.get("success") is True
     and counts.get("failed_tool_calls", 0) >= 1
-    and any(item.get("tool_name") == "apply_text_edits" for item in recent if isinstance(item, dict))
+    and any(item.get("tool_name") == "edit_project_files" for item in recent if isinstance(item, dict))
 )
 sys.exit(0 if ok else 1)
 PY
@@ -765,7 +749,7 @@ import sys
 
 data = json.loads(sys.argv[1])
 out = data.get("output") or {}
-changes = ((out.get("changes") or {}).get("show_changes") or {})
+changes = ((out.get("changes") or {}).get("read_workspace_changes") or {})
 files = changes.get("files") or []
 ok = (
     data.get("success") is True
@@ -977,32 +961,32 @@ complete_case_session() {
         fi
     else
         params="$(params_workspace_hygiene "$session_id")"
-        call_tool "workspace_hygiene_check" "$params"
-        assert_success "workspace_hygiene_check succeeds" "$LAST_BODY"
+        call_tool "check_workspace_hygiene" "$params"
+        assert_success "check_workspace_hygiene succeeds" "$LAST_BODY"
 
         params="$(params_session_handoff "$session_id")"
-        call_tool "session_handoff_summary" "$params"
-        assert_success "session_handoff_summary succeeds" "$LAST_BODY"
-        assert_handoff_available "session_handoff_summary returns handoff" "$LAST_BODY" "output"
+        call_tool "read_session_handoff" "$params"
+        assert_success "read_session_handoff succeeds" "$LAST_BODY"
+        assert_handoff_available "read_session_handoff returns handoff" "$LAST_BODY" "output"
         capture_validation_metrics "$LAST_BODY" "output.validation"
 
         if [ "$case_name" = "small_structured_line_edit" ]; then
             assert_validation_available \
-                "session_handoff_summary validation summary is available" \
+                "read_session_handoff validation summary is available" \
                 "$LAST_BODY" \
                 "output.validation"
         elif [ "$case_name" = "failed_call_recovery" ]; then
             assert_validation_unavailable \
-                "session_handoff_summary validation summary is unavailable without validation events" \
+                "read_session_handoff validation summary is unavailable without validation events" \
                 "$LAST_BODY" \
                 "output.validation"
             assert_handoff_failed_tool_metadata \
-                "session_handoff_summary includes failed tool metadata" \
+                "read_session_handoff includes failed tool metadata" \
                 "$LAST_BODY" \
                 "output"
         else
             assert_validation_unavailable \
-                "session_handoff_summary validation summary is unavailable without validation events" \
+                "read_session_handoff validation summary is unavailable without validation events" \
                 "$LAST_BODY" \
                 "output.validation"
         fi
@@ -1054,7 +1038,7 @@ EOF
 # Coding Loop Eval
 
 This disposable project is used by the WebCodex coding-loop eval harness.
-It contains the phrase coding-loop eval so search_project_text has a stable match.
+It contains the phrase coding-loop eval so search_project_texts has a stable match.
 EOF
         cat >.gitignore <<'EOF'
 /target/
@@ -1128,7 +1112,7 @@ EOF
     for _ in $(seq 1 90); do
         check_deadline
         body="$(api_post /api/runtime/status '{}' || true)"
-        if [ "$(json_get "$body" output.agents.count)" = "1" ]; then
+        if [ "$(json_get "$body" output.runners.count)" = "1" ]; then
             registered=1
             break
         fi
@@ -1164,21 +1148,25 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "pattern": "coding-loop eval",
-    "path": ".",
-    "limit": 10,
+    "queries": [{
+        "pattern": "coding-loop eval",
+        "path": ".",
+        "limit": 10,
+    }],
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "search_project_text" "$params"
-    assert_success "search_project_text succeeds" "$LAST_BODY"
+    call_tool "search_project_texts" "$params"
+    assert_success "search_project_texts succeeds" "$LAST_BODY"
     if python3 - "$LAST_BODY" <<'PY'
 import json
 import sys
 
 data = json.loads(sys.argv[1])
 out = data.get("output") or {}
-matches = out.get("matches")
+items = out.get("items") or []
+item = items[0] if items and isinstance(items[0], dict) else {}
+matches = (item.get("output") or {}).get("matches")
 ok = (
     data.get("success") is True
     and isinstance(matches, list)
@@ -1195,9 +1183,9 @@ ok = (
 sys.exit(0 if ok else 1)
 PY
     then
-        case_ok "search_project_text returns structured match records"
+        case_ok "search_project_texts returns structured match records"
     else
-        case_fail "search_project_text structured match records missing"
+        case_fail "search_project_texts structured match records missing"
     fi
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
@@ -1207,15 +1195,17 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "README.md",
-    "start_line": 1,
-    "limit": 6,
+    "items": [{
+        "path": "README.md",
+        "start_line": 1,
+        "limit": 6,
+    }],
     "with_line_numbers": True,
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "read_file" "$params"
-    assert_success "read_file succeeds" "$LAST_BODY"
+    call_tool "read_files" "$params"
+    assert_success "read_files succeeds" "$LAST_BODY"
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
 import json
@@ -1228,8 +1218,8 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "show_changes" "$params"
-    assert_success "show_changes succeeds" "$LAST_BODY"
+    call_tool "read_workspace_changes" "$params"
+    assert_success "read_workspace_changes succeeds" "$LAST_BODY"
 
     complete_case_session "$flow_kind" "$session_id" "inspect_only"
 
@@ -1263,42 +1253,51 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "src/lib.rs",
-    "start_line": 1,
-    "limit": 8,
+    "items": [{
+        "path": "src/lib.rs",
+        "start_line": 1,
+        "limit": 8,
+    }],
     "with_line_numbers": True,
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "read_file" "$params"
-    assert_success "read_file with line numbers succeeds" "$LAST_BODY"
+    call_tool "read_files" "$params"
+    assert_success "read_files with line numbers succeeds" "$LAST_BODY"
     if python3 - "$LAST_BODY" <<'PY'
 import json
 import sys
 
 data = json.loads(sys.argv[1])
 out = data.get("output") or {}
+items = out.get("items") or []
+item = items[0] if items and isinstance(items[0], dict) else {}
+read_out = item.get("output") or {}
 ok = (
     data.get("success") is True
-    and out.get("format") == "numbered"
-    and isinstance(out.get("text"), str)
-    and "1 | pub fn greeting" in out.get("text", "")
+    and read_out.get("format") == "numbered"
+    and isinstance(read_out.get("text"), str)
+    and "1 | pub fn greeting" in read_out.get("text", "")
 )
 sys.exit(0 if ok else 1)
 PY
     then
-        case_ok "read_file returned stable line-number metadata"
+        case_ok "read_files returned stable line-number metadata"
     else
-        case_fail "read_file line-number metadata missing"
+        case_fail "read_files line-number metadata missing"
     fi
 
-    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$TEST_REPO/src/lib.rs" <<'PY'
-import hashlib
+    local read_revision
+    read_revision="$(json_get "$LAST_BODY" output.items.0.output.read_revision)"
+    if [[ "$read_revision" =~ ^[0-9]+$ ]]; then
+        case_ok "read_files returned a valid read_revision mutation fence"
+    else
+        case_fail "read_files did not return a valid read_revision"
+    fi
+
+    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$read_revision" <<'PY'
 import json
 import sys
-
-with open(sys.argv[3], "rb") as handle:
-    current_sha = hashlib.sha256(handle.read()).hexdigest()
 
 print(json.dumps({
     "project": sys.argv[1],
@@ -1306,7 +1305,7 @@ print(json.dumps({
     "changes": [{
         "kind": "edit",
         "path": "src/lib.rs",
-        "expected_sha256": current_sha,
+        "expected_read_revision": int(sys.argv[3]),
         "edits": [{
             "kind": "replace_exact",
             "old_text": "    \"hello\"",
@@ -1316,8 +1315,8 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "apply_text_edits" "$params"
-    assert_success "apply_text_edits structured edit succeeds" "$LAST_BODY"
+    call_tool "edit_project_files" "$params"
+    assert_success "edit_project_files structured edit succeeds" "$LAST_BODY"
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
 import json
@@ -1332,8 +1331,8 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "show_changes" "$params"
-    assert_success "show_changes after edit succeeds" "$LAST_BODY"
+    call_tool "read_workspace_changes" "$params"
+    assert_success "read_workspace_changes after edit succeeds" "$LAST_BODY"
     if python3 - "$LAST_BODY" <<'PY'
 import json
 import sys
@@ -1349,9 +1348,9 @@ ok = (
 sys.exit(0 if ok else 1)
 PY
     then
-        case_ok "show_changes reports src/lib.rs as changed"
+        case_ok "read_workspace_changes reports src/lib.rs as changed"
     else
-        case_fail "show_changes did not report src/lib.rs as changed"
+        case_fail "read_workspace_changes did not report src/lib.rs as changed"
     fi
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
@@ -1398,7 +1397,36 @@ run_case_failed_call_recovery() {
         return
     fi
 
+    # Read both the mutation target and another path. Reusing README.md's valid
+    # revision for src/lib.rs creates a deterministic path-mismatch failure in
+    # the model-facing read-revision contract without modifying either file.
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "project": sys.argv[1],
+    "session_id": sys.argv[2],
+    "items": [
+        {"path": "src/lib.rs", "start_line": 1, "limit": 4},
+        {"path": "README.md", "start_line": 1, "limit": 4},
+    ],
+}, separators=(",", ":")))
+PY
+)"
+    call_tool "read_files" "$params"
+    assert_success "read_files establishes deliberate-failure revisions" "$LAST_BODY"
+    local src_revision_before_fail
+    local wrong_path_revision
+    src_revision_before_fail="$(json_get "$LAST_BODY" output.items.0.output.read_revision)"
+    wrong_path_revision="$(json_get "$LAST_BODY" output.items.1.output.read_revision)"
+    if [[ "$src_revision_before_fail" =~ ^[0-9]+$ && "$wrong_path_revision" =~ ^[0-9]+$ ]]; then
+        case_ok "deliberate-failure read revisions are valid"
+    else
+        case_fail "deliberate-failure read revisions are missing"
+    fi
+
+    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$wrong_path_revision" <<'PY'
 import json
 import sys
 
@@ -1408,7 +1436,7 @@ print(json.dumps({
     "changes": [{
         "kind": "edit",
         "path": "src/lib.rs",
-        "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "expected_read_revision": int(sys.argv[3]),
         "edits": [{
             "kind": "replace_exact",
             "old_text": "    \"hello\"",
@@ -1418,9 +1446,35 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "apply_text_edits" "$params"
+    call_tool "edit_project_files" "$params"
     assert_failure_error_kind \
-        "apply_text_edits wrong sha guard reports sha256_conflict" "$LAST_BODY" "sha256_conflict"
+        "edit_project_files mismatched read revision reports read_revision_path_mismatch" \
+        "$LAST_BODY" "read_revision_path_mismatch"
+    if python3 - "$LAST_BODY" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+out = data.get("output") or {}
+recovery = out.get("recovery") or {}
+arguments = recovery.get("arguments") or {}
+items = arguments.get("items") or []
+ok = (
+    data.get("success") is False
+    and out.get("error_kind") == "read_revision_path_mismatch"
+    and out.get("state_changed") is False
+    and recovery.get("tool") == "read_files"
+    and len(items) == 1
+    and isinstance(items[0], dict)
+    and items[0].get("path") == "src/lib.rs"
+)
+sys.exit(0 if ok else 1)
+PY
+    then
+        case_ok "failed edit returns read_files recovery metadata and no mutation"
+    else
+        case_fail "failed edit recovery metadata does not match read-revision contract"
+    fi
 
     params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" <<'PY'
 import json
@@ -1429,37 +1483,47 @@ import sys
 print(json.dumps({
     "project": sys.argv[1],
     "session_id": sys.argv[2],
-    "path": "src/lib.rs",
-    "start_line": 1,
-    "limit": 4,
+    "items": [{
+        "path": "src/lib.rs",
+        "start_line": 1,
+        "limit": 4,
+    }],
     "with_line_numbers": True,
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "read_file" "$params"
-    assert_success "read_file after failed edit succeeds" "$LAST_BODY"
+    call_tool "read_files" "$params"
+    assert_success "read_files after failed edit succeeds" "$LAST_BODY"
+    local recovery_read_revision
+    recovery_read_revision="$(json_get "$LAST_BODY" output.items.0.output.read_revision)"
     if python3 - "$LAST_BODY" <<'PY'
 import json
 import sys
 
 data = json.loads(sys.argv[1])
-text = (data.get("output") or {}).get("text", "")
-ok = data.get("success") is True and '"hello"' in text and "should not apply" not in text
+items = (data.get("output") or {}).get("items") or []
+item = items[0] if items and isinstance(items[0], dict) else {}
+read_out = item.get("output") or {}
+text = read_out.get("text", "")
+revision = read_out.get("read_revision")
+ok = (
+    data.get("success") is True
+    and '"hello"' in text
+    and "should not apply" not in text
+    and isinstance(revision, int)
+    and revision > 0
+)
 sys.exit(0 if ok else 1)
 PY
     then
-        case_ok "failed edit did not corrupt src/lib.rs"
+        case_ok "failed edit left src/lib.rs unchanged and reread returned a valid revision"
     else
-        case_fail "failed edit changed src/lib.rs unexpectedly"
+        case_fail "failed edit changed src/lib.rs or recovery revision is missing"
     fi
 
-    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$TEST_REPO/src/lib.rs" <<'PY'
-import hashlib
+    params="$(python3 - "$RUNTIME_PROJECT_ID" "$session_id" "$recovery_read_revision" <<'PY'
 import json
 import sys
-
-with open(sys.argv[3], "rb") as handle:
-    current_sha = hashlib.sha256(handle.read()).hexdigest()
 
 print(json.dumps({
     "project": sys.argv[1],
@@ -1467,7 +1531,7 @@ print(json.dumps({
     "changes": [{
         "kind": "edit",
         "path": "src/lib.rs",
-        "expected_sha256": current_sha,
+        "expected_read_revision": int(sys.argv[3]),
         "edits": [{
             "kind": "replace_exact",
             "old_text": "    \"hello\"",
@@ -1477,8 +1541,8 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "apply_text_edits" "$params"
-    assert_success "apply_text_edits recovery edit succeeds" "$LAST_BODY"
+    call_tool "edit_project_files" "$params"
+    assert_success "edit_project_files recovery edit succeeds" "$LAST_BODY"
 
     if [ "$CASE_FAILED_TOOL_CALLS" -ge 1 ]; then
         CASE_RECOVERED_FAILED_TOOL_CALLS=1
@@ -1500,8 +1564,8 @@ print(json.dumps({
 }, separators=(",", ":")))
 PY
 )"
-    call_tool "show_changes" "$params"
-    assert_success "show_changes after recovery succeeds" "$LAST_BODY"
+    call_tool "read_workspace_changes" "$params"
+    assert_success "read_workspace_changes after recovery succeeds" "$LAST_BODY"
 
     complete_case_session "$flow_kind" "$session_id" "failed_call_recovery"
 
@@ -1615,6 +1679,13 @@ summary = {
 print(json.dumps(summary, separators=(",", ":"), sort_keys=True))
 PY
 }
+
+# Isolated shell contract fixtures source the real helpers without starting
+# services or repositories. This is not EVAL_SKIP_RUN's planned result report.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    trap - INT TERM EXIT
+    return 0
+fi
 
 start_eval_services
 

@@ -343,30 +343,56 @@ async fn coding_task_semantic_navigation_disconnected_agent_is_nonblocking() {
         .is_none());
 }
 
+fn assert_inconclusive_startup(result: &ToolResult, status: &str) {
+    let semantic = &result.output["semantic_navigation"];
+    assert_eq!(semantic["supported"], true);
+    assert_eq!(semantic["available"], Value::Null);
+    assert_eq!(semantic["status"], status);
+    assert_eq!(result.output["startup_verdict"]["status"], "pass");
+    assert!(!result.output["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning == "semantic_navigation_unavailable"));
+    let compact = crate::tool_runtime::coding_task::project_work_on_project_output(
+        "demo".to_string(),
+        result.output.clone(),
+    );
+    assert!(compact.success, "{compact:?}");
+    assert_eq!(compact.output["semantic_navigation"]["status"], status);
+    assert_eq!(
+        compact.output["semantic_navigation"]["available"],
+        Value::Null
+    );
+    for absent in ["readiness", "warnings", "blockers", "action_required"] {
+        assert!(compact.output.get(absent).is_none(), "{compact:?}");
+    }
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+        &serde_json::to_value(&compact).unwrap(),
+        &crate::tool_runtime::registry::output_schema_for_tool("work_on_project"),
+    )
+    .unwrap();
+}
+
 #[tokio::test]
-async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_waiter() {
-    let runtime = test_runtime().with_semantic_navigation_probe_timeout(Duration::from_millis(25));
+async fn coding_task_semantic_navigation_does_not_wait_after_mandatory_startup() {
+    let runtime = test_runtime().with_semantic_navigation_probe_timeout(Duration::from_secs(60));
     let temp = tempfile::tempdir().unwrap();
     seed_clean_repo(temp.path());
     let project =
         register_semantic_agent(&runtime, "timeout-agent", "demo", temp.path(), true).await;
-    let started = Instant::now();
     let task = spawn_start(&runtime, project, SessionMode::Normal);
     let request = next_semantic_status_request(&runtime, "timeout-agent").await;
     let result = finish_start_servicing_locally(&runtime, "timeout-agent", task).await;
-    // This wall-clock bound includes the normal Git startup inspection that
-    // follows the 25ms semantic-navigation probe. Keep it well below the
-    // helper's 10-second liveness deadline so a lost probe budget still fails,
-    // but leave enough scheduler headroom for the full Windows test suite.
-    assert!(started.elapsed() < Duration::from_secs(5));
     assert!(result.success, "{result:?}");
     let semantic = &result.output["semantic_navigation"];
-    assert_eq!(semantic["status"], "probe_timeout");
-    assert_eq!(semantic["reason_code"], "status_probe_timed_out");
+    assert_eq!(semantic["status"], "not_observed");
+    assert_eq!(semantic["reason_code"], Value::Null);
     assert_eq!(semantic["supported"], true);
     assert_eq!(semantic["available"], Value::Null);
     assert_eq!(semantic["provider"], Value::Null);
     assert_eq!(semantic["capability"], "lsp_read_only_navigation");
+    assert_inconclusive_startup(&result, "not_observed");
     assert!(!result.output["warnings"]
         .as_array()
         .unwrap()
@@ -383,6 +409,8 @@ async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_wai
             exit_code: Some(0),
             stdout: Some("{}".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -395,7 +423,7 @@ async fn coding_task_semantic_navigation_timeout_uses_one_budget_and_cancels_wai
     assert!(summary
         .events
         .iter()
-        .all(|event| event.tool_name != "lsp_status"));
+        .all(|event| event.tool_name != "get_lsp_status"));
     assert_eq!(summary.counts.failed, 0);
 }
 
@@ -426,11 +454,7 @@ async fn coding_task_semantic_navigation_malformed_result_is_sanitized() {
     for forbidden in ["/private/secret", "do not leak", "stderr"] {
         assert!(!serialized.contains(forbidden), "{serialized}");
     }
-    assert!(result.output["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| warning == "semantic_navigation_unavailable"));
+    assert_inconclusive_startup(&result, "probe_failed");
 }
 
 #[tokio::test]
@@ -455,11 +479,7 @@ async fn coding_task_semantic_navigation_agent_failure_uses_fixed_reason_code() 
     assert_eq!(semantic["status"], "probe_failed");
     assert_eq!(semantic["reason_code"], "status_probe_failed");
     assert!(!semantic.to_string().contains("private raw failure detail"));
-    assert!(result.output["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|warning| warning == "semantic_navigation_unavailable"));
+    assert_inconclusive_startup(&result, "probe_failed");
 }
 
 #[tokio::test]
@@ -523,6 +543,7 @@ fn coding_workflow_semantic_navigation_output_schema_is_explicit_and_surface_cou
             "not_applicable",
             "agent_unavailable",
             "agent_capability_unavailable",
+            "not_observed",
             "probe_timeout",
             "probe_failed"
         ])
@@ -533,15 +554,41 @@ fn coding_workflow_semantic_navigation_output_schema_is_explicit_and_surface_cou
         .iter()
         .any(|entry| entry["type"] == "null"));
 
-    let openapi = crate::openapi::build_openapi_spec();
-    let operation_count: usize = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|methods| methods.as_object().unwrap().len())
-        .sum();
-    assert_eq!(operation_count, 22);
     assert!(!known_tool_names().any(|name| name == "semantic_navigation"));
     assert!(crate::runner_protocol::RUNNER_CAPABILITY_NAMES
         .contains(&RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION));
+}
+
+#[tokio::test(start_paused = true)]
+async fn semantic_probe_completion_signal_and_timeout_are_distinct() {
+    for completed in [true, false] {
+        let runtime = test_runtime();
+        let temp = tempfile::tempdir().unwrap();
+        let project =
+            register_semantic_agent(&runtime, "signal-agent", "demo", temp.path(), true).await;
+        let resolved = runtime
+            .resolve_project_input_for_auth(&project, Some(&auth_context(None, true)))
+            .await
+            .unwrap();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let probe = runtime.probe_semantic_navigation_for_startup(&resolved, receive);
+        tokio::pin!(probe);
+        assert!(futures_util::poll!(&mut probe).is_pending());
+        if completed {
+            send.send(()).unwrap();
+        } else {
+            tokio::time::advance(Duration::from_secs(2)).await;
+        }
+        let summary = serde_json::to_value(probe.await).unwrap();
+        assert_eq!(summary["supported"], true);
+        assert_eq!(summary["available"], Value::Null);
+        assert_eq!(
+            summary["status"],
+            if completed {
+                "not_observed"
+            } else {
+                "probe_timeout"
+            }
+        );
+    }
 }

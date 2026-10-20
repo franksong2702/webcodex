@@ -102,8 +102,11 @@ fn map_macos_pointer_coordinate(
         );
     }
 
-    let target_x = geometry.origin_x + (f64::from(x) / f64::from(source_width)) * geometry.width;
-    let target_y = geometry.origin_y + (f64::from(y) / f64::from(source_height)) * geometry.height;
+    // Scale first: exact Retina ratios (for example 1/2) must retain exact
+    // integral/half-point positions for Quartz readback. Normalize-then-scale
+    // invents subpixel roundoff and falsely reports an uncertain pointer move.
+    let target_x = geometry.origin_x + f64::from(x) * (geometry.width / f64::from(source_width));
+    let target_y = geometry.origin_y + f64::from(y) * (geometry.height / f64::from(source_height));
     let right = geometry.origin_x + geometry.width;
     let bottom = geometry.origin_y + geometry.height;
     if !target_x.is_finite()
@@ -500,6 +503,19 @@ mod macos_pointer_tests {
         MacPointerInputState {
             buttons_down: 0,
             modifier_flags: CGEventFlags::empty(),
+        }
+    }
+
+    #[test]
+    fn macos_pointer_hidpi_scale_does_not_invent_subpixel_roundoff() {
+        // Real 3840x2160 -> 1920x1080 dogfood: normalizing x/y first
+        // produced 987.9999999999999 and 591.0000000000001. Quartz
+        // read back exact integral points, so equality falsely failed.
+        let hidpi = geometry(0.0, 0.0, 1920.0, 1080.0);
+        for (x, y) in [(1976, 1184), (1950, 1182), (1977, 1183)] {
+            let target = map_macos_pointer_coordinate(3840, 2160, hidpi, x, y).unwrap();
+            assert_eq!(target.target_x, f64::from(x) * 0.5);
+            assert_eq!(target.target_y, f64::from(y) * 0.5);
         }
     }
 
@@ -1255,6 +1271,15 @@ mod key_input_native_contract_tests {
 
     #[test]
     fn closed_key_codes_and_modifier_flags_are_stable() {
+        for key in crate::COMPUTER_KEY_INPUT_KEYS {
+            assert!(key_code(key).is_ok(), "{key}");
+        }
+        for modifier in crate::COMPUTER_KEY_INPUT_MODIFIERS {
+            assert!(
+                key_modifier_flags(&[modifier.to_string()]).is_ok(),
+                "{modifier}"
+            );
+        }
         for (key, expected) in [
             ("enter", 0x24),
             ("tab", 0x30),

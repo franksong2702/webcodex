@@ -34,6 +34,7 @@ pub struct LoginOutput {
     pub server_url: String,
     pub runner_config: String,
     pub user_token_file: String,
+    pub device: String,
     #[serde(default)]
     pub registered_projects: Vec<RegisteredProjectOutput>,
 }
@@ -41,9 +42,14 @@ pub struct LoginOutput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerStatusOutput {
     pub http_reachable: bool,
+    #[serde(default)]
+    pub server_pid: Option<u32>,
     pub probe_url: String,
     #[serde(default)]
-    pub revision_check: Option<String>,
+    pub desktop_runtime_contract:
+        Option<webcodex_core::desktop_runtime_contract::DesktopRuntimeContract>,
+    #[serde(default)]
+    pub server_build: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,22 +141,6 @@ pub struct QuickShareConnection {
     pub clipboard_contains: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RegularTunnelReadyEvent {
-    pub event: String,
-    pub schema_version: u64,
-    pub provider: String,
-    pub ready_for_chatgpt: bool,
-    pub connection: RegularTunnelConnection,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RegularTunnelConnection {
-    pub kind: String,
-    pub clipboard_state: String,
-    pub clipboard_contains: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,11 +152,13 @@ mod tests {
                 "server_url":"https://example.test",
                 "runner_config":"C:\\state\\runner.toml",
                 "user_token_file":"C:\\state\\user-token",
+                "device":"desktop-runner",
                 "future_metadata":{"generation":3}
             }"#,
         )
         .unwrap();
         assert!(login.registered_projects.is_empty());
+        assert_eq!(login.device, "desktop-runner");
 
         let runner: RunnerStatusOutput = serde_json::from_str(
             r#"{
@@ -200,28 +192,19 @@ mod tests {
         )
         .unwrap();
         assert!(share.connection.mcp_url.is_none());
-
-        let tunnel: RegularTunnelReadyEvent = serde_json::from_str(
-            r#"{
-                "event":"ready",
-                "schema_version":1,
-                "provider":"openai",
-                "ready_for_chatgpt":true,
-                "connection":{
-                    "kind":"openai_tunnel",
-                    "clipboard_state":"copied",
-                    "clipboard_contains":"tunnel_id",
-                    "future":1
-                },
-                "future_top_level":2
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(tunnel.connection.kind, "openai_tunnel");
     }
 
     #[test]
     fn json_contracts_fail_closed_when_required_identity_is_missing() {
+        let missing_device = serde_json::from_str::<LoginOutput>(
+            r#"{
+                "server_url":"https://example.test",
+                "runner_config":"C:\\state\\runner.toml",
+                "user_token_file":"C:\\state\\user-token"
+            }"#,
+        );
+        assert!(missing_device.is_err());
+
         let invalid = serde_json::from_str::<RunnerStatusOutput>(
             r#"{
                 "config":{

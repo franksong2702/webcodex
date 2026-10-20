@@ -22,10 +22,9 @@ pub(crate) use evaluator::PermissionEvaluator;
 pub(crate) use model::{PermissionDecision, DEFAULT_PERMISSION_RECENT_LIMIT};
 pub(crate) use policy::EffectiveAuthorityConfig;
 
-// Shared with the connector approval gate: one authority contract for both
-// runtime and connector surfaces.
 #[cfg(test)]
 pub(crate) use model::AuthorityMode;
+#[cfg(test)]
 pub(crate) use policy::TRUSTED_AGENT_AUTO_REASON;
 
 // Test-facing surface: mode parsing, outcomes, constants, compatibility wrapper.
@@ -43,7 +42,7 @@ use super::sessions::{canonical_tool_call_finished_events, SessionEvent};
 use super::tool_definition::runtime_tool_approval_policy;
 use super::tool_result::{RecoveryKind, ToolResult};
 
-/// Canonical authority profile (runtime_status / coding-task startup).
+/// Canonical authority profile (get_runtime_status / coding-task startup).
 pub(crate) fn authority_profile_payload() -> Value {
     policy::authority_profile_payload_for(&EffectiveAuthorityConfig::from_env())
 }
@@ -108,7 +107,7 @@ pub(crate) fn permission_execution_denied_result(decision: &PermissionDecision) 
             "permission_status": decision.status,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 /// Deserialize a permission decision previously attached to tool output.

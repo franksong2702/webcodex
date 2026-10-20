@@ -439,6 +439,102 @@ fn uia_text_value(
 }
 
 #[cfg(windows)]
+pub(crate) fn uia_observes_value(fingerprint: &ElementFingerprint) -> bool {
+    !fingerprint.protected
+        && (is_supported_text_input_fingerprint(fingerprint) || fingerprint.role == "AXComboBox")
+}
+
+#[cfg(windows)]
+fn uia_observed_value(
+    context: &UiaContext,
+    element: &IUIAutomationElement,
+    fingerprint: &ElementFingerprint,
+) -> Result<Option<String>, String> {
+    if !uia_observes_value(fingerprint) {
+        return Ok(None);
+    }
+    if let Some(value) = uia_text_value(context, element)? {
+        return Ok(Some(value));
+    }
+    if fingerprint.role != "AXComboBox" {
+        return Ok(None);
+    }
+    let Some(selection) = optional_uia_pattern::<IUIAutomationSelectionPattern>(
+        context,
+        element,
+        UIA_SelectionPatternId,
+    )?
+    else {
+        return Ok(None);
+    };
+    context.deadline.ensure_remaining()?;
+    let selected = unsafe { selection.GetCurrentSelection() }
+        .map_err(|error| uia_error("IUIAutomationSelectionPattern::GetCurrentSelection", &error))?;
+    context.deadline.ensure_remaining()?;
+    let count = unsafe { selected.Length() }
+        .map_err(|error| uia_error("IUIAutomationElementArray::Length", &error))?;
+    if count != 1 {
+        return Ok(None);
+    }
+    context.deadline.ensure_remaining()?;
+    let selected = unsafe { selected.GetElement(0) }
+        .map_err(|error| uia_error("IUIAutomationElementArray::GetElement", &error))?;
+    uia_selection_item_value(
+        || {
+            context.deadline.ensure_remaining()?;
+            uia_selection_property(
+                unsafe { selected.CurrentIsPassword() },
+                "IUIAutomationElement::CurrentIsPassword",
+            )
+            .map(|value| value.map(|password| password.as_bool()))
+        },
+        || {
+            context.deadline.ensure_remaining()?;
+            let name = uia_selection_property(
+                unsafe { selected.CurrentName() },
+                "IUIAutomationElement::CurrentName",
+            )?;
+            Ok(name.and_then(|name| {
+                let name = bounded_text(&name.to_string());
+                (!name.is_empty()).then_some(name)
+            }))
+        },
+    )
+}
+
+#[cfg(windows)]
+fn uia_selection_property<T>(
+    result: windows::core::Result<T>,
+    operation: &str,
+) -> Result<Option<T>, String> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        // A selected item may be virtualized or disappear independently of its
+        // live ComboBox. Missing optional properties do not invalidate its tree.
+        Err(error)
+            if matches!(
+                uia_error_code(&error),
+                UIA_E_ELEMENTNOTAVAILABLE | UIA_E_NOTSUPPORTED
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(uia_error(operation, &error)),
+    }
+}
+
+#[cfg(windows)]
+fn uia_selection_item_value(
+    read_is_password: impl FnOnce() -> Result<Option<bool>, String>,
+    read_name: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    if read_is_password()? != Some(false) {
+        return Ok(None);
+    }
+    read_name()
+}
+
+#[cfg(windows)]
 fn uia_children(
     context: &UiaContext,
     element: &IUIAutomationElement,
@@ -621,18 +717,44 @@ pub(crate) fn accessibility_tree(
     max_depth: usize,
     max_nodes: usize,
 ) -> Result<AccessibilityTreeResult, String> {
+    accessibility_tree_impl(surface_id, surface, max_depth, max_nodes, None)
+}
+
+#[cfg(windows)]
+pub(crate) fn accessibility_tree_scoped(
+    surface_id: &str,
+    surface: &SurfaceRecord,
+    max_depth: usize,
+    max_nodes: usize,
+    root: &ElementRecord,
+) -> Result<AccessibilityTreeResult, String> {
+    accessibility_tree_impl(surface_id, surface, max_depth, max_nodes, Some(root))
+}
+
+#[cfg(windows)]
+fn accessibility_tree_impl(
+    surface_id: &str,
+    surface: &SurfaceRecord,
+    max_depth: usize,
+    max_nodes: usize,
+    scope: Option<&ElementRecord>,
+) -> Result<AccessibilityTreeResult, String> {
     let context = UiaContext::new()?;
-    let root = exact_uia_window(&context, surface)?;
+    let (path, lineage, inherited_protected) = crate::accessibility_tree_seed(scope)?;
+    let root = match scope {
+        Some(element) => resolve_uia_element(&context, surface, element)?,
+        None => exact_uia_window(&context, surface)?,
+    };
     let mut queue = VecDeque::from([(
         root,
         None::<String>,
         0usize,
-        Vec::<usize>::new(),
-        Vec::<ElementFingerprint>::new(),
-        false,
+        path,
+        lineage,
+        inherited_protected,
     )]);
     let mut nodes = Vec::with_capacity(max_nodes.min(64));
-    let mut elements = Vec::with_capacity(max_nodes.min(64));
+    let mut elements: Vec<(String, ElementRecord)> = Vec::with_capacity(max_nodes.min(64));
     let mut truncated = false;
 
     while let Some((current, parent_element_id, depth, path, mut lineage, inherited_protected)) =
@@ -643,7 +765,9 @@ pub(crate) fn accessibility_tree(
             break;
         }
 
-        let element_id = format!("element_{}", Uuid::new_v4().simple());
+        let element_id = crate::allocate_selector("element_", |id| {
+            elements.iter().any(|(existing, _)| existing == id)
+        })?;
         let fingerprint = uia_fingerprint(&context, &current, inherited_protected)?;
         let role = fingerprint.role.clone();
         let subrole = fingerprint.subrole.clone();
@@ -651,11 +775,7 @@ pub(crate) fn accessibility_tree(
         let description = fingerprint.description.clone();
         let placeholder = fingerprint.placeholder.clone();
         let protected = fingerprint.protected;
-        let value = if protected || !is_supported_text_input_fingerprint(&fingerprint) {
-            None
-        } else {
-            uia_text_value(&context, &current)?
-        };
+        let value = uia_observed_value(&context, &current, &fingerprint)?;
         context.deadline.ensure_remaining()?;
         let enabled = unsafe { current.CurrentIsEnabled() }
             .map_err(|error| uia_error("IUIAutomationElement::CurrentIsEnabled", &error))?
@@ -668,7 +788,8 @@ pub(crate) fn accessibility_tree(
 
         let reserved = nodes.len() + queue.len() + 1;
         let remaining = max_nodes.saturating_sub(reserved);
-        let inspect_limit = if depth < max_depth {
+        let can_descend = depth < max_depth && path.len() < crate::MAX_ACCESSIBILITY_PATH_DEPTH;
+        let inspect_limit = if can_descend {
             remaining.saturating_add(1).max(1)
         } else {
             1
@@ -676,7 +797,7 @@ pub(crate) fn accessibility_tree(
         let (children, has_more_children) = uia_children(&context, &current, inspect_limit)?;
         let child_count = children.len() + usize::from(has_more_children);
 
-        if depth < max_depth {
+        if can_descend {
             if children.len() > remaining || has_more_children {
                 truncated = true;
             }
@@ -1108,4 +1229,93 @@ pub(crate) fn test_windows_focused_element_belongs_to_surface(
     let context = UiaContext::new()?;
     let root = exact_uia_window(&context, surface)?;
     validate_uia_focused_element_root(&context, &root)
+}
+
+#[cfg(all(test, windows))]
+mod selection_item_tests {
+    use super::*;
+    use std::cell::Cell;
+    use windows::core::{Error, HRESULT};
+
+    fn unavailable<T>(code: u32) -> windows::core::Result<T> {
+        Err(Error::from_hresult(HRESULT(code as i32)))
+    }
+
+    #[test]
+    fn selection_item_unavailable_protection_redacts_without_reading_name() {
+        for code in [UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED] {
+            let name_read = Cell::new(false);
+            let value = uia_selection_item_value(
+                || uia_selection_property::<bool>(unavailable(code), "CurrentIsPassword"),
+                || {
+                    name_read.set(true);
+                    Ok(Some("must remain unread".into()))
+                },
+            )
+            .unwrap();
+            assert_eq!(value, None);
+            assert!(!name_read.get());
+        }
+    }
+
+    #[test]
+    fn selection_item_unavailable_name_keeps_optional_value_unknown() {
+        for code in [UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED] {
+            let value = uia_selection_item_value(
+                || Ok(Some(false)),
+                || uia_selection_property::<String>(unavailable(code), "CurrentName"),
+            )
+            .unwrap();
+            assert_eq!(value, None);
+        }
+    }
+
+    #[test]
+    fn selection_item_protected_or_unknown_does_not_read_name() {
+        for protection in [Some(true), None] {
+            assert_eq!(
+                uia_selection_item_value(
+                    || Ok(protection),
+                    || panic!("protected or unknown selected item name must not be read"),
+                )
+                .unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            uia_selection_item_value(|| Ok(Some(false)), || Ok(Some("Theme".into()))).unwrap(),
+            Some("Theme".into())
+        );
+    }
+
+    #[test]
+    fn selection_item_unexpected_property_failures_remain_errors() {
+        let e_fail = 0x8000_4005;
+        let password_error = uia_selection_item_value(
+            || uia_selection_property::<bool>(unavailable(e_fail), "CurrentIsPassword"),
+            || panic!("failed protection read must not disclose the name"),
+        )
+        .unwrap_err();
+        assert!(password_error.contains("CurrentIsPassword"));
+        let name_error = uia_selection_item_value(
+            || Ok(Some(false)),
+            || uia_selection_property::<String>(unavailable(e_fail), "CurrentName"),
+        )
+        .unwrap_err();
+        assert!(name_error.contains("CurrentName"));
+    }
+
+    #[test]
+    fn selection_item_deadline_errors_are_not_optional_property_failures() {
+        let timeout = "accessibility_timeout: native observation deadline exceeded";
+        assert_eq!(
+            uia_selection_item_value(|| Err(timeout.into()), || panic!("deadline expired"))
+                .unwrap_err(),
+            timeout
+        );
+        assert_eq!(
+            uia_selection_item_value(|| Ok(Some(false)), || Err(timeout.into())).unwrap_err(),
+            timeout
+        );
+    }
 }

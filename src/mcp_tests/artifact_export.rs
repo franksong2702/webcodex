@@ -4,19 +4,19 @@ async fn mcp_export_runtime(
     root: &std::path::Path,
     owner: Option<&str>,
 ) -> (Arc<ToolRuntime>, Arc<crate::runner_http::RunnerRegistry>) {
-    mcp_export_runtime_with_surface(root, owner, ModelSurface::FullOperatorRuntime).await
+    mcp_export_runtime_inner(root, owner).await
 }
 
-async fn mcp_export_runtime_with_surface(
+async fn mcp_export_runtime_inner(
     root: &std::path::Path,
     owner: Option<&str>,
-    model_surface: ModelSurface,
 ) -> (Arc<ToolRuntime>, Arc<crate::runner_http::RunnerRegistry>) {
     use crate::runner_protocol::{RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest};
     let registry = Arc::new(crate::runner_http::RunnerRegistry::default());
     registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -51,6 +51,8 @@ async fn mcp_export_runtime_with_surface(
             hooks: Vec::new(),
             disabled: false,
             revision: None,
+            root_fingerprint: None,
+            lineage: None,
             git_branch: None,
             git_head: None,
             git_dirty: None,
@@ -59,10 +61,9 @@ async fn mcp_export_runtime_with_surface(
         }],
     )
     .await;
-    let runtime = Arc::new(
-        ToolRuntime::new_for_tests_with_runner_registry(registry.clone())
-            .with_model_surface(model_surface),
-    );
+    let runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
+        registry.clone(),
+    ));
     (runtime, registry)
 }
 
@@ -70,18 +71,31 @@ async fn poll_mcp_export_request(
     registry: &Arc<crate::runner_http::RunnerRegistry>,
 ) -> crate::runner_protocol::RunnerRequest {
     use crate::runner_protocol::RunnerPollRequest;
-    loop {
-        if let Some(request) = registry
-            .poll(RunnerPollRequest {
-                client_id: "exporter".to_string(),
-                runner_instance_id: "inst-export".to_string(),
-            })
-            .await
-            .unwrap()
-        {
-            return request;
+    let request = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(request) = registry
+                .poll(RunnerPollRequest {
+                    client_id: "exporter".to_string(),
+                    runner_instance_id: "inst-export".to_string(),
+                })
+                .await
+                .unwrap()
+            {
+                return request;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    })
+    .await;
+    match request {
+        Ok(request) => request,
+        Err(_) => {
+            let pending = registry
+                .get_runner_view("exporter")
+                .await
+                .map(|view| view.pending_requests);
+            panic!("timed out polling MCP export Runner request; pending_requests={pending:?}");
+        }
     }
 }
 
@@ -99,6 +113,8 @@ async fn complete_mcp_export_request(
             exit_code: Some(0),
             stdout: Some(stdout.to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -117,7 +133,7 @@ fn mcp_export_optimized_chunk_range(
     assert_eq!(payload["expected_file_bytes"], file_bytes);
     let offset = payload["offset"].as_u64().unwrap() as usize;
     let length = payload["length"].as_u64().unwrap() as usize;
-    assert!(length <= MAX_READ_PROJECT_ARTIFACT_LENGTH);
+    assert!(length <= INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES);
     let end = offset.saturating_add(length).min(file_bytes);
     (offset, end)
 }
@@ -190,6 +206,8 @@ async fn complete_mcp_export_metadata_with_max(
                 .to_string(),
             ),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -261,7 +279,7 @@ async fn complete_mcp_export_resource_read(
         let offset = payload["offset"].as_u64().unwrap() as usize;
         let length = payload["length"].as_u64().unwrap() as usize;
         assert_eq!(offset, expected_offset);
-        assert!(length <= MAX_READ_PROJECT_ARTIFACT_LENGTH);
+        assert!(length <= INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES);
         let end = offset.saturating_add(length).min(bytes.len());
         let mut chunk = bytes[offset..end].to_vec();
         if (fault == McpExportChunkFault::MutateFirstChunk && offset == 0)
@@ -306,6 +324,8 @@ async fn complete_mcp_export_resource_read(
                 exit_code: Some(0),
                 stdout: Some(stdout),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             })
@@ -346,10 +366,11 @@ async fn issue_mcp_artifact_export_with_metadata_max(
                     "tools/call",
                     Some(json!(3101)),
                     mcp_2026_params(json!({
-                        "name": "export_project_artifact",
+                        "name": "inspect_project_artifact",
                         "arguments": {
                             "project": "agent:exporter:demo",
                             "path": path,
+                            "action": "export"
                         }
                     })),
                 ),
@@ -395,31 +416,73 @@ async fn issue_mcp_artifact_export(
 }
 
 #[tokio::test]
-async fn mcp_artifact_export_surface_is_stateless_full_operator_only() {
-    let legacy = mcp_tools_list_payload_with_compact(ModelSurface::FullOperatorRuntime, false);
-    assert!(!legacy["tools"]
+async fn project_artifact_export_uses_existing_resource_link_authority_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
+    let auth = mcp_export_api_auth("key-unified-export", "alice");
+    let path = "paper/unified.pdf";
+    let bytes = b"%PDF-1.7\nunified export\n%%EOF\n".to_vec();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+
+    let call = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            handle_mcp_request(
+                &runtime,
+                rpc(
+                    "tools/call",
+                    Some(json!(3099)),
+                    mcp_2026_params(json!({
+                        "name": "inspect_project_artifact",
+                        "arguments": {
+                            "project": "agent:exporter:demo",
+                            "path": path,
+                            "action": "export"
+                        }
+                    })),
+                ),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+    complete_mcp_export_metadata(registry, path, bytes.len(), &sha256, "application/pdf").await;
+    let outcome = call.await.unwrap();
+    let McpOutcome::Ok(value) = outcome else {
+        panic!("unified artifact export must succeed, got {outcome:?}");
+    };
+    let result = &value["result"];
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["content"][0]["type"], "resource_link");
+    assert!(result["content"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .starts_with(MCP_ARTIFACT_EXPORT_URI_PREFIX));
+    let serialized = serde_json::to_string(result).unwrap();
+    assert!(!serialized.contains("content_base64"));
+}
+
+#[tokio::test]
+async fn project_artifact_export_is_stateless_protocol_only() {
+    let legacy = mcp_tools_list_payload_with_compact(false);
+    assert!(legacy["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "export_project_artifact"));
+        .any(|tool| tool["name"] == "inspect_project_artifact"));
 
-    let stateless =
-        mcp_tools_list_payload_with_compact_and_app(ModelSurface::FullOperatorRuntime, false, true);
-    let spec = stateless["tools"]
+    let stateless = mcp_tools_list_payload_with_compact_and_app(false, true);
+    assert!(stateless["tools"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|tool| tool["name"] == "export_project_artifact")
-        .expect("stateless full-operator tools/list must expose artifact export");
-    assert_eq!(spec["inputSchema"]["required"], json!(["project", "path"]));
-    assert!(spec["inputSchema"]["properties"]
-        .get("session_id")
-        .is_some());
-    assert!(spec["inputSchema"]["properties"]
-        .get("allow_cross_project_session")
-        .is_none());
+        .any(|tool| tool["name"] == "inspect_project_artifact"));
+    assert!(registered_tool_specs()
+        .into_iter()
+        .all(|spec| spec.name != "export_project_artifact"));
 
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+    let runtime = test_runtime();
     let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
     auth.is_bootstrap = true;
     let legacy_call = handle_mcp_request(
@@ -428,8 +491,12 @@ async fn mcp_artifact_export_surface_is_stateless_full_operator_only() {
             "tools/call",
             Some(json!(3100)),
             json!({
-                "name": "export_project_artifact",
-                "arguments": {"project": "agent:any:any", "path": "report.pdf"}
+                "name": "inspect_project_artifact",
+                "arguments": {
+                    "project": "agent:any:any",
+                    "path": "report.pdf",
+                    "action": "export"
+                }
             }),
         ),
         Some(&auth),
@@ -443,68 +510,60 @@ async fn mcp_artifact_export_surface_is_stateless_full_operator_only() {
                 .unwrap()
                 .contains("stateless-2026"));
         }
-        other => panic!("legacy artifact export must fail closed, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn adaptive_artifact_export_direct_and_gateway_preserve_protocol_and_caller_gates() {
-    let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
-    let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
-    auth.is_bootstrap = true;
-    for via_gateway in [false, true] {
-        let arguments = json!({"project": "agent:any:any", "path": "report.pdf"});
-        let params = if via_gateway {
-            json!({
-                "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
-                "arguments": {"tool": "export_project_artifact", "arguments": arguments}
-            })
-        } else {
-            json!({"name": "export_project_artifact", "arguments": arguments})
-        };
-        for (stateless, expected_error) in [
-            (false, "stateless-2026"),
-            (true, "authenticated caller identity is unavailable"),
-        ] {
-            let outcome = handle_mcp_request(
-                &runtime,
-                rpc(
-                    "tools/call",
-                    Some(json!(3101)),
-                    if stateless {
-                        mcp_2026_params(params.clone())
-                    } else {
-                        params.clone()
-                    },
-                ),
-                if stateless { None } else { Some(&auth) },
-            )
-            .await;
-            let McpOutcome::BadRequest(value) = outcome else {
-                panic!(
-                    "export must reject gateway={via_gateway}, stateless={stateless}: {outcome:?}"
-                );
-            };
-            assert_eq!(value["error"]["code"], -32602);
-            assert!(
-                value["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains(expected_error),
-                "gateway={via_gateway}, stateless={stateless}: {value}"
-            );
+        other => {
+            panic!("inspect_project_artifact export must fail closed on legacy MCP, got {other:?}")
         }
     }
 }
 
 #[tokio::test]
-async fn adaptive_artifact_export_gateway_returns_resource_link_and_round_trips_binary() {
+async fn project_artifact_export_preserves_protocol_and_auth_gates() {
+    let runtime = test_runtime();
+    let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
+    auth.is_bootstrap = true;
+    let params = json!({
+        "name": "inspect_project_artifact",
+        "arguments": {
+            "project": "agent:any:any",
+            "path": "report.pdf",
+            "action": "export"
+        }
+    });
+    for (stateless, expected_error) in [
+        (false, "stateless-2026"),
+        (true, "authenticated caller identity is unavailable"),
+    ] {
+        let outcome = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(3101)),
+                if stateless {
+                    mcp_2026_params(params.clone())
+                } else {
+                    params.clone()
+                },
+            ),
+            if stateless { None } else { Some(&auth) },
+        )
+        .await;
+        let McpOutcome::BadRequest(value) = outcome else {
+            panic!("export must reject stateless={stateless}: {outcome:?}");
+        };
+        assert_eq!(value["error"]["code"], -32602);
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(expected_error));
+    }
+}
+
+#[tokio::test]
+async fn project_artifact_export_returns_resource_link_and_round_trips_binary() {
     use base64::Engine as _;
 
     let tmp = tempfile::tempdir().unwrap();
-    let (runtime, registry) =
-        mcp_export_runtime_with_surface(tmp.path(), Some("alice"), ModelSurface::AdaptiveRuntime)
-            .await;
+    let (runtime, registry) = mcp_export_runtime_inner(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-adaptive-gateway-export", "alice");
     let path = "paper/adaptive-gateway.pdf";
     let bytes = b"%PDF-1.7\nadaptive gateway export\n%%EOF\n".to_vec();
@@ -520,13 +579,11 @@ async fn adaptive_artifact_export_gateway_returns_resource_link_and_round_trips_
                     "tools/call",
                     Some(json!(3102)),
                     mcp_2026_params(json!({
-                        "name": crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                        "name": "inspect_project_artifact",
                         "arguments": {
-                            "tool": "export_project_artifact",
-                            "arguments": {
-                                "project": "agent:exporter:demo",
-                                "path": path
-                            }
+                            "project": "agent:exporter:demo",
+                            "path": path,
+                            "action": "export"
                         }
                     })),
                 ),
@@ -745,17 +802,22 @@ async fn mcp_artifact_export_oauth_resource_read_uses_project_read_and_stable_id
 }
 
 #[tokio::test]
-async fn export_project_artifact_non_mcp_path_fails_before_runner_read() {
+async fn project_artifact_export_non_mcp_path_fails_before_runner_read() {
     use crate::runner_protocol::RunnerPollRequest;
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-export", "alice");
     let result = runtime
         .dispatch_with_auth(
-            crate::tool_runtime::ToolCall::ExportProjectArtifact {
+            crate::tool_runtime::ToolCall::ProjectArtifact {
                 project: "agent:exporter:demo".to_string(),
                 path: "paper/report.pdf".to_string(),
+                action: crate::tool_runtime::ProjectArtifactAction::Export,
                 session_id: None,
+                allow_missing: None,
+                offset: None,
+                length: None,
+                expected_sha256: None,
             },
             Some(&auth),
         )
@@ -764,7 +826,7 @@ async fn export_project_artifact_non_mcp_path_fails_before_runner_read() {
     assert!(result
         .error
         .as_deref()
-        .is_some_and(|error| error.contains("MCP-only")));
+        .is_some_and(|error| error.contains("requires Stateless MCP 2026")));
     assert!(registry
         .poll(RunnerPollRequest {
             client_id: "exporter".to_string(),
@@ -984,8 +1046,8 @@ async fn http_mcp_artifact_export_resources_read_streams_valid_json_blob() {
     assert_eq!(body["jsonrpc"], "2.0");
     assert_eq!(body["id"], 3190);
     assert_eq!(body["result"]["resultType"], "complete");
-    assert!(body["result"].get("ttlMs").is_none());
-    assert!(body["result"].get("cacheScope").is_none());
+    assert_eq!(body["result"]["ttlMs"], 0);
+    assert_eq!(body["result"]["cacheScope"], "private");
     assert_eq!(body["result"]["contents"][0]["uri"], uri);
     assert_eq!(body["result"]["contents"][0]["mimeType"], "application/pdf");
     let decoded = general_purpose::STANDARD
@@ -1005,7 +1067,7 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-pipeline", "alice");
     let path = "paper/pipeline.pdf";
-    let size = MAX_READ_PROJECT_ARTIFACT_LENGTH * 9 + 123;
+    let size = INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES * 9 + 123;
     let bytes: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     let export = issue_mcp_artifact_export(
@@ -1067,7 +1129,7 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
     assert_eq!(
         first_offsets,
         (1..=4)
-            .map(|index| index * MAX_READ_PROJECT_ARTIFACT_LENGTH)
+            .map(|index| index * INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES)
             .collect::<Vec<_>>()
     );
     assert!(
@@ -1115,7 +1177,7 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
             .map(|request| mcp_export_optimized_chunk_range(request, path, bytes.len()).0)
             .collect::<Vec<_>>(),
         (5..=8)
-            .map(|index| index * MAX_READ_PROJECT_ARTIFACT_LENGTH)
+            .map(|index| index * INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES)
             .collect::<Vec<_>>()
     );
     assert!(
@@ -1136,7 +1198,7 @@ async fn mcp_artifact_export_optimized_pipeline_is_four_way_bounded_and_offset_o
     let final_chunk = poll_mcp_export_request(&registry).await;
     assert_eq!(
         mcp_export_optimized_chunk_range(&final_chunk, path, bytes.len()).0,
-        9 * MAX_READ_PROJECT_ARTIFACT_LENGTH
+        9 * INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES
     );
     complete_mcp_export_optimized_chunk(&registry, final_chunk, path, &bytes).await;
 
@@ -1164,7 +1226,7 @@ async fn mcp_artifact_export_total_timeout_cleans_abandoned_pending_reads() {
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-pipeline-timeout", "alice");
     let path = "paper/pipeline-timeout.pdf";
-    let bytes: Vec<u8> = (0..MAX_READ_PROJECT_ARTIFACT_LENGTH * 5)
+    let bytes: Vec<u8> = (0..INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES * 5)
         .map(|index| (index % 233) as u8)
         .collect();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -1273,7 +1335,7 @@ async fn mcp_artifact_export_optimized_batch_drains_before_offset_ordered_error(
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-pipeline-error", "alice");
     let path = "paper/pipeline-error.pdf";
-    let bytes: Vec<u8> = (0..MAX_READ_PROJECT_ARTIFACT_LENGTH * 5)
+    let bytes: Vec<u8> = (0..INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES * 5)
         .map(|index| (index % 239) as u8)
         .collect();
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
@@ -1391,7 +1453,7 @@ async fn mcp_artifact_export_same_size_mutations_fail_final_sha() {
     let tmp = tempfile::tempdir().unwrap();
     let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
     let auth = mcp_export_api_auth("key-mutation", "alice");
-    let bytes = vec![0x5a; 70 * 1024];
+    let bytes = vec![0x5a; INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES + 17];
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     for fault in [
         McpExportChunkFault::MutateFirstChunk,
@@ -1883,7 +1945,7 @@ fn mcp_artifact_export_preserves_streaming_bound_and_durable_projection_has_no_h
         "name": "report.pdf",
     }));
     let durable =
-        crate::tool_runtime::audit_safe_result_for_tool("export_project_artifact", &stable.output);
+        crate::tool_runtime::audit_safe_result_for_tool("inspect_project_artifact", &stable.output);
     let serialized = serde_json::to_string(&durable).unwrap();
     assert!(!serialized.contains(MCP_ARTIFACT_EXPORT_URI_PREFIX));
     assert!(!serialized.contains("content_base64"));
@@ -1892,13 +1954,20 @@ fn mcp_artifact_export_preserves_streaming_bound_and_durable_projection_has_no_h
 
 #[test]
 fn mcp_artifact_export_incremental_base64_matches_whole_encoding() {
-    let bytes: Vec<u8> = (0..(2 * MAX_READ_PROJECT_ARTIFACT_LENGTH + 17))
+    let bytes: Vec<u8> = (0..(2 * INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES + 17))
         .map(|index| (index % 251) as u8)
         .collect();
     let mut encoder = McpArtifactExportBase64Encoder::default();
     let mut encoded = String::new();
     let mut offset = 0usize;
-    for length in [1usize, 2, 7, MAX_READ_PROJECT_ARTIFACT_LENGTH, 11, 65531] {
+    for length in [
+        1usize,
+        2,
+        7,
+        INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES,
+        11,
+        65531,
+    ] {
         if offset >= bytes.len() {
             break;
         }
@@ -2038,22 +2107,26 @@ async fn mcp_artifact_export_action_audit_does_not_persist_handle_or_blob() {
             true,
         )
         .add_header(MCP_METHOD_HEADER, "tools/call", true)
-        .add_header(MCP_NAME_HEADER, "export_project_artifact", true)
+        .add_header(MCP_NAME_HEADER, "inspect_project_artifact", true)
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 3112,
             "method": "tools/call",
             "params": mcp_2026_params(json!({
-                "name": "export_project_artifact",
+                "name": "inspect_project_artifact",
                 "arguments": {
                     "project": "agent:exporter:demo",
-                    "path": "paper/audit.pdf"
+                    "path": "paper/audit.pdf",
+                    "action": "export"
                 }
             }))
         }))
         .send(&service)
         .await;
-    agent.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), agent)
+        .await
+        .expect("artifact export audit fixture timed out")
+        .unwrap();
     assert_eq!(effective_status(&response), StatusCode::OK);
     let body: Value = response.take_json().await.unwrap();
     let uri = body["result"]["content"][0]["uri"]
@@ -2070,11 +2143,362 @@ async fn mcp_artifact_export_action_audit_does_not_persist_handle_or_blob() {
         )
         .unwrap()
     };
-    assert_eq!(operation, "export_project_artifact");
+    assert_eq!(operation, "inspect_project_artifact");
     for durable in [&summary, &error] {
         assert!(!durable.contains(MCP_ARTIFACT_EXPORT_URI_PREFIX));
         assert!(!durable.contains("wc_export_"));
         assert!(!durable.contains("content_base64"));
         assert!(!durable.contains("\"blob\""));
     }
+}
+
+#[tokio::test]
+async fn present_spreadsheet_reuses_fenced_export_without_model_file_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
+    // Apps-disabled Hosts retain the metadata/resource path without hydration.
+    let runtime = Arc::new(ToolRuntime::new(
+        registry.clone(),
+        Arc::new(crate::tool_runtime::RuntimeInfo {
+            mcp_apps_enabled: false,
+            ..Default::default()
+        }),
+    ));
+    let auth = mcp_export_api_auth("spreadsheet-owner", "alice");
+    let path = "budget.csv";
+    let bytes = b"department,budget\nresearch,120000\n".to_vec();
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let call = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            handle_mcp_request(&runtime, rpc("tools/call", Some(json!(7101)),
+                mcp_2026_params(json!({"name":"present_spreadsheet", "arguments":{"project":"agent:exporter:demo", "path":path}}))), Some(&auth)).await
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        complete_mcp_export_metadata_with_max(
+            registry.clone(),
+            path,
+            bytes.len(),
+            &sha256,
+            "text/csv",
+            5 * 1024 * 1024,
+        ),
+    )
+    .await
+    .unwrap();
+    let outcome = call.await.unwrap();
+    let McpOutcome::Ok(result) = outcome else {
+        panic!("spreadsheet presentation failed: {outcome:?}");
+    };
+    assert_eq!(result["result"]["structuredContent"]["success"], true);
+    assert_eq!(
+        result["result"]["structuredContent"]["output"]["sha256"],
+        sha256
+    );
+    let uri = result["result"]["content"][0]["uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!result.to_string().contains("content_base64"));
+    assert!(!result.to_string().contains("\"chunks\""));
+    assert!(mcp_artifact_export_lookup(&uri, Some(&auth)).is_ok());
+    let foreign = mcp_export_api_auth("spreadsheet-foreign", "alice");
+    assert!(mcp_artifact_export_lookup(&uri, Some(&foreign)).is_err());
+    let read = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        let uri = uri.clone();
+        async move {
+            handle_mcp_request(
+                &runtime,
+                rpc(
+                    "resources/read",
+                    Some(json!(7102)),
+                    mcp_2026_params(json!({"uri":uri})),
+                ),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        complete_mcp_export_resource_read(
+            registry.clone(),
+            path,
+            bytes.clone(),
+            "text/csv",
+            &sha256,
+            McpExportChunkFault::None,
+        ),
+    )
+    .await
+    .unwrap();
+    let outcome = read.await.unwrap();
+    let McpOutcome::Ok(resource) = outcome else {
+        panic!("spreadsheet resource failed: {outcome:?}");
+    };
+    assert_eq!(
+        general_purpose::STANDARD
+            .decode(resource["result"]["contents"][0]["blob"].as_str().unwrap())
+            .unwrap(),
+        bytes
+    );
+    assert!(result["result"]["_meta"]
+        .get("webcodex/spreadsheetSource")
+        .is_none());
+    mcp_expire_artifact_export_for_test(&uri);
+    assert!(mcp_artifact_export_lookup(&uri, Some(&auth)).is_err());
+}
+
+#[tokio::test]
+async fn present_spreadsheet_reuses_generic_private_chunks_without_per_call_ui_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
+    let runtime = Arc::new(ToolRuntime::new(
+        registry.clone(),
+        Arc::new(crate::tool_runtime::RuntimeInfo {
+            mcp_apps_enabled: true,
+            ..Default::default()
+        }),
+    ));
+    let auth = mcp_export_api_auth("spreadsheet-private-owner", "alice");
+    let path = "identifiers.csv";
+    let bytes = vec![b'x'; 3 * 1024 * 1024 + 1];
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let params = mcp_2026_params(
+        json!({"name":"present_spreadsheet", "arguments":{"project":"agent:exporter:demo", "path":path}}),
+    );
+    assert!(!crate::mcp::resources::request_supports_mcp_apps(&params));
+    let call = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            handle_mcp_request(
+                &runtime,
+                rpc("tools/call", Some(json!(7110)), params),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+    complete_mcp_export_metadata_with_max(
+        registry.clone(),
+        path,
+        bytes.len(),
+        &sha256,
+        "text/csv",
+        5 * 1024 * 1024,
+    )
+    .await;
+    let McpOutcome::Ok(response) = call.await.unwrap() else {
+        panic!("direct spreadsheet call failed");
+    };
+    let result = &response["result"];
+    assert_eq!(result["structuredContent"]["success"], true);
+    assert_eq!(
+        result["_meta"]["webcodex/spreadsheetSource"],
+        result["structuredContent"]
+    );
+    let source = result["structuredContent"]["output"].clone();
+    assert_eq!(source["project"], "agent:exporter:demo");
+    assert_eq!(source["path"], path);
+    let arguments = |offset| json!({"project":source["project"],"path":path,"bytes":bytes.len(),"sha256":sha256,"byte_offset":offset});
+    let mut received = Vec::new();
+    while received.len() < bytes.len() {
+        let offset = received.len();
+        let params = mcp_2026_params(
+            json!({"name":"read_app_artifact_chunk","arguments":arguments(offset)}),
+        );
+        let call = tokio::spawn({
+            let runtime = runtime.clone();
+            let auth = auth.clone();
+            async move {
+                handle_mcp_request(
+                    &runtime,
+                    rpc("tools/call", Some(json!(7111)), params),
+                    Some(&auth),
+                )
+                .await
+            }
+        });
+        let request = poll_mcp_export_request(&registry).await;
+        let (start, end) = mcp_export_optimized_chunk_range(&request, path, bytes.len());
+        assert_eq!(start, offset);
+        assert_eq!(end - offset, (bytes.len() - offset).min(512 * 1024));
+        complete_mcp_export_optimized_chunk(&registry, request, path, &bytes).await;
+        let McpOutcome::Ok(reply) = call.await.unwrap() else {
+            panic!("generic App segment read failed");
+        };
+        let payload = &reply["result"];
+        assert_eq!(
+            payload["structuredContent"]["output"]["artifact_chunk"]["byte_offset"],
+            offset
+        );
+        let encoded = payload["_meta"]["webcodex/artifactChunk"]["content_base64"]
+            .as_str()
+            .unwrap();
+        assert!(!payload["content"].to_string().contains(encoded));
+        assert!(!payload["structuredContent"]
+            .to_string()
+            .contains("content_base64"));
+        received.extend(general_purpose::STANDARD.decode(encoded).unwrap());
+    }
+    assert_eq!(received, bytes);
+    let foreign = mcp_export_api_auth("spreadsheet-other", "bob");
+    let denied = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(7112)),
+            mcp_2026_params(json!({"name":"read_app_artifact_chunk","arguments":arguments(0)})),
+        ),
+        Some(&foreign),
+    )
+    .await;
+    let McpOutcome::Ok(denied) = denied else {
+        panic!("expected typed Project denial");
+    };
+    assert_eq!(denied["result"]["structuredContent"]["success"], false);
+    assert_eq!(
+        registry
+            .get_runner_view("exporter")
+            .await
+            .unwrap()
+            .pending_requests,
+        0
+    );
+    let missing_scope = crate::auth::AuthContext::new(crate::auth::AuthKind::OAuth2Token);
+    assert!(matches!(
+        handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(7113)),
+                mcp_2026_params(json!({"name":"read_app_artifact_chunk","arguments":arguments(0)}))
+            ),
+            Some(&missing_scope)
+        )
+        .await,
+        McpOutcome::Forbidden { .. }
+    ));
+    let changed_params =
+        mcp_2026_params(json!({"name":"read_app_artifact_chunk","arguments":arguments(0)}));
+    let changed = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            handle_mcp_request(
+                &runtime,
+                rpc("tools/call", Some(json!(7114)), changed_params),
+                Some(&auth),
+            )
+            .await
+        }
+    });
+    let request = poll_mcp_export_request(&registry).await;
+    complete_mcp_export_request(
+        &registry,
+        request,
+        json!({"error_kind":"snapshot_changed","error":"changed"}),
+    )
+    .await;
+    let McpOutcome::Ok(changed) = changed.await.unwrap() else {
+        panic!("expected typed version mismatch");
+    };
+    assert_eq!(changed["result"]["structuredContent"]["success"], false);
+    assert_eq!(
+        changed["result"]["structuredContent"]["output"]["error_kind"],
+        "snapshot_changed"
+    );
+    assert!(!result.to_string().contains("content_base64"));
+    assert!(matches!(
+        handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(7115)),
+                mcp_2026_params(json!({"name":"read_spreadsheet_chunk","arguments":{}}))
+            ),
+            Some(&auth)
+        )
+        .await,
+        McpOutcome::BadRequest(_)
+    ));
+}
+
+#[test]
+fn present_spreadsheet_descriptor_has_an_independent_capability_scoped_app() {
+    for compact in [false, true] {
+        let enabled = crate::mcp::tools::mcp_tools_list_payload_with_features_for_auth(
+            compact, true, true, None,
+        );
+        let descriptor = enabled["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "present_spreadsheet")
+            .unwrap();
+        assert_eq!(
+            descriptor["_meta"]["ui"]["resourceUri"],
+            "ui://webcodex/spreadsheet/v3"
+        );
+        let disabled = crate::mcp::tools::mcp_tools_list_payload_with_features_for_auth(
+            compact, false, true, None,
+        );
+        let descriptor = disabled["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "present_spreadsheet")
+            .unwrap();
+        assert!(descriptor.pointer("/_meta/ui/resourceUri").is_none());
+        assert!(!disabled["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "read_app_artifact_chunk"));
+        let helper = enabled["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "read_app_artifact_chunk")
+            .unwrap();
+        assert_eq!(helper["_meta"]["ui"]["visibility"], json!(["app"]));
+        assert!(!enabled["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "read_spreadsheet_chunk"));
+        assert!(helper.pointer("/_meta/ui/resourceUri").is_none());
+    }
+}
+
+#[tokio::test]
+async fn present_spreadsheet_rejects_invalid_paths_and_unsupported_formats_without_runner_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (runtime, registry) = mcp_export_runtime(tmp.path(), Some("alice")).await;
+    let auth = mcp_export_api_auth("spreadsheet-policy", "alice");
+    for path in ["../budget.csv", ".git/config.csv", "budget.pdf"] {
+        let outcome = handle_mcp_request(&runtime, rpc("tools/call", Some(json!(7103)),
+            mcp_2026_params(json!({"name":"present_spreadsheet", "arguments":{"project":"agent:exporter:demo", "path":path}}))), Some(&auth)).await;
+        let McpOutcome::Ok(value) = outcome else {
+            panic!("expected typed path/format failure: {outcome:?}");
+        };
+        assert_eq!(
+            value["result"]["structuredContent"]["success"], false,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        registry
+            .get_runner_view("exporter")
+            .await
+            .unwrap()
+            .pending_requests,
+        0
+    );
 }

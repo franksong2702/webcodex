@@ -5,6 +5,7 @@
 //! and protocol callbacks; the Server sees only the bounded typed structures in
 //! this module.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -19,6 +20,8 @@ pub const CODING_AGENT_MAX_INSTRUCTION_BYTES: usize = 64 * 1024;
 pub const CODING_AGENT_MAX_CONFIG_OPTIONS: usize = 32;
 pub const CODING_AGENT_MAX_CONFIG_KEY_BYTES: usize = 128;
 pub const CODING_AGENT_MAX_CONFIG_VALUE_BYTES: usize = 4096;
+pub const CODING_AGENT_MAX_CONFIG_SELECT_CHOICES: usize = 64;
+pub const CODING_AGENT_MAX_CONFIG_LABEL_BYTES: usize = 256;
 pub const CODING_AGENT_MAX_EVENT_TEXT_BYTES: usize = 16 * 1024;
 pub const CODING_AGENT_MAX_ERROR_KIND_BYTES: usize = 64;
 pub const CODING_AGENT_MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
@@ -45,16 +48,76 @@ pub struct CodingAgentProvider {
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodingAgentRunState {
-    Starting,
-    Running,
-    WaitingPermission,
-    Completed,
-    Failed,
-    Cancelled,
-    Lost,
+/// Safe discovery metadata, not a provider replacement fence or execution authority.
+/// Keep this separate from the Runner wire inventory: serializing the latter into
+/// a model/product response would disclose the private provider instance identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentProviderSummary {
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_PROVIDER_ID_BYTES))]
+    pub provider_id: String,
+    #[schemars(length(min = 1, max = CODING_AGENT_MAX_PROVIDER_NAME_BYTES))]
+    pub name: String,
+}
+
+pub fn safe_provider_inventory(
+    providers: Option<&[CodingAgentProvider]>,
+) -> Vec<CodingAgentProviderSummary> {
+    providers
+        .unwrap_or_default()
+        .iter()
+        .take(CODING_AGENT_MAX_PROVIDERS)
+        .filter(|provider| {
+            validate_provider_id(&provider.provider_id).is_ok()
+                && !provider.name.is_empty()
+                && provider.name.len() <= CODING_AGENT_MAX_PROVIDER_NAME_BYTES
+                && !provider.name.chars().any(char::is_control)
+        })
+        .map(|provider| CodingAgentProviderSummary {
+            provider_id: provider.provider_id.clone(),
+            name: provider.name.clone(),
+        })
+        .collect()
+}
+
+// Keep each persisted/wire spelling in one place. This local table generates
+// both serde's vocabulary and the explicit, strict wire conversion helpers.
+macro_rules! coding_agent_state {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        $(#[$meta])*
+        pub enum $name {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+
+        impl $name {
+            pub const fn as_str(&self) -> &'static str {
+                match self { $(Self::$variant => $wire),+ }
+            }
+
+            pub fn from_wire(value: &str) -> Option<Self> {
+                match value { $($wire => Some(Self::$variant),)+ _ => None }
+            }
+
+            // Preserve the pre-SSOT public helper while keeping the wire table
+            // above as the only vocabulary source.
+            pub fn from_str(value: &str) -> Option<Self> {
+                Self::from_wire(value)
+            }
+        }
+    };
+}
+
+coding_agent_state! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    CodingAgentRunState {
+        Starting => "starting",
+        Running => "running",
+        WaitingPermission => "waiting_permission",
+        Completed => "completed",
+        Failed => "failed",
+        Cancelled => "cancelled",
+        Lost => "lost",
+    }
 }
 
 impl CodingAgentRunState {
@@ -64,60 +127,15 @@ impl CodingAgentRunState {
             Self::Completed | Self::Failed | Self::Cancelled | Self::Lost
         )
     }
-
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Starting => "starting",
-            Self::Running => "running",
-            Self::WaitingPermission => "waiting_permission",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Lost => "lost",
-        }
-    }
-
-    pub fn from_str(value: &str) -> Option<Self> {
-        Some(match value {
-            "starting" => Self::Starting,
-            "running" => Self::Running,
-            "waiting_permission" => Self::WaitingPermission,
-            "completed" => Self::Completed,
-            "failed" => Self::Failed,
-            "cancelled" => Self::Cancelled,
-            "lost" => Self::Lost,
-            _ => return None,
-        })
-    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CodingAgentExecutionState {
-    NotStarted,
-    Started,
-    OutcomeUnknown,
-    Completed,
-}
-
-impl CodingAgentExecutionState {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotStarted => "not_started",
-            Self::Started => "started",
-            Self::OutcomeUnknown => "outcome_unknown",
-            Self::Completed => "completed",
-        }
-    }
-
-    pub fn from_str(value: &str) -> Option<Self> {
-        Some(match value {
-            "not_started" => Self::NotStarted,
-            "started" => Self::Started,
-            "outcome_unknown" => Self::OutcomeUnknown,
-            "completed" => Self::Completed,
-            _ => return None,
-        })
+coding_agent_state! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    CodingAgentExecutionState {
+        NotStarted => "not_started",
+        Started => "started",
+        OutcomeUnknown => "outcome_unknown",
+        Completed => "completed",
     }
 }
 
@@ -129,7 +147,7 @@ pub enum CodingAgentDispatchState {
     Completed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum CodingAgentConfigValue {
     String(String),
@@ -145,7 +163,7 @@ impl CodingAgentConfigValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodingAgentEventKind {
     AgentMessage,
@@ -287,12 +305,106 @@ pub struct CodingAgentCancelRequest {
     pub run_id: String,
 }
 
+/// Identity-fenced diagnostic for one authorized Project/provider. Its run_id
+/// is solely an ephemeral correlation value, never a persisted Run.
+///
+/// `include_live_acp` additionally authorizes one bounded ephemeral ACP
+/// process: the Runner performs only `initialize` and `session/new`, then
+/// always terminates the whole process tree. The probe can trigger
+/// provider-side side effects such as an external login prompt, so it is
+/// never implied by the presence-only diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentDiagnoseRequest {
+    pub run_id: String,
+    pub runtime_project_id: String,
+    pub project_root: String,
+    pub provider_id: String,
+    pub provider_instance_id: String,
+    #[serde(default)]
+    pub include_live_acp: bool,
+}
+
+/// How far a live ACP diagnostic reached before it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingAgentDiagnosePhase {
+    /// A required `env_from_env` source was absent from the Runner process.
+    Environment,
+    Spawn,
+    Initialize,
+    SessionNew,
+    /// Options were obtained and projected within the response bounds.
+    Projection,
+}
+
+/// Closed failure classification for a live ACP diagnostic. No provider text,
+/// stderr, path, or environment value ever becomes one of these codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingAgentDiagnoseOutcome {
+    /// `initialize` and `session/new` both succeeded and options are projected.
+    Ok,
+    EnvUnavailable,
+    SpawnFailed,
+    ProcessExited,
+    TransportFailed,
+    /// The provider answered with a JSON-RPC error.
+    Rejected,
+    /// The provider did not negotiate ACP v1.
+    ProtocolUnsupported,
+    /// A successful ACP answer did not match the stable v1 response shape.
+    InvalidResponse,
+    Timeout,
+    /// Another live probe already owns the one allowed ephemeral process slot.
+    Busy,
+    /// The Runner stopped accepting work before the probe finished.
+    Interrupted,
+}
+
+/// One live ACP config option, projected only as bounded identities: option
+/// id/label, kind, safe current selection, and allowlisted choice values and
+/// labels. Values that are credentials never traverse this projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentLiveConfigChoice {
+    pub value: String,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentLiveConfigOption {
+    pub id: String,
+    pub label: Option<String>,
+    /// `select` or `boolean`; the only stable v1 kinds.
+    pub kind: String,
+    /// Current select choice value or boolean state, when the live kind
+    /// carries one that is already part of the advertised identity.
+    pub current: Option<String>,
+    pub choices: Vec<CodingAgentLiveConfigChoice>,
+    pub choices_truncated: bool,
+}
+
+/// Bounded projection of one ephemeral ACP session. When `outcome` is not
+/// [`CodingAgentDiagnoseOutcome::Ok`], `options` is always empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodingAgentLiveAcpDiagnostic {
+    pub outcome: CodingAgentDiagnoseOutcome,
+    pub phase: CodingAgentDiagnosePhase,
+    pub protocol_version: Option<u64>,
+    pub options: Vec<CodingAgentLiveConfigOption>,
+    pub options_truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CodingAgentRequest {
     Start(CodingAgentStartRequest),
     Observe(CodingAgentObserveRequest),
     Cancel(CodingAgentCancelRequest),
+    Diagnose(CodingAgentDiagnoseRequest),
 }
 
 impl CodingAgentRequest {
@@ -301,12 +413,14 @@ impl CodingAgentRequest {
             Self::Start(request) => &request.run_id,
             Self::Observe(request) => &request.run_id,
             Self::Cancel(request) => &request.run_id,
+            Self::Diagnose(request) => &request.run_id,
         }
     }
 
     pub fn provider_binding(&self) -> Option<(&str, &str)> {
         match self {
             Self::Start(request) => Some((&request.provider_id, &request.provider_instance_id)),
+            Self::Diagnose(request) => Some((&request.provider_id, &request.provider_instance_id)),
             Self::Observe(_) | Self::Cancel(_) => None,
         }
     }
@@ -334,6 +448,14 @@ pub enum CodingAgentResponsePayload {
     },
     Cancel {
         run: CodingAgentRunSnapshot,
+    },
+    Diagnose {
+        provider_id: String,
+        provider_instance_id: String,
+        /// Configured destination environment names, mapped only to booleans.
+        env_presence: BTreeMap<String, bool>,
+        /// Present only when the request explicitly authorized the live probe.
+        live_acp: Option<CodingAgentLiveAcpDiagnostic>,
     },
 }
 
@@ -480,6 +602,21 @@ pub fn validate_request(request: &CodingAgentRequest) -> Result<(), String> {
             }
         }
         CodingAgentRequest::Cancel(_) => {}
+        CodingAgentRequest::Diagnose(request) => {
+            validate_provider_id(&request.provider_id)?;
+            validate_provider_instance_id(&request.provider_instance_id)?;
+            if request.runtime_project_id.trim().is_empty()
+                || request.runtime_project_id.len() > CODING_AGENT_MAX_PROJECT_ID_BYTES
+            {
+                return Err("diagnostic runtime_project_id is invalid".into());
+            }
+            if request.project_root.is_empty()
+                || request.project_root.len() > CODING_AGENT_MAX_PROJECT_ROOT_BYTES
+                || request.project_root.contains('\0')
+            {
+                return Err("diagnostic project_root is invalid".into());
+            }
+        }
     }
     Ok(())
 }
@@ -501,6 +638,44 @@ pub fn validate_response_for_request(
         validate_coding_agent_error(error)?;
         return Ok(());
     };
+    if let (
+        CodingAgentRequest::Diagnose(request),
+        CodingAgentResponsePayload::Diagnose {
+            provider_id,
+            provider_instance_id,
+            env_presence,
+            live_acp,
+        },
+    ) = (request, payload)
+    {
+        if provider_id != &request.provider_id
+            || provider_instance_id != &request.provider_instance_id
+            || env_presence.len() > CODING_AGENT_MAX_CONFIG_OPTIONS
+        {
+            return Err("ACP diagnostic provider identity or size is invalid".into());
+        }
+        for key in env_presence.keys() {
+            if !diagnostic_identity_key_is_bounded(key) {
+                return Err("ACP diagnostic destination key is invalid".into());
+            }
+        }
+        // Live ACP data crosses only when the caller explicitly authorized the
+        // ephemeral probe, and only within the closed bounded projection.
+        match live_acp {
+            None => {
+                if request.include_live_acp {
+                    return Err("authorized ACP live diagnostic is missing".into());
+                }
+            }
+            Some(live) => {
+                if !request.include_live_acp {
+                    return Err("unrequested ACP live diagnostic is not allowed".into());
+                }
+                validate_live_acp_diagnostic(live)?;
+            }
+        }
+        return Ok(());
+    }
     let run = match (request, payload) {
         (CodingAgentRequest::Start(_), CodingAgentResponsePayload::Start { run }) => run,
         (CodingAgentRequest::Observe(_), CodingAgentResponsePayload::Observe { observation }) => {
@@ -555,6 +730,106 @@ pub fn validate_response_for_request(
         return Err("CodingAgentRun response run_id does not match request".to_string());
     }
     validate_coding_agent_run_snapshot(run)?;
+    Ok(())
+}
+
+/// Bounded identity vocabulary shared by diagnostic destination keys, live
+/// option ids, and select choice values. Provider-supplied free text never
+/// uses this helper; it is bounded as labels instead.
+pub fn diagnostic_identity_key_is_bounded(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= CODING_AGENT_MAX_CONFIG_KEY_BYTES
+        && !key.contains(['\0', '\r', '\n'])
+}
+
+/// Bounded provider-supplied free text: option labels and choice labels are
+/// truncated to the label budget on a char boundary before they can cross
+/// this contract.
+pub fn bounded_diagnostic_label(value: &str) -> String {
+    const MAX: usize = CODING_AGENT_MAX_CONFIG_LABEL_BYTES;
+    const SUFFIX: &str = "…";
+    if value.len() <= MAX {
+        return value.to_string();
+    }
+    let mut end = MAX.saturating_sub(SUFFIX.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded = String::with_capacity(MAX);
+    bounded.push_str(&value[..end]);
+    bounded.push_str(SUFFIX);
+    debug_assert!(bounded.len() <= MAX);
+    bounded
+}
+
+/// Bounded provider-supplied free text: option labels and choice labels are
+/// truncated by the Runner before they can cross this validation.
+fn diagnostic_label_is_bounded(label: &str) -> bool {
+    label.len() <= CODING_AGENT_MAX_CONFIG_LABEL_BYTES && !label.contains(['\0', '\r', '\n'])
+}
+
+/// Closed bounds for the live ACP projection. A failed probe must not carry
+/// partial options, and every projected identity must fit the same budgets
+/// that bounded the request side.
+fn validate_live_acp_diagnostic(live: &CodingAgentLiveAcpDiagnostic) -> Result<(), String> {
+    if live.protocol_version.is_some_and(|version| version != 1) {
+        return Err("ACP live diagnostic protocol version is invalid".into());
+    }
+    if live.outcome != CodingAgentDiagnoseOutcome::Ok {
+        if !live.options.is_empty() || live.options_truncated {
+            return Err("failed ACP live diagnostic must not carry options".into());
+        }
+        return Ok(());
+    }
+    if live.phase != CodingAgentDiagnosePhase::Projection
+        || live.protocol_version != Some(1)
+        || live.options.len() > CODING_AGENT_MAX_CONFIG_OPTIONS
+    {
+        return Err("ACP live diagnostic outcome/phase/size is invalid".into());
+    }
+    for option in &live.options {
+        if !diagnostic_identity_key_is_bounded(&option.id)
+            || option
+                .label
+                .as_ref()
+                .is_some_and(|label| !diagnostic_label_is_bounded(label))
+            || (option.kind != "select" && option.kind != "boolean")
+            || option.choices.len() > CODING_AGENT_MAX_CONFIG_SELECT_CHOICES
+        {
+            return Err("ACP live diagnostic option identity is invalid".into());
+        }
+        match option.kind.as_str() {
+            "select" => {
+                if option
+                    .current
+                    .as_ref()
+                    .is_some_and(|value| !diagnostic_identity_key_is_bounded(value))
+                {
+                    return Err("ACP live diagnostic select state is invalid".into());
+                }
+                for choice in &option.choices {
+                    if !diagnostic_identity_key_is_bounded(&choice.value)
+                        || choice
+                            .label
+                            .as_ref()
+                            .is_some_and(|label| !diagnostic_label_is_bounded(label))
+                    {
+                        return Err("ACP live diagnostic select choice is invalid".into());
+                    }
+                }
+            }
+            _ => {
+                if !option.choices.is_empty()
+                    || option
+                        .current
+                        .as_ref()
+                        .is_some_and(|value| value != "true" && value != "false")
+                {
+                    return Err("ACP live diagnostic boolean state is invalid".into());
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -975,10 +1250,17 @@ mod tests {
             (CodingAgentRunState::Lost, "lost"),
         ] {
             assert_eq!(state.as_str(), expected);
+            assert_eq!(
+                CodingAgentRunState::from_wire(expected),
+                Some(state.clone())
+            );
             assert_eq!(CodingAgentRunState::from_str(expected), Some(state.clone()));
             assert_eq!(serde_json::to_value(&state).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<CodingAgentRunState>(expected.into()).unwrap(),
+                state
+            );
         }
-        assert!(CodingAgentRunState::from_str("future_state").is_none());
 
         for (state, expected) in [
             (CodingAgentExecutionState::NotStarted, "not_started"),
@@ -987,10 +1269,20 @@ mod tests {
             (CodingAgentExecutionState::Completed, "completed"),
         ] {
             assert_eq!(state.as_str(), expected);
+            assert_eq!(CodingAgentExecutionState::from_wire(expected), Some(state));
             assert_eq!(CodingAgentExecutionState::from_str(expected), Some(state));
             assert_eq!(serde_json::to_value(state).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<CodingAgentExecutionState>(expected.into()).unwrap(),
+                state
+            );
         }
-        assert!(CodingAgentExecutionState::from_str("future_state").is_none());
+        for invalid in ["future_state", "Completed", " completed", "completed ", ""] {
+            assert!(CodingAgentRunState::from_wire(invalid).is_none());
+            assert!(CodingAgentExecutionState::from_wire(invalid).is_none());
+            assert!(serde_json::from_value::<CodingAgentRunState>(invalid.into()).is_err());
+            assert!(serde_json::from_value::<CodingAgentExecutionState>(invalid.into()).is_err());
+        }
     }
 
     #[test]
@@ -1389,6 +1681,222 @@ mod tests {
         let response =
             CodingAgentResponse::success(CodingAgentResponsePayload::Start { run: contradictory });
         assert!(validate_response_for_request(&request, &response).is_err());
+    }
+
+    #[test]
+    fn diagnostic_wire_is_identity_fenced_and_does_not_accept_raw_secrets() {
+        let request = CodingAgentRequest::Diagnose(CodingAgentDiagnoseRequest {
+            run_id: "wc_agent_run_diag_core_994".into(),
+            runtime_project_id: "agent:runner:demo".into(),
+            project_root: "/workspace/demo".into(),
+            provider_id: "codex".into(),
+            provider_instance_id: "acp_current".into(),
+            include_live_acp: false,
+        });
+        validate_request(&request).unwrap();
+        let serialized_request = serde_json::to_string(&request).unwrap();
+        assert!(!serialized_request.contains("secret"));
+        assert!(!serialized_request.contains("executable"));
+        assert!(!serialized_request.contains("command"));
+        assert_eq!(
+            serde_json::from_str::<CodingAgentRequest>(&serialized_request).unwrap(),
+            request
+        );
+
+        let response = CodingAgentResponse::success(CodingAgentResponsePayload::Diagnose {
+            provider_id: "codex".into(),
+            provider_instance_id: "acp_current".into(),
+            env_presence: BTreeMap::from([("API_KEY".into(), true)]),
+            live_acp: None,
+        });
+        validate_response_for_request(&request, &response).unwrap();
+        let mut stale = response.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose {
+            provider_instance_id,
+            ..
+        }) = &mut stale.payload
+        {
+            *provider_instance_id = "acp_old".into();
+        }
+        assert!(validate_response_for_request(&request, &stale).is_err());
+
+        let mut oversized = response.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { env_presence, .. }) =
+            &mut oversized.payload
+        {
+            env_presence.insert("x".repeat(CODING_AGENT_MAX_CONFIG_KEY_BYTES + 1), true);
+        }
+        assert!(validate_response_for_request(&request, &oversized).is_err());
+
+        let mut invalid = request.clone();
+        if let CodingAgentRequest::Diagnose(diag) = &mut invalid {
+            diag.project_root = String::new();
+        }
+        assert!(validate_request(&invalid).is_err());
+    }
+
+    #[test]
+    fn live_acp_diagnostic_wire_is_authorized_bounded_and_safe() {
+        let presence_request = CodingAgentRequest::Diagnose(CodingAgentDiagnoseRequest {
+            run_id: "wc_agent_run_diag_core_994".into(),
+            runtime_project_id: "agent:runner:demo".into(),
+            project_root: "/workspace/demo".into(),
+            provider_id: "codex".into(),
+            provider_instance_id: "acp_current".into(),
+            include_live_acp: false,
+        });
+        let live = CodingAgentLiveAcpDiagnostic {
+            outcome: CodingAgentDiagnoseOutcome::Ok,
+            phase: CodingAgentDiagnosePhase::Projection,
+            protocol_version: Some(1),
+            options: vec![CodingAgentLiveConfigOption {
+                id: "model".into(),
+                label: Some("Model".into()),
+                kind: "select".into(),
+                current: Some("gpt-6-sol".into()),
+                choices: vec![CodingAgentLiveConfigChoice {
+                    value: "gpt-6-sol".into(),
+                    label: Some("GPT 6 Sol".into()),
+                }],
+                choices_truncated: false,
+            }],
+            options_truncated: false,
+        };
+        let failed = CodingAgentLiveAcpDiagnostic {
+            outcome: CodingAgentDiagnoseOutcome::Timeout,
+            phase: CodingAgentDiagnosePhase::Initialize,
+            protocol_version: None,
+            options: Vec::new(),
+            options_truncated: false,
+        };
+
+        // Unrequested live data fails closed, and a requested-but-missing live
+        // section also fails closed.
+        let mut unrequested = CodingAgentResponse::success(CodingAgentResponsePayload::Diagnose {
+            provider_id: "codex".into(),
+            provider_instance_id: "acp_current".into(),
+            env_presence: BTreeMap::new(),
+            live_acp: Some(live.clone()),
+        });
+        assert!(validate_response_for_request(&presence_request, &unrequested).is_err());
+        let mut authorized_request = presence_request.clone();
+        if let CodingAgentRequest::Diagnose(diag) = &mut authorized_request {
+            diag.include_live_acp = true;
+        }
+        if let Some(CodingAgentResponsePayload::Diagnose { live_acp, .. }) =
+            &mut unrequested.payload
+        {
+            *live_acp = None;
+        }
+        assert!(validate_response_for_request(&authorized_request, &unrequested).is_err());
+
+        let successful = CodingAgentResponse::success(CodingAgentResponsePayload::Diagnose {
+            provider_id: "codex".into(),
+            provider_instance_id: "acp_current".into(),
+            env_presence: BTreeMap::new(),
+            live_acp: Some(live.clone()),
+        });
+        validate_response_for_request(&authorized_request, &successful).unwrap();
+
+        // Failed probes stay empty, protocol versions beyond v1 are rejected,
+        // and every projected identity respects the closed budgets.
+        let mut failure_with_options = successful.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { live_acp, .. }) =
+            &mut failure_with_options.payload
+        {
+            let mut failed_with_options = failed.clone();
+            failed_with_options.options = live_acp.as_ref().unwrap().options.clone();
+            *live_acp = Some(failed_with_options);
+        }
+        assert!(validate_response_for_request(&authorized_request, &failure_with_options).is_err());
+
+        let mut future_protocol = successful.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { live_acp, .. }) =
+            &mut future_protocol.payload
+        {
+            live_acp.as_mut().unwrap().protocol_version = Some(2);
+        }
+        assert!(validate_response_for_request(&authorized_request, &future_protocol).is_err());
+
+        let too_many_options = CodingAgentLiveAcpDiagnostic {
+            options: (0..CODING_AGENT_MAX_CONFIG_OPTIONS + 1)
+                .map(|index| CodingAgentLiveConfigOption {
+                    id: format!("option_{index}"),
+                    label: None,
+                    kind: "boolean".into(),
+                    current: Some("true".into()),
+                    choices: Vec::new(),
+                    choices_truncated: false,
+                })
+                .collect(),
+            ..live.clone()
+        };
+        let mut oversized = successful.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { live_acp, .. }) = &mut oversized.payload
+        {
+            *live_acp = Some(too_many_options);
+        }
+        assert!(validate_response_for_request(&authorized_request, &oversized).is_err());
+
+        let too_many_choices = CodingAgentLiveAcpDiagnostic {
+            options: vec![CodingAgentLiveConfigOption {
+                id: "model".into(),
+                label: None,
+                kind: "select".into(),
+                current: None,
+                choices: (0..CODING_AGENT_MAX_CONFIG_SELECT_CHOICES + 1)
+                    .map(|index| CodingAgentLiveConfigChoice {
+                        value: format!("model-{index}"),
+                        label: None,
+                    })
+                    .collect(),
+                choices_truncated: false,
+            }],
+            ..live.clone()
+        };
+        let mut oversized_choices = successful.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { live_acp, .. }) =
+            &mut oversized_choices.payload
+        {
+            *live_acp = Some(too_many_choices);
+        }
+        assert!(validate_response_for_request(&authorized_request, &oversized_choices).is_err());
+
+        let mut hostile_label = successful.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { live_acp, .. }) =
+            &mut hostile_label.payload
+        {
+            if let Some(CodingAgentLiveAcpDiagnostic { options, .. }) = live_acp.as_mut() {
+                options[0].label = Some("x".repeat(CODING_AGENT_MAX_CONFIG_LABEL_BYTES + 1));
+            }
+        }
+        assert!(validate_response_for_request(&authorized_request, &hostile_label).is_err());
+
+        let mut ok_without_projection = successful.clone();
+        if let Some(CodingAgentResponsePayload::Diagnose { live_acp, .. }) =
+            &mut ok_without_projection.payload
+        {
+            live_acp.as_mut().unwrap().phase = CodingAgentDiagnosePhase::SessionNew;
+        }
+        assert!(
+            validate_response_for_request(&authorized_request, &ok_without_projection).is_err()
+        );
+
+        let validated_failure =
+            CodingAgentResponse::success(CodingAgentResponsePayload::Diagnose {
+                provider_id: "codex".into(),
+                provider_instance_id: "acp_current".into(),
+                env_presence: BTreeMap::new(),
+                live_acp: Some(failed),
+            });
+        validate_response_for_request(&authorized_request, &validated_failure).unwrap();
+
+        let serialized = serde_json::to_string(&successful).unwrap();
+        assert!(serialized.contains("\"kind\":\"select\""));
+        assert_eq!(
+            serde_json::from_str::<CodingAgentResponse>(&serialized).unwrap(),
+            successful
+        );
     }
 
     #[test]

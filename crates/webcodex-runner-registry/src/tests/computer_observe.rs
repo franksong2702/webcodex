@@ -1,6 +1,92 @@
 use super::*;
 
 #[tokio::test]
+async fn brokered_computer_requires_current_session_availability() {
+    let registry = RunnerRegistry::default();
+    let mut registration = runner_registration("computer-brokered", "broker-instance", Vec::new());
+    registration.owner = Some("alice".to_string());
+    registration.capabilities.computer_observe = true;
+    registration.computer_session_availability = Some(false);
+    registry
+        .register(current_runner_registration(registration))
+        .await
+        .unwrap();
+
+    let view = registry
+        .get_runner_semantic_view("computer-brokered")
+        .await
+        .unwrap();
+    let alice = auth_context(Some("alice"), false);
+    assert!(view.view.capabilities.computer_observe); // static support remains separate
+    assert!(!view.supports(RunnerFeature::ComputerObserve));
+    let error = registry
+        .enqueue_computer(
+            "computer-brokered".to_string(),
+            "computer_list_windows",
+            r#"{"limit":1}"#.to_string(),
+            "test".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("does not support computer_observe"),
+        "{error}"
+    );
+
+    registry
+        .update_computer_session_availability(
+            "computer-brokered",
+            "broker-instance",
+            None,
+            Some(true),
+        )
+        .await
+        .unwrap();
+    assert!(registry
+        .get_runner_semantic_view("computer-brokered")
+        .await
+        .unwrap()
+        .supports(RunnerFeature::ComputerObserve));
+    let (_id, _rx) = registry
+        .enqueue_computer(
+            "computer-brokered".to_string(),
+            "computer_list_windows",
+            r#"{"limit":1}"#.to_string(),
+            "test".to_string(),
+            Some(&alice),
+            5,
+        )
+        .await
+        .unwrap();
+
+    assert!(registry
+        .update_computer_session_availability(
+            "computer-brokered",
+            "old-instance",
+            None,
+            Some(false)
+        )
+        .await
+        .is_err());
+    registry
+        .update_computer_session_availability(
+            "computer-brokered",
+            "broker-instance",
+            None,
+            Some(false),
+        )
+        .await
+        .unwrap();
+    assert!(!registry
+        .get_runner_semantic_view("computer-brokered")
+        .await
+        .unwrap()
+        .supports(RunnerFeature::ComputerObserve));
+}
+
+#[tokio::test]
 async fn computer_enqueue_requires_exact_owner_and_distinct_capability() {
     let registry = RunnerRegistry::default();
     register_computer_test_runner(
@@ -107,6 +193,7 @@ async fn computer_snapshot_region_requires_additive_capability() {
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -146,6 +233,7 @@ async fn computer_snapshot_region_requires_additive_capability() {
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -195,11 +283,71 @@ async fn computer_snapshot_region_requires_additive_capability() {
 }
 
 #[tokio::test]
-async fn computer_snapshot_display_preserves_large_native_image_response_stdout() {
+async fn computer_snapshots_preserve_json_within_the_native_image_budget() {
+    let ordinary_cap = super::super::ORDINARY_RESULT_STREAM_RETENTION_BYTES;
+    let image_cap = crate::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES;
+    for (kind, payload, cap) in [
+        (
+            "computer_snapshot",
+            r#"{"surface_id":"surface_test"}"#,
+            image_cap,
+        ),
+        (
+            "computer_snapshot_region",
+            r#"{"surface_id":"surface_test","region":null,"max_width":1800,"max_height":1000}"#,
+            image_cap,
+        ),
+        (
+            "computer_snapshot_region",
+            r#"{"surface_id":"surface_test","region":{"x":0,"y":0,"width":100,"height":100},"max_width":null,"max_height":null}"#,
+            image_cap,
+        ),
+        (
+            "computer_snapshot_display",
+            r#"{"display_id":"display_iavN7wEjRWeJq83v","max_width":null,"max_height":null}"#,
+            image_cap,
+        ),
+        ("computer_list_windows", r#"{"limit":1}"#, ordinary_cap),
+    ] {
+        for bytes in [
+            ordinary_cap - 1,
+            ordinary_cap,
+            ordinary_cap + 1,
+            417_121,
+            image_cap - 1,
+            image_cap,
+            image_cap + 1,
+        ] {
+            // Registry retention is format-neutral. Use valid JSON so accidental
+            // text-tail retention demonstrates the downstream parse failure.
+            let mut stdout = serde_json::json!({"content_base64":""}).to_string();
+            stdout.insert_str(stdout.len() - 2, &"A".repeat(bytes - stdout.len()));
+            let response = retained_computer_stdout(kind, payload, stdout.clone()).await;
+            assert!(response.success, "{kind}, {bytes}");
+            assert_eq!(response.stdout_truncated, bytes > cap, "{kind}, {bytes}");
+            let retained = response.stdout.as_deref().unwrap();
+            if bytes <= cap {
+                assert_eq!(retained, stdout, "{kind}, {bytes}");
+                assert!(serde_json::from_str::<serde_json::Value>(retained).is_ok());
+            } else {
+                assert!(retained.starts_with("[output truncated to last "));
+                assert!(retained.len() <= cap + 64);
+                assert!(serde_json::from_str::<serde_json::Value>(retained).is_err());
+            }
+        }
+    }
+}
+
+async fn retained_computer_stdout(
+    kind: &'static str,
+    payload: &str,
+    stdout: String,
+) -> crate::runner_protocol::ShellRunResponse {
     let registry = RunnerRegistry::default();
     let alice = auth_context(Some("alice"), false);
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -214,6 +362,8 @@ async fn computer_snapshot_display_preserves_large_native_image_response_stdout(
             hostname: None,
             host_context: None,
             capabilities: RunnerCapabilities {
+                computer_observe: true,
+                computer_snapshot_region: true,
                 computer_display_observe: true,
                 ..Default::default()
             },
@@ -222,11 +372,10 @@ async fn computer_snapshot_display_preserves_large_native_image_response_stdout(
         .await
         .unwrap();
 
-    let payload = r#"{"display_id":"display_0123456789abcdef0123456789abcdef","max_width":null,"max_height":null}"#;
     let (request_id, response_rx) = registry
         .enqueue_computer(
             "computer-display-large".to_string(),
-            "computer_snapshot_display",
+            kind,
             payload.to_string(),
             "alice".to_string(),
             Some(&alice),
@@ -242,25 +391,22 @@ async fn computer_snapshot_display_preserves_large_native_image_response_stdout(
         .await
         .unwrap()
         .expect("queued display snapshot request");
-    assert_eq!(request.kind, "computer_snapshot_display");
-
-    let stdout = "x".repeat(super::super::MAX_OUTPUT_BYTES + 1024);
-    assert!(stdout.len() < crate::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES);
+    assert_eq!(request.kind, kind);
     registry
         .complete(RunnerResultRequest {
             client_id: "computer-display-large".to_string(),
             runner_instance_id: "display-large-inst".to_string(),
             request_id,
             exit_code: Some(0),
-            stdout: Some(stdout.clone()),
+            stdout: Some(stdout),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
         .await
         .unwrap();
 
-    let response = response_rx.await.unwrap();
-    assert!(response.success);
-    assert_eq!(response.stdout.as_deref(), Some(stdout.as_str()));
+    response_rx.await.unwrap()
 }

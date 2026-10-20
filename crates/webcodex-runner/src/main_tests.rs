@@ -1,10 +1,105 @@
-use super::*;
+#[test]
+fn check_config_is_a_separate_non_runtime_action() {
+    assert_eq!(
+        super::parse_runner_args(["--check-config", "--config", "/tmp/runner.toml"]).unwrap(),
+        super::RunnerCliAction::CheckConfig {
+            config_path: std::path::PathBuf::from("/tmp/runner.toml")
+        }
+    );
+    assert!(super::parse_runner_args(["--check-config", "--once"]).is_err());
+    assert!(super::parse_runner_args(["--check-config", "--stop-on-stdin-eof"]).is_err());
+}
+
+use super::{parse_runner_args, RunnerCliAction};
+use reqwest::blocking::Client;
+#[cfg(test)]
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::webcodex_runner;
+use webcodex_runner::job_manager::JobManager;
+#[cfg(test)]
+use webcodex_runner::{cwd_allowed, PreparedShellProfileCache};
+
+use runner_operation::RunnerFileOperation;
+#[cfg(test)]
+use webcodex_core::{runner_operation, runner_protocol};
+
+use runner_protocol::{
+    RunnerCapabilities, RunnerCapabilityId, RunnerPollResponse, RunnerRequest,
+    ShellProjectInventoryStatus, RUNNER_PROTOCOL_GENERATION_V2,
+};
+#[cfg(test)]
+use runner_protocol::{RunnerJobUpdateRequest, ShellCommandExecutionState};
+
+#[cfg(test)]
+use runner_protocol::{RunnerEnvelope, RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES};
+#[cfg(test)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::net::SocketAddr;
+#[cfg(test)]
+use webcodex_runner::dispatch_request;
+#[cfg(test)]
+use webcodex_runner::QuicClientConfig;
+#[cfg(test)]
+use webcodex_runner::{
+    auto_transport_plan, build_ws_request, default_quic_alpn, default_quic_connect_timeout_secs,
+    default_quic_keepalive_interval_secs, default_websocket_connect_timeout_secs,
+    effective_transport, load_runner_project_summaries_from_dir, non_empty_token,
+    parse_runner_project_toml, quic_client_bind_addr_for, resolve_quic_config,
+    resolve_quic_server_addrs, run_shell, runner_project_summary, server_url_to_ws,
+    sha256_hex_bytes, validate_project_path_policy, websocket_session, RunnerRuntimeState,
+    ShellProfileConfig, CLIENT_PROFILE_ERROR, DEFAULT_MAX_CONCURRENT_JOBS, WS_OUTGOING_CAPACITY,
+};
+use webcodex_runner::{
+    client_profile_runner_config, load_config, max_concurrent_jobs, project_registry_dir,
+    resolve_requested_path, CommandResult, HttpSendConfig, ReloadableRunnerConfig, RunnerConfig,
+    RunnerPolicy, RunnerProjectCache, RunnerSink, ShellConfig, SubmitResultError,
+};
+#[cfg(test)]
+use webcodex_runner_config::{
+    TRANSPORT_AUTO, TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET,
+};
+
+#[cfg(test)]
+use webcodex_runner::SshConfig;
+use webcodex_runner::SshConnectionPool;
+
+use crate::webcodex_runner::file_dispatch::*;
+use crate::webcodex_runner::transport::http_client::*;
+use crate::webcodex_runner::transport::poll_dispatch::*;
+use crate::webcodex_runner::transport::registration::*;
+
 use crate::webcodex_runner::config::validate_shell_config;
+use crate::webcodex_runner::job_manager::job_manager_tests::{shell_job_request, ws_sink};
+use crate::webcodex_runner::projects::{project_root_fingerprint, RunnerProjectFile};
 use crate::webcodex_runner::run_shell_with_profiles;
 use crate::webcodex_runner::{
     handle_prepare_managed_worktree, handle_project_lifecycle_op, handle_project_op,
     handle_resolve_or_register_project,
 };
+/// Create a test temp directory on the repository build filesystem.
+///
+/// Some hardened hosts mount the system temp directory with `noexec`. Tests
+/// that intentionally create and execute fake binaries/scripts must not assume
+/// `tempfile::tempdir()` is executable. Keep ordinary data-only temp dirs on
+/// the system temp filesystem; use this helper only for executable fixtures.
+pub(crate) fn executable_tempdir() -> tempfile::TempDir {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join("test-executables");
+    std::fs::create_dir_all(&root).expect("create executable test temp root");
+    tempfile::Builder::new()
+        .prefix("webcodex-runner-exec-")
+        .tempdir_in(root)
+        .expect("create executable test temp dir")
+}
+
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -13,47 +108,9 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// RAII restore for environment variables mutated by tests: restores the
-/// previous value (or absence) on drop, even when the test panics, so a
-/// failure cannot leak env state into later tests.
-pub(crate) struct EnvGuard {
-    restored: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl EnvGuard {
-    pub(crate) fn new() -> Self {
-        EnvGuard {
-            restored: Vec::new(),
-        }
-    }
-
-    pub(crate) fn set(mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        self.capture(name);
-        std::env::set_var(name, value.as_ref());
-        self
-    }
-
-    pub(crate) fn remove(mut self, name: &'static str) -> Self {
-        self.capture(name);
-        std::env::remove_var(name);
-        self
-    }
-
-    fn capture(&mut self, name: &'static str) {
-        self.restored.push((name, std::env::var_os(name)));
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in self.restored.drain(..).rev() {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
+#[path = "main_tests/isolated_env.rs"]
+mod isolated_env;
+pub(crate) use isolated_env::IsolatedEnv;
 
 /// Policy for tests that exercise shell/profile behavior inside a temp dir
 /// rather than the filesystem boundary itself. `RunnerPolicy::default()` is
@@ -70,6 +127,7 @@ fn unrestricted_test_policy() -> RunnerPolicy {
 fn test_config(project_registry_dir: PathBuf) -> RunnerConfig {
     RunnerConfig {
         server_url: "http://127.0.0.1:8000".to_string(),
+        server_url_override: None,
         token: "test-token".to_string(),
         client_id: "oe".to_string(),
         display_name: None,
@@ -77,12 +135,13 @@ fn test_config(project_registry_dir: PathBuf) -> RunnerConfig {
         hostname: None,
         host_context: None,
         project_registry_dir: Some(project_registry_dir),
-        legacy_projects_dir: None,
         poll_interval_ms: 1000,
         capabilities: None,
         max_concurrent_jobs: None,
         policy: unrestricted_test_policy(),
         shell: ShellConfig::default(),
+        skills: crate::webcodex_runner::config::SkillsConfig::default(),
+        instructions: crate::webcodex_runner::config::InstructionsConfig::default(),
         ssh: SshConfig::default(),
         transport: None,
         websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
@@ -104,9 +163,33 @@ fn detached_process_capability_matches_supported_native_backends() {
 }
 
 #[test]
+fn project_format_capability_matches_supported_native_backends() {
+    let capabilities = runner_register_capabilities(&test_config(PathBuf::new()));
+    assert_eq!(
+        capabilities.project_format_v1,
+        cfg!(any(target_os = "linux", target_os = "macos", windows))
+    );
+    assert_eq!(
+        capabilities.project_format_go_v1,
+        capabilities.project_format_v1
+    );
+}
+
+#[test]
 fn runner_config_control_capability_is_platform_neutral() {
     let capabilities = runner_register_capabilities(&test_config(PathBuf::new()));
     assert!(capabilities.runner_config_control);
+}
+
+#[test]
+fn browser_user_handoff_capability_requires_owned_browser_and_exact_native_surface() {
+    let capabilities = runner_register_capabilities(&test_config(PathBuf::new()));
+    if !cfg!(any(target_os = "macos", windows))
+        || !capabilities.browser_managed_profile
+        || !capabilities.browser_surface_handoff
+    {
+        assert!(!capabilities.browser_user_handoff);
+    }
 }
 
 #[test]
@@ -176,6 +259,11 @@ mod shell_job_tree;
 mod shell_profiles;
 #[path = "main_tests/structured_delete.rs"]
 mod structured_delete;
+#[cfg(unix)]
+#[path = "main_tests/structured_write_paths.rs"]
+mod structured_write_paths;
+#[path = "main_tests/workspace_checkpoints.rs"]
+mod workspace_checkpoints;
 #[path = "main_tests/write_project_file.rs"]
 mod write_project_file;
 
@@ -341,140 +429,6 @@ fn run_profile_shell(
     )
 }
 
-fn shell_job_request(cwd: &Path, command: &str) -> RunnerRequest {
-    RunnerRequest {
-        request_id: "req-job".to_string(),
-        client_id: "ws-client".to_string(),
-        kind: "start_job".to_string(),
-        job_id: Some("job-profile".to_string()),
-        cwd: Some(cwd.to_string_lossy().to_string()),
-        path: None,
-        content: None,
-        max_bytes: None,
-        expected_sha256: None,
-        expected_prefix: None,
-        start_line: None,
-        end_line: None,
-        create_dirs: false,
-        command: command.to_string(),
-        process: None,
-        script: None,
-        stdin: None,
-        timeout_secs: 10,
-        requested_by: "tester".to_string(),
-        created_at: 0,
-        validation: None,
-        lsp: None,
-        job_context: Some(test_job_context(cwd, Vec::new())),
-        mcp_gateway: None,
-        plugin_gateway: None,
-        coding_agent: None,
-        persistent_shell: None,
-    }
-}
-
-#[test]
-fn runner_recovery_context_rejects_cross_product_go_test_metadata() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut request = shell_job_request(temp.path(), "");
-    request.kind = "start_validation_job".to_string();
-    let cargo_step = ShellJobValidationStep {
-        name: "test".to_string(),
-        program: "cargo".to_string(),
-        args: vec!["test".to_string(), "tool_runtime".to_string()],
-        env: Vec::new(),
-    };
-    request.command = serde_json::to_string(&vec![cargo_step.clone()]).unwrap();
-    let context = request.job_context.as_mut().unwrap();
-    context.purpose = Some("validation".to_string());
-    context.validation_steps = vec!["test".to_string()];
-    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
-        tool: "go_test".to_string(),
-        kind: "test".to_string(),
-        steps: vec![cargo_step],
-        effective_timeout_secs: 1800,
-        sync_wait_secs: 10,
-        adapter: "go_test".to_string(),
-        validation_target_id: None,
-        minimum_tests: None,
-        require_tests: None,
-        no_run: None,
-    });
-    let context = context.clone();
-
-    let error = validate_runner_job_context(&context, &request, "ws-client").unwrap_err();
-    assert!(error.contains("validation metadata is invalid"), "{error}");
-}
-
-#[test]
-fn runner_recovery_context_accepts_server_validation_identity_metadata() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut request = shell_job_request(temp.path(), "");
-    request.kind = "start_process_job".to_string();
-    request.process = Some(runner_protocol::ShellProcessArgv {
-        executable: "cargo".to_string(),
-        args: vec!["test".to_string(), "focused".to_string()],
-    });
-    let context = request.job_context.as_mut().unwrap();
-    context.purpose = Some("test".to_string());
-    context.shell = Some("direct_argv".to_string());
-    context.command_preview = "cargo test focused".to_string();
-    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
-        execution_source: "run_process".to_string(),
-        language: None,
-        script_bytes: None,
-        arg_count: 2,
-        stdin_present: false,
-        validation_identity: Some("assertion:0123456789abcdef01234567".to_string()),
-        validation_tool: Some("cargo_test".to_string()),
-        assertion_name: Some("runner restart assertion".to_string()),
-    });
-    let context = context.clone();
-
-    validate_runner_job_context(&context, &request, "ws-client").unwrap();
-
-    let mut invalid = context.clone();
-    invalid
-        .structured_execution
-        .as_mut()
-        .unwrap()
-        .validation_identity = Some("target:not-valid".to_string());
-    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
-    assert!(
-        error.contains("structured execution metadata is invalid"),
-        "{error}"
-    );
-
-    let mut detached_assertion = context.clone();
-    let structured = detached_assertion.structured_execution.as_mut().unwrap();
-    structured.execution_source = "run_detached_process".to_string();
-    structured.validation_tool = None;
-    structured.assertion_name = None;
-    assert!(
-        !structured.is_valid(),
-        "assertion identities must remain closed to model-facing process/script Jobs"
-    );
-}
-
-fn wait_for_job_envelope(
-    rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
-    message: &str,
-) -> RunnerEnvelope {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match rx.try_recv() {
-            Ok(envelope) => return envelope,
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => panic!("{message}"),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                panic!("{message}: channel disconnected")
-            }
-        }
-    }
-}
-
 fn line_edit_json(result: CommandResult) -> serde_json::Value {
     assert_eq!(result.exit_code, Some(0), "unexpected result: {:?}", result);
     assert!(
@@ -492,6 +446,8 @@ fn json_file_op_request(
     payload: serde_json::Value,
 ) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: format!("req-{kind}"),
         client_id: "agent-1".to_string(),
         kind: kind.to_string(),
@@ -735,20 +691,23 @@ fn assert_descendant_reaped(pid_file: &Path) {
 /// Compiled copy of the `validation_tree_helper` fixture, kept alive for the
 /// whole test process so its binary path never disappears under a running
 /// descendant (same pattern as the validation lifecycle tests).
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 struct ShellTreeHelper {
     _temp: tempfile::TempDir,
     path: PathBuf,
 }
 
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 static SHELL_TREE_HELPER: std::sync::OnceLock<std::sync::Arc<ShellTreeHelper>> =
     std::sync::OnceLock::new();
 
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 fn shell_tree_helper() -> PathBuf {
     SHELL_TREE_HELPER
         .get_or_init(|| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("src/webcodex_runner/validation/validation_tree_helper.rs");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = executable_tempdir();
             let output = temp
                 .path()
                 .join(format!("shell-tree-helper{}", std::env::consts::EXE_SUFFIX));
@@ -793,6 +752,7 @@ fn shell_tree_quote(value: &str) -> String {
 /// cmd.exe quote-parsing pitfalls) and appends `exit $LASTEXITCODE` so the
 /// helper's exit status becomes the shell's exit status. Unix uses the POSIX
 /// shell directly.
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 fn shell_tree_command(helper: &Path, args: &[String]) -> String {
     let mut parts: Vec<String> = vec![shell_tree_quote(&helper.to_string_lossy())];
     parts.extend(args.iter().map(|arg| shell_tree_quote(arg)));
@@ -810,6 +770,7 @@ fn shell_tree_command(helper: &Path, args: &[String]) -> String {
 /// Test shell that can actually run on this platform: PowerShell on Windows
 /// (cmd.exe quote parsing and missing `sleep` make POSIX-style commands
 /// unusable), the default `sh -c` on Unix.
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 #[cfg(windows)]
 fn shell_tree_test_shell() -> ShellConfig {
     ShellConfig {
@@ -819,6 +780,7 @@ fn shell_tree_test_shell() -> ShellConfig {
     }
 }
 
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 #[cfg(not(windows))]
 fn shell_tree_test_shell() -> ShellConfig {
     ShellConfig::default()
@@ -826,6 +788,7 @@ fn shell_tree_test_shell() -> ShellConfig {
 
 /// Shell timeout used by the tree tests: Windows needs headroom for
 /// PowerShell startup, Unix shells start instantly.
+#[cfg(feature = "runner-real-process-tests")]
 fn shell_tree_test_timeout_secs() -> u64 {
     if cfg!(windows) {
         5
@@ -901,6 +864,7 @@ fn wait_until_process_dead(pid: u32, timeout: Duration, tag: &str) -> bool {
 }
 
 /// Parse `KEY=<pid>` from a marker file written by the fixture helper.
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 fn read_marker_pid(marker: &Path, key: &str) -> u32 {
     let text = std::fs::read_to_string(marker).expect("read pid marker");
     text.lines()
@@ -914,11 +878,13 @@ fn read_marker_pid(marker: &Path, key: &str) -> u32 {
 
 /// Marker paths and the keepalive command for the two-argument
 /// `spawn-descendant-keepalive` / `spawn-descendant` fixtures.
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 struct ShellTreeMarkers {
     parent: PathBuf,
     alive: PathBuf,
 }
 
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 impl ShellTreeMarkers {
     fn in_dir(tmp: &std::path::Path, tag: &str) -> Self {
         Self {
@@ -941,6 +907,7 @@ impl ShellTreeMarkers {
 
     /// Both pids must be dead after cancellation; `PARENT_PID` and
     /// `DESCENDANT_PID` are both written to the parent marker.
+    #[cfg(any(windows, feature = "runner-real-process-tests"))]
     fn assert_tree_dead(&self, tag: &str) {
         let parent = read_marker_pid(&self.parent, "PARENT_PID");
         let descendant = read_marker_pid(&self.parent, "DESCENDANT_PID");
@@ -968,12 +935,21 @@ impl ShellTreeMarkers {
 fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().to_string_lossy().to_string();
-    let helper = shell_tree_helper();
+    // Use the OS-owned command processor instead of the rustc-built process-tree
+    // fixture. This test only verifies PowerShell native-exit propagation; a freshly
+    // generated EXE can be delayed by Windows malware scanning under parallel CI and
+    // would turn that unrelated startup latency into a false shell timeout.
+    // Allow time for PowerShell startup on a busy Windows CI host as well.
+    let command_processor = std::env::var_os("ComSpec")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .expect("Windows ComSpec must name the native command processor");
     // No fixture-level `exit $LASTEXITCODE`: the PowerShell command wrapper
     // must propagate the native executable's exit code on its own.
     let command = format!(
-        "& {} sleep 0 3",
-        shell_tree_quote(&helper.to_string_lossy())
+        "& {} /d /c {}",
+        shell_tree_quote(&command_processor.to_string_lossy()),
+        shell_tree_quote("exit /b 3")
     );
     let result = run_shell(
         &unrestricted_test_policy(),
@@ -981,7 +957,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
         Some(&cwd),
         &command,
         None,
-        10,
+        30,
         None,
     );
     assert_eq!(result.exit_code, Some(3), "{result:?}");
@@ -991,7 +967,6 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
 #[cfg(windows)]
 #[test]
 fn shell_job_unicode_stdout_stderr_env_and_cwd() {
-    let _guard = test_env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/project-registry"));
     let unicode_cwd = tmp.path().join("unicode cwd 测试");
@@ -1015,40 +990,42 @@ fn shell_job_unicode_stdout_stderr_env_and_cwd() {
     assert_eq!(result.stderr.as_deref(), Some("err 測試"));
 
     // Unicode environment value inherited from the parent process.
-    let _env = EnvGuard::new().set("WEBCODEX_UNICODE_ENV", "值 测试");
-    let result = run_shell(
-        &cfg.policy,
-        &ShellConfig::default(),
-        Some(&cwd),
-        &shell_env_var("WEBCODEX_UNICODE_ENV"),
-        None,
-        10,
-        None,
-    );
-    assert_eq!(result.exit_code, Some(0), "{result:?}");
-    assert_eq!(result.stdout.as_deref(), Some("值 测试"));
+    IsolatedEnv::new()
+        .set("WEBCODEX_UNICODE_ENV", "值 测试")
+        .run("inherited", || {
+            let result = run_shell(
+                &cfg.policy,
+                &ShellConfig::default(),
+                Some(&cwd),
+                &shell_env_var("WEBCODEX_UNICODE_ENV"),
+                None,
+                10,
+                None,
+            );
+            assert_eq!(result.exit_code, Some(0), "{result:?}");
+            assert_eq!(result.stdout.as_deref(), Some("值 测试"));
 
-    // Unicode cwd: the shell reports its working directory verbatim.
-    let result = run_shell(
-        &cfg.policy,
-        &ShellConfig::default(),
-        Some(&cwd),
-        "[Console]::Out.Write((Get-Location).Path)",
-        None,
-        10,
-        None,
-    );
-    assert_eq!(result.exit_code, Some(0), "{result:?}");
-    assert!(
-        result
-            .stdout
-            .as_deref()
-            .unwrap_or_default()
-            .contains("测试"),
-        "{result:?}"
-    );
+            // Unicode cwd: the shell reports its working directory verbatim.
+            let result = run_shell(
+                &cfg.policy,
+                &ShellConfig::default(),
+                Some(&cwd),
+                "[Console]::Out.Write((Get-Location).Path)",
+                None,
+                10,
+                None,
+            );
+            assert_eq!(result.exit_code, Some(0), "{result:?}");
+            assert!(
+                result
+                    .stdout
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("测试"),
+                "{result:?}"
+            );
+        });
 }
-
 #[cfg(windows)]
 #[test]
 fn prepared_profile_unicode_env_round_trip_and_unicode_init_path() {
@@ -1131,18 +1108,6 @@ fn generated_runner_instance_id_is_non_empty_uuid_like() {
     );
 }
 
-fn ws_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
-    (
-        RunnerSink::WebSocket {
-            tx,
-            client_id: client_id.to_string(),
-            runner_instance_id: "ws-inst".to_string(),
-        },
-        rx,
-    )
-}
-
 fn quic_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
     (
@@ -1155,127 +1120,6 @@ fn quic_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<Runner
     )
 }
 
-#[cfg(unix)]
-#[test]
-fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/project-registry"));
-    let jobs = JobManager::new(1);
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let mut running_command =
-        configured_shell_job_command(&ShellConfig::default(), "sleep 60").unwrap();
-    running_command
-        .current_dir(tmp.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let running_child = Arc::new(Mutex::new(
-        ManagedChild::spawn(&mut running_command).unwrap(),
-    ));
-    let running_pid = lock_unpoison(&running_child).id();
-    jobs.jobs.lock().unwrap().insert(
-        "running-job".to_string(),
-        RunningJob {
-            client_id: "ws-client".to_string(),
-            runner_instance_id: "ws-instance".to_string(),
-            snapshot: test_job_snapshot("running-job"),
-            child: Some(Arc::clone(&running_child)),
-            stop_requested: stop_requested.clone(),
-            slot_reserved: true,
-        },
-    );
-    let (sink, mut rx) = ws_sink("ws-client");
-    let request = RunnerRequest {
-        request_id: "req-queued".to_string(),
-        client_id: "ws-client".to_string(),
-        kind: "start_job".to_string(),
-        job_id: Some("queued-job".to_string()),
-        cwd: Some(tmp.path().to_string_lossy().to_string()),
-        path: None,
-        content: None,
-        max_bytes: None,
-        expected_sha256: None,
-        expected_prefix: None,
-        start_line: None,
-        end_line: None,
-        create_dirs: false,
-        command: ": > queued-started".to_string(),
-        process: None,
-        script: None,
-        stdin: None,
-        timeout_secs: 60,
-        requested_by: "tester".to_string(),
-        created_at: 0,
-        validation: None,
-        lsp: None,
-        job_context: Some(test_job_context(tmp.path(), Vec::new())),
-        mcp_gateway: None,
-        plugin_gateway: None,
-        coding_agent: None,
-        persistent_shell: None,
-    };
-    let mut rejected_request = request.clone();
-    rejected_request.request_id = "req-after-shutdown".to_string();
-    rejected_request.job_id = Some("job-after-shutdown".to_string());
-
-    jobs.enqueue(
-        sink,
-        PendingJobStart::from_wire(
-            1,
-            cfg.policy.clone(),
-            cfg.shell.clone(),
-            cfg.ssh.clone(),
-            project_registry_dir(&cfg).unwrap(),
-            request,
-        ),
-    );
-    match wait_for_job_envelope(&mut rx, "queued status was sent") {
-        RunnerEnvelope::JobUpdate { payload } => {
-            assert_eq!(payload.job_id, "queued-job");
-            assert_eq!(payload.status, "agent_queued");
-        }
-        other => panic!("expected job_update, got {:?}", other.kind()),
-    }
-    assert_eq!(jobs.queued.lock().unwrap().len(), 1);
-
-    jobs.stop_all();
-
-    assert!(stop_requested.load(Ordering::SeqCst));
-    assert!(jobs.queued.lock().unwrap().is_empty());
-    assert!(lock_unpoison(&running_child).try_wait().unwrap().is_some());
-    assert!(!job_manager_tests::process_running(running_pid));
-    assert!(
-        !tmp.path().join("queued-started").exists(),
-        "queued job started during shutdown"
-    );
-
-    let (rejected_sink, mut rejected_rx) = ws_sink("ws-client");
-    jobs.enqueue(
-        rejected_sink,
-        PendingJobStart::from_wire(
-            1,
-            cfg.policy.clone(),
-            cfg.shell.clone(),
-            cfg.ssh.clone(),
-            project_registry_dir(&cfg).unwrap(),
-            rejected_request,
-        ),
-    );
-    assert!(jobs.queued.lock().unwrap().is_empty());
-    let rejected = (0..2)
-        .find_map(
-            |_| match wait_for_job_envelope(&mut rejected_rx, "shutdown update was sent") {
-                RunnerEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
-                RunnerEnvelope::JobUpdate { .. } => None,
-                other => panic!("expected job_update, got {:?}", other.kind()),
-            },
-        )
-        .expect("shutdown rejection terminal update was sent");
-    assert_eq!(rejected.job_id, "job-after-shutdown");
-    assert_eq!(rejected.status, "failed");
-    assert!(rejected.finished);
-    assert_eq!(rejected.error.as_deref(), Some("runner is shutting down"));
-}
-
 fn project_policy(root: &Path) -> RunnerPolicy {
     RunnerPolicy {
         allow_cwd_anywhere: false,
@@ -1286,6 +1130,8 @@ fn project_policy(root: &Path) -> RunnerPolicy {
 
 fn project_request(kind: &str, payload: serde_json::Value) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: format!("req-{}", kind),
         client_id: "oe".to_string(),
         kind: kind.to_string(),
@@ -1387,6 +1233,35 @@ fn seed_managed_worktree_repo(source: &Path) -> (String, String) {
     (first, second)
 }
 
+fn register_managed_source_project(registry: &Path, source: &Path) {
+    std::fs::create_dir_all(registry).unwrap();
+    let source = source.canonicalize().unwrap();
+    let project = RunnerProjectFile {
+        id: "source".to_string(),
+        path: source.to_string_lossy().into_owned(),
+        shell_profile: None,
+        allow_patch: true,
+        name: Some("Source".to_string()),
+        kind: Some("repo".to_string()),
+        registration_source: None,
+        description: None,
+        disabled: false,
+        hooks: HashMap::new(),
+        managed_worktree: false,
+        managed_source: None,
+        managed_source_project_id: None,
+        managed_source_root_fingerprint: None,
+        managed_base_ref: None,
+        managed_base_sha: None,
+        managed_operation_id: None,
+    };
+    std::fs::write(
+        registry.join("source.toml"),
+        toml::to_string(&project).unwrap(),
+    )
+    .unwrap();
+}
+
 fn managed_worktree_request(
     source: &Path,
     base_ref: serde_json::Value,
@@ -1402,6 +1277,48 @@ fn managed_worktree_request(
             "resume_project_id": resume_project_id,
         }),
     )
+}
+
+fn managed_worktree_request_with_source_identity(
+    source: &Path,
+    base_ref: serde_json::Value,
+    operation_id: &str,
+    source_project_id: &str,
+    source_root_fingerprint: &str,
+) -> RunnerRequest {
+    project_request(
+        "prepare_managed_worktree",
+        serde_json::json!({
+            "path": source.to_string_lossy(),
+            "base_ref": base_ref,
+            "operation_id": operation_id,
+            "resume_project_id": null,
+            "expected_source_project_id": source_project_id,
+            "expected_source_root_fingerprint": source_root_fingerprint,
+        }),
+    )
+}
+
+#[test]
+fn project_root_fingerprint_uses_platform_path_identity_rules() {
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            project_root_fingerprint(Path::new(r"C:\Foo\Repo")),
+            project_root_fingerprint(Path::new(r"\\?\c:\foo\repo\"))
+        );
+        assert_eq!(
+            project_root_fingerprint(Path::new(r"\\SERVER\Share\Repo")),
+            project_root_fingerprint(Path::new(r"\\?\UNC\server\share\repo"))
+        );
+    }
+    #[cfg(unix)]
+    {
+        assert_ne!(
+            project_root_fingerprint(Path::new("/tmp/Repo")),
+            project_root_fingerprint(Path::new("/tmp/repo"))
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -1428,11 +1345,120 @@ fn managed_worktree_network_source_requires_runner_authority_before_resolution()
 }
 
 #[test]
+fn managed_worktree_uses_authorized_namespace_and_keeps_follow_up_cwd_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let allowed = tmp.path().join("allowed");
+    let source = allowed.join("repo");
+    let arbitrary = tmp.path().join("arbitrary");
+    let registry = tmp.path().join("project-registry");
+    std::fs::create_dir_all(&allowed).unwrap();
+    seed_managed_worktree_repo(&source);
+    std::fs::create_dir(&arbitrary).unwrap();
+    register_managed_source_project(&registry, &source);
+
+    let policy = project_policy(&allowed);
+    let created = project_ok(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request(
+            &source,
+            serde_json::Value::Null,
+            "10101010-1010-4010-8010-101010101010",
+            None,
+        ),
+    ));
+    let worktree = PathBuf::from(created["path"].as_str().unwrap());
+    let expected_namespace = allowed.join(".webcodex-worktrees").canonicalize().unwrap();
+    assert_eq!(
+        worktree.parent().unwrap().canonicalize().unwrap(),
+        expected_namespace
+    );
+    assert_ne!(
+        worktree.canonicalize().unwrap(),
+        source.canonicalize().unwrap()
+    );
+    crate::webcodex_runner::shell::cwd_allowed(&policy, &worktree)
+        .expect("managed Project cwd must remain inside ordinary Runner authority");
+
+    let denied = project_error_value(handle_resolve_or_register_project(
+        &policy,
+        &registry,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": arbitrary.to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(denied["error_code"], "path_outside_allowed_roots");
+    assert_eq!(
+        load_runner_project_summaries_from_dir(&registry).len(),
+        2,
+        "the denied arbitrary sibling must not become a Project"
+    );
+}
+
+#[test]
+fn managed_worktree_does_not_escape_an_exact_source_allowed_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("repo");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+
+    let policy = project_policy(&source);
+    let error = project_error_value(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request(
+            &source,
+            serde_json::Value::Null,
+            "11111111-1111-4111-8111-111111111111",
+            None,
+        ),
+    ));
+    assert_eq!(error["error_code"], "managed_worktree_root_unavailable");
+    assert_eq!(error["state_changed"], false);
+    assert!(
+        !tmp.path().join(".webcodex-worktrees").exists(),
+        "managed bootstrap must not create a sibling outside allowed_roots"
+    );
+}
+#[test]
+fn managed_worktree_expected_source_identity_is_revalidated_before_creation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(&source);
+    let mismatched_fingerprint = format!("wc_projroot_{}", "f".repeat(64));
+
+    let error = project_error_value(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request_with_source_identity(
+            &source,
+            serde_json::Value::Null,
+            "20202020-2020-4020-8020-202020202020",
+            "source",
+            &mismatched_fingerprint,
+        ),
+    ));
+    assert_eq!(
+        error["error_code"],
+        "managed_worktree_source_identity_changed"
+    );
+    assert_eq!(error["state_changed"], false);
+    assert_eq!(error["source_project_id"], "source");
+    assert!(!tmp.path().join(".webcodex-worktrees").exists());
+}
+
+#[test]
 fn managed_worktree_bootstrap_is_detached_registered_and_same_operation_recovers() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let registry = tmp.path().join("project-registry");
     let (_first, head) = seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
     let policy = project_policy(tmp.path());
     let request = managed_worktree_request(
         &source,
@@ -1451,6 +1477,27 @@ fn managed_worktree_bootstrap_is_detached_registered_and_same_operation_recovers
     assert_eq!(first["outcome"], "managed_worktree_created");
     assert_eq!(first["registered"], true);
     let worktree = PathBuf::from(first["path"].as_str().unwrap());
+    assert_eq!(
+        worktree.file_name().unwrap().to_str().unwrap().len(),
+        "source-".len() + 8
+    );
+    assert!(!first["id"]
+        .as_str()
+        .unwrap()
+        .contains("11111111-1111-4111-8111-111111111111"));
+    let config = std::fs::read_to_string(registry.join(format!(
+        "{}.toml",
+        first["agent_project_id"].as_str().unwrap()
+    )))
+    .unwrap();
+    assert_eq!(
+        parse_runner_project_toml(&config)
+            .unwrap()
+            .managed_operation_id
+            .as_deref(),
+        Some("11111111-1111-4111-8111-111111111111")
+    );
+
     assert_ne!(
         worktree.canonicalize().unwrap(),
         source.canonicalize().unwrap()
@@ -1464,8 +1511,20 @@ fn managed_worktree_bootstrap_is_detached_registered_and_same_operation_recovers
     assert!(!detached.success(), "managed worktree must start detached");
 
     let projects = load_runner_project_summaries_from_dir(&registry);
-    assert_eq!(projects.len(), 1);
-    assert_eq!(Path::new(&projects[0].path), worktree.as_path());
+    assert_eq!(projects.len(), 2);
+    let managed_id = first["agent_project_id"].as_str().unwrap();
+    let managed = projects
+        .iter()
+        .find(|project| project.id == managed_id)
+        .unwrap();
+    assert_eq!(Path::new(&managed.path), worktree.as_path());
+    assert_eq!(first["lineage"]["kind"], "managed_worktree_source");
+    assert_eq!(first["lineage"]["source_project_id"], "source");
+    assert_eq!(first["lineage"]["base_sha"], head);
+    assert!(first["lineage"]["source_root_fingerprint"]
+        .as_str()
+        .unwrap()
+        .starts_with("wc_projroot_"));
 
     let recovered = project_ok(handle_prepare_managed_worktree(
         &policy, &registry, &request,
@@ -1478,11 +1537,62 @@ fn managed_worktree_bootstrap_is_detached_registered_and_same_operation_recovers
 }
 
 #[test]
+fn managed_worktree_slug_collision_escalates_and_unknown_identity_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(tmp.path());
+    let operation = "11111111-1111-4111-8111-111111111111";
+    let request = managed_worktree_request(&source, serde_json::Value::Null, operation, None);
+    let first = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    let config_path = registry.join(format!(
+        "{}.toml",
+        first["agent_project_id"].as_str().unwrap()
+    ));
+    let mut project =
+        parse_runner_project_toml(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    // Establish a different exact operation occupying this short slug.
+    project.managed_operation_id = Some("22222222-2222-4222-8222-222222222222".into());
+    std::fs::write(&config_path, toml::to_string(&project).unwrap()).unwrap();
+    let second = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    assert_ne!(first["path"], second["path"]);
+    assert_ne!(first["id"], second["id"]);
+    assert_eq!(
+        Path::new(second["path"].as_str().unwrap())
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .len(),
+        "source-".len() + 12
+    );
+    let recovery = project_ok(handle_prepare_managed_worktree(
+        &policy, &registry, &request,
+    ));
+    assert_eq!(recovery["id"], second["id"]);
+    // An occupied path without a verifiable identity is not a collision hint.
+    std::fs::remove_file(config_path).unwrap();
+    assert_eq!(
+        project_err(handle_prepare_managed_worktree(
+            &policy, &registry, &request
+        )),
+        "managed_worktree_recovery_conflict"
+    );
+}
+
+#[test]
 fn managed_worktree_explicit_ref_preserves_dirty_source_and_resume_survives_source_head_move() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let registry = tmp.path().join("project-registry");
     let (first_sha, _second_sha) = seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
     std::fs::write(source.join("hello.txt"), "dirty source\n").unwrap();
     std::fs::write(source.join("untracked.txt"), "keep me\n").unwrap();
     let status_before = managed_git(&source, &["status", "--porcelain"]);
@@ -1534,7 +1644,115 @@ fn managed_worktree_explicit_ref_preserves_dirty_source_and_resume_survives_sour
     assert_eq!(resumed["base_sha"], first_sha);
     assert_eq!(resumed["outcome"], "managed_worktree_recovered");
     assert_eq!(resumed["registered"], false);
-    assert_eq!(load_runner_project_summaries_from_dir(&registry).len(), 1);
+    assert_eq!(load_runner_project_summaries_from_dir(&registry).len(), 2);
+}
+
+#[test]
+fn managed_worktree_invalid_and_missing_base_refs_fail_deterministically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(&source);
+
+    let invalid = project_error_value(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request(
+            &source,
+            serde_json::json!(42),
+            "30303030-3030-4030-8030-303030303030",
+            None,
+        ),
+    ));
+    assert_eq!(invalid["error_code"], "invalid_base_ref");
+    assert_eq!(invalid["state_changed"], false);
+
+    let missing = project_error_value(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request(
+            &source,
+            serde_json::json!("refs/heads/does-not-exist"),
+            "40404040-4040-4040-8040-404040404040",
+            None,
+        ),
+    ));
+    assert_eq!(missing["error_code"], "base_ref_resolution_failed");
+    assert_eq!(missing["state_changed"], false);
+    assert_eq!(missing["base_ref"], "refs/heads/does-not-exist");
+    assert!(!tmp.path().join(".webcodex-worktrees").exists());
+}
+
+#[test]
+fn managed_worktree_resume_fails_closed_when_persisted_source_lineage_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(tmp.path());
+    let create = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "12121212-1212-4212-8212-121212121212",
+        None,
+    );
+    let created = project_ok(handle_prepare_managed_worktree(&policy, &registry, &create));
+    let managed_id = created["agent_project_id"].as_str().unwrap();
+    let managed_config_path = registry.join(format!("{managed_id}.toml"));
+    let original_managed = std::fs::read_to_string(&managed_config_path).unwrap();
+    let mut managed_project = parse_runner_project_toml(&original_managed).unwrap();
+    assert_eq!(
+        managed_project.managed_source_project_id.as_deref(),
+        Some("source")
+    );
+    managed_project.managed_source_root_fingerprint =
+        Some(format!("wc_projroot_{}", "f".repeat(64)));
+    std::fs::write(
+        &managed_config_path,
+        toml::to_string(&managed_project).unwrap(),
+    )
+    .unwrap();
+    let resume = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "13131313-1313-4313-8313-131313131313",
+        Some(managed_id),
+    );
+    assert_eq!(
+        project_err(handle_prepare_managed_worktree(&policy, &registry, &resume)),
+        "managed_worktree_resume_mismatch"
+    );
+
+    std::fs::write(&managed_config_path, original_managed).unwrap();
+    let source_config_path = registry.join("source.toml");
+    let mut source_project =
+        parse_runner_project_toml(&std::fs::read_to_string(&source_config_path).unwrap()).unwrap();
+    source_project.id = "replacement-source".to_string();
+    std::fs::write(
+        &source_config_path,
+        toml::to_string(&source_project).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        project_err(handle_prepare_managed_worktree(&policy, &registry, &resume)),
+        "managed_worktree_resume_mismatch"
+    );
+}
+
+#[test]
+fn managed_project_explicit_lineage_cannot_self_associate() {
+    let root_fingerprint = format!("wc_projroot_{}", "1".repeat(64));
+    let config = format!(
+        "id = \"self\"\npath = \"/tmp/self\"\nmanaged_worktree = true\nmanaged_source = \"/tmp/source\"\nmanaged_source_project_id = \"self\"\nmanaged_source_root_fingerprint = \"{root_fingerprint}\"\nmanaged_base_sha = \"{}\"\nmanaged_operation_id = \"op\"\n",
+        "a".repeat(40)
+    );
+    assert_eq!(
+        parse_runner_project_toml(&config).unwrap_err(),
+        "managed source project cannot equal target project"
+    );
 }
 
 #[test]
@@ -1560,6 +1778,7 @@ fn concurrent_managed_worktree_bootstraps_choose_distinct_runner_paths() {
     let source = tmp.path().join("source");
     let registry = tmp.path().join("project-registry");
     seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
     let policy = project_policy(tmp.path());
     let first_request = managed_worktree_request(
         &source,
@@ -1595,7 +1814,47 @@ fn concurrent_managed_worktree_bootstraps_choose_distinct_runner_paths() {
     let second = second.join().unwrap();
     assert_ne!(first["path"], second["path"]);
     assert_ne!(first["id"], second["id"]);
-    assert_eq!(load_runner_project_summaries_from_dir(&registry).len(), 2);
+    assert_eq!(load_runner_project_summaries_from_dir(&registry).len(), 3);
+}
+
+#[test]
+fn managed_worktree_git_source_without_registered_project_does_not_infer_lineage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    let request = managed_worktree_request(
+        &source,
+        serde_json::Value::Null,
+        "99999999-9999-4999-8999-999999999999",
+        None,
+    );
+    let result = handle_prepare_managed_worktree(&project_policy(tmp.path()), &registry, &request);
+    assert_eq!(
+        project_err(result),
+        "managed_worktree_source_project_unavailable"
+    );
+    assert!(load_runner_project_summaries_from_dir(&registry).is_empty());
+}
+
+#[test]
+fn legacy_managed_project_without_explicit_lineage_stays_unassociated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let worktree = tmp.path().join("legacy-worktree");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    let legacy = format!(
+        "id = \"legacy\"\npath = {:?}\nmanaged_worktree = true\nmanaged_source = {:?}\nmanaged_base_sha = \"{}\"\nmanaged_operation_id = \"legacy-op\"\n",
+        worktree.to_string_lossy(),
+        source.to_string_lossy(),
+        "a".repeat(40)
+    );
+    let parsed = parse_runner_project_toml(&legacy).unwrap();
+    assert!(parsed.managed_worktree);
+    assert!(parsed.managed_source_project_id.is_none());
+    assert!(parsed.managed_source_root_fingerprint.is_none());
+    assert!(runner_project_summary(&parsed, 1, false).lineage.is_none());
 }
 
 #[test]
@@ -1620,10 +1879,11 @@ fn runner_project_cache_invalidate_refreshes_after_project_op() {
     project_ok(handle_project_op(&cfg.policy, &project_registry_dir, &req));
 
     assert!(
-        cache.get(&cfg).is_empty(),
-        "cache should still be stale before invalidation"
+        !cache.needs_refresh(),
+        "project operation must not mutate this cache instance directly"
     );
     cache.invalidate();
+    assert!(cache.needs_refresh());
     let projects = cache.get(&cfg);
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].id, "cached");
@@ -1690,7 +1950,6 @@ fn canonical_registered_client_json(instance_id: &str, transport: &str) -> serde
 
 #[test]
 fn empty_tokens_http_register_omits_authorization_header() {
-    use std::io::{Read, Write};
     use std::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

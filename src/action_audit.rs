@@ -107,12 +107,12 @@ impl ActionAudit {
         transition: Option<crate::tool_runtime::WindowLoopTransition>,
         streaming: bool,
         continuity_eligible: bool,
-    ) {
+    ) -> bool {
         self.record_inner(
             event,
             audit_timing,
             Some((timing, transition, streaming, continuity_eligible)),
-        );
+        )
     }
 
     fn record_inner(
@@ -125,11 +125,12 @@ impl ActionAudit {
             bool,
             bool,
         )>,
-    ) {
+    ) -> bool {
         let Some(db) = self.db.as_ref() else {
-            return;
+            return false;
         };
-        record_action_event(
+        let started = Instant::now();
+        let recorded = record_action_event(
             db,
             ActionAuditEventInput {
                 explicit_session_id: self.explicit_session_id.clone(),
@@ -181,6 +182,12 @@ impl ActionAudit {
                 workflow_links: event.workflow_links,
             },
         );
+        crate::tool_request_trace::record_phase_latency(
+            "audit_finalize",
+            started,
+            if recorded { "completed" } else { "failed" },
+        );
+        recorded
     }
 }
 

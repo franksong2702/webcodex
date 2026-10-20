@@ -1,39 +1,82 @@
 mod activity;
+mod coding_agents;
 mod commands;
+mod connection_id;
+mod connections;
 mod deadline;
+mod desktop_data_dir;
+mod desktop_locale;
 mod desktop_shell;
+mod diagnostics;
 mod error;
+mod lifecycle_log;
+mod managed_instructions;
+mod mcp_providers;
 mod models;
 mod operation;
 mod platform;
 mod process;
+mod project_inventory;
+mod runner_capability_grant;
+mod runtime_selection;
+mod ssh_resources;
 mod state;
 mod tray;
+mod tunnel_config;
+mod updates;
 mod webcodex;
+mod workspace;
 
 use state::AppState;
 use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 
+/// The no-window CLI probe and Tauri command share one build-info source.
+pub use commands::get_desktop_build_info as desktop_build_info;
+
 pub fn run() {
-    let app = tauri::Builder::default()
+    desktop_builder()
+        .build(tauri::generate_context!())
+        .expect("failed to build WebCodex Desktop")
+        .run(handle_run_event);
+}
+
+// Shared by the real Windows smoke: plugins, setup and IPC remain production code.
+fn desktop_builder() -> tauri::Builder<tauri::Wry> {
+    tauri::Builder::default()
         // Tauri recommends registering single-instance first so a secondary
         // process is rejected before any other plugin can initialize state.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             desktop_shell::handle_second_instance(app, &argv);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(vec!["--background"]),
         ))
         .setup(|app| {
-            let data_dir = app.path().app_local_data_dir()?;
+            let logical_data_dir = app.path().app_local_data_dir()?;
+            let data_dir = desktop_data_dir::resolve(logical_data_dir)?;
+            eprintln!(
+                "WebCodex Desktop data root source={} physical_resolution={}",
+                data_dir.source.label(),
+                if data_dir.physical_resolution_changed {
+                    "changed"
+                } else {
+                    "unchanged"
+                }
+            );
             let resource_dir = app.path().resource_dir()?;
-            app.manage(AppState::new(data_dir, resource_dir)?);
+            app.manage(desktop_locale::DesktopLocaleState::load(
+                &data_dir.effective,
+            ));
+            app.manage(AppState::new_resolved(data_dir, resource_dir)?);
             app.manage(desktop_shell::DesktopShellState::default());
             app.manage(tray::TrayPresentationCache::default());
+            platform::install_session_shutdown(app.handle())?;
             tray::setup(app.handle())?;
+            tray::start_background_observer(app.handle());
 
             let snapshot = app.state::<AppState>().get_state();
             tray::refresh_from_snapshot(app.handle(), &snapshot);
@@ -44,15 +87,80 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_desktop_state,
+            commands::desktop_shell_restore_only,
+            commands::desktop_shell_bootstrap_complete,
+            commands::read_desktop_navigation,
+            commands::acknowledge_desktop_navigation,
+            commands::set_desktop_locale,
+            commands::get_runtime_settings,
+            commands::get_desktop_build_info,
+            commands::check_for_updates,
+            commands::get_update_download_state,
+            commands::get_local_update_status,
+            commands::download_update,
+            commands::cancel_update_download,
+            commands::set_automatic_update_download,
+            commands::install_verified_update,
+            commands::remind_update_later,
+            commands::open_latest_release,
+            commands::get_diagnostics,
+            commands::set_tool_request_tracing,
+            commands::open_diagnostic_resource,
+            commands::copy_runtime_console_credential,
+            commands::copy_diagnostic_report,
+            commands::export_support_bundle,
+            commands::get_path_inventory,
+            commands::open_inventory_location,
+            commands::export_inventory_document,
+            commands::probe_runtime,
+            commands::recheck_runtime,
+            commands::switch_runtime,
+            commands::restore_previous_configuration,
+            commands::workspace_query,
+            commands::get_computer_permissions,
+            commands::request_computer_permission,
+            commands::get_runner_settings,
+            commands::managed_instructions_read,
+            commands::managed_instructions_save,
+            commands::managed_instructions_enable,
+            commands::add_runner_plugin,
+            commands::update_runner_settings,
+            commands::update_runner_allowed_roots,
+            commands::save_runner_job_concurrency,
+            commands::restart_owned_runner,
             commands::open_powershell_install_guide,
             commands::get_launch_at_login,
             commands::set_launch_at_login,
             commands::refresh_runtime_status,
             commands::observe_chatgpt_activity,
             commands::resume_saved_runtime,
+            commands::resume_saved_connections,
             commands::update_tunnel_proxy,
+            commands::update_tunnel_config,
+            commands::save_tunnel_profile,
+            commands::save_mcp_provider,
+            commands::remove_mcp_provider,
+            commands::save_coding_agent,
+            commands::remove_coding_agent,
+            commands::ssh_resource_list,
+            commands::ssh_resource_register,
+            commands::ssh_resource_remove,
+            commands::authorize_runner_capabilities,
+            commands::runner_capability_authorization,
+            commands::tunnel_profile_action,
+            commands::cloudflare_connection,
             commands::inspect_project,
+            commands::inspect_project_access,
             commands::configure_local_setup,
+            commands::configure_environment,
+            commands::create_environment_invitation,
+            commands::environment_service_action,
+            commands::repair_environment_user_credential,
+            commands::activate_local_project,
+            commands::prepare_project_unregister,
+            commands::prepare_projects_unregister,
+            commands::unregister_project,
+            commands::unregister_projects,
             commands::configure_remote_setup,
             commands::start_quick_share,
             commands::stop_quick_share,
@@ -62,10 +170,10 @@ pub fn run() {
             commands::cancel_desktop_operation,
             commands::get_bounded_activity,
         ])
-        .build(tauri::generate_context!())
-        .expect("failed to build WebCodex Desktop");
+}
 
-    app.run(|app_handle, event| match event {
+fn handle_run_event(app_handle: &tauri::AppHandle, event: tauri::RunEvent) {
+    match event {
         tauri::RunEvent::WindowEvent {
             label,
             event: tauri::WindowEvent::CloseRequested { api, .. },
@@ -77,6 +185,13 @@ pub fn run() {
                 let _ = desktop_shell::hide_main_window(app_handle);
             }
         }
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } if label == desktop_shell::MAIN_WINDOW_LABEL => {
+            desktop_shell::main_window_destroyed(app_handle);
+        }
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen {
             has_visible_windows,
@@ -86,17 +201,32 @@ pub fn run() {
                 let _ = desktop_shell::show_main_window(app_handle);
             }
         }
-        tauri::RunEvent::ExitRequested { .. } => {
+        tauri::RunEvent::ExitRequested { api, code, .. } => {
+            let shell = app_handle.state::<desktop_shell::DesktopShellState>();
+            let prevented = shell.prevent_implicit_exit(code);
             app_handle
-                .state::<desktop_shell::DesktopShellState>()
-                .mark_exit_requested();
-            let state = app_handle.state::<AppState>();
-            tauri::async_runtime::block_on(state.shutdown());
+                .state::<AppState>()
+                .record_lifecycle(lifecycle_log::LifecycleEvent::ExitRequested { code, prevented });
+            if prevented {
+                api.prevent_exit();
+            } else {
+                shell.mark_exit_requested();
+                let state = app_handle.state::<AppState>();
+                tauri::async_runtime::block_on(state.shutdown());
+            }
         }
         tauri::RunEvent::Exit => {
+            app_handle
+                .state::<AppState>()
+                .record_lifecycle(lifecycle_log::LifecycleEvent::DesktopExiting);
+            platform::stop_session_shutdown(app_handle);
             let state = app_handle.state::<AppState>();
             tauri::async_runtime::block_on(state.shutdown());
         }
         _ => {}
-    });
+    }
 }
+
+#[cfg(all(test, windows, desktop_native_smoke))]
+#[path = "desktop_shell/native_smoke.rs"]
+mod desktop_native_smoke;

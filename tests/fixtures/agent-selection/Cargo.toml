@@ -1,0 +1,9 @@
+[package]
+name = "webcodex-agent-selection-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Intentionally independent of the repository workspace. Its failing test is
+# input for the recovery experiment, not a production workspace test.
+[workspace]

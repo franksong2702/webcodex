@@ -1,0 +1,272 @@
+use super::*;
+use serde_json::json;
+
+#[test]
+fn browser_batch_audit_omits_nested_field_values_and_upload_paths() {
+    let projection = session_log_arguments_for_tool_request(
+        "control_browser",
+        &json!({
+            "action": "batch", "client_id": "mini", "browser_id": "browser_abcdefghijklmnop",
+            "page_id": "page_abcdefghijklmnop", "operations": [
+                {"action": "input_text", "element_id": "element_abcdefghijklmnop", "text": "PRIVATE_TEXT"},
+                {"action": "select_option", "element_id": "element_abcdefghijklmnop", "option": "PRIVATE_OPTION"},
+                {"action": "set_value", "element_id": "element_abcdefghijklmnop", "value": "PRIVATE_VALUE"},
+                {"action": "select_choice", "element_id": "element_abcdefghijklmnop", "choice_path": ["PRIVATE_PROVINCE", "PRIVATE_CITY"]},
+                {"action": "set_date", "element_id": "element_abcdefghijklmnop", "value": "2027-06-30"},
+                {"action": "upload_file", "element_id": "element_abcdefghijklmnop", "project": "agent:mini:resume", "path": "PRIVATE_PATH.pdf"}
+            ]
+        }),
+    );
+    assert_eq!(projection["operation_count"], 6);
+    assert!(!projection.to_string().contains("2027-06-30"));
+    assert!(projection.get("operations").is_none());
+    assert!(!projection.to_string().contains("PRIVATE_"));
+}
+
+#[test]
+fn browser_complex_control_audit_keeps_identity_without_location_or_date() {
+    for operation in [
+        json!({"action":"select_choice","choice_path":["PRIVATE_PROVINCE","PRIVATE_CITY"]}),
+        json!({"action":"set_date","value":"2027-06-30"}),
+    ] {
+        let mut request = operation;
+        request["client_id"] = json!("mini");
+        request["browser_id"] = json!("browser_abcdefghijklmnop");
+        request["page_id"] = json!("page_abcdefghijklmnop");
+        request["element_id"] = json!("element_abcdefghijklmnop");
+        let projection = session_log_arguments_for_tool_request("control_browser", &request);
+        assert_eq!(projection["action"], request["action"]);
+        assert_eq!(projection["element_id"], request["element_id"]);
+        assert!(projection.get("choice_path").is_none());
+        assert!(projection.get("value").is_none());
+        assert!(!projection.to_string().contains("PRIVATE_"));
+        assert!(!projection.to_string().contains("2027-06-30"));
+    }
+}
+
+#[test]
+fn browser_effect_request_audit_drops_sensitive_text_and_url() {
+    let text_secret = "PASSWORD_SECRET_123";
+    let text = session_log_arguments_for_tool_request(
+        "control_browser",
+        &json!({
+            "action":"input_text",
+            "client_id":"msi",
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "element_id":"element_abcdefghijklmnop",
+            "text": text_secret
+        }),
+    );
+    assert_eq!(text["text_present"], true);
+    assert_eq!(text["text_bytes"], text_secret.len());
+    let serialized = serde_json::to_string(&text).unwrap();
+    assert!(!serialized.contains(text_secret));
+    assert!(text.get("text").is_none());
+
+    let option_secret = "PRIVATE_OPTION_SECRET";
+    let option = session_log_arguments_for_tool_request(
+        "control_browser",
+        &json!({
+            "action":"select_option",
+            "client_id":"msi",
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "element_id":"element_abcdefghijklmnop",
+            "option":option_secret
+        }),
+    );
+    assert_eq!(option["option_present"], true);
+    assert_eq!(option["option_bytes"], option_secret.len());
+    assert!(!serde_json::to_string(&option)
+        .unwrap()
+        .contains(option_secret));
+    assert!(option.get("option").is_none());
+
+    let value_secret = "PRIVATE_VALUE_SECRET";
+    let value = session_log_arguments_for_tool_request(
+        "control_browser",
+        &json!({
+            "action":"set_value",
+            "client_id":"msi",
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "element_id":"element_abcdefghijklmnop",
+            "value":value_secret
+        }),
+    );
+    assert_eq!(value["value_present"], true);
+    assert_eq!(value["value_bytes"], value_secret.len());
+    assert!(!serde_json::to_string(&value)
+        .unwrap()
+        .contains(value_secret));
+    assert!(value.get("value").is_none());
+
+    let private_path = "private/resume-SECRET.pdf";
+    let upload = session_log_arguments_for_tool_request(
+        "control_browser",
+        &json!({
+            "action":"upload_file",
+            "client_id":"msi",
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "element_id":"element_abcdefghijklmnop",
+            "project":"agent:msi:resume",
+            "path":private_path
+        }),
+    );
+    assert_eq!(upload["path_present"], true);
+    assert_eq!(upload["path_bytes"], private_path.len());
+    assert_eq!(upload["project"], "agent:msi:resume");
+    assert!(!serde_json::to_string(&upload)
+        .unwrap()
+        .contains(private_path));
+    assert!(upload.get("path").is_none());
+
+    let private_url = "https://example.test/path?token=URL_QUERY_SECRET";
+    let navigate = session_log_arguments_for_tool_request(
+        "control_browser",
+        &json!({
+            "action":"navigate",
+            "client_id":"msi",
+            "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop",
+            "url": private_url
+        }),
+    );
+    assert_eq!(navigate["url_present"], true);
+    assert!(!serde_json::to_string(&navigate)
+        .unwrap()
+        .contains(private_url));
+    assert!(navigate.get("url").is_none());
+}
+
+#[test]
+fn browser_observation_audit_keeps_only_bounded_metadata() {
+    let output = json!({
+        "execution_state":"completed",
+        "state_changed":false,
+        "browser_id":"browser_abcdefghijklmnop",
+        "page_id":"page_abcdefghijklmnop",
+        "node_count":1,
+        "retained_count":200,
+        "truncated":true,
+        "console_retained":200,
+        "console_count":2,
+        "console_truncated":true,
+        "network_retained":300,
+        "network_count":1,
+        "network_truncated":false,
+        "pages":[{"title":"PAGE_BODY_SECRET","url":"https://example.test/?secret=QUERY_SECRET"}],
+        "nodes":[{"role":"textbox","name":"AX_BODY_SECRET","value":"FORM_VALUE_SECRET","element_id":"element_abcdefghijklmnop"}],
+        "entries":[{"level":"error","text":"CONSOLE_BODY_SECRET"}],
+        "console":[{"level":"error","text":"DIAGNOSTIC_CONSOLE_SECRET"}],
+        "network":[{"method":"GET","url":"https://example.test/?secret=NETWORK_SECRET"}],
+        "content_base64":"BASE64_IMAGE_SECRET",
+        "raw_dom":"RAW_DOM_SECRET",
+        "raw_ax":"RAW_AX_SECRET",
+        "debugger_url":"DEBUGGER_SECRET"
+    });
+    let projected = session_log_result_for_tool("observe_browser", &output);
+    assert_eq!(projected["node_count"], 1);
+    assert_eq!(projected["page_count"], 1);
+    assert_eq!(projected["projected_node_count"], 1);
+    assert_eq!(projected["retained_count"], 200);
+    assert_eq!(projected["console_retained"], 200);
+    assert_eq!(projected["console_count"], 2);
+    assert_eq!(projected["console_truncated"], true);
+    assert_eq!(projected["network_retained"], 300);
+    assert_eq!(projected["network_count"], 1);
+    assert_eq!(projected["network_truncated"], false);
+    let serialized = serde_json::to_string(&projected).unwrap();
+    for private in [
+        "PAGE_BODY_SECRET",
+        "QUERY_SECRET",
+        "AX_BODY_SECRET",
+        "FORM_VALUE_SECRET",
+        "CONSOLE_BODY_SECRET",
+        "DIAGNOSTIC_CONSOLE_SECRET",
+        "NETWORK_SECRET",
+        "BASE64_IMAGE_SECRET",
+        "RAW_DOM_SECRET",
+        "RAW_AX_SECRET",
+        "DEBUGGER_SECRET",
+    ] {
+        assert!(!serialized.contains(private), "audit leaked {private}");
+    }
+    assert!(projected.get("pages").is_none());
+    assert!(projected.get("nodes").is_none());
+    assert!(projected.get("content_base64").is_none());
+    assert!(projected.get("entries").is_none());
+    assert!(projected.get("console").is_none());
+    assert!(projected.get("network").is_none());
+}
+
+#[test]
+fn browser_control_result_audit_drops_page_text_and_url() {
+    let output = json!({
+        "execution_state":"completed",
+        "state_changed":true,
+        "browser_id":"browser_abcdefghijklmnop",
+        "page_id":"page_abcdefghijklmnop",
+        "requested_count":4,
+        "completed_count":2,
+        "stopped_at_index":2,
+        "remaining_count":1,
+        "needs_snapshot":true,
+        "stopped_execution_state":"outcome_unknown",
+        "title":"PRIVATE_TITLE",
+        "url":"https://example.test/?secret=PRIVATE_QUERY",
+        "value":"PRIVATE_FORM_VALUE"
+    });
+    let projected = session_log_result_for_tool("control_browser", &output);
+    assert_eq!(projected["requested_count"], 4);
+    assert_eq!(projected["completed_count"], 2);
+    assert_eq!(projected["stopped_at_index"], 2);
+    assert_eq!(projected["remaining_count"], 1);
+    assert_eq!(projected["needs_snapshot"], true);
+    assert_eq!(projected["stopped_execution_state"], "outcome_unknown");
+    let serialized = serde_json::to_string(&projected).unwrap();
+    for private in ["PRIVATE_TITLE", "PRIVATE_QUERY", "PRIVATE_FORM_VALUE"] {
+        assert!(!serialized.contains(private));
+    }
+}
+
+#[test]
+fn browser_semantic_query_audit_omits_private_search_terms() {
+    let projection = session_log_arguments_for_tool_request(
+        "observe_browser",
+        &json!({
+            "action":"snapshot", "client_id":"mini", "browser_id":"browser_abcdefghijklmnop",
+            "page_id":"page_abcdefghijklmnop", "query": {
+                "text":"PRIVATE_TEXT", "group":"PRIVATE_GROUP", "section":"PRIVATE_SECTION"
+            }
+        }),
+    );
+    assert!(!projection.to_string().contains("PRIVATE_"));
+    assert!(projection.get("query").is_none());
+}
+
+#[test]
+fn browser_handoff_fences_and_native_surfaces_never_enter_audit() {
+    let projection = session_log_arguments_for_tool_request(
+        "control_browser",
+        &json!({
+            "action":"finish_user_handoff", "client_id":"mini", "browser_id":"browser_abcdefghijklmnop",
+            "session_id":"wc_sess_owner", "handoff_fence":"handoff_PRIVATE_AUTHORITY_FENCE"
+        }),
+    );
+    assert_eq!(projection["session_id"], "wc_sess_owner");
+    assert!(!projection.to_string().contains("PRIVATE_AUTHORITY"));
+    let output = json!({"browser_id":"browser_abcdefghijklmnop", "session_id":"wc_sess_owner",
+        "message_id":"wc_msg_question", "handoff_fence":"handoff_PRIVATE_AUTHORITY_FENCE",
+        "surface_id":"surface_PRIVATE_NATIVE", "expires_in_ms":600000, "needs_snapshot":true,
+        "execution_state":"completed", "state_changed":true});
+    let audit = session_log_result_for_tool("control_browser", &output);
+    assert!(!audit.to_string().contains("PRIVATE_"));
+    let observation = session_log_result_for_tool(
+        "observe_browser",
+        &json!({"browsers":[{"browser_id":"browser_abcdefghijklmnop","user_handoff":output}], "count":1}),
+    );
+    assert!(!observation.to_string().contains("PRIVATE_"));
+}

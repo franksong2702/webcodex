@@ -12,6 +12,7 @@ pub enum ToolRisk {
     CheckpointManage,
     RunControl,
     ComputerControl,
+    BrowserControl,
     JobRun,
     Unknown,
 }
@@ -31,6 +32,7 @@ impl ToolRisk {
             ToolRisk::CheckpointManage => "checkpoint_manage",
             ToolRisk::RunControl => "run_control",
             ToolRisk::ComputerControl => "computer_control",
+            ToolRisk::BrowserControl => "browser_control",
             ToolRisk::JobRun => "job_run",
             ToolRisk::Unknown => "unknown",
         }
@@ -171,6 +173,9 @@ pub const PROJECT_WRITE: &str = webcodex_core::authority::SCOPE_PROJECT_WRITE;
 pub const ADMIN: &str = webcodex_core::authority::SCOPE_ADMIN;
 pub const JOB_RUN: &str = webcodex_core::authority::SCOPE_JOB_RUN;
 pub const CODING_AGENT_RUN: &str = webcodex_core::authority::SCOPE_CODING_AGENT_RUN;
+pub const BROWSER_READ: &str = webcodex_core::authority::SCOPE_BROWSER_READ;
+pub const BROWSER_CONTROL: &str = webcodex_core::authority::SCOPE_BROWSER_CONTROL;
+pub const BROWSER_LAUNCH: &str = webcodex_core::authority::SCOPE_BROWSER_LAUNCH;
 pub const COMPUTER_READ: &str = webcodex_core::authority::SCOPE_COMPUTER_READ;
 pub const COMPUTER_CONTROL: &str = webcodex_core::authority::SCOPE_COMPUTER_CONTROL;
 pub const COMPUTER_LAUNCH: &str = webcodex_core::authority::SCOPE_COMPUTER_LAUNCH;
@@ -247,9 +252,9 @@ pub fn tool_metadata(name: &str) -> ToolMetadata {
 mod tests {
     use super::*;
     use crate::known_tool_names;
-    use webcodex_core::authority::{
-        SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
-    };
+    #[cfg(feature = "workspace-checkpoints")]
+    use webcodex_core::authority::SCOPE_PROJECT_READ;
+    use webcodex_core::authority::{SCOPE_JOB_RUN, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ};
 
     #[test]
     fn tool_metadata_covers_all_known_tools() {
@@ -276,7 +281,7 @@ mod tests {
 
     #[test]
     fn tool_metadata_show_changes_is_project_read_observation() {
-        let metadata = lookup_tool_metadata("show_changes").unwrap();
+        let metadata = lookup_tool_metadata("read_workspace_changes").unwrap();
         assert_eq!(metadata.provider_id, TOOL_PROVIDER_RUNNER);
         assert_eq!(metadata.effect, ToolEffect::Observe);
         assert_eq!(metadata.risk, ToolRisk::Read);
@@ -306,8 +311,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "workspace-checkpoints")]
     fn checkpoint_metadata_separates_effect_from_existing_authority() {
-        let create = lookup_tool_metadata("workspace_checkpoint_create").unwrap();
+        let create = lookup_tool_metadata("create_workspace_checkpoint").unwrap();
         assert_eq!(create.provider_id, TOOL_PROVIDER_NATIVE);
         assert_eq!(create.effect, ToolEffect::Mutate);
         assert_eq!(create.risk, ToolRisk::CheckpointManage);
@@ -319,7 +325,7 @@ mod tests {
         );
         assert!(create.requires_project);
 
-        for name in ["workspace_checkpoint_list", "workspace_checkpoint_show"] {
+        for name in ["list_workspace_checkpoints", "read_workspace_checkpoint"] {
             let metadata = lookup_tool_metadata(name).unwrap();
             assert_eq!(metadata.provider_id, TOOL_PROVIDER_NATIVE, "{name}");
             assert_eq!(metadata.effect, ToolEffect::Observe, "{name}");
@@ -334,8 +340,8 @@ mod tests {
             assert!(metadata.requires_project, "{name}");
         }
         for name in [
-            "workspace_checkpoint_restore",
-            "workspace_checkpoint_delete",
+            "restore_workspace_checkpoint",
+            "delete_workspace_checkpoint",
         ] {
             let metadata = lookup_tool_metadata(name).unwrap();
             assert_eq!(metadata.provider_id, TOOL_PROVIDER_NATIVE, "{name}");
@@ -360,19 +366,21 @@ mod tests {
     fn tool_metadata_write_tools_are_project_write() {
         for name in [
             "write_project_file",
-            "apply_text_edits",
+            "edit_project_files",
             "apply_patch",
             "apply_unified_diff",
             "delete_project_files",
             "save_project_artifact",
-            "artifact_upload_begin",
-            "artifact_upload_chunk",
-            "artifact_upload_finish",
-            "artifact_upload_abort",
-            "git_restore_paths",
+            "begin_artifact_upload",
+            "upload_artifact_chunk",
+            "finish_artifact_upload",
+            "abort_artifact_upload",
+            "restore_git_paths",
             "discard_untracked",
-            "workspace_checkpoint_restore",
-            "workspace_checkpoint_delete",
+            #[cfg(feature = "workspace-checkpoints")]
+            "restore_workspace_checkpoint",
+            #[cfg(feature = "workspace-checkpoints")]
+            "delete_workspace_checkpoint",
             "register_project",
             "unregister_project",
             "create_project",

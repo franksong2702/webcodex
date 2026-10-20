@@ -2,7 +2,25 @@
 
 [English](CODING_WORKFLOW.md) | [简体中文](CODING_WORKFLOW.zh-CN.md)
 
-本文面向普通 WebCodex coding/review 工作，只说明模型真正需要遵循的流程，不展开内部 continuity、audit 或 transport 协议。
+本文面向通过已连接的 WebCodex runtime 完成的 coding/review 工作；文中的工具名称和
+Workflow Session 属于该 runtime。使用其他 Host 的工具在本地开发 WebCodex 仓库时，
+请遵循 [CONTRIBUTING.md](../CONTRIBUTING.zh-CN.md) 和 [AGENTS.md](../AGENTS.md)，
+无需为了贡献代码而先安装 WebCodex。
+
+## 计划后继续执行
+
+对于复杂开发任务，先调查相关规则与代码，明确可观察的完成条件，展示按结果组织的简短计划，
+随后继续已授权的实现；不要仅为了询问“是否开始”而停下。只有缺少实质需求或权限时才提问。
+小任务无需计划；可见计划不要求创建持久 Goal，现有 Goal 选择偏好保持不变。
+
+下一步由实际工具结果决定。证据推翻假设或用户修改要求时，调整剩余方案，并在已建立的
+Session 中保留有用的决策与进度。不要预先完成测试，不要没有新诊断就重复相同失败。
+每次执行保留同一个 Job；读取截断沿返回的 continuation 继续，陈旧编辑先重新读取，
+效果不确定时先核对而不是重放。
+
+Project selector 被拒绝属于输入校验，不证明 Runner 离线，也不证明必须已有 Session。
+已注册项目使用 canonical id 或已签发的 `project_ref`；未知时先授权调用 `list_projects`，
+不要从文件路径猜测 Runner。`client_id + path` 仍是显式 bootstrap 方式，权限边界不变。
 
 ## 普通循环
 
@@ -12,12 +30,112 @@
 work_on_project
 → inspect / search / read
 → edit
+→ substantial work 调用一次 present_work_result
 → focused validation
 → review changes
 → finish_coding_task
 ```
 
 `work_on_project` 是普通 coding/review 的 canonical bootstrap。把当前任务 instruction 交给它，然后遵循连接到的 Server 返回的 project instructions 与 tool surface。
+它会复用同一次 startup Git observation，提供有界的 branch/HEAD、upstream tracking、ahead/behind，以及可用时的 dirty-path 列表；这些字段就是初始 workspace observation，不应立刻再机械执行 `git status`/branch probe。只有相关 mutation 之后或确实需要额外精确 Git 事实时再刷新。Git、runtime、instruction、semantic-navigation 与 extension 等互不依赖且 authority 不变的 startup observation 会尽量并发调度。
+
+对于 substantial coding，在 Workflow Session 进入真实工作状态后（例如第一次有意义的源码 mutation，或开始长时间 validation），对该 exact Session 调用一次 `present_work_result(project, session_id)`。挂载后的 MCP App 会自行进行有界的 Workspace / Validation / Review live read，因此不要重复创建卡片，也不要为了给卡片喂状态而额外消耗 model turn。tiny/read-only 工作不需要 progress card。`finish_coding_task` 在 non-blocking closeout 时 seal eligible final changes，已经挂载的同一张卡会在后续 App refresh 中发现这份 immutable snapshot；如果此前没有挂卡而 closeout 明确返回 presentation suggestion，再在收尾时调用一次即可。
+它的 primary output 默认保持紧凑，不重复静态 instruction/workflow 正文；当前模型上下文缺少这些材料时，分别显式请求 `context_request=["project.instructions"]` 和/或 `context_request=["webcodex.workflow"]`。Workflow Session identity 不证明当前模型仍保留这些上下文。
+Bootstrap 或 discovery 返回 `project_ref` 后，普通 Project-scoped tool call 的 `project` 应优先复用这个短 selector。Canonical `agent:<client_id>:<project_id>` 仍保留用于 diagnostic 与显式 addressing，但模型无需机械重复。`project_ref` 由 Server 持久维护、按 principal 隔离，不携带 authority；每次调用都会根据其钉住的 canonical Project/root identity 重新授权。
+
+当已经有 registered Project、又需要隔离工作区时，直接使用 `work_on_project(project=<canonical id 或 project_ref>, mode="worktree", ...)`。不要重新推导 `client_id`、source absolute path，也不要猜 managed destination。Server 会在本次调用重新授权 source Project，Runner 负责派生并拥有 managed placement、持久化 source/base provenance，并返回新的 canonical Project 与短 ref。source Project → managed Project 是 fresh-Session transition，因此不要携带 source Project 的 Session；后续使用返回的 managed `project_ref` 与 Session 继续。兼容入口 `client_id + path + mode="worktree"` 仍受普通 path authority 约束；当已有 Project identity 时，它不是推荐流程。Managed storage 的实际目录布局属于实现细节，模型不应记忆或猜测。
+
+当 `work_on_project`、`start_session`、`read_session_summary` 或显式 handoff 返回 `session_ref` 时，后续显式 Session 选择可优先复用这个短 selector。Business `session_id` 与 wrapper `recording_session_id` 仍是两套独立语义，但都可以显式携带已签发的 ref：Runtime 会先把它还原为钉住的 canonical `wc_sess_*`，再执行各自原有的授权、生命周期或 guard 逻辑。Canonical identity 仍是持久化、审计、诊断和内部关联的权威身份。`session_ref` 只是按 principal 隔离的便利选择器；省略 recorder 时不会自动推断，也不会形成隐式或粘滞的 recorder context。
+
+使用 Stateless MCP 时，每次希望把 recorder provenance 归入所选 Session 的普通调用，都应显式携带 `_wc.record`。业务 `session_id` 不会选择 recorder；省略该字段的调用不会补录到 Session ledger。
+
+默认情况下，它还会返回一个很小且有界的 `extensions` selection catalog：Skill metadata 来自 canonical 的 project / Runner-configured `skills.roots` / Runner-managed Skill Store 三类来源；Plugin metadata 只包含 configured working directory 与当前 Project root 匹配、且已 ready/committed 的 provider。该 metadata 不授予任何 authority，也不会自动读取 Skill body 或创建 Plugin binding；模型选择后使用 `read_skill_file` 读取 Skill 文本，`run_skill_resource` 只执行可信 Runner-configured live `scripts/` resource（由 `expected_definition_revision` fence definition）或 Runner-installed managed resource（另由 `expected_package_revision` fence package），Plugin 则走 `plugin_tool describe -> call`。Configured resource bytes 会一直保持 live 到实际执行时，并不会预先被 package revision 固定。只有当前模型上下文仍明确保留这些 discovery metadata 时，才应设置 `include_extension_catalog=false`。
+
+Skill 读取（`load_skill` 和 `read_skill_file`）返回规范化的包内路径 `skill_path`，供 `read_skill_file.path` 使用。Project Skill 另返回权威的项目相对路径 `project_path`：项目引用应使用它和返回的来源行号，即使包目录与 metadata name 不同。Runner-configured 和 managed Skill 不返回 `project_path`；引用其 Skill identity、`skill_path`、resource `sha256`、revision 和来源行号，不要编造项目路径。不会暴露 Skill 的本机根目录。
+
+跨轮次的重要工作可以用 durable Goal 记录目标和完成标准，无需用户管理步骤。`update_goal` 使用精确的 `expected_revision` 和 `idempotency_key` 编辑 active Goal：省略 `completion_conditions` 会保留原列表，传入 `[]` 则清空。替换条件沿用创建时的限制（最多八项，每项去除首尾空白后非空，且不超过 512 UTF-8 字节）。编辑完成标准保留已有步骤、checkpoint 和进度；不会自动判断验收、恢复执行或重新打开 completed/cancelled Goal。revision 冲突时重新读取；结果不确定时复用同一个 key 和完全相同的请求。
+
+## Workbench 应用
+
+**Projects & Resources** Workbench 在现有 Project 与 Session 资源浏览器中增加 Files、Work 和 Goals 视图。文件预览和引用为只读；点击 **Add selected references** 后，如果 Host 声明了受支持的 modality，Workbench 会更新 Host model context。它不会编辑 Project 文件。Goal 属于当前 communication account，可跨 Project 使用。
+
+Workbench 实例名称默认是 `WebCodex`。在 Server 设置 `WEBCODEX_INSTANCE_NAME` 可更改所有用户看到的实例名称。每个已认证账户也可在 Workbench 设置中保存自己的显示名称覆盖值；清除后会恢复为配置的实例名称。升级后若看不到 Workbench 命令，请刷新 Host 的 tool list 或重新连接 Server，让 Host 发现当前 App 工具。原生 Host 渲染还有独立的 capability 要求；本地 fixture 测试不能证明真实 Host 已验证。
+
+提交工作时必须明确选择 Project、属于当前用户的 Agent，以及一个当前确实可用的精确 route：当前 chat 中已验证的 continuation，或所选 Project 的 Runner 提供的 provider。Workbench 会创建 canonical AgentTask 和 Attempt，并通过这个已有 route 分发，不接受自由格式命令，也不会创建新的 execution backend。若提交结果不确定，使用同一草稿、同一个 key 和完全相同的字段重试；若要发起不同提交，应先检查返回的 Task 或 reconcile 现有 Task。可以选择把 Task 关联到当前用户拥有的 Goal。
+
+Session todo 只有在明确选择 Project 和一个有权限访问的 Workflow Session 后才会显示。Workbench 不会根据最近活动推断 Session。历史 32-hex Goal ID 来自 stable 发布前的开发版本；受支持的 stable 版本使用 compact `wc_goal_` ID。不要手工改写数据库 ID。如果旧开发数据库导致 Goal ID 无效或出现存储错误，请保留数据库备份，并向维护者提供 WebCodex 版本和已清理敏感信息的错误，以获取对应版本的迁移指导；不要首先删除或重置数据库。参见 [Workbench implementation notes](implementation/workbench-resource-references.md)。
+
+### 切回明确的工作上下文
+
+已明确选择 Active Session 时，可以直接调用 `work_on_project(session_id="~s12", instruction="继续评审")`，省略 `project`、`client_id` 和 `path`。默认的 `checkout` 模式会授权这个精确 Session，取得它绑定的 Project，重新检查当前项目访问权限，再恢复同一个 Session。后续普通 Project 工具使用返回的 `project_ref`。显式传入 Project 仍然有效，但必须匹配；`_wc.record` 仍仅为独立的记录来源，不会替代业务目标。
+
+Fresh work 仍须明确 `project` 或 `client_id + path`。`mode="worktree"` 始终要求明确 source，不能从 Session 推导新 worktree 的 source。Closed、不存在、不可访问或未绑定 Project 的 Session 不会触发 fresh fallback，也不会给 Window 增加隐式 current Project/Session。
+
+在原 Window 丢失 Session selector 时，请求 `_wc.context=["workflow.resume"]` 并显式选择候选。已授权候选保留 canonical identity，并提供 `session_ref`；当前 root fingerprint 和 reference store 可用时还提供 `project_ref`。这只是发现，不会自动恢复；丢失任务上下文时应先读取精确 handoff。跨 Window 必要时仍用 `list_sessions(project)` 发现候选。
+
+## 工具策略 guidance
+
+需要切换账号或窗口时，用 `post_session_message` 保存已确认的决策和当前进度。不知道旧 Session 身份时，通过 `list_sessions(project)` 发现并显式选择候选，读取交接后再恢复。完整恢复及已配置模型评审流程见[任务接续](SESSION_CONTINUITY.zh-CN.md)。
+
+`work_on_project` 的 `guidance_profile` 是可选的：显式值只覆盖指导文本；MCP 省略时
+使用当次请求的 `X-WebCodex-MCP-Profile`，header 省略才使用部署默认
+`WEBCODEX_MCP_HOST_PROFILE`。HTTP header 独立决定返回/等待策略，见
+[MCP 客户端策略](MCP.zh-CN.md#同一-server-的客户端策略)。非 MCP/internal
+调用省略时仍回退到 `direct`。当前 workflow contract 保持共享的 `guidance`、
+`model_protocol` 和 review `roles`，并在显式 `context_request=["webcodex.workflow"]`
+时通过 `tool_strategy` 返回本次请求选中的 effective 策略。
+
+- `direct`：简单 observation 直接调用最合适的 primitive；预先确定且独立的
+  observations 可以批量执行，模型根据结果顺序决定 adaptive follow-up。
+- `host_code_mode`：Host 确实提供 native orchestration 时使用。预先确定的同类输入
+  首先使用工具自己的 canonical batch，不要拆成同类 micro-call 并发；预先确定、互相
+  独立的 cross-tool read-only observation 才适合 Host 并行。native batch 之后若仍需
+  cross-tool fan-out，partial evidence 仍有价值时优先 `Promise.allSettled`，只有真正的
+  all-or-nothing 才使用 `Promise.all`。对于 result-dependent search/read/branch chain，
+  只有 Server 返回 parser-ready `follow_up_kind=mechanically_followable` 时，Host 才可以
+  在同一个 cell 内机械续作，并在当前 Host input schema 校验后原样复制生成参数；
+  `fallback_recovery` 只表示 recovery/detail/dependency，不能仅因为字段存在就自动执行。
+  单个 child ToolResult 返回本身不是 model-turn boundary；需要 semantic choice、
+  ambiguous result、新用户决策、authority/permission、uncertain outcome、竞争性 recovery、
+  mutation intent 尚未确定，或 stale revision/fence 之后需要继续 effectful replay 时才自然回到模型。
+  精确 stale-source reread 仍可以是 mechanically followable observation；但
+  `reread_required=true` 或 `direct_retry_safe=false` 是 effectful replay 的硬边界，
+  recovery 可以指出下一步应重新观察什么，但不授权 Host 自动重试 mutation。  完整 ToolResult 尽量留在 Host cell，只返回下一次决策需要的紧凑证据。每个 Host cell 应是短生命周期 dependency DAG，
+  而不是承载长时间 Job lifetime。Job handoff 保存精确 identity 后，先完成已经确定的独立工作；
+  执行所有 ready independent work 和明确 `mechanically_followable` 的续作，直到 quiescent。
+  只剩真正阻塞后续有效工作的 pending Job dependencies 时，把整个 exact Job set 交给一次
+  `wait_for_job_readiness(job_ids, mode=any|all, wait_secs)` join barrier；任意一个 Job terminal
+  就能解锁有用的独立后续 branch 时使用 `any`，只有真正需要全部 blocked dependency 的
+  join point 才使用 `all`。不能为每个 Job 开一个长 wait，也不能用 `Promise.race`
+  模拟 any-ready。应在保留 Host return guard 后，从当前 activation 剩余安全预算中选择
+  尽可能大的 `wait_secs`，同时受 canonical 45 秒上限约束；不再偏好固定 10/15/20 秒
+  slice。ready 后重新计算 ready/blocked work 并继续 same cell。deadline 后也先重新计算；
+  如果 ready work、blocked set 和 semantic information 都没有变化，不要机械续同一组 wait，
+  接近预算边界时正常 yield。Job terminal 不等于 mechanically_followable；
+  fallback_recovery、authority change、ambiguous result、outcome_unknown 和 effect uncertainty
+  仍回模型。Host cell 返回不等于当前 turn 完成；继续在当前 turn 推进任务，不假设
+  自动开启下一 turn，也不要用 `observe_jobs` heartbeat 保活。startup
+  `tool_strategy.host_orchestration` catalog 与 exact
+  `read_tool_manifest(tool_name=...)` hint 都从 canonical `ToolDefinition` metadata 派生；
+  它们只提供 guidance，不改变 `ToolCompositionPolicy`、authority、effect、permission、
+  retry、idempotency 或 runtime scheduling，默认/broad ToolSpec 也不携带这批 metadata。
+  该 profile 不授予任何 WebCodex capability/authority，也不要求 nested WebCodex Code Mode。
+- `code_mode`：简单单步 observation 仍直接调用；相关 search/read、跨文件定位或
+  综合调查能减少外层模型往返时，优先 read-only Code Mode。在同一个 cell 内顺序
+  完成依赖结果的 follow-up，只并发独立 observations。Raw child results 留在 cell
+  内，先筛选、提取、交叉引用和归纳，再用 `text(...)` 输出下一步决策需要的紧凑证据；
+  避免 `text(results)` 原样倾倒，并在触及 outer-output limit 前主动 projection。
+
+这只是本次请求的 presentation 选择，不增加 admission、权限或 execution semantics，
+不写入 Session。Exact resume 可以重新选择，也不会根据 Window、Session 或历史调用
+猜测。未编译 Experimental Code Mode 时，显式 `code_mode` 被拒绝为无效输入。
+`work_on_project` startup 与后续普通工具的 `webcodex.workflow` context refresh
+使用同一套 effective profile 规则；不会因为 Session/Window 历史选择发生漂移。
+
+这些策略共用 scope、recovery、validation truth、Job continuation、review 和 closeout。
+默认仍走 canonical edit 和 structured validation；只有多个相关 validation 或
+adaptive read → one guarded edit 确实减少外层往返时，才考虑相应的 effectful/mutating
+Code Mode。Nested canonical authority、effects、evidence 和 retry certainty 不变。
 
 ## 开始或继续任务
 
@@ -25,29 +143,22 @@ work_on_project
 
 普通使用不需要理解 WebCodex 内部的 continuity/audit field；这些属于 implementation/maintainer contract。
 
-内置工作流为所有任务提供默认 guidance，不要求先指定角色：核对目标和适用规则、保留已有工作、完成已授权的实现、按改动范围验证、观察已有 Job 而不重复执行，以及如实报告证据。只使用当前暴露的 schema 支持的工具与协议字段。
+内置默认 guidance 本身就是普通 implementation workflow。正常的“implement/fix/refactor”任务不需要知道任何实现角色名：把已授权工作推进到具体、可评审的完成状态，端到端覆盖跨层改动，保持设计最小化，按范围验证，并如实报告证据。只使用当前暴露 schema 支持的工具与协议字段。
 
-Behavioral role 在默认原则上增加侧重点，写在 task instruction 里即可，例如实现任务：
-
-```text
-使用 implementation_owner guidance。实现 <任务>，运行聚焦 validation，
-并审查最终 diff。
-```
-
-独立评审：
+`independent_review` 是唯一保留的可选 named role，因为它确实改变行为。只有任务明确要求独立评审 pass 时才使用：
 
 ```text
 使用 independent_review guidance。独立评审 <改动或 commit>，
 报告有文件/行号证据和影响说明的具体发现，不修改文件。
 ```
 
-如果也希望修复，明确补充“修复具体发现，并运行聚焦回归验证”。单独指定评审角色不代表授权修改。
+如果也希望修复，明确补充“修复具体发现，并运行聚焦回归验证”。单独指定评审角色不代表授权修改，任何 role 都不会授予额外 authority。
 
 Guidance 通过工具结果交给客户端，不是客户端的 system prompt，也不会授予执行权限。Host 指令、用户任务、适用项目规则、认证和运行时安全策略仍然有效。返回 guidance 不等于模型已经读取、记住或遵守；只有当前模型上下文仍保留内容时才应关闭其返回。
 
 ## 编辑前先检查
 
-能够表达任务时，优先使用 structured project search/read，而不是 shell。只读取理解当前改动所需的文件和范围，并保留 workspace 中已经存在的无关工作。
+选择能够保持正确语义的最简单 inspection primitive。已经知道 symbol、test 或具体实现区域时，优先读取有界目标范围；多个相关范围在调用前已经确定时可以一起 batch。做 broad discovery 时，先用 files-with-matches、count 或少量低 context match 等窄 projection，再读取真正相关的范围。小型、已知 scope、输出可预测的 native `rg` 通过 `run_process`/`run_shell` 同样是一等路径。
 
 Bootstrap 只读取固定的几个指令入口，不会扫描所有子目录规则。修改某个路径前，需要检查适用的子目录指令，并补读相关缺失或被截断的规则内容。
 
@@ -55,11 +166,15 @@ Bootstrap 只读取固定的几个指令入口，不会扫描所有子目录规�
 
 ## 编辑
 
-模型生成的普通编辑，在 `read_file`/`read_files` 已经拿到当前文件内容和 SHA 时，canonical/default 路径是 `apply_text_edits`。现有文件把读取结果中的 SHA 作为 `expected_sha256`；exact selector 默认要求唯一，需要显式消歧时再使用 `line_scope`/`occurrence`。即使一次修改很多行，默认路径仍然不变；“改动行数多”本身不是选择 `apply_patch` 的理由。只有当 contextual patch 明显更自然、large/multi-hunk rewrite 用 guarded exact edit 表达明显笨重，或 patch-style context 本身更清楚地表达修改关系时，才使用 `apply_patch`。对于 repetitive code，每个 patch chunk 都必须带稳定且唯一的 surrounding context，优先使用 containing function / impl / type / test / module；不要只拿重复出现的单行或短片段作为 mutation anchor。默认 `matching_mode=unique` 仍要求唯一 mutation target。只有明确需要 stale-context/concurrency fence 时才使用 `matching_mode=exact_unique`。输入本身已经是标准 unified diff 时才使用 `apply_unified_diff`。
+模型生成的普通编辑统一走 `read_files -> edit_project_files`。`read_revision` 是模型侧的 snapshot handle；每个 edit/delete/rename change 都必须把它作为 `expected_read_revision`，create 只需要新内容。ToolRuntime 会在内部把 revision 解析成 Runner 的精确 SHA guard，因此模型不复制 digest。唯一文本使用 exact edit；需要确定性整行替换时使用 `replace_range`，其 `start_line/end_line` 为 1-based、inclusive，并且同一个文件中的所有 edit 都相对于同一份 original snapshot 规划。整个 batch 在真正写入前做 transactional preflight。
+
+exact match 出现歧义属于 zero-write conflict。返回结果可以给出有界 candidate line ranges；只要原 `read_revision` 仍然有效，模型可以选定目标行后，用同一个 `expected_read_revision` 直接改成 `replace_range` 重试，不必做无意义的 reread。若 revision 已 stale，则返回 parser-ready `read_files` recovery，必须重新读取。`outcome_unknown` 则不同：在允许任何写入重试前，先检查 workspace 的实际状态。
+
+`write_project_file`、`apply_patch`、`apply_unified_diff` 是 exact-name specialist，故意不进入普通 coding discovery。只有当输入本身天然就是 whole-file replacement、Codex patch 或标准 unified diff 时才使用；它们不是 `edit_project_files` 失败后的默认 recovery。
 
 Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重新读取当前源码，并基于最新状态重新生成原本的编辑。
 
-遇到 `matching_mode_rejected` 时，保持 matching guard，不要切换到 `first_match`。先重新读取当前源码；如果已经有 current source + SHA，而且原本修改很容易表达成 exact edit，优先转为 `apply_text_edits`。如果 patch 形式仍明显更合适，则消费返回的有界 `recovery.action=read_files` / `recovery.items`，并保留原请求的 patch guard：原来是 `matching_mode=unique` 时，补充稳定且唯一的上下文后仍以 `unique` 重试；原来是 `exact_unique` 时，基于 exact current source 重新生成并继续使用 `exact_unique`。不要降级明确的 stale-context/concurrency fence。
+specialist `apply_patch` 遇到 `matching_mode_rejected` 时，保持 matching guard，不要切换到 `first_match`。重新读取当前源码；如果原本修改天然适合 exact/range edit，则回到 `edit_project_files`。如果 patch 形式仍明显更合适，则消费返回的有界、parser-ready `read_files` recovery call，并保留原请求的 patch guard。不要降级明确的 stale-context/concurrency fence。
 
 对于确定性的 `context_mismatch`，同样消费有界 `read_files` recovery，并基于 current source 重新生成 patch；不要盲目重复相同 patch。若结果是 `outcome_unknown`，先检查 workspace，再决定是否允许任何写入重试。
 
@@ -67,11 +182,17 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 ## Validation
 
-能使用 `cargo_test`、`cargo_check`、`go_test` 等 structured validation 时优先使用它们。先运行能够发现当前回归的最小检查，只有实际受影响的边界需要时才扩大范围。
+Formatting 属于收尾，不是每次编辑后的 validation。普通循环是：编辑 → focused validation → 必要时继续编辑 → 源码稳定 → format 一次 → 最终 review/validation。Rust 格式化应在相关源码稳定后、最终 diff/closeout 前执行；只有后续 Rust 编辑可能改变格式时才重跑。`cargo_fmt(check=false)` 用于有意执行最终格式化，`check=true` 用于需要最终只读格式证明的情况。CI/release 格式检查保持不变。
 
-如果一个确定需要执行的 validation 很可能明显超过 synchronous grace，同时还有真正独立的 read-only inspection，可以显式设置较短的 `sync_wait_secs`（通常可用 `1`），让已经启动的 validation 以**同一个 execution** 尽早 handoff 为 Job。随后只继续独立的源码读取、搜索、diff/architecture inspection 或 review，再观察该 Job；不要为了“并行”额外启动 CPU-heavy validation。如果运行中的 validation 所覆盖源码随后发生 mutation，那么其结果只能算 stale/cache-warmup evidence，不能证明 final workspace；最终源码仍需重新运行 task-appropriate validation。
+普通、可移植的 structured validation 优先使用 `project_validate`；只有确实需要高级生态专属选项时，才显式选择 `cargo_check`、`cargo_test`、`go_test` 等 specialist contract。先运行能够发现当前回归的最小检查，只有实际受影响的边界需要时才扩大范围。
+
+普通 package-scoped validation 使用 `project_validate.scope.packages`，由 WebCodex 在有界范围内校验后交给选定 adapter 转译；Rust 会在确定性排序、去重后映射为一次带重复 `-p` selector 的 Cargo 调用。只有确实需要高级 Cargo 专属 contract 时，才使用 `cargo_check` 的 `package` / `packages` specialist selector。
+
+如果一个确定需要执行的 validation 超过 Server 管理的 synchronous grace，它会自动以**同一个 execution** handoff 为 Job，模型不需要调整 handoff timing。随后只继续独立的源码读取、搜索、diff/architecture inspection 或 review，再观察该 Job；不要为了“并行”额外启动 CPU-heavy validation。如果运行中的 validation 所覆盖源码随后发生 mutation，那么其结果只能算 stale/cache-warmup evidence，不能证明 final workspace；最终源码仍需重新运行 task-appropriate validation。
 
 如果某次 test invocation 必须证明“测试确实执行了”，使用 `require_tests: true` 或 `min_tests: N`。它们是本次调用的 evidence assertion，不会自动变成 Workflow Session 的持久要求。如果 validator execution 成功，但请求的 test 数量未满足或无法证明，closeout 会把这次调用保留为 evidence gap，而不是代码/测试 correctness failure。否则，exit-zero 但合法运行零个 test 只是 execution result，并不能证明 test coverage。
+
+把 validation failure 当作 evidence，而不是必须立即清空的队列。如果失败说明当前实现方向无效，或者阻塞后续依赖工作，就先诊断修复；否则保留该 evidence，继续真正独立的工作，在依赖或 closeout 需要时再解决/重验。故意重跑同一个逻辑 assertion 时复用 `assertion_name`。Mutation 会让相关旧 evidence 变 stale，`outcome_unknown` 继续 fail closed。
 
 只有 structured validation 无法表达检查时，才使用 shell/process escape hatch。
 
@@ -81,9 +202,13 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 `finish_coding_task` 返回有界 closeout evidence。把它当成 advisory summary，不要把它当成“任务已经正确完成”的 authority。最终工程判断仍由模型完成并向用户报告。
 
+Closeout（含 `summary_only`）、`read_session_handoff` 和绑定 Session 的 Work Result 会提供从同一组观察推导的可选 `acceptance` 摘要。`state` 为 `ready_for_review`、`needs_evidence`、`failed` 或 `not_applicable`，均不表示自然语言需求已验收。`reason_codes` 说明缺失、过期或尚未证明的证据；`evidence_refs` 指向已有 workspace、validation、review 或 outputs 类证据。沿用现有下一步动作，需要细节时读取精确 Session 的证据。交接快照发生变化时，先重新读取再继续依赖该快照的工作。
+
+执行结束及历史检查通过不能证明当前源码正确。现有源码 fence 返回 `unproven` 或 `stale`，所以检查成功后仍需复核源码状态与检查适用性。保留的产物元数据是历史观察，不证明当前文件新鲜度或内容正确。只读任务可以合理地无需测试：明确判断适用性，不要只为改变状态标记而运行测试。没有任务 Session 的卡片返回 `not_applicable`，不会从 Project 活动推断任务。
+
 ## 长时间运行的工作
 
-命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。观察该 Job，不要再启动一个副本。Tool 返回的 recovery/continuation hint 只是下一次显式调用的 guidance；WebCodex 不会对不确定 effect 做隐藏 retry。
+命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。保留其精确 Job identity 与 parser-ready continuation；如果仍有有用的独立工作，就先继续这些工作，之后再 observe，不要为了“保持可见”反复轮询 running Job。只有下一步真正依赖 terminal result 时，才使用返回的 continuation；Server 会按照当前 MCP Host profile 对 observation wait 做有界适配。Runtime 内部仍保留 transport-neutral observation ceiling，而 MCP 等待会适配 Host budget。单个 Job 或任一 terminal result 即可推进时使用 `terminal`；预先确定的一组 Job 必须全部结束才能推进时使用 `all_terminal`。Recovery/continuation hint 不会授权对不确定 effect 做 retry。
 
 ## 手动多窗口协作
 

@@ -46,6 +46,7 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
         registry
             .register_with_auth(
                 RunnerRegisterRequest {
+                    computer_session_availability: None,
                     process_started_at: None,
                     build: None,
                     job_concurrency_limit: None,
@@ -75,6 +76,7 @@ async fn registry_filters_lightweight_clients_by_auth_group() {
     ] {
         registry
             .register(RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -213,6 +215,7 @@ async fn non_bootstrap_admin_keeps_global_visibility_without_owner_bypass() {
     let registry = RunnerRegistry::default();
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -279,6 +282,7 @@ async fn managed_user_coding_agent_inventory_does_not_cross_owner() {
     ] {
         registry
             .register(RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -356,14 +360,15 @@ async fn managed_user_coding_agent_inventory_does_not_cross_owner() {
 
 #[tokio::test]
 async fn same_client_id_in_different_project_grants_is_isolated() {
-    // Expected pre-fix failure: reusing the same instance id currently
-    // lets a second auth group replace the first group's global lease.
+    // A matching client/instance identity in another ProjectGrant must not replace
+    // or reveal the original grant's Runner lease.
     let registry = RunnerRegistry::default();
     let grant_a = crate::auth::shared_key::project_credential_context("wc_pgrant_aaaaaaaaaaaaaaaa");
     let grant_b = crate::auth::shared_key::project_credential_context("wc_pgrant_bbbbbbbbbbbbbbbb");
     let grant_a_access = runner_access_from_auth(Some(&grant_a)).unwrap();
     let grant_b_access = runner_access_from_auth(Some(&grant_b)).unwrap();
     let registration = |hostname: &str| RunnerRegisterRequest {
+        computer_session_availability: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -431,6 +436,7 @@ async fn shared_key_client_id_collision_cannot_cross_group_or_revive_old_connect
     let bootstrap_access = runner_access_from_auth(Some(&bootstrap)).unwrap();
     let registration = |client_id: &str, instance: &str, hostname: &str, owner: Option<&str>| {
         RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,

@@ -375,6 +375,42 @@ $form.Add_Shown({ $form.Activate(); $input.Focus() })
         Self { child }
     }
 
+    fn start_combobox() -> Self {
+        let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'WebCodex ComboBox read fixture'
+$combo = New-Object System.Windows.Forms.ComboBox
+$combo.AccessibleName = 'Theme choice'
+$combo.DropDownStyle = 'DropDownList'
+[void]$combo.Items.Add('White')
+[void]$combo.Items.Add('Black')
+$combo.SelectedIndex = 1
+$form.Controls.Add($combo)
+$editableCombo = New-Object System.Windows.Forms.ComboBox
+$editableCombo.AccessibleName = 'Editable theme'
+$editableCombo.Top = 45
+$editableCombo.Text = 'White'
+$form.Controls.Add($editableCombo)
+[System.Windows.Forms.Application]::Run($form)
+"#;
+        let child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-STA",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self { child }
+    }
+
     fn start_foreground_probe() -> Self {
         let script = r#"
 Add-Type -AssemblyName System.Windows.Forms
@@ -448,6 +484,130 @@ impl Drop for WindowsControlFixture {
 }
 
 #[test]
+#[ignore = "requires an interactive Windows desktop; launches a private WinForms fixture"]
+fn computer_windows_combobox_values_live() {
+    let mut fixture = WindowsControlFixture::start_combobox();
+    let window = fixture.wait_for_window("WebCodex ComboBox read fixture", "combo read fixture");
+    let record = surface_record(window);
+    let tree = platform::accessibility_tree("surface_combo", &record, 1, 64).unwrap();
+    for (label, expected) in [("Theme choice", "Black"), ("Editable theme", "White")] {
+        let node = tree.output["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["role"] == "AXComboBox" && node["title"] == label)
+            .expect("fixture combo is present");
+        assert_eq!(node["value"], expected, "{label}");
+        let id = node["element_id"].as_str().unwrap();
+        let element = tree.elements.iter().find(|(key, _)| key == id).unwrap();
+        let state = platform::element_state("surface_combo", id, 1, &record, &element.1).unwrap();
+        assert_eq!(state["can_focus"], false);
+        assert_eq!(state["can_input_text"], false);
+    }
+}
+
+#[test]
+#[ignore = "requires an interactive Windows desktop; launches a private deep WinForms fixture"]
+fn computer_windows_subtree_recovers_truncated_depth_live() {
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$form = New-Object System.Windows.Forms.Form
+$form.Text = 'WebCodex subtree smoke'
+$form.Width = 500
+$form.Height = 500
+$parent = $form
+for ($i=1; $i -le 12; $i++) {
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.AccessibleName = "Level $i"
+    $panel.AccessibleRole = 'Grouping'
+    $panel.Dock = 'Fill'
+    $parent.Controls.Add($panel)
+    $parent = $panel
+}
+$button = New-Object System.Windows.Forms.Button
+$button.Text = 'Deep target'
+$button.AccessibleName = 'Deep target'
+$parent.Controls.Add($button)
+[System.Windows.Forms.Application]::Run($form)
+"#;
+    let mut fixture = WindowsControlFixture {
+        child: Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-STA",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    };
+    fixture.wait_for_window("WebCodex subtree smoke", "deep fixture");
+    let runtime = ComputerRuntime::new(ComputerConfig {
+        max_encoded_image_bytes: 6 * 1024 * 1024,
+    });
+    let windows = runtime.list_windows(MAX_WINDOWS).unwrap();
+    let surface = windows["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|window| window["title"] == "WebCodex subtree smoke")
+        .unwrap()["surface_id"]
+        .as_str()
+        .unwrap();
+    let tree = runtime.accessibility_tree(surface, 8, 256).unwrap();
+    assert_eq!(tree["truncated"], true);
+    assert!(!tree["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|node| node["title"] == "Deep target"));
+    let root = tree["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["depth"] == 8)
+        .unwrap()["element_id"]
+        .as_str()
+        .unwrap();
+    let subtree = runtime
+        .accessibility_tree_scoped(surface, Some(root), 8, 256)
+        .unwrap();
+    assert_eq!(subtree["root_element_id"], root);
+    assert_eq!(subtree["truncated"], false);
+    assert!(
+        subtree["observation_generation"].as_u64().unwrap()
+            > tree["observation_generation"].as_u64().unwrap()
+    );
+    assert_eq!(subtree["nodes"][0]["depth"], 0);
+    assert_eq!(subtree["nodes"][0]["parent_element_id"], Value::Null);
+    assert!(subtree["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|node| node["title"] == "Deep target"));
+    assert!(runtime
+        .accessibility_tree_scoped(surface, Some(root), 8, 256)
+        .unwrap_err()
+        .starts_with("stale_element:"));
+    let current = subtree["nodes"][0]["element_id"].as_str().unwrap();
+    let bounded = runtime
+        .accessibility_tree_scoped(surface, Some(current), 8, 1)
+        .unwrap();
+    assert_eq!(bounded["node_count"], 1);
+    assert_eq!(bounded["truncated"], true);
+    let current = bounded["nodes"][0]["element_id"].as_str().unwrap();
+    runtime.list_windows(MAX_WINDOWS).unwrap();
+    assert!(runtime
+        .accessibility_tree_scoped(surface, Some(current), 8, 256)
+        .is_err());
+}
+
+#[test]
 fn computer_windows_uia_control_types_use_existing_semantic_roles() {
     assert_eq!(
         platform::uia_control_role(UIA_WindowControlTypeId),
@@ -502,6 +662,12 @@ fn computer_windows_scroll_attempt_failure_is_unknown() {
 
 #[test]
 fn computer_windows_key_input_native_plan_is_closed_and_releases_modifiers_in_reverse() {
+    for key in COMPUTER_KEY_INPUT_KEYS {
+        assert!(
+            platform::test_windows_key_input_plan(key, &[]).is_ok(),
+            "{key}"
+        );
+    }
     for (key, expected_vk) in [
         ("enter", 13u16),
         ("escape", 27),

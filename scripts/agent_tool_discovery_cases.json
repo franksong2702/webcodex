@@ -1,0 +1,1055 @@
+{
+  "schema_version": 1,
+  "corpus_version": "1.0.0",
+  "top_k": 5,
+  "metadata": {
+    "purpose": "Offline read_tool_manifest retrieval baseline; labels describe relevant eligible tools, not a required order or measured baseline outcome.",
+    "evidence_limit": "This corpus is retrieval labels, not live Host proof. It does not establish invocation success, authority to execute, Host registration, or end-to-end task completion.",
+    "split_policy": "Fixed before baseline capture: every fourth case by immutable numeric ID is heldout (12 of 48), balanced English/Chinese with all five kinds. English/Chinese paraphrases of the same labeled intent share a split. Tune only on development cases; this small fixture does not establish independent generalization.",
+    "scope_semantics": "allowed_scopes is an explicit non-bootstrap OAuth caller fixture, including an empty list; ordinary non-OAuth catalogs do not enforce these discovery scope exclusions. This fixture is not manifest input or execution authorization. Other eligibility context must be recorded by the evaluator.",
+    "label_semantics": "expected_tools is an unordered relevance set of eligible tools; forbidden_tools is a must-not-return set for category or authority leakage. Empty relevance sets represent no relevant eligible match. Do not require current literal ranking to satisfy paraphrase labels."
+  },
+  "cases": [
+    {
+      "id": "discovery-001",
+      "split": "development",
+      "language": "en",
+      "kind": "exact_name",
+      "prompt": "read_files",
+      "request": {
+        "limit": 5,
+        "tool_name": "read_files"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "read_files"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-002",
+      "split": "development",
+      "language": "en",
+      "kind": "exact_name",
+      "prompt": "get_git_status",
+      "request": {
+        "limit": 5,
+        "tool_name": "get_git_status"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "get_git_status"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-003",
+      "split": "development",
+      "language": "zh",
+      "kind": "exact_name",
+      "prompt": "查看 edit_project_files 的参数",
+      "request": {
+        "limit": 5,
+        "tool_name": "edit_project_files"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "edit_project_files"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-004",
+      "split": "heldout",
+      "language": "en",
+      "kind": "exact_name",
+      "prompt": "run_process",
+      "request": {
+        "limit": 5,
+        "tool_name": "run_process"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "run_process"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-005",
+      "split": "development",
+      "language": "en",
+      "kind": "exact_name",
+      "prompt": "review_changes",
+      "request": {
+        "limit": 5,
+        "tool_name": "review_changes"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "review_changes"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-006",
+      "split": "development",
+      "language": "en",
+      "kind": "exact_name",
+      "prompt": "cargo_check",
+      "request": {
+        "limit": 5,
+        "tool_name": "cargo_check"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "cargo_check"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-007",
+      "split": "development",
+      "language": "en",
+      "kind": "exact_name",
+      "prompt": "resolve_workspace",
+      "request": {
+        "limit": 5,
+        "tool_name": "resolve_workspace"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "resolve_workspace"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-008",
+      "split": "heldout",
+      "language": "zh",
+      "kind": "exact_name",
+      "prompt": "查找 observe_jobs 的调用契约",
+      "request": {
+        "limit": 5,
+        "tool_name": "observe_jobs"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "observe_jobs"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-009",
+      "split": "development",
+      "language": "en",
+      "kind": "paraphrase",
+      "prompt": "Read several source files with bounded output",
+      "request": {
+        "limit": 5,
+        "query": "Read several source files with bounded output",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "read_files"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-010",
+      "split": "development",
+      "language": "en",
+      "kind": "paraphrase",
+      "prompt": "Find occurrences of a symbol across source files",
+      "request": {
+        "limit": 5,
+        "query": "Find occurrences of a symbol across source files",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "search_project_texts"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-011",
+      "split": "development",
+      "language": "en",
+      "kind": "paraphrase",
+      "prompt": "Check whether the working tree is clean",
+      "request": {
+        "limit": 5,
+        "query": "Check whether the working tree is clean",
+        "category": "git"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "get_git_status"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-012",
+      "split": "heldout",
+      "language": "en",
+      "kind": "paraphrase",
+      "prompt": "Review the complete pending code patch",
+      "request": {
+        "limit": 5,
+        "query": "Review the complete pending code patch",
+        "category": "git"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "review_changes"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-013",
+      "split": "development",
+      "language": "en",
+      "kind": "paraphrase",
+      "prompt": "Replace a few exact snippets in existing files",
+      "request": {
+        "limit": 5,
+        "query": "Replace a few exact snippets in existing files",
+        "category": "edit"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "edit_project_files"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-014",
+      "split": "development",
+      "language": "en",
+      "kind": "paraphrase",
+      "prompt": "Start one executable with literal arguments",
+      "request": {
+        "limit": 5,
+        "query": "Start one executable with literal arguments",
+        "category": "execution"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "run_process"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-015",
+      "split": "development",
+      "language": "en",
+      "kind": "paraphrase",
+      "prompt": "Locate a registered workspace without opening a session",
+      "request": {
+        "limit": 5,
+        "query": "Locate a registered workspace without opening a session",
+        "category": "project"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "resolve_workspace"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-016",
+      "split": "heldout",
+      "language": "en",
+      "kind": "paraphrase",
+      "prompt": "Check Rust compilation with parsed diagnostics",
+      "request": {
+        "limit": 5,
+        "query": "Check Rust compilation with parsed diagnostics",
+        "category": "validation"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "cargo_check"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-017",
+      "split": "development",
+      "language": "zh",
+      "kind": "paraphrase",
+      "prompt": "批量读取几个源码文件的内容",
+      "request": {
+        "limit": 5,
+        "query": "批量读取几个源码文件的内容",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "read_files"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-018",
+      "split": "development",
+      "language": "zh",
+      "kind": "paraphrase",
+      "prompt": "在项目中搜索包含这个函数名的文件",
+      "request": {
+        "limit": 5,
+        "query": "在项目中搜索包含这个函数名的文件",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "search_project_texts"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-019",
+      "split": "development",
+      "language": "zh",
+      "kind": "paraphrase",
+      "prompt": "检查工作区是否干净，有哪些暂存和未暂存文件",
+      "request": {
+        "limit": 5,
+        "query": "检查工作区是否干净，有哪些暂存和未暂存文件",
+        "category": "git"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "get_git_status"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-020",
+      "split": "heldout",
+      "language": "zh",
+      "kind": "paraphrase",
+      "prompt": "审查这次代码修改的完整差异",
+      "request": {
+        "limit": 5,
+        "query": "审查这次代码修改的完整差异",
+        "category": "git"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "review_changes"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-021",
+      "split": "development",
+      "language": "zh",
+      "kind": "paraphrase",
+      "prompt": "在现有文件中替换指定的几段文字",
+      "request": {
+        "limit": 5,
+        "query": "在现有文件中替换指定的几段文字",
+        "category": "edit"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "edit_project_files"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-022",
+      "split": "development",
+      "language": "zh",
+      "kind": "paraphrase",
+      "prompt": "运行一个程序并传入字面量参数列表",
+      "request": {
+        "limit": 5,
+        "query": "运行一个程序并传入字面量参数列表",
+        "category": "execution"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "run_process"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-023",
+      "split": "development",
+      "language": "zh",
+      "kind": "paraphrase",
+      "prompt": "根据路径定位已注册工作区，不创建会话",
+      "request": {
+        "limit": 5,
+        "query": "根据路径定位已注册工作区，不创建会话",
+        "category": "project"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "resolve_workspace"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-024",
+      "split": "heldout",
+      "language": "zh",
+      "kind": "paraphrase",
+      "prompt": "执行 Rust 编译检查并获取结构化诊断",
+      "request": {
+        "limit": 5,
+        "query": "执行 Rust 编译检查并获取结构化诊断",
+        "category": "validation"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "cargo_check"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-025",
+      "split": "development",
+      "language": "en",
+      "kind": "ambiguous",
+      "prompt": "read source",
+      "request": {
+        "limit": 5,
+        "query": "read source",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "read_files",
+        "search_project_texts"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-026",
+      "split": "development",
+      "language": "en",
+      "kind": "ambiguous",
+      "prompt": "inspect git changes",
+      "request": {
+        "limit": 5,
+        "query": "inspect git changes",
+        "category": "git"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "get_git_status",
+        "review_changes"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-027",
+      "split": "development",
+      "language": "en",
+      "kind": "ambiguous",
+      "prompt": "run command",
+      "request": {
+        "limit": 5,
+        "query": "run command",
+        "category": "execution"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "run_process",
+        "run_shell",
+        "run_script"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-028",
+      "split": "heldout",
+      "language": "en",
+      "kind": "ambiguous",
+      "prompt": "find workspace",
+      "request": {
+        "limit": 5,
+        "query": "find workspace",
+        "category": "project"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "resolve_workspace",
+        "list_projects"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-029",
+      "split": "development",
+      "language": "zh",
+      "kind": "ambiguous",
+      "prompt": "找文件内容",
+      "request": {
+        "limit": 5,
+        "query": "找文件内容",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "read_files",
+        "search_project_texts"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-030",
+      "split": "development",
+      "language": "zh",
+      "kind": "ambiguous",
+      "prompt": "查看代码变动",
+      "request": {
+        "limit": 5,
+        "query": "查看代码变动",
+        "category": "git"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "get_git_status",
+        "review_changes"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-031",
+      "split": "development",
+      "language": "zh",
+      "kind": "ambiguous",
+      "prompt": "执行命令或脚本",
+      "request": {
+        "limit": 5,
+        "query": "执行命令或脚本",
+        "category": "execution"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "run_process",
+        "run_shell",
+        "run_script"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-032",
+      "split": "heldout",
+      "language": "zh",
+      "kind": "ambiguous",
+      "prompt": "寻找已注册的项目",
+      "request": {
+        "limit": 5,
+        "query": "寻找已注册的项目",
+        "category": "project"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [
+        "resolve_workspace",
+        "list_projects"
+      ],
+      "forbidden_tools": []
+    },
+    {
+      "id": "discovery-033",
+      "split": "development",
+      "language": "en",
+      "kind": "no_match",
+      "prompt": "Find a tool named deploy_everywhere_now",
+      "request": {
+        "limit": 5,
+        "query": "deploy_everywhere_now"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "run_shell",
+        "run_process"
+      ]
+    },
+    {
+      "id": "discovery-034",
+      "split": "development",
+      "language": "zh",
+      "kind": "no_match",
+      "prompt": "查找不存在的工具 teleport_repository",
+      "request": {
+        "limit": 5,
+        "query": "teleport_repository"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "register_project",
+        "create_project"
+      ]
+    },
+    {
+      "id": "discovery-035",
+      "split": "development",
+      "language": "zh",
+      "kind": "no_match",
+      "prompt": "有没有计算龙语咒语的工具",
+      "request": {
+        "limit": 5,
+        "query": "龙语咒语计算器"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "run_script"
+      ]
+    },
+    {
+      "id": "discovery-036",
+      "split": "heldout",
+      "language": "en",
+      "kind": "no_match",
+      "prompt": "Find a quantum-entanglement meter",
+      "request": {
+        "limit": 5,
+        "query": "quantum_entanglement_meter"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "get_runtime_status"
+      ]
+    },
+    {
+      "id": "discovery-037",
+      "split": "development",
+      "language": "en",
+      "kind": "no_match",
+      "prompt": "Look up runtime health only among edit tools",
+      "request": {
+        "limit": 5,
+        "query": "get_runtime_status",
+        "category": "edit"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "get_runtime_status"
+      ]
+    },
+    {
+      "id": "discovery-038",
+      "split": "development",
+      "language": "zh",
+      "kind": "no_match",
+      "prompt": "仅在 Git 类别中找文件读取工具",
+      "request": {
+        "limit": 5,
+        "query": "read_files",
+        "category": "git"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "read_files"
+      ]
+    },
+    {
+      "id": "discovery-039",
+      "split": "development",
+      "language": "en",
+      "kind": "no_match",
+      "prompt": "Find a rust compilation checker among file readers",
+      "request": {
+        "limit": 5,
+        "query": "cargo_check",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "cargo_check"
+      ]
+    },
+    {
+      "id": "discovery-040",
+      "split": "heldout",
+      "language": "zh",
+      "kind": "no_match",
+      "prompt": "仅在执行类别中查找项目注册工具",
+      "request": {
+        "limit": 5,
+        "query": "register_project",
+        "category": "execution"
+      },
+      "allowed_scopes": [
+        "runtime:read",
+        "project:read",
+        "project:write",
+        "job:run"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "register_project"
+      ]
+    },
+    {
+      "id": "discovery-041",
+      "split": "development",
+      "language": "en",
+      "kind": "scope_negative",
+      "prompt": "Find a file editor with read-only project access",
+      "request": {
+        "limit": 5,
+        "query": "edit_project_files",
+        "category": "edit"
+      },
+      "allowed_scopes": [
+        "project:read"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "edit_project_files",
+        "write_project_file"
+      ]
+    },
+    {
+      "id": "discovery-042",
+      "split": "development",
+      "language": "zh",
+      "kind": "scope_negative",
+      "prompt": "只有项目读取权限时查找文件修改工具",
+      "request": {
+        "limit": 5,
+        "query": "edit_project_files",
+        "category": "edit"
+      },
+      "allowed_scopes": [
+        "project:read"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "edit_project_files",
+        "write_project_file"
+      ]
+    },
+    {
+      "id": "discovery-043",
+      "split": "development",
+      "language": "zh",
+      "kind": "scope_negative",
+      "prompt": "没有作业执行权限时查找进程运行工具",
+      "request": {
+        "limit": 5,
+        "query": "run_process",
+        "category": "execution"
+      },
+      "allowed_scopes": [
+        "project:read"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "run_process",
+        "run_shell",
+        "run_script"
+      ]
+    },
+    {
+      "id": "discovery-044",
+      "split": "heldout",
+      "language": "en",
+      "kind": "scope_negative",
+      "prompt": "Find process execution without job authority",
+      "request": {
+        "limit": 5,
+        "query": "run_process",
+        "category": "execution"
+      },
+      "allowed_scopes": [
+        "project:read"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "run_process",
+        "run_shell",
+        "run_script"
+      ]
+    },
+    {
+      "id": "discovery-045",
+      "split": "development",
+      "language": "en",
+      "kind": "scope_negative",
+      "prompt": "Find runtime status without runtime access",
+      "request": {
+        "limit": 5,
+        "query": "get_runtime_status",
+        "category": "runtime"
+      },
+      "allowed_scopes": [
+        "project:read"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "get_runtime_status",
+        "list_runners"
+      ]
+    },
+    {
+      "id": "discovery-046",
+      "split": "development",
+      "language": "zh",
+      "kind": "scope_negative",
+      "prompt": "只有运行时读取权限时查找源码读取工具",
+      "request": {
+        "limit": 5,
+        "query": "read_files",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "runtime:read"
+      ],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "read_files",
+        "search_project_texts"
+      ]
+    },
+    {
+      "id": "discovery-047",
+      "split": "development",
+      "language": "en",
+      "kind": "scope_negative",
+      "prompt": "Discover a reader but never an editor with read-only access",
+      "request": {
+        "limit": 5,
+        "query": "read",
+        "category": "file"
+      },
+      "allowed_scopes": [
+        "project:read"
+      ],
+      "expected_tools": [
+        "read_files"
+      ],
+      "forbidden_tools": [
+        "edit_project_files",
+        "write_project_file"
+      ]
+    },
+    {
+      "id": "discovery-048",
+      "split": "heldout",
+      "language": "zh",
+      "kind": "scope_negative",
+      "prompt": "无任何权限时查找 Git 提交工具",
+      "request": {
+        "limit": 5,
+        "query": "commit_git_paths",
+        "category": "git"
+      },
+      "allowed_scopes": [],
+      "expected_tools": [],
+      "forbidden_tools": [
+        "commit_git_paths"
+      ]
+    }
+  ]
+}

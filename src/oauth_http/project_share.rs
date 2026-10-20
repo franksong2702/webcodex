@@ -234,6 +234,7 @@ fn issue_project_share_authorization_code(
     let plaintext_code = crate::auth::generate_oauth_authorization_code();
     let code_hash = crate::auth::hash_token(&plaintext_code);
     let record = OAuthAuthorizationCodeRecord {
+        admin_authority: false,
         id: uuid::Uuid::new_v4().to_string(),
         code_hash,
         client_id: validated.client.client_id.clone(),
@@ -334,20 +335,20 @@ pub(crate) async fn oauth_authorize_project(
     };
 
     let submitted = form_field(&pairs, "project_credential").unwrap_or("");
-    let runtime = depot
-        .obtain::<crate::connector_runtime::ConnectorRuntimeSlot>()
+    let project_auth = depot
+        .obtain::<std::sync::Arc<crate::auth::ProjectAuthState>>()
         .ok()
-        .and_then(|slot| slot.0.clone());
-    let Some(runtime) = runtime else {
+        .cloned();
+    let Some(project_auth) = project_auth.filter(|state| state.is_configured()) else {
         oauth_authorize_direct_error(
             res,
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
-            "project Connector runtime is unavailable",
+            "project authentication state is unavailable",
         );
         return;
     };
-    let authenticated = runtime
+    let authenticated = project_auth
         .authenticate_project_credential(submitted)
         .and_then(|ctx| ctx.project_grant_id)
         .is_some_and(|grant_id| {

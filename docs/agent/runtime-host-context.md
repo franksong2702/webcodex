@@ -30,7 +30,7 @@ configuration**. It is not another source of runtime state.
 
 The existing boundaries stay authoritative:
 
-1. live registration, capabilities, `agent_instance_id`, build identity, Job
+1. live registration, capabilities, `runner_instance_id`, build identity, Job
    state, project registration, and connection observations remain runtime facts;
 2. authority mode, OAuth scopes, project policy, `allowed_roots`, session guards,
    and tool-specific safety checks remain authorization/safety facts;
@@ -138,7 +138,7 @@ Good host context:
 Do **not** put these in host context:
 
 - IP addresses, SSH aliases, relay state, ports, or current network paths;
-- PID, `agent_instance_id`, process start time, current service status, or health;
+- PID, `runner_instance_id`, process start time, current service status, or health;
 - current Git branch/HEAD, binary SHA, build commit, or deployed version;
 - active Jobs, current capacity, project availability, or current capability
   advertisement;
@@ -150,23 +150,23 @@ Do **not** put these in host context:
 Those values either already have authoritative runtime projections or must be
 queried at the time they matter.
 
-## 5. Placement in `runtime_status`
+## 5. Placement in `get_runtime_status`
 
 The natural first projection is per Runner alongside the existing identity,
 capability, policy, build, and liveness facts:
 
 ```text
-runtime_status
-  agents.clients[]
+get_runtime_status
+  runners.clients[]
     client_id
-    agent_instance_id
+    runner_instance_id
     status / connected / capabilities / ...
     host_context?       <- declarative planning context
 ```
 
 `host_context` is also projected in full `list_runners` entries. Compact
-`runtime_status` carries a deliberately small per-Runner client list with
-`client_id`, `agent_instance_id`, status/transport, host context, and exact-build
+`get_runtime_status` carries a deliberately small per-Runner client list with
+`client_id`, `runner_instance_id`, status/transport, host context, and exact-build
 alignment facts; it does not copy full capabilities or policy into that compact
 view. No new top-level resource, session identity, or durable Server table is
 needed.
@@ -259,7 +259,7 @@ The implemented slice is intentionally limited to:
 1. optional closed/bounded `host_context` in Runner startup configuration;
 2. local validation plus Server-side registration revalidation;
 3. current-registration storage with reconnect/replacement semantics;
-4. full `runtime_status` / `list_runners` projection plus a bounded compact
+4. full `get_runtime_status` / `list_runners` projection plus a bounded compact
    Runner summary;
 5. focused bounds, config, restart-required, registration, reconnect, and
    projection tests.

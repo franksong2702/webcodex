@@ -18,10 +18,10 @@ WebCodex 之所以有多种认证方式，是因为 Server 管理、模型/API �
 | --- | --- | --- |
 | Server bootstrap token | Server env 中的 `WEBCODEX_TOKEN` | 初始管理与紧急恢复 |
 | Pairing code | `wc_pair_...` | 一次性设备/用户接入 |
-| 个人 API 令牌（PAT） | `wc_pat_...` | managed user 的 MCP、GPT Actions 与 runtime API |
+| 个人 API 令牌（PAT） | `wc_pat_...` | managed user 的 MCP 与 runtime API |
 | Runner token | `wc_agent_...` | 仅 `webcodex-runner` 传输 |
 | Shared key | `wck_...` | hosted shared-key MCP/runtime 与对应 Runner group |
-| Project Credential | 受保护的项目私有文件 | 单个 project-first Connector/share 环境 |
+| Project Credential | 受保护的项目私有文件 | 一个 ProjectGrant 的普通 runtime API/MCP 访问 |
 | OAuth access token | `wc_oat_...` | 启用 OAuth 后的委派 MCP/GPT 访问 |
 | Account credential | `wc_acct_...` | 高级 managed-account 本地令牌创建 |
 
@@ -49,7 +49,10 @@ WebCodex 内部还有一些非 secret 的 ID 与 opaque tool state。普通用�
 
 ## Server bootstrap token
 
-`WEBCODEX_TOKEN` 是 Server bootstrap/admin 凭据。`webcodex server init` 会把它保存到 Server 环境中。它只用于初始管理、建用户/pairing 与紧急恢复，不用于 MCP、GPT Actions、Runner 连接或日常开发。
+`WEBCODEX_TOKEN` 是 Server bootstrap/admin 凭据。`webcodex server init` 会把它保存到 Server 环境中。通常用于初始管理、建用户/pairing 与紧急恢复，不应手动交给外部 MCP/GPT 客户端或用作 Runner token。
+
+同一所有者自部署的 Desktop/本地 Server Tunnel 是明确的例外：受保护的本地 authorization 文件在内部使用 bootstrap，ChatGPT 配置中不包含 WebCodex secret。此可信连接使用该所有者的权限，并不是受限的多用户委托；无需再签发一份 Tunnel token。跨信任域仍使用已有的委托凭据。
+[个人部署生命周期](implementation/personal-environment-lifecycle.md)。
 
 ## Pairing 与 managed login
 
@@ -59,7 +62,7 @@ Pairing code 是一次性的，不是长期 API 凭据。
 
 ## 个人 API 令牌（`wc_pat_*`）
 
-PAT 在 MCP、GPT Actions 与 runtime API 上代表一个 managed user。Server 只保存其 hash。`webcodex login` 通常会把用户 token 写到该 Server/user 本地配置目录中的 `webcodex-user-token`。
+PAT 在 MCP 与 runtime API 上代表一个 managed user。Server 只保存其 hash。`webcodex login` 通常会把用户 token 写到该 Server/user 本地配置目录中的 `webcodex-user-token`。
 
 按工作流只授予需要的最小 scopes。普通 MCP coding client 只需要与其实际读写/执行能力对应的 runtime/project 权限；account-management authority 与普通 coding client 分开。
 
@@ -77,11 +80,15 @@ Shared key 是 `webcodex connect` 使用的简单 hosted connection credential�
 
 ## Project Credential
 
-`webcodex setup` 与临时 project-first 流程使用一把受保护的 Project Credential，只属于一个项目环境。它不是通用 user/admin token，也不应跨项目复用。
+`webcodex setup` 与临时 project-first 流程使用一把受保护的 Project Credential，只属于一个 ProjectGrant。它不是通用 user/admin token，也不应跨项目复用。ProjectGrant Runner visibility 与 canonical Project resolution 会阻止它列出、resolve 或调用其它 grant 的 Project；Adaptive direct tool 与 `call_runtime_tool` gateway 使用同一条 authority boundary。
+
+Project-scoped credential 也不能通过普通 `register_project`、`create_project`、`unregister_project` 扩张 Runner Project registry。path-based coding 只能复用 exact caller-visible registered Project；唯一 canonical 的派生路径是从这个已授权 source Project 使用 `work_on_project(mode=worktree)` 创建 managed worktree Project。
 
 WebCodex 验证该 credential 后只在内部保留所需的非 secret authorization metadata；它不是另一把需要用户复制或管理的 credential。
 
 ## OAuth2
+
+Authentication 确认用户身份；ownership 限制可管理谁的资源；credential scopes 承载实际 authority。`admin` 是 credential-level super-scope；`account:manage` 是受 ownership 限制的账户、token、pairing 与 OAuth client 窄管理能力，不等于 admin。Bootstrap 保持完整 authority。`user.role` 仅保留为 legacy metadata，不授予 runtime/admin authority。PAT、Runner token、OAuth、shared-key 与 Project Credential 的 kinds/audiences 继续严格隔离。
 
 OAuth 允许 MCP/GPT client 使用 authorization-code flow，而不是在 client 中长期保存 PAT。注册 client 实际要求的精确 callback URL，并按 `webcodex share --auth oauth` 或 `webcodex connect --auth oauth` 的输出完成连接。
 
@@ -97,6 +104,14 @@ WebCodex 新增 scope 时不会静默扩大已有 OAuth client 的权限上限�
 
 普通 hosted shared-key OAuth 使用 `webcodex connect ... --auth oauth`：Runner 继续使用 shared key，而 MCP client 获得独立 OAuth credential。`--oauth-computer-permissions` 显式开放该流程中的额外 Computer 权限；`--oauth-local-mcp` 显式开放 Runner-owned local MCP provider。Managed-user OAuth 仍是另一条高级流程（`--auth managed-oauth`）。
 
+Browser Use 的 shared-key OAuth delegation 需要在 `connect --auth oauth` 时显式指定 `--oauth-browser-permissions`，仅追加 `browser:read`、`browser:control`、`browser:launch`。默认 baseline 不包含 Browser scope；Browser 与 `--oauth-computer-permissions` 相互独立，也不使用 Computer consent checkbox。已有 client 不会自动扩权，历史窄权限仅追加显式选择的类别。scope ceiling 变化会撤销旧 grants 并要求重新授权；复用已启用 Browser 的 profile 时必须继续携带该 flag。
+
+Managed-user OAuth 在 first-party PAT 授权时快照 credential authority。普通 requested scopes 必须同时满足全局 supported scopes、client allowed scopes 和 PAT 自身 authority（`admin` 满足全部普通 scope）。`offline_access` 只是 OAuth refresh capability，不要求 PAT 自身持有。浏览器登录只保存用户身份、credential scopes 与 expiry，不保存 PAT 明文或 hash。
+
+admin PAT 授权**自己拥有的** managed-user client 时，grant 还会获得内部 admin authority；授权其他用户的 client 时只委托普通 scopes。`admin` 不可作为 requestable OAuth scope，不可进入 client `allowed_scopes`，也不出现在 token response 的公开 `scope` 中。shared-key 与 project-share OAuth 均不继承 admin authority。
+
+签发后的 grant 是独立 credential：原 PAT 被撤销、过期或修改 scopes，不改变该 grant。Code exchange 和 refresh rotation 保留内部 authority；现有 OAuth 撤销和 disabled-user 检查继续生效。升级前的 grant 未记录当初 PAT authority，因此全部默认无 admin authority，不按 role 或现有 PAT 猜测。旧 ChatGPT/NewWebCodex connection 需要**用 admin PAT 对自己拥有的 managed client 重新授权一次**才能获得 admin authority；之后 refresh 持续保留，无须再次登录，直至正常失效或撤销。
+
 Server 侧配置见[部署指南](DEPLOYMENT.zh-CN.md#oauth2)；MCP client 设置见 [MCP](MCP.zh-CN.md#oauth2)。
 
 ## Scope 与 authority
@@ -105,7 +120,10 @@ Authentication 回答“**调用方是谁**”；scope 回答“**该调用方�
 
 一个 token 拥有某个 scope，并不能绕过 project boundary 或 native safety check；反过来，知道 Project/Session/Job ID 也不会凭空获得缺失的 scope。
 
-`WEBCODEX_AUTHORITY_MODE` 同样与 authentication 分离。它决定有后果的操作在硬安全检查之后是自动执行还是走配置好的人工授权路径，但不会改变 credential identity 或 scope。Maintainer 级细节见 [Authority model](agent/permission-model.md)。
+`WEBCODEX_AUTHORITY_MODE` 同样与 authentication 分离。`trusted_agent` 在硬安全检查
+通过后自动授权有后果的操作；`restricted` 拒绝这些操作，不会创建审批队列。
+无效配置会拒绝执行。该模式不改变凭据身份或 scope，也不授权超出用户任务范围的发布
+或部署。Maintainer 级细节见 [Authority model](agent/permission-model.md)。
 
 ## Computer observation and control authorization
 

@@ -2,21 +2,21 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const css = readFileSync(new URL("../src/styles/app.css", import.meta.url), "utf8");
-const fullWidthSelector = 'input:not([type="radio"]):not([type="checkbox"]), select';
+const fullWidthSelector = 'input:not([type="radio"]):not([type="checkbox"]):not(.mantine-Input-input), select:not(.mantine-Input-input)';
 const legacySelector = 'input:not([type="radio"]), select';
 
 assert.match(
   css,
-  new RegExp(`${escapeRegExp(fullWidthSelector)}\\s*\\{[^}]*width:\\s*100%;[^}]*height:\\s*39px;`),
-  "text/password/url inputs and selects must retain the full-width 39px input contract",
+  new RegExp(`${escapeRegExp(fullWidthSelector)}\\s*\\{[^}]*width:\\s*100%;[^}]*height:\\s*var\\(--ui-control-height\\);`),
+  "text/password/url inputs and selects must retain the full-width shared control-height contract",
 );
 assert.ok(
-  !css.includes(`${legacySelector} { width: 100%; height: 39px;`),
+  !css.includes(`${legacySelector} { width: 100%;`),
   "checkboxes must not re-enter the legacy full-width input selector",
 );
 assert.match(
   css,
-  /input\[type="checkbox"\]\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;/,
+  /input\[type="checkbox"\]:not\(\.mantine-Checkbox-input\)\s*\{[^}]*width:\s*18px;[^}]*height:\s*18px;/,
   "checkboxes must keep an explicit compact sizing contract",
 );
 assert.match(

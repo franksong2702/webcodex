@@ -107,6 +107,20 @@ impl AuthContext {
         matches!(self.kind, AuthKind::OAuth2Token)
     }
 
+    /// Authenticated managed-user identity for Window Operator continuity only.
+    /// OAuth bridge/project-share subjects and incomplete identities stay apart.
+    pub(crate) fn managed_oauth_window_identity(&self) -> Option<(&str, &str)> {
+        if self.kind != AuthKind::OAuth2Token || self.token_kind.as_deref() != Some("oauth2") {
+            return None;
+        }
+        let user = self.user_id.as_deref().filter(|id| !id.trim().is_empty())?;
+        let client = self
+            .allowed_client_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())?;
+        Some((user, client))
+    }
+
     pub fn is_oauth_shared_key_subject(&self) -> bool {
         self.is_oauth_token() && self.token_kind.as_deref() == Some("oauth2_shared_key")
     }
@@ -125,6 +139,13 @@ impl AuthContext {
         matches!(self.kind, AuthKind::ProjectCredential)
     }
 
+    /// Model/API credentials whose Runner visibility is constrained to one
+    /// ProjectGrant. Runner Agent Tokens deliberately do not participate: they
+    /// are transport credentials and are rejected from model/API surfaces.
+    pub(crate) fn is_project_scoped_model_subject(&self) -> bool {
+        self.is_project_credential() || self.is_oauth_project_subject()
+    }
+
     pub fn is_open_anonymous(&self) -> bool {
         matches!(self.kind, AuthKind::OpenAnonymous)
     }
@@ -133,15 +154,9 @@ impl AuthContext {
         self.is_shared_key() || self.is_open_anonymous()
     }
 
-    /// True when the caller may manage any user (bootstrap token, `admin`
-    /// role, or the `admin` scope). Shared by the user/token/pairing HTTP
-    /// handlers; kept distinct from [`AuthContext::is_admin`] because some
-    /// callers historically also treat an explicit `admin` role as
-    /// authoritative.
+    /// Credential-level admin authority. User role is legacy identity metadata.
     pub fn is_admin_caller(&self) -> bool {
-        self.is_bootstrap
-            || self.role.as_deref() == Some("admin")
-            || self.scopes.iter().any(|s| s == SCOPE_ADMIN)
+        self.is_admin()
     }
 
     /// Resolve the authenticated caller's username, if any. Bootstrap callers
@@ -186,5 +201,26 @@ mod tests {
             auth.token_kind = token_kind.map(str::to_string);
             assert_eq!(auth.principal_kind(), expected, "kind: {kind:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_authority_tests {
+    use super::*;
+
+    #[test]
+    fn admin_is_credential_authority_only() {
+        let mut auth = AuthContext::new(AuthKind::ApiToken);
+        auth.role = Some("admin".into());
+        auth.scopes = vec!["account:manage".into()];
+        assert!(!auth.is_admin_caller());
+        assert!(!auth.has_scope(SCOPE_ADMIN));
+        auth.role = Some("user".into());
+        auth.scopes = vec![SCOPE_ADMIN.into()];
+        assert!(auth.is_admin_caller());
+        assert!(auth.has_scope("project:write"));
+        let bootstrap = super::super::bootstrap_context();
+        assert!(bootstrap.is_admin_caller());
+        assert!(bootstrap.has_scope("account:manage"));
     }
 }

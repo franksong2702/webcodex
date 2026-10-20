@@ -2,26 +2,31 @@
 
 [English](DEPLOYMENT.md) | [简体中文](DEPLOYMENT.zh-CN.md)
 
-本文档只面向**生产与高级自托管**：长期 Server、多机器/多用户、systemd/Docker、反向代理和 operator 管理的网络配置。普通 Windows / macOS 工作站**不要从这里开始**；最推荐的路径是 [WebCodex Desktop + 官方 OpenAI Secure Tunnel](desktop-install.zh-CN.md)。CLI 或已有 Server 再看[完整使用指南](PERSONAL_SETUP.zh-CN.md)；如果只想几分钟临时体验一个仓库，再看[快速试用](QUICK_START.zh-CN.md)。
+本文档只面向**生产与高级自托管**：长期 Server、多机器/多用户、systemd/Docker、反向代理和 operator 管理的网络配置。个人和多机配置请先看[统一安装指南](unified-installation.zh-CN.md)及其发布/验收状态。已发布 Desktop 包仍可按[旧版安装指南](desktop-install.zh-CN.md)使用；高级 CLI 流程保留在[完整使用指南](PERSONAL_SETUP.zh-CN.md)；如果只想几分钟临时体验一个仓库，再看[快速试用](QUICK_START.zh-CN.md)。
+
+## 统一安装状态
+
+个人或多机安装请先看[统一安装指南](unified-installation.zh-CN.md)。其中面向 Windows NSIS、macOS 安装包和 Debian 12 / Ubuntu 22.04+ `.deb` 的 x64、arm64 安装目标已在构建流程中定义；六类安装文件尚未完成原生构建与安装验收，也未作为统一安装包发布。三种平台的真实机器安装、重启持久性、GUI 行为和升级尚未全部验收，详见[部署验收清单](unified-deployment-validation.md)。
+
+下文的 npm/runtime 压缩包、Docker 和平台专属操作流程作为高级兼容与历史运维参考保留，不改变统一安装流程。
 
 ## 组件
 
 - `webcodex` —— 统一 CLI：项目工作流、Server/Runner 生命周期、接入与运维。
-- `webcodex-server` —— Server 进程：暴露 REST、GPT Actions OpenAPI、MCP 与
-  Runner endpoint。
+- `webcodex-server` —— Server 进程：暴露 REST、MCP 与 Runner endpoint。
 - `webcodex-runner` —— 运行在持有仓库机器上的长驻 worker。
 
 执行配置属于实际工作的 Runner。旧 Server 的 `CODEX_*` 设置不再用于选择编码代理的可执行文件、审批模式、超时或参数白名单；编码代理应通过 Runner 的 `[acp]` / `[[acp.agents]]` 配置，参见 [ACP 编码代理指南](agent/acp-coding-agent-run.md)。Server 需要可写的数据目录，不需要单独的旧 `uploads` 目录。
 
 ## 构建与安装
 
-官方分发路径是 npm 薄安装器/包装器：
+已有的 runtime/CLI 发布产物仍可通过 npm 薄安装器/包装器获取：
 
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
 
-支持 Linux x64、Linux arm64、macOS x64、macOS arm64、Windows x64 与 Windows arm64。Windows 支持 CLI + Runner、显式前台 Server，以及显式本机 `webcodex share --tunnel cloudflare|openai|none`。Windows x64 支持 managed Cloudflare 获取；固定版本 upstream 没有官方 Windows ARM64 artifact，因此 ARM64 使用 Cloudflare 时需要受信任的显式/`PATH` binary。managed OpenAI `tunnel-client` 支持 Windows x64/arm64。WebCodex 仍不支持 Windows Server/Runner service 托管生命周期；Windows 上应显式以前台方式运行。npm 包装器要求 Node.js 18 或更新。Linux x64 native artifact 以 glibc 2.17 或更新为兼容基线。
+支持 Linux x64、Linux arm64、macOS x64、macOS arm64、Windows x64 与 Windows arm64。Windows 支持 CLI + Runner、显式前台 Server，以及显式本机 `webcodex share --tunnel cloudflare|openai|none`。Windows x64 支持 managed Cloudflare 获取；固定版本 upstream 没有官方 Windows ARM64 artifact，因此 ARM64 使用 Cloudflare 时需要受信任的显式/`PATH` binary。原生 OpenAI Tunnel 支持 Windows x64/arm64。旧 `server install` / `runner install` 命令不托管 Windows 服务，仍可使用下文前台流程。新的 `environment` 配置默认使用 user scope，在 Windows 上由已登录用户的计划任务托管。显式 `--scope system` 才选择 SCM 服务，并要求 OS 授权与账户配置；已有环境保留其已保存范围和所有者。user scope 不保证登录前或注销后运行；参见[统一安装指南](unified-installation.zh-CN.md#服务与凭据)及待完成的原生验收。npm 包装器要求 Node.js 18 或更新。Linux x64 native artifact 以 glibc 2.17 或更新为兼容基线。
 
 从源码构建：
 
@@ -91,8 +96,7 @@ shared-key 自动化场景优先使用 `--key-file <path>`，不要与 `--key` �
 4. 在 server 上创建短期 pairing code，并在持有仓库的机器上运行
    `webcodex login <server-url> --code <code>`。
 5. 在该仓库机器上安装 `webcodex-runner` 服务。
-6. 运行 `webcodex ops status --strict`；之后才导入 GPT Actions schema 或添加
-   MCP connector。
+6. 运行 `webcodex ops status --strict`；之后再添加 MCP connector。
 
 ### Server 设置
 
@@ -149,6 +153,38 @@ WebSocket continuity，也不宣称 literal zero interruption。
 boundary：installer 会 fail closed，避免与旧进程争抢地址。先停止 legacy Server，再用
 `--overwrite` 重新安装；这次首次迁移本身不保证无 gap。
 
+### MCP Host timing profile
+
+MCP 调用等待属于 Server 侧的 Host 适配，与 Runner execution timeout 分开配置。普通 MCP Host 使用默认的 `direct` profile，通常无需额外配置：
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=direct
+```
+
+如果外部 Host 自带 native Code Mode/orchestration，并且整个 composition 的 wall-clock budget 约为 55 秒，可配置：
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=host_code_mode
+# 可选：host_code_mode 本身默认就是 55 秒。
+WEBCODEX_MCP_HOST_BUDGET_SECS=55
+```
+
+如果需要独立测试有界的 **Server 端等待上限**，可以显式配置以下两个可选变量；不配置时维持当前默认行为：
+
+```text
+# 可选；未设置时 host_code_mode 仍采用原有的 5 秒派生值。
+WEBCODEX_MCP_HOST_SYNC_WAIT_MAX_SECS=8
+WEBCODEX_MCP_HOST_CONTINUATION_WAIT_MAX_SECS=5
+```
+
+前者控制已启动的 structured Job 同步等待多久后移交续接（整数 1–60 秒）；后者控制普通 `observe_jobs`／`job_tail` 等待及生成的续接等待（整数 1–100 秒）。变量无效或超出范围时，Server 在启动阶段明确报错，错误文本只包含变量名称和合法范围，不回显输入值。两个数值还受到所选请求的 Host budget 减去 5 秒返回预留时间的约束；客户端通过请求头切换 profile 或缩小预算，不会绕过部署上限。`wait_for_job_readiness` 仍独立按照 Host budget 计算。
+
+这两个设置在 Server 重启后生效，不改变 Job 真实执行超时，也不是模型工具参数。上述数值仅用于**实验**，不是推荐的全局默认值；评估时应同时观察 Host 请求耗时及最终 Job 结果。`get_runtime_status.effective_config.mcp_host` 展示非敏感的部署生效值，而不是每次请求头缩小后的值。
+
+`WEBCODEX_MCP_HOST_BUDGET_SECS` 表示 Host 侧单次 MCP call / composition 的预算，不是 command runtime。工具的 `timeout_secs` 仍表示真实 execution lifetime，可以远大于 Host budget。WebCodex 不会根据 `clientInfo`、User-Agent 或 Host 产品名自动推断 profile。
+
+`host_code_mode` 表示外部 MCP Host 提供的 orchestration，与 WebCodex experimental internal Code Mode 及其自身 nested-execution 防护不是同一个概念。`runtime_status.effective_config.mcp_host` 报告的是非敏感的**部署默认值**。同服混用时，在每个客户端连接上配置 `X-WebCodex-MCP-Profile`，并可用 `X-WebCodex-MCP-Budget-Secs` 缩短等待预算；不是模型工具参数。详见 [MCP 客户端策略](MCP.zh-CN.md#同一-server-的客户端策略)。省略 header 才使用部署默认值，不按品牌自动识别。
+
 ### Tool invocation trace
 
 Tool-request trace 是 **operator diagnostic**，默认关闭。轻量排障使用 metadata 模式；只有明确需要 request/response payload capture 时才使用 `full`：
@@ -166,7 +202,7 @@ WEBCODEX_TOOL_REQUEST_TRACE_MAX_TOTAL_BYTES=2147483648
 
 ### 公网 HTTPS
 
-Hosted MCP 客户端与 GPT Actions 需要公网 HTTPS URL。在 Server env 文件中设置
+Hosted MCP 客户端 需要公网 HTTPS URL。在 Server env 文件中设置
 `WEBCODEX_PUBLIC_URL`，并在 `127.0.0.1:8080` 前面配置反向代理。支持 Nginx；
 named Cloudflare Tunnel 也是有效入口。同一 hostname 必须承载普通 HTTPS 请求
 与 `/api/agents/ws`（Cloudflare 支持 WebSocket upgrade）。WebCodex CLI 不会自动
@@ -269,8 +305,7 @@ bootstrap 现在是可恢复事务，而不是一次性脚本。它会在创建 
 随后通过私有 `.webcodex-bootstrap.receipt` 依次记录 `AssetsPrepared`、
 `SecretCommitted`、`ContainerStarted`、`ServerHealthy`、`PairingReady`。receipt 只保存
 hash 与阶段，不保存 administrator token。`.env` 通过 0600 临时文件写入、sync 后原子 rename。
-只有 Compose healthcheck 与 `/openapi.json` 都验证通过后才打印成功，并在这个 readiness
-barrier 之后创建第一枚短期 pairing code。
+只有 Compose healthcheck 与 `/healthz` readiness 都验证通过后才打印成功，并在这个 readiness barrier 之后创建第一枚短期 pairing code。
 
 安装被中断，或 startup/health check 失败时，不要删除 `.env`；在同一目录继续使用同一份
 bootstrap：
@@ -316,6 +351,8 @@ package 时默认将其设为 private；维护者
 | `transport` | 配置 `[quic]` 时优先用 `auto`。 |
 | `project_registry_dir` | 项目注册文件目录。 |
 | `[policy]` | 本地执行边界（`allowed_roots` 等）。 |
+| `[skills].roots` | **自 v0.4.2 起可用。** 可选的 Runner 本机绝对 live Skill roots；WebCodex 不修改其中内容，受支持脚本可经 `run_skill_resource` 执行，也不会复制进 managed Skill Store。 |
+| `[instructions].files` | 可选 Runner 本机绝对 instruction 文件；应用于该 Runner 上每个 Project。无隐式默认路径；路径列表可 hot reload，文件内容本身 live。 |
 | `[shell]` | 可选 shell profile 定义与有界 persistent-shell 限制。 |
 | `[ssh.resources.<name>]` | 可选命名 SSH 目标，用于 Session 绑定的 `run_shell` / `run_job`。 |
 
@@ -332,13 +369,20 @@ max_output_bytes = 262144
 ```
 
 编辑已经运行的 Runner 启动时绑定的 `runner.toml` 后，先调用
-`runner_config_check(client_id=...)`，再把返回的 `current_generation` 作为
-`runner_config_reload(client_id=..., expected_generation=...)` 的 fence，最后调用
-`runtime_status(client_id=...)` 检查状态。check 不激活 candidate；reload 也不写配置文件。
+`check_runner_config(client_id=...)`，再把返回的 `current_generation` 作为
+`reload_runner_config(client_id=..., expected_generation=...)` 的 fence，最后调用
+`get_runtime_status(client_id=...)` 检查状态。check 不激活 candidate；reload 也不写配置文件。
 无效 candidate 保留旧 active snapshot/generation，`restart_required_fields` 明确列出仍需
 重启、且不会假装已经在线生效的 startup-only 变更。Unix service reload/SIGHUP 仍保留为
 调用同一 reload primitive 的兼容 trigger，但 first-class config control 不依赖它。身份、
 server/auth、项目来源、并发、能力与传输等字段在被报告为 restart-only 时仍需要重启。
+
+`[instructions].files` 明确属于 hot-reloadable 字段：完成 check/reload 后，新 Project
+bootstrap 会立即使用新的路径列表，不需要重启 Runner。已配置 instruction 文件的内容
+发生变化时甚至不需要 config reload，下一次 bootstrap 会直接重新读取。Configured
+instruction path 不会扩大 `[policy].allowed_roots` 或普通 Project filesystem authority，
+startup projection 也不会暴露 native absolute path。当前行为是 Runner-level 的手工
+`runner.toml` 配置，对该 Runner 上每个 Project 生效；Desktop 文件选择/上传 UI 后续再做。
 
 `[plugins]` 支持 live reload：generic Runner config reload 与 `plugin_tool reload` 共用同一个
 Plugin candidate admission/atomic-commit primitive。Plugin provider Tool 始终是 Runner-local
@@ -350,14 +394,20 @@ Plugin discovery 重启 Runner。
 
 ## OAuth2
 
-Server 没有公网 origin 时 OAuth2 仍默认关闭。使用 `webcodex server init --public-url https://your-domain.example` 时，初始化会写入 public URL、以该 URL 作为 issuer 启用 OAuth，并为普通 hosted connect 启用 shared-key OAuth bridge。手工维护 env 时等价配置为：
+Server 没有公网 origin 时 OAuth2 仍默认关闭。使用 `webcodex server init --public-url https://your-domain.example` 时，初始化会写入 public URL，并以该 URL 作为 issuer 启用 OAuth。跨该 public boundary 的 direct shared-key auth 与 shared-key OAuth bridge 默认仍关闭；如需有意启用，必须额外传入 `--allow-remote-shared-key`。
+
+手工维护 env 且有意启用 remote shared-key auth 与 shared-key OAuth bridge 时，配置为：
 
 ```text
 WEBCODEX_PUBLIC_URL=https://your-domain.example
 WEBCODEX_OAUTH2_ENABLED=true
 WEBCODEX_OAUTH2_ISSUER=https://your-domain.example
+WEBCODEX_SHARED_KEY_ENABLED=true
+WEBCODEX_SHARED_KEY_REMOTE_ENABLED=true
 WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE=true
 ```
+
+如果配置了 direct shared-key auth，同时启用的 QUIC Runner listener 绑定到非 loopback 地址，也必须使用同一个 remote opt-in；QUIC 默认监听地址为 `0.0.0.0:8443`。
 
 普通仓库机器不需要 managed login，直接使用 MCP 客户端要求的精确 callback：
 
@@ -377,6 +427,12 @@ webcodex connect https://your-domain.example --auth oauth \
 
 Runner 继续使用原有 hosted credential，MCP client 获得独立 OAuth credential。`--oauth-computer-permissions` 与 `--oauth-local-mcp` 都是 optional capability 的显式 opt-in；普通 reconnect 不会静默增加这些权限。真实 OAuth 权限变化需要 client 重新授权。ChatGPT 不会得到 Runner/shared-key credential，OAuth token 也不能用于 Runner transport。
 
+Browser Use 的 shared-key OAuth delegation 需要在 `connect --auth oauth` 时显式指定 `--oauth-browser-permissions`，仅追加 `browser:read`、`browser:control`、`browser:launch`。默认 baseline 不包含 Browser scope；Browser 与 `--oauth-computer-permissions` 相互独立，也不使用 Computer consent checkbox。已有 client 不会自动扩权，历史窄权限仅追加显式选择的类别。scope ceiling 变化会撤销旧 grants 并要求重新授权；复用已启用 Browser 的 profile 时必须继续携带该 flag。
+
+OAuth authority 迁移为 authorization-code、access-token、refresh-token 表增加 `admin_authority INTEGER NOT NULL DEFAULT 0 CHECK(admin_authority IN (0, 1))`。迁移 additive 且幂等，旧记录全部保持 false，不从 user role 或当前 PAT 回填。`users.role` 保留为 legacy metadata，不提供 runtime/admin authority。窄 PAT 不再因用户 role=admin 而获得 admin 操作权限，管理 OAuth client 还需 `account:manage`。
+
+旧 ChatGPT/NewWebCodex OAuth connection 不会自动获得 admin authority。需要使用 admin PAT，为同一用户自己拥有的 managed-user client 重新授权一次。新 grant 在 exchange 与 refresh 中持续保留内部 admin authority，不受原 PAT 后续撤销、过期或 scopes 变化影响。OAuth 撤销与 disabled-user 检查仍有效。公开 scopes 不含 `admin`，shared-key/project-share OAuth 仍无 admin authority。参见[认证模型](AUTH_MODEL.zh-CN.md#oauth2)。
+
 只有明确需要 managed-user OAuth identity 时，才使用高级 `webcodex login` 流程，再执行 `webcodex connect ... --auth managed-oauth --oauth-redirect-uri ...`；`--user` 仅用于该模式。
 
 创建 OAuth client（`client_secret` 只返回一次；服务端只存其 hash）：
@@ -390,26 +446,36 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` 限制 OAuth client 最多可以请求哪些权限。WebCodex 新增 permission 时不会静默扩大已有 client。要修改现有 client，请把期望保留的完整、非空 allow-list 提交到 `POST /api/oauth/clients/update_scopes`。真实变化会让旧 OAuth grant 失效并要求重新授权；提交相同 canonical list 是 no-op。安全模型见[认证](AUTH_MODEL.zh-CN.md#oauth2)。
 
-如果启用 ChatGPT MCP host-file import，请把精确的 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`。重新创建 client 会生成新 id，因此应把更新这个设置作为一次显式 trust rotation。Client display name 与 redirect URI 不能替代该精确 client id。
+ChatGPT MCP host-file import 采用两级 trust。正常 active authenticated OAuth client 只能从 OpenAI attachment host 导入：`files.oaiusercontent.com` 及其子域，以及严格匹配的 Sediment Azure Blob 账户 `oaisdmntpr<region>.blob.core.windows.net`；这些 URL 仍要求 HTTPS、public DNS resolution + address pinning、443 端口、无 userinfo、禁止 redirect，并继续受 bounded download 与 Project write policy 约束。只有当某个 client 还需要从任意 public HTTPS host 导入时，才把其精确 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`，获得同样 SSRF 防护下的 Tier 1 扩展信任。重新创建 client 会生成新 id，但普通 OpenAI-host attachment import 不再因此失效；更新该设置只用于恢复更宽的 Tier 1 trust。Client display name 与 redirect URI 永远不能授予 Tier 1 trust。
+
+对于绑定到 loopback、并通过 OpenAI Secure Tunnel 访问的 operator-controlled Server，还有一个独立的 local-only 例外。设置 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` 后，仅当请求由允许的本地 credential 认证时才信任 ChatGPT host-file rewrite：普通 user API token，或 Desktop regular Tunnel 使用的已配置 Server bootstrap credential。该 Tunnel 从本机 `WEBCODEX_TOKEN` 配置派生 credential 并私下完成注入；不要复制或暴露它。非 loopback bind 和其它 credential class 都会忽略该 flag；network-accessible Server 应保持未设置。
+
+仅上述明确受信任的 loopback 来源，在 HTTPS 主机名匹配现有 OpenAI 附件域名白名单时，
+才允许 DNS 解析结果落入 RFC 2544/TUN Fake-IP 网段 `198.18.0.0/15`。
+其它内网或敏感地址仍被拒绝；OAuth 及远程可信客户端仍要求 DNS 结果为公网地址。
+DNS 地址固定、TLS 主机名校验、禁止代理与重定向、文件大小限制及 Project 写入权限均保持不变。
+如果本机没有正确配置 TUN，该例外也不会让 Fake-IP 自动可达。
+
+导入阶段诊断与精确主机的 Fake-IP DNS 排障见[会话附件导入](CONVERSATION_FILE_IMPORT.md)。
+解析器配置变更必须保留导入信任边界、地址策略与地址固定保护。
 
 用 `POST /api/oauth/clients/list` 与 `POST /api/oauth/clients/revoke` 列出与
 撤销 client。OAuth 使用 authorization-code 流程；动态 client 注册、OIDC 与
 device-code 流程未实现。宿主提供 `offline_access` 时保持勾选——它是协议级
 refresh-token scope，不授予额外 WebCodex 权限。
 
-## GPT Actions 与 MCP
+## MCP 接入
 
-- **MCP：** 用 user API token（`wc_pat_*`）把客户端连接到
-  `https://your-domain.example/mcp`；启用 OAuth 时用 OAuth 流程。
-- **GPT Actions：** 把 `https://your-domain.example/openapi.json` 以 HTTP Bearer
-  认证导入 Custom GPT。
+用 user API token（`wc_pat_*`）连接 `/mcp`；启用 OAuth 时使用 OAuth 流程。
+MCP 与通用 REST 仍进入同一个 ToolRuntime 授权路径。v0.5 不再提供 Action
+适配器、OpenAPI 导入文档或兼容 feature。
 
-两者使用同一个 user API token 与同一个 ToolRuntime。OpenAPI schema 有意排除
-users、token、pairing/enrollment、setup、doctor、npm、server 管理与 audit
-endpoint。这些请用 `webcodex` 完成。
+详见 [MCP](MCP.zh-CN.md) 与 [AI 接入指南](AI_ONBOARDING.zh-CN.md)。
 
-MCP 与 GPT Actions 见 [MCP.md](MCP.zh-CN.md) 与客户端特定设置
-[AI 接入指南](AI_ONBOARDING.zh-CN.md)。
+如果 ChatGPT 返回 conversation-level developer-MCP `FORBIDDEN`，不要直接把它当作
+Server 或 Runner 已离线的证据。先使用下面的 operator checks 独立验证部署，再按照
+[故障排查](TROUBLESHOOTING.zh-CN.md) 中的 Host 分层决策树判断；不要在 Runner 本来
+健康时仅因为该 Host error 就旋转 credential、重新注册 project 或反复重启 Runner。
 
 ## 运维
 
@@ -421,11 +487,12 @@ MCP 与 GPT Actions 见 [MCP.md](MCP.zh-CN.md) 与客户端特定设置
 | --- | --- |
 | 未设置 / 空 | `trusted_agent`（自托管单运维者部署的默认值）。 |
 | `trusted_agent` | 项目工作、shell、jobs、git、校验在硬安全检查后自动执行，无审批中断。Push/tag/publish/release/deploy 仍要求用户任务显式包含该动作。 |
-| `restricted` | 有后果的工具在人工批准前被拒绝（`webcodex task approve/deny`）。 |
+| `restricted` | 有后果的 runtime 工具由 permission policy 拒绝；不存在独立 Connector command approval queue。 |
 
 `trusted_agent` 永不放松硬安全边界（项目根、只读会话、路径策略、凭据脱敏、
-job 取消语义）。`WEBCODEX_PERMISSION_MODE` 支持明确映射：`dev_auto_approve` → `trusted_agent`，
-`require_approval` → `restricted`；未知值及新旧配置冲突仍拒绝。
+job 取消语义）。v0.5 只接受上表的 canonical 值；`dev_auto_approve`、`require_approval`
+不再作为别名。必须彻底取消设置旧的 `WEBCODEX_PERMISSION_MODE`（空值也不行）；
+发现旧变量时明确拒绝，不能静默回落到 `trusted_agent`。
 
 ### 运维检查
 
@@ -447,22 +514,17 @@ webcodex ops smoke-preflight --server-url "$SERVER_URL" \
 1. `webcodex ops status ... --strict` 通过。
 2. `POST /api/runtime/status` 返回 `service=webcodex` 与预期公网 URL。
 3. `list_runners` 显示至少一个在线 Runner。
-4. `listProjects` 显示 `agent:<client_id>:<project_id>` id。
+4. `list_projects` 显示 `agent:<client_id>:<project_id>` id。
 5. 已知项目上的只读项目工具可用。
 6. 写入/替换/校验测试只针对一次性 smoke 项目。
 
 ### Runtime console
 
-Server 在 `/console` 提供 host-local 浏览器 console。它展示项目就绪状态、工作队列、
-Workflow Session 活动、当前可见 Runner 与近期变更性活动。对于 Connector task，同机
-人类可以发送 task guidance、处理待审批操作、取消工作，并对稳定结果执行 Accept 或
-Reject；这些动作与 CLI 使用相同的权限边界，在线模型仍然不能接受自己的工作。Console
-还会展示不含 secret 的客户端连接目标，并把 ChatGPT Developer Mode MCP custom app
-作为 ChatGPT 主路径。Credential 不会由 console API 返回。
+Server 在 `/runtime` 提供 Runtime Console。它通过与 ToolRuntime 相同的 authorization path 展示普通 runtime、Project、Runner、Job、Workflow Session、collaboration 与近期 activity。Project-scoped credential 只能看到自己的 ProjectGrant-visible Runner/Project；知道其它 Project/Runner id 也不会扩大可见性。旧 `/console` Project Review Console 以及 task/result/approval API 已删除。Runtime Console API 不会返回 credential。
 
 ### Runtime job API 信任模型
 
-`job_status`、`job_log`、`list_jobs` 与 `job_tail` 面向受信的单运维者部署。它们
+`observe_jobs`、`list_jobs` 与 `read_job_tail` 面向受信的单运维者部署。它们
 不是互不信任用户之间的租户边界。不要把单个 runtime 暴露给多个不受信用户，除非
 为无项目 job API 增加 job-owner 隔离；否则请使用独立的 server/runtime 实例。
 

@@ -32,6 +32,30 @@ pub(crate) struct ServerStatusOptions {
 }
 
 pub(crate) async fn run_server_tunnel(opts: ServerTunnelOptions) -> Result<(), String> {
+    run_server_tunnel_with_stop(opts, std::future::pending()).await
+}
+
+pub(crate) async fn run_server_tunnel_with_stop(
+    opts: ServerTunnelOptions,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    if let Some(runtime_binding) = opts.runtime_binding {
+        let profile =
+            webcodex_environment::load_cloudflare_tunnel_materialization(&runtime_binding)
+                .map_err(|error| error.to_string())?;
+        if !opts.provider.matches(&profile.provider) {
+            return Err(
+                "The requested Tunnel provider does not match its private runtime binding".into(),
+            );
+        }
+        return webcodex::run_cloudflare_tunnel_with_stop(
+            runtime_binding,
+            opts.stop_on_stdin_eof,
+            stop,
+        )
+        .await;
+    }
+    webcodex::load_service_environment_file(&opts.env_file)?;
     let local_server_url = derive_regular_tunnel_server_url(&opts.env_file)?;
     let bootstrap_token = derive_regular_tunnel_bootstrap_token(&opts.env_file)?;
     let runtime_parent = opts
@@ -39,11 +63,15 @@ pub(crate) async fn run_server_tunnel(opts: ServerTunnelOptions) -> Result<(), S
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    webcodex::run_regular_server_tunnel(webcodex::RegularServerTunnelOptions {
-        local_server_url,
-        bootstrap_token,
-        runtime_parent,
-    })
+    webcodex::run_regular_server_tunnel_with_stop(
+        webcodex::RegularServerTunnelOptions {
+            local_server_url,
+            bootstrap_token,
+            runtime_parent,
+            stop_on_stdin_eof: opts.stop_on_stdin_eof,
+        },
+        stop,
+    )
     .await
 }
 
@@ -150,14 +178,16 @@ pub(crate) fn run_server_init(opts: ServerInitOptions) -> Result<String, String>
         }
         next_steps.push(foreground_command.clone());
         next_steps.push(status_command.clone());
-        next_steps.push("configure HTTPS/public URL separately if using GPT Actions".to_string());
+        next_steps.push("configure HTTPS/public URL separately for remote MCP clients".to_string());
+        let shared_key_enabled = super::env::server_init_direct_shared_key_enabled(&opts);
         let summary = json!({
             "env_file": opts.env_file.to_string_lossy(),
             "listen": opts.listen,
             "data_dir": opts.data_dir.to_string_lossy(),
             "public_url": opts.public_url,
             "open": opts.open,
-            "shared_key_enabled": true,
+            "shared_key_enabled": shared_key_enabled,
+            "shared_key_remote_enabled": opts.allow_remote_shared_key,
             "token_generated": token_generated,
             "token_prefix": token_prefix(&token),
             "wrote_env_file": true,
@@ -184,6 +214,17 @@ pub(crate) fn run_server_init(opts: ServerInitOptions) -> Result<String, String>
     out.push_str("\nDetails:\n");
     out.push_str(&format!("  Configuration: {}\n", opts.env_file.display()));
     out.push_str(&format!("  Listen:        {}\n", opts.listen));
+    if super::env::server_init_has_remote_boundary(&opts) {
+        if opts.allow_remote_shared_key {
+            out.push_str(
+                "  Shared key:    enabled, remote shared-key auth ALLOWED (--allow-remote-shared-key)\n",
+            );
+        } else {
+            out.push_str(
+                "  Shared key:    disabled for this remote/public setup (pass --allow-remote-shared-key to allow)\n",
+            );
+        }
+    }
     Ok(out)
 }
 
@@ -557,8 +598,8 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
     let tools_count = output
         .and_then(|v| v.pointer("/tools/count"))
         .and_then(Value::as_u64);
-    let agents_online_count = output
-        .and_then(|v| v.pointer("/agents/online_count"))
+    let runners_online_count = output
+        .and_then(|v| v.pointer("/runners/online_count"))
         .and_then(Value::as_u64);
     let server_build = runtime_build_metadata(output);
     let local_build = local_cli_build_metadata();
@@ -569,6 +610,7 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
     if opts.json {
         let summary = json!({
             "http_reachable": http.reachable,
+            "server_pid": output.and_then(|v| v.get("pid")).and_then(Value::as_u64),
             "probe_url": probe_url,
             "http_status_code": http.status_code,
             "http_content_type": http.content_type,
@@ -590,8 +632,8 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
             "tools": {
                 "count": tools_count,
             },
-            "agents": {
-                "online_count": agents_online_count,
+            "runners": {
+                "online_count": runners_online_count,
             },
             "server_build": {
                 "version": server_build.version,
@@ -606,6 +648,14 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
                 "built_at": local_build.built_at,
             },
             "revision_check": server_status_revision_check(&revision_comparison),
+            "desktop_runtime_contract": output.and_then(|v| v.get("desktop_runtime_contract")).cloned().unwrap_or(Value::Null),
+            "protocol_compatibility": output.and_then(|v| v.get("desktop_runtime_contract"))
+                .and_then(|v| serde_json::from_value::<webcodex_core::desktop_runtime_contract::DesktopRuntimeContract>(v.clone()).ok())
+                .filter(|range| range.is_valid())
+                .map(|range| if range.overlaps(webcodex_core::desktop_runtime_contract::DESKTOP_RUNTIME_CONTRACT) { "compatible" } else { "incompatible" })
+                .unwrap_or("unknown"),
+            "server_runner_protocol_compatibility": output.and_then(|v| v.get("protocol_compatibility")).cloned().unwrap_or(Value::Null),
+            "build_alignment": output.and_then(|v| v.get("build_alignment")).cloned().unwrap_or(Value::Null),
         });
         return serde_json::to_string_pretty(&summary).map_err(|e| e.to_string());
     }
@@ -615,7 +665,7 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
     } else {
         "Server: unreachable\n"
     });
-    if let Some(count) = agents_online_count {
+    if let Some(count) = runners_online_count {
         out.push_str(&format!("Runners online: {count}\n"));
     }
     out.push_str("\nNext:\n");
@@ -632,11 +682,11 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
         } else {
             out.push_str("  Start the WebCodex Server, then run this status command again.\n");
         }
-    } else if agents_online_count == Some(0) {
+    } else if runners_online_count == Some(0) {
         out.push_str(
             "  Create a one-time login code in another terminal with `webcodex pairing create`.\n",
         );
-    } else if agents_online_count.is_some_and(|count| count > 0) {
+    } else if runners_online_count.is_some_and(|count| count > 0) {
         out.push_str(
             "  Check project readiness on the project machine with `webcodex runner status`.\n",
         );
@@ -693,8 +743,8 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
             .unwrap_or_else(|| "unknown".to_string())
     ));
     out.push_str(&format!(
-        "  agents.online_count:   {}\n",
-        agents_online_count
+        "  runners.online_count:   {}\n",
+        runners_online_count
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     ));

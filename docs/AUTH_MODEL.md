@@ -18,10 +18,10 @@ Do not copy the Server bootstrap token to a client, and do not use a Runner toke
 | --- | --- | --- |
 | Server bootstrap token | `WEBCODEX_TOKEN` in the Server env | Initial administration and emergency recovery |
 | Pairing code | `wc_pair_...` | One-time device/user enrollment |
-| Personal API token (PAT) | `wc_pat_...` | MCP, GPT Actions, and runtime API access for a managed user |
+| Personal API token (PAT) | `wc_pat_...` | MCP and runtime API access for a managed user |
 | Runner token | `wc_agent_...` | `webcodex-runner` transport only |
 | Shared key | `wck_...` | Hosted shared-key MCP/runtime access and the matching Runner group |
-| Project Credential | protected project-private file | One project-first Connector/share environment |
+| Project Credential | protected project-private file | One ProjectGrant's ordinary runtime API/MCP access |
 | OAuth access token | `wc_oat_...` | Delegated MCP/GPT access when OAuth is enabled |
 | Account credential | `wc_acct_...` | Advanced managed-account token creation only |
 
@@ -49,7 +49,14 @@ The rule is simple: **knowing an ID or opaque tool value never substitutes for a
 
 ## Server bootstrap token
 
-`WEBCODEX_TOKEN` is the Server's bootstrap/admin credential. `webcodex server init` stores it in the Server environment. Use it for initial administration, user creation/pairing, and emergency recovery. Do not use it for MCP, GPT Actions, Runner connectivity, or ordinary daily work.
+`WEBCODEX_TOKEN` is the Server's bootstrap/admin credential. `webcodex server init` stores it in the Server environment. Use it for initial administration, user creation/pairing, and emergency recovery. Do not manually supply it to external MCP/GPT clients or reuse it as a Runner token.
+
+The same-owner Desktop/local Server Tunnel is an intentional exception: its protected
+local authorization file uses bootstrap internally, while the ChatGPT connection
+contains no WebCodex secret. This trusted self-hosted connection carries that owner's
+authority; it is not a restricted delegated user. No additional Tunnel token is needed.
+Use the existing delegated credentials when connecting a different trust domain.
+[Personal deployment lifecycle](implementation/personal-environment-lifecycle.md).
 
 ## Pairing and managed login
 
@@ -59,7 +66,7 @@ The pairing code is temporary; it is not a long-lived API credential.
 
 ## Personal API token (`wc_pat_*`)
 
-A PAT represents a managed user on MCP, GPT Actions, and the runtime API. The Server stores only its hash. `webcodex login` normally writes the user's token to `webcodex-user-token` under that Server/user's local configuration directory.
+A PAT represents a managed user on MCP and the runtime API. The Server stores only its hash. `webcodex login` normally writes the user's token to `webcodex-user-token` under that Server/user's local configuration directory.
 
 Use the smallest scopes needed for the workflow. A PAT used by an MCP coding client normally needs runtime/project scopes appropriate to the actions that client will perform. Account-management authority is separate and should not be added to ordinary coding clients.
 
@@ -77,11 +84,15 @@ The protected profile stores the key after creation; repeated `connect` reuses i
 
 ## Project Credential
 
-`webcodex setup` and temporary project-first flows use a protected Project Credential tied to one project environment. It is not a general user/admin token and must not be reused for unrelated projects.
+`webcodex setup` and temporary project-first flows use a protected Project Credential tied to one ProjectGrant. It is not a general user/admin token and must not be reused for unrelated projects. ProjectGrant Runner visibility plus canonical Project resolution prevents a credential from listing, resolving, or calling Projects from another grant. Direct Adaptive tools and `call_runtime_tool` use the same authority boundary.
+
+Project-scoped credentials also cannot expand the Runner Project registry with ordinary `register_project`, `create_project`, or `unregister_project` operations. Path-based coding may reuse only an exact caller-visible registered Project; `work_on_project(mode=worktree)` is the canonical exception that may derive a managed worktree Project from that already-authorized source Project.
 
 After verification, WebCodex keeps the non-secret authorization metadata it needs internally. It is not another credential the user needs to copy or manage.
 
 ## OAuth2
+
+Authentication identifies the user. Ownership limits whose resources may be managed. Credential scopes carry authority: `admin` is the credential-level super-scope, while `account:manage` grants narrower account, token, pairing and OAuth-client management within ownership boundaries. Bootstrap retains full authority. `user.role` remains legacy metadata and does not grant runtime/admin authority. PAT, Runner token, OAuth, shared-key and Project Credential kinds/audiences remain isolated.
 
 OAuth lets MCP/GPT clients use the authorization-code flow instead of storing a long-lived PAT in the client. Register the exact callback URL required by the client and follow the connection output from `webcodex share --auth oauth` or `webcodex connect --auth oauth`.
 
@@ -97,6 +108,14 @@ WebCodex never silently expands an existing OAuth client's allowed permissions w
 
 For ordinary hosted shared-key OAuth, `webcodex connect ... --auth oauth` keeps the Runner on its shared key and gives the MCP client a separate OAuth credential. `--oauth-computer-permissions` explicitly enables the additional Computer permissions offered by that flow; `--oauth-local-mcp` explicitly enables access to configured Runner-owned local MCP providers. Managed-user OAuth remains a separate advanced flow (`--auth managed-oauth`).
 
+Shared-key OAuth delegation for Browser Use requires explicit `--oauth-browser-permissions` on `connect --auth oauth`. It adds only `browser:read`, `browser:control`, and `browser:launch`. The baseline excludes Browser scopes. Browser authority is independent of `--oauth-computer-permissions` and its consent checkboxes. Existing clients never expand automatically; narrow historical profiles gain only the explicitly selected class. Scope ceiling changes revoke old grants and require reauthorization. Reusing a Browser-enabled profile requires the flag again.
+
+Managed-user OAuth snapshots credential authority when a first-party PAT authorizes the grant. Ordinary requested scopes must be supported globally, allowed by the client, and held by the PAT (`admin` satisfies every ordinary scope). `offline_access` is only an OAuth refresh capability and does not need to be held by the PAT. Browser login retains only user identity, credential scopes and expiry; it never retains the PAT secret or hash.
+
+An admin PAT authorizing its **own** managed-user client also grants internal admin authority. An admin PAT authorizing another user's client delegates only ordinary scopes. `admin` is never a requestable OAuth scope, a client `allowed_scopes` entry, or part of the public token-response `scope`. Shared-key and project-share OAuth never inherit admin authority.
+
+The grant is an independent credential after issuance: revoking or expiring the PAT, or changing its scopes, does not change the grant. Code exchange and refresh rotation preserve internal authority. Existing OAuth revocation and disabled-user checks still apply. Pre-upgrade grants default to no admin authority because their authorizing PAT authority was not recorded; no role or current PAT is used to guess it. Existing ChatGPT/NewWebCodex connections need **one reauthorization using an admin PAT for its own managed client** to acquire admin authority. Subsequent refreshes preserve it without another login until normal expiry or revocation.
+
 Server configuration is in [Deployment](DEPLOYMENT.md#oauth2); MCP client setup is in [MCP](MCP.md#oauth2).
 
 ## Scopes and authority
@@ -105,7 +124,12 @@ Authentication answers **who the caller is**. Scopes answer **which classes of o
 
 A token having a scope does not bypass project boundaries or native safety checks. Conversely, knowing a Project/Session/Job identifier does not create the missing scope.
 
-The Server's `WEBCODEX_AUTHORITY_MODE` is also separate from authentication. It controls whether consequential operations auto-execute after hard safety checks or require the configured human-authorization path; it does not change credential identity or scope membership. See [Authority model](agent/permission-model.md) for maintainer-level detail.
+The Server's `WEBCODEX_AUTHORITY_MODE` is also separate from authentication.
+`trusted_agent` auto-authorizes consequential operations after hard safety checks;
+`restricted` denies them and does not create an approval queue. Invalid settings
+fail closed. The mode does not change credential identity or scope membership,
+and does not grant permission to publish or deploy outside the user's authorized
+task. See [Authority model](agent/permission-model.md) for maintainer-level detail.
 
 ## Computer observation and control authorization
 

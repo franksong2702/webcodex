@@ -12,12 +12,12 @@ async fn activation_stops_if_connection_identity_changes_during_config_retry() {
             std::fs::create_dir(&project).unwrap();
             let config_path = tmp.path().join("runner.toml");
             let mut responses = vec![(
-                "/api/runners/config/check",
+                "tool:check_runner_config",
                 json!({"success":true,"output":{"valid":true,"current_generation":1,"restart_required":false}}),
             )];
             if generation_conflict {
                 responses.push((
-                    "/api/runners/config/reload",
+                    "tool:reload_runner_config",
                     json!({"success":false,"output":{"error_code":"config_generation_conflict"}}),
                 ));
             }
@@ -37,7 +37,15 @@ async fn activation_stops_if_connection_identity_changes_during_config_retry() {
                     std::fs::write(&edited_path, replacement.to_string()).unwrap();
                 }
             });
-            activation_config(&config_path, &server_url, &[], false);
+            let unrelated = tmp.path().join("authorized");
+            std::fs::create_dir_all(&unrelated).unwrap();
+            let unrelated = unrelated.canonicalize().unwrap();
+            activation_config(
+                &config_path,
+                &server_url,
+                std::slice::from_ref(&unrelated),
+                false,
+            );
             let token_file = tmp.path().join("user-token");
             std::fs::write(&token_file, "wc_pat_project_activation_test").unwrap();
 

@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     preflight.add_argument("--version", required=True)
     preflight.add_argument("--source-sha", required=True)
+    preflight.add_argument("--source-ref", default="main", help="main or release/v<VERSION>")
     preflight.add_argument("--root", type=Path, default=Path.cwd())
     preflight.add_argument("--repo", default=collector.DEFAULT_REPO)
     preflight.add_argument("--timeout", type=float, default=30.0)
@@ -43,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="delete an explicitly confirmed failed pre-publication version tag after bounded safety checks",
     )
     reclaim_tag.add_argument("--version", required=True)
+    reclaim_tag.add_argument("--source-ref", default="main", help="main or release/v<VERSION>")
     reclaim_tag.add_argument("--root", type=Path, default=Path.cwd())
     reclaim_tag.add_argument("--repo", default=collector.DEFAULT_REPO)
     reclaim_tag.add_argument("--confirm", required=True, help="must exactly equal v<VERSION>")
@@ -62,12 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--tag", required=True)
     collect.add_argument("--output-dir", type=Path, required=True)
     collect.add_argument("--repo", default=collector.DEFAULT_REPO)
+    collect.add_argument("--require-unified-installers", action="store_true")
+    collect.add_argument("--require-runtime-installers", action="store_true")
     collect.add_argument("--timeout", type=float, default=120.0)
     readiness_start = subparsers.add_parser(
         "readiness-start",
-        help="dispatch exact-main pre-tag readiness and record durable correlation state",
+        help="dispatch exact-source pre-tag readiness and record durable correlation state",
     )
     readiness_start.add_argument("--source-sha", required=True)
+    readiness_start.add_argument("--source-ref", default="main", help="main or release/v<VERSION>")
     readiness_start.add_argument("--state-file", type=Path, required=True)
     readiness_start.add_argument("--repo", default=collector.DEFAULT_REPO)
     readiness_start.add_argument("--timeout", type=float, default=30.0)
@@ -88,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     build_start.add_argument("--tag", required=True)
     build_start.add_argument("--state-file", type=Path, required=True)
     build_start.add_argument("--repo", default=collector.DEFAULT_REPO)
+    build_start.add_argument("--include-unified-installers", action="store_true")
+    build_start.add_argument("--include-runtime-installers", action="store_true")
     build_start.add_argument("--timeout", type=float, default=30.0)
     build_start.add_argument("--resolve-secs", type=int, default=60)
 
@@ -107,6 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     stage_npm.add_argument("--source-root", type=Path, default=Path.cwd())
     stage_npm.add_argument("--output-dir", type=Path, required=True)
     stage_npm.add_argument("--repo", default=collector.DEFAULT_REPO)
+    stage_npm.add_argument("--require-unified-installers", action="store_true")
+    stage_npm.add_argument("--require-runtime-installers", action="store_true")
 
     verify_draft = subparsers.add_parser(
         "verify-draft",
@@ -114,6 +123,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_draft.add_argument("--bundle-dir", type=Path, required=True)
     verify_draft.add_argument("--repo", default=collector.DEFAULT_REPO)
+    verify_draft.add_argument("--require-unified-installers", action="store_true")
+    verify_draft.add_argument("--require-runtime-installers", action="store_true")
     verify_draft.add_argument("--timeout", type=float, default=30.0)
 
     doctor_parser = subparsers.add_parser(
@@ -122,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor_parser.add_argument("--version", required=True)
     doctor_parser.add_argument("--source-sha", required=True)
+    doctor_parser.add_argument("--source-ref", default="main", help="main or release/v<VERSION>")
     doctor_parser.add_argument("--root", type=Path, default=Path.cwd())
     doctor_parser.add_argument("--repo", default=collector.DEFAULT_REPO)
     doctor_parser.add_argument("--timeout", type=float, default=30.0)
@@ -130,8 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
         "release-init",
         help="create a durable high-level release plan after read-only preflight",
     )
+    release_init.add_argument("--require-runtime-installers", action="store_true")
     release_init.add_argument("--version", required=True)
     release_init.add_argument("--source-sha", required=True)
+    release_init.add_argument("--source-ref", default="main", help="main or release/v<VERSION>")
     release_init.add_argument("--root", type=Path, default=Path.cwd())
     release_init.add_argument("--state-file", type=Path, required=True)
     release_init.add_argument("--work-dir", type=Path, required=True)
@@ -163,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo=args.repo,
                 version=args.version,
                 source_sha=args.source_sha,
+                source_ref=args.source_ref,
                 root=args.root,
                 timeout=args.timeout,
             )
@@ -177,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             summary = publication.reclaim_prepublication_tag(
                 repo=args.repo,
                 version=args.version,
+                source_ref=args.source_ref,
                 root=args.root,
                 confirm=args.confirm,
                 timeout=args.timeout,
@@ -192,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             summary = collector.collect_bundle(
                 repo=args.repo,
+                require_unified_installers=args.require_unified_installers,
+                require_runtime_installers=args.require_runtime_installers,
                 run_id=args.run_id,
                 expected_source_sha=args.source_sha,
                 expected_tag=args.tag,
@@ -209,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
             summary, exit_code = readiness.start_readiness(
                 repo=args.repo,
                 source_sha=args.source_sha,
+                source_ref=args.source_ref,
                 state_file=args.state_file,
                 timeout=args.timeout,
                 resolve_secs=args.resolve_secs,
@@ -236,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             summary, exit_code = publication.start_build(
                 repo=args.repo,
+                include_unified_installers=args.include_unified_installers,
+                include_runtime_installers=args.include_runtime_installers,
                 source_sha=args.source_sha,
                 tag=args.tag,
                 state_file=args.state_file,
@@ -265,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             summary = publication.stage_npm(
                 repo=args.repo,
+                require_unified_installers=args.require_unified_installers,
+                require_runtime_installers=args.require_runtime_installers,
                 bundle_dir=args.bundle_dir,
                 source_root=args.source_root,
                 output_dir=args.output_dir,
@@ -279,6 +302,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             summary = publication.verify_draft_assets(
                 repo=args.repo,
+                require_unified_installers=args.require_unified_installers,
+                require_runtime_installers=args.require_runtime_installers,
                 bundle_dir=args.bundle_dir,
                 timeout=args.timeout,
             )
@@ -294,6 +319,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo=args.repo,
                 version=args.version,
                 source_sha=args.source_sha,
+                source_ref=args.source_ref,
                 root=args.root,
                 timeout=args.timeout,
             )
@@ -306,9 +332,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "release-init":
         try:
             summary = plan.init_plan(
+                require_runtime_installers=args.require_runtime_installers,
                 repo=args.repo,
                 version=args.version,
                 source_sha=args.source_sha,
+                source_ref=args.source_ref,
                 root=args.root,
                 state_file=args.state_file,
                 work_dir=args.work_dir,

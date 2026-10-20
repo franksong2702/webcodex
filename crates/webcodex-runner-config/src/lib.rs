@@ -17,6 +17,10 @@ use webcodex_core::runner_protocol::RunnerCapabilities;
 
 pub mod paths;
 
+/// Desktop injects provider credentials under these private source names. Only
+/// explicit MCP env_from_env mappings may inherit them, not ordinary job children.
+pub const DESKTOP_MCP_ENV_PREFIX: &str = "WEBCODEX_DESKTOP_MCP_";
+
 /// Default Runner project registry selected for a new system-level install.
 pub const DEFAULT_INIT_PROJECT_REGISTRY_DIR: &str = "/etc/webcodex/project-registry";
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
@@ -25,6 +29,9 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1000;
 /// 30 seconds leaves one full interval of scheduling/network slack.
 pub const MAX_POLL_INTERVAL_MS: u64 = 30_000;
 pub const DEFAULT_MAX_TIMEOUT_SECS: u64 = 3600;
+/// Default Runner policy for captured/presented bytes in each stdout or stderr
+/// stream. It is a per-stream execution-retention policy, not a protocol
+/// request/body/frame ceiling and not the model-facing ToolResult ceiling.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// Config value selecting the polling transport (HTTP `/api/shell/agent/poll`).
 pub const TRANSPORT_POLLING: &str = "polling";
@@ -94,6 +101,10 @@ pub fn effective_allowed_roots(
 }
 
 pub fn validate_runner_init_options(opts: &RunnerInitOptions) -> Result<(), String> {
+    webcodex_core::runner_protocol::validate_optional_runner_field(
+        &opts.display_name,
+        "display_name",
+    )?;
     if opts.server_url.trim().is_empty() {
         return Err("--server-url is required".to_string());
     }
@@ -193,6 +204,10 @@ struct GeneratedRunnerPolicy {
 }
 
 pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, String> {
+    webcodex_core::runner_protocol::validate_optional_runner_field(
+        &opts.display_name,
+        "display_name",
+    )?;
     let effective_roots = effective_allowed_roots(&opts.allowed_roots, opts.allow_cwd_anywhere)?;
     let cfg = GeneratedRunnerConfig {
         server_url: opts.server_url.trim_end_matches('/').to_string(),
@@ -205,10 +220,15 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
         project_registry_dir: opts.project_registry_dir.clone(),
         capabilities: RunnerCapabilities {
             shell: true,
+            // Structured explicit-shell selection is advertised only by the
+            // running binary that implements the selector.
+            explicit_shell_selection: false,
+            bash_login_shell: false,
             file_read: true,
             file_write: true,
             // The running binary advertises the internal optimized export read
             // only after installing that request handler.
+            file_list_page: false,
             artifact_export_chunk_read: false,
             // Large export metadata is likewise a running-binary capability;
             // generated config is not authoritative for registration semantics.
@@ -219,9 +239,17 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Exact occurrence selectors are a running-binary capability; the
             // running Runner advertises the canonical registration baseline.
             apply_text_edit_occurrence: false,
+            // SHA-less local exact edit proof is implemented by the running
+            // binary and must never be inferred from generated static config.
+            apply_text_edit_local_guard_without_sha: false,
             // Scoped exact matching is likewise runtime-only and must not be
             // inferred from generated config or occurrence support.
             apply_text_edit_line_scope: false,
+            // Deterministic range replacement is advertised only by the
+            // running binary that implements it.
+            apply_text_edit_range: false,
+            // Bulk cardinality is implemented by the running binary, never inferred.
+            apply_text_edit_expected_match_count: false,
             // Codex Patch is a running-binary request kind and must not be
             // inferred from generated config or generic file-write support.
             apply_patch: false,
@@ -231,9 +259,6 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Enum-based matching semantics are runtime-only and current
             // Servers require an explicit registration capability.
             apply_patch_matching_mode: false,
-            // Strict patch matching is also runtime-only and must be explicitly
-            // advertised for rolling compatibility with older Servers.
-            apply_patch_strict_matching: false,
             git: true,
             jobs: true,
             async_jobs: true,
@@ -253,9 +278,34 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // rolling-upgrade capability and is never inferred from the older
             // count-assertion bit or protocol generation.
             structured_cargo_test_execution_policy: false,
+            // Cargo test --lib argv is accepted only by the running binary that
+            // advertises the additive structured Cargo selector capability.
+            structured_cargo_test_lib: false,
+            // Multi-package Cargo check argv is also an additive running-binary
+            // capability and is never inferred from generic validation argv.
+            structured_cargo_check_packages: false,
             // The running binary advertises this process-lifetime protocol
             // capability after installing its exact Go argv boundary.
             structured_go_test_json: false,
+            project_validation_v1: false,
+            project_build_v1: false,
+            project_build_node_v1: false,
+            project_validation_node_json_v1: false,
+            project_build_python_v1: false,
+            project_format_v1: false,
+            project_format_go_v1: false,
+            project_dependency_policy_v1: false,
+            project_dependency_resolution_offline_v1: false,
+            // Go project single-module semantics are implemented and advertised
+            // by the running binary, never inferred from generated static config.
+            project_go_single_module_v1: false,
+            project_validation_package_scope_v1: false,
+            project_all_packages_v1: false,
+            project_validation_test_options_v1: false,
+            project_validation_python_pytest_v1: false,
+            project_validation_python_ruff_v1: false,
+            project_validation_node_script_check_v1: false,
+            project_validation_node_tap_v1: false,
             // Like JSON parsing, first-class durable go_test support is
             // advertised by the running binary, never by generated static config.
             structured_go_test_tool: false,
@@ -264,10 +314,19 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             structured_go_test_packages: false,
             structured_process_argv: true,
             structured_script_payload: true,
+            // JavaScript is an additive typed-script semantic implemented by
+            // the running binary. Static config must not make an older binary
+            // appear to understand the newer language variant.
+            structured_script_javascript: false,
+            // TypeScript is another additive running-binary semantic. Generated
+            // static config must not claim that older Runners understand it.
+            structured_script_typescript: false,
+            structured_script_python: false,
             // Internal generated-program execution is a running-binary
             // capability and must fail closed across mixed-version rollout.
             internal_posix_script: false,
             structured_execution_jobs: true,
+            job_process_input: false, // Advertised only by an implementing binary.
             // Detached process authority is advertised only by a running binary
             // after its durable ownership-transfer backend is installed.
             detached_process_jobs: false,
@@ -276,10 +335,26 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             project_lifecycle: false,
             project_path_registration: false,
             managed_worktree: false,
-            // Runner-global Skill store support is runtime-only and never
-            // inferred from project/file capabilities in generated config.
-            skill_store_read: false,
-            skill_store_manage: false,
+            // Runner-local Skill runtime and management are implemented by the
+            // running binary and are never inferred from project/file capabilities.
+            skill_runtime: false,
+            // Trusted Skill resource execution is implemented by the running binary
+            // and must not be inferred from static generated config.
+            skill_resource_execution: false,
+            skill_management: false,
+            // Browser availability is a process-local executable/runtime fact.
+            // Generated config must not claim Browser capabilities.
+            browser_observe: false,
+            browser_control: false,
+            browser_element_action_admission: false,
+            browser_batch: false,
+            browser_semantic_query: false,
+            browser_complex_controls: false,
+            browser_launch: false,
+            browser_managed_profile: false,
+            browser_surface_handoff: false,
+            browser_user_handoff: false,
+            browser_extension_bridge: false,
             // Desktop observation is a runtime/platform capability and is never
             // claimed by generated static config.
             computer_observe: false,
@@ -324,6 +399,9 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Native Tool Plugins are likewise advertised only by a Runner
             // binary that implements the typed local Plugin lifecycle.
             native_tool_plugins: false,
+            // Only an implementing binary may advertise the additive MCP
+            // resource-link result wire; static generated config stays false.
+            mcp_gateway_resource_links: false,
             // Managed SSH resource lifecycle is likewise a running-binary
             // capability and is never implied by generated static SSH config.
             managed_ssh_resources: false,
@@ -331,6 +409,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // against its startup-bound path and must never be inferred from a
             // generated static runner.toml capability block.
             runner_config_control: false,
+            instruction_runtime: false,
         },
         policy: GeneratedRunnerPolicy {
             allow_raw_shell: true,
@@ -527,6 +606,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runner_name_uses_registration_bounds_before_generation() {
+        let mut opts = init_opts(PathBuf::from("-"));
+        for valid in [None, Some("".into()), Some("😀".repeat(200))] {
+            opts.display_name = valid;
+            validate_runner_init_options(&opts).unwrap();
+            let content = generated_runner_config_toml(&opts).unwrap();
+            let parsed: toml::Value = toml::from_str(&content).unwrap();
+            assert_eq!(
+                parsed.get("display_name").and_then(toml::Value::as_str),
+                opts.display_name.as_deref()
+            );
+        }
+        for invalid in ["😀".repeat(201), "private\0value".into()] {
+            opts.display_name = Some(invalid);
+            assert!(validate_runner_init_options(&opts).is_err());
+            assert!(generated_runner_config_toml(&opts).is_err());
+        }
+    }
     #[test]
     fn polling_capable_init_rejects_interval_beyond_online_window_slack() {
         for transport in [TRANSPORT_POLLING, TRANSPORT_AUTO] {

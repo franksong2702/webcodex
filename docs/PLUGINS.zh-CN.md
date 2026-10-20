@@ -13,7 +13,16 @@ Native Plugin 是**受信任的本地 executable**。WebCodex 不会 sandbox、�
 不可信 executable 自动变安全；启动 Plugin 与在 prepared Runner environment 下直接运行
 这个本地程序具有同等级别的本机信任含义。
 
+> **术语区分：** ChatGPT 有时把 developer MCP/custom app 也称为“插件”，但它与
+> WebCodex 的 **Native Tool Plugin** 不是同一层。若 ChatGPT 返回
+> `FORBIDDEN: This conversation does not support developer MCPs`，并且 Host 在
+> `plugin_tool` 到达 WebCodex 之前就拒绝 MCP connection，这不是 Native Tool Plugin
+> health result。此类问题先看[故障排查](TROUBLESHOOTING.zh-CN.md)；只有请求已经到达
+> WebCodex 后，才使用本文的 `plugin_tool` diagnostic 排查本地 provider。
+
 ## 配置 Plugin
+
+Desktop 在“扩展 → 原生 Plugin”提供独立分类，与 MCP 工具服务分开。添加可信程序后，上方显示已保存的注册项；下方选择项目，查看该项目 Runner 实际提供的工具。预览展示该 Runner 报告的插件加载状态，失败时给出处理建议和安全诊断码；它不是 Project-affine 工具目录，也不显示 provider-list 接口未提供的工具数量。保存不启动 Plugin，需要明确重启所管理的 Runner 才会应用；重新加载仅针对所选项目中获授权的 Plugin。
 
 Plugin 使用独立的 `runner.toml` 配置，不复用 MCP provider：
 
@@ -72,25 +81,26 @@ Windows 继续使用 Runner 已有的 `PATH` / `PATHEXT` native executable 规�
 
 Native Plugin 是 Runner-owned capability。provider 的具体 Tool 永远不会加入
 Server-global WebCodex tool namespace，也不会被追加到外层 MCP `tools/list`。Plugin
-可以定义 `safe_delete`、`runtime_status` 或其他合法 provider-local 名称；它们不需要
+可以定义 `safe_delete`、`get_runtime_status` 或其他合法 provider-local 名称；它们不需要
 和 WebCodex builtin、其他 Runner 或同一 Runner 的其他 provider 做全局避让。
 
 唯一稳定的 model-facing 入口是一等 WebCodex 工具 `plugin_tool`。它的 ToolSpec 走和
 其他 WebCodex 工具相同的 canonical metadata/registry 链路，schema 与 Runner 是否在线、
 安装了哪些 Plugin 无关。因此即使当前没有 Plugin-capable Runner，
-`tool_manifest(tool_name="plugin_tool")` 也能返回准确 gateway contract。
+`read_tool_manifest(tool_name="plugin_tool")` 也能返回准确 gateway contract。
+`work_on_project` 还可以在 startup 中提供一个有界、Project-affine 的 Plugin selection catalog。它只包含 configured `cwd` 解析后与 authoritative Project root 一致且当前 ready/committed 的 provider tool；其他目录的 provider 不会自动进入 catalog。该 projection 不会暴露 provider path、command/argv/environment、schema、provider instance identity 或 invocation binding。Runner gateway 和模型 projection 都按序列化后的字节数截断 catalog；`total_count` 与 `catalog_revision` 仍描述完整目录。模型选择后仍必须走 canonical `plugin_tool describe -> call`。在支持 context sidecar 的 surface 上，同时具备 `project:read` 与 `plugin:inspect` 的调用者也可以显式请求 `plugins.catalog` 获取同类 Project-affine metadata。
 
-MCP 与 OpenAPI/GPT Actions 使用的 generic Tool Runtime 都复用同一个 canonical
-`plugin_tool` parser 和 action-aware gateway executor；不存在 MCP Plugin 实现和 GPT
-Plugin 实现两套逻辑。任何声明暴露 `plugin_tool` 的 canonical model surface 都可以实际
-调用它。对 generic `callRuntimeTool`，完整 Plugin contract 使用 canonical nested
-`params`：外层 `tool` 已经用于选择 `plugin_tool`，provider-local `tool` 必须留在 Plugin
-业务参数里：
-
+MCP 与 Runtime API 复用同一个 canonical `plugin_tool` parser 和 action-aware
+executor，不存在独立的客户端实现或工具名称兼容表。按照当前 `read_tool_manifest`
+返回的调用路径，向已获准的 gateway 传入正常 business arguments：
 ```json
-{"tool":"plugin_tool","params":{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}}
-{"tool":"plugin_tool","params":{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}}
+{"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}
+{"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}
 ```
+
+独立的 `call_runtime_tool` operation 只用于 manifest route 为 `gateway` 的 Adaptive
+long-tail tools；`plugin_tool` 这类 direct tool 不得再通过 gateway 调用。generic
+gateway envelope 是 canonical `{tool, arguments}`。
 
 静态 ToolDefinition 只表达 worst-case discovery contract。真正执行 policy 会在校验后的
 `action` 上先分类，再进入 Session/permission governance：list/describe 只要求
@@ -159,9 +169,21 @@ live provider 与最近一次 disposable `check` candidate 保留 bounded、cont
 本机 stderr ring；这个 local projection 不属于 Plugin gateway response。
 
 `call` 的 dispatch identity 只有这个 opaque `binding`；call 阶段不再接受
-`runner`、`plugin`、`tool` 作为路由字段。每次 describe 都会创建独立 binding，精确
+`runner`、`plugin`、`tool` 或 `project` 作为路由字段。每次 describe 都会创建独立 binding，精确
 记录当时观察到的 Runner instance、provider instance、tool name 和 schema；handle
 本身不会编码或暴露这些内部 identity。
+
+对 `projectBound` 工具，在 `describe` 时显式传入目标已授权 `project`。缺少它时，
+错误保留 `plugin_project_required`，并提示对同一 Runner/provider/tool 补充该 Project
+重新 describe；此时没有调用 provider 工具，也没有创建 binding。WebCodex 生成的
+gateway 错误还会将已有 recovery 投影到有界的 MCP 错误文本，供只展示文本的 Host
+使用；结构化错误字段仍为权威数据。恢复指导优先显示，避免长错误消息挤占原有
+1,024 字节文本上限。provider 自身返回的工具结果保持原样。Project selector
+内容非法与在 `call` 上传入 Project 会得到不同的参数提示。
+同一目标 Project 可复用已保留的 schema/binding，call 只传 `binding` 和符合 schema
+的 `arguments`。更换目标 Project 必须 describe 新目标并取得新 binding；仅删除
+call 上冲突的 Project 可能仍会选中旧目标。Session 或 recorder metadata 不能提供
+业务 Project。修正参数或重新 describe 不代表可以重放先前结果不明的操作；应先核对结果。
 
 `reload` 是 Windows、macOS、Linux 都可用的 authoritative reload 入口。Runner
 自己重新读取自己的 `runner.toml`；Server 不会上传 executable、env 或 raw Plugin
@@ -191,16 +213,166 @@ set 原样保留；全部成功后才原子替换。被删除的 provider 会立
 reload 前运行 `check` 不会替换当前 committed provider set，也不会创建 binding。成功的
 check candidate 会被销毁，不会偷偷复用成下一次 reload provider。
 
-`runner_config_reload` 与 `plugin_tool reload` 共用同一个 Plugin candidate
+`reload_runner_config` 与 `plugin_tool reload` 共用同一个 Plugin candidate
 admission/commit primitive。修改 `[plugins]` 不需要为了 Plugin 生效而重启 Runner：generic
 Runner config reload 会在同一次 activation 中 live apply Plugin candidate；`plugin_tool
 reload` 则提供更窄、只需要 `plugin:manage` 的专门入口。Plugin management authority 不会
 因此获得修改其他 Runner config 的权限。
 
-`runner_config_check` 仍然只是 Runner config 的结构性检查：读取/解析 startup-bound
+`check_runner_config` 仍然只是 Runner config 的结构性检查：读取/解析 startup-bound
 `runner.toml`、验证配置边界并分类 restart-only 字段，不会启动 disposable Plugin process。
 需要检查 executable resolution 以及 Plugin `initialize -> tools/list` protocol/admission 时，
 使用 `plugin_tool check(runner, plugin)`。
+
+## Plugin authoring/operator CLI
+
+`webcodex plugin` 现在明确分成两条路径：`plugin init` 是纯本地 scaffold generator，不使用
+Server auth、Runner、`plugin_tool` 或 `/api/tools/call`；另外四个 inspect/manage 命令仍是
+同一条 canonical `plugin_tool` 链路的 operator-friendly adapter，不新增 Plugin endpoint、
+Runtime、supervisor 或 admission implementation。每个网络命令都只向现有
+`POST /api/tools/call` 发一次 authenticated request，外层固定为 `tool="plugin_tool"`，
+`params` 严格映射已有 action：
+
+```text
+webcodex plugin list
+    -> {"action":"list"}
+webcodex plugin list --runner special
+    -> {"action":"list","runner":"special"}
+webcodex plugin list --runner special --plugin safe-delete
+    -> {"action":"list","runner":"special","plugin":"safe-delete"}
+webcodex plugin describe --runner special --plugin safe-delete --tool safe_delete
+    -> {"action":"describe","runner":"special","plugin":"safe-delete","tool":"safe_delete"}
+webcodex plugin check --runner special --plugin safe-delete
+    -> {"action":"check","runner":"special","plugin":"safe-delete"}
+webcodex plugin reload --runner special
+    -> {"action":"reload","runner":"special"}
+```
+
+本地创建一个可独立使用的 authoring project：
+
+```text
+webcodex plugin init ./my-plugin
+webcodex plugin init ./MyPlugin --id my-plugin
+```
+
+生成目录只包含 `.gitignore`、`package.json`、`tsconfig.json`、`src/plugin.ts`、`README.md`。
+其中 `@yyjeqhc/webcodex-plugin-sdk` **精确固定**为公开 npm 版本 `0.1.0`，不会生成
+`file:`、workspace、Git、源码 checkout 或 floating version dependency。`plugin init` 不会
+安装依赖、执行生成代码、修改 `runner.toml`、注册 provider、reload Runner 或创建 credential。
+目标目录只能不存在或是空的 ordinary directory；任何已有用户数据都不会被覆盖。
+
+scaffold 创建成功后，human output 还会打印一个可以复制的 `[[plugins.providers]]` block，
+其中 `args` 指向这次生成项目真实的 absolute `dist/plugin.js`。路径值通过 TOML serializer
+生成，而不是字符串拼接，因此空格、Windows 反斜杠、引号及其它 TOML-sensitive character
+都会正确 escape。这仍然只是 onboarding guidance：operator 必须在目标 Runner 主机上把该
+block 复制到这个 Runner 启动时绑定的 `runner.toml`。portable scaffold README 继续保留
+absolute-path placeholder，不会永久写入作者机器的真实路径。如果不确定本机 Runner 实际
+使用哪个配置，应在 Runner 主机上检查对应 profile/service，例如
+`webcodex runner status --profile <profile>`；Server 不会为此发现或返回 Runner-local config
+path / executable path。
+
+实际 author loop 可以直接写成：
+
+```text
+webcodex plugin init ./my-plugin
+    -> npm install
+    -> npm run build
+    -> 把输出的 provider block 复制到 Runner-local startup config
+    -> webcodex plugin check --runner special --plugin my-plugin --token-file /path/to/plugin-authoring-pat
+    -> webcodex plugin reload --runner special --token-file /path/to/plugin-authoring-pat
+    -> webcodex plugin list --runner special --plugin my-plugin --token-file /path/to/plugin-authoring-pat
+    -> webcodex plugin describe --runner special --plugin my-plugin --tool echo --token-file /path/to/plugin-authoring-pat
+```
+
+identity/lifecycle 语义没有变化。Runner id 必须精确提供，CLI 不做 fuzzy match，也不会从
+provider/project 推断 Runner。`list` 不会偷偷 check/reload；`describe` 直接消费 canonical
+describe response，不额外 list。`check` 仍由 Runner 启动并销毁 disposable candidate，且不
+commit。`reload` 仍由 exact Runner 重新读取自己的 `runner.toml`，准备**完整 provider set**，
+只有全部 admission 成功才原子替换；因此刻意不存在 `reload --plugin`。describe 返回的
+binding 只作为 opaque observation 输出，不缓存、不提升为 credential；reload retire provider
+后，旧 binding 仍按原 contract fail closed。
+
+网络参数沿用现有 CLI Server conventions：`--server-url`、`--proxy`、
+`--no-system-proxy`、`--env-file`、`--token-file`、`--token`、`--json`。Plugin authoring
+长期使用时优先推荐显式 token file，例如 `--token-file /path/to/plugin-authoring-pat`。共享
+user/API resolver 保持向后兼容的优先级：显式 `--token`；`--token-file`；指定 env file 中的
+`WEBCODEX_TOKEN`，再 `WEBCODEX_PAT`；当前进程 `WEBCODEX_TOKEN`，再 `WEBCODEX_PAT`。
+`WEBCODEX_PAT` 只是 additive user/API CLI input alias，不改变 Server bootstrap
+`WEBCODEX_TOKEN` 的配置语义；两个环境变量同时存在时仍优先原有 `WEBCODEX_TOKEN`。如果需要
+专用 authoring PAT，复用已有 `webcodex tokens create-local` / Server token management flow，
+不要建立 Plugin-specific credential path。
+
+Runner transport token 会在发起 user/API HTTP request 前被拒绝。`list` / `describe` 要求
+`plugin:inspect`；canonical `plugin_tool` call 要求 `plugin:invoke`；`check` / `reload` 必须由
+用户显式提供具有 `plugin:manage` 的 credential。现有 `--oauth-local-plugins` 仍然只表示
+`plugin:inspect + plugin:invoke`，**不会**授予 manage。401/403 会正常 non-zero 失败；CLI
+不会为了通过请求自动 mint、升级或修改 credential。
+
+`--json` 直接打印 canonical `plugin_tool` output object，不再设计第二套 CLI Plugin JSON
+模型；human output 只渲染有界 canonical fields。`check` 只有在 `ready=true` 时 exit 0；
+`ready=false` non-zero，但仍保留 phase/code/detail/diagnostic。reload 只有 canonical
+`failures` 为空时 exit 0；known rejection non-zero。
+
+如果 `check` 返回 `phase=initialize`、`code=plugin_eof`，表示 provider 的 protocol
+output 在 initialize 完成前已经结束；进程可能已经退出，也可能只是关闭了 stdout。应先检查
+配置的 command 与 arguments。对于由 `webcodex plugin init` 创建的 Plugin，还应确认已执行
+`npm run build`，并且 Runner 主机上已经生成 `dist/plugin.js`，再重试。这里是条件性的 author
+guidance，不是 root-cause 分类：任何在 initialize 阶段结束 protocol output 的 provider 都
+可能产生 `plugin_eof`，WebCodex 不会根据 raw stderr 或 opaque argv 推断具体原因。
+
+CLI 不会自动 retry `check` 或 `reload`。请求开始后如果遇到 HTTP timeout、connection reset、
+post-send malformed response 或 response lost，CLI 无法证明 management operation 没有到达
+Server/Runner，因此会保守报告 outcome may be unknown，并要求先观察当前 Plugin state 再决定
+是否 retry。`check` 也遵循这一点，因为 arbitrary Plugin startup/initialize/list 本身仍可能
+有外部副作用。
+
+本阶段刻意没有 `webcodex plugin call`。raw `plugin_tool describe -> call` 仍是 canonical
+invocation path，并继续拥有原有 binding、effect、retry 和 `OutcomeUnknown` 语义。
+
+Phase 1 曾有意暂缓 `webcodex plugin init`，直到 SDK 建立真实 external dependency contract。
+这个前置条件现在已经满足：`@yyjeqhc/webcodex-plugin-sdk@0.1.0` 已通过 npm 公开分发，Phase 3
+因此加入使用该**精确兼容版本**的本地 scaffold。生成项目不依赖 WebCodex 源码 checkout。
+仓库内 first-party dogfood（例如 `plugins/safe-delete`、
+[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md)、
+[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 和
+[`plugins/agent-browser`](../plugins/agent-browser/README.zh-CN.md)）仍有意使用同 checkout
+的 local SDK source，以持续测试正在开发的 SDK；外部 `plugin init` 项目则使用
+published package。
+
+## TypeScript Plugin SDK
+
+`@yyjeqhc/webcodex-plugin-sdk` 是 Native Tool Plugin 的可选 TypeScript authoring layer。
+`0.1.0` 已通过 npm 公开分发；由于 SDK 仍处于 pre-1.0，`plugin init` 生成项目使用 exact
+compatibility pin，而不是允许自动跨 minor 的版本范围：
+
+```text
+raw executable protocol
+    -> @yyjeqhc/webcodex-plugin-sdk
+    -> 仍然是 webcodex-plugin-v1
+    -> Runner-authoritative check / reload / call
+```
+
+SDK 提供小型 v1 schema builder、`defineTool`、`definePlugin`、result helper，以及严格
+串行的 newline-delimited JSON-RPC stdio runtime，让 Plugin 作者不用重复手写 framing 和
+dispatch 样板代码。它**不是** MCP SDK，不会改变 Plugin authority，也不会 sandbox 受信任
+executable。WebCodex Server / Runner 不会因为 SDK 而要求 Node；只有主动选择这个 SDK 的
+Plugin 自己需要 Runner 机器提供 Node。TypeScript 只用于 authoring/build，生产环境执行编译
+后的 ESM JavaScript，不要求 TypeScript runtime。
+
+SDK 类型只是 authoring assistance，并不是第二套 admission authority。Rust Runner 继续权威
+拥有 protocol/schema admission、frozen catalog、bounds、timeout/process lifecycle、output
+validation 与 `OutcomeUnknown`。`plugin_tool check` 仍然是 authoritative admission check。
+其中显式 `errorResult(...)` 表示确定的 completed application result；未处理的 handler
+throw/rejection 会终止 provider，并且不会伪造 ToolResult，因此 effectful call 的 send
+ambiguity 仍可由 Runner 正确保留。
+
+完整 SDK 说明见 [`../npm/plugin-sdk/README.zh-CN.md`](../npm/plugin-sdk/README.zh-CN.md)，
+TypeScript 示例见 [`echo-plugin.ts`](../npm/plugin-sdk/examples/echo-plugin.ts)。原有无 SDK
+依赖的 raw [`native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs) 继续作为 protocol
+reference 保留。
+
+Plugin 的架构边界、开发阶段兼容策略和后续 authoring roadmap 见
+[`architecture/native-tool-plugins.md`](architecture/native-tool-plugins.md)。
 
 ## WebCodex Plugin Protocol v1
 
@@ -261,10 +433,38 @@ keyword 会在 provider admission 时明确拒绝，不会 silently ignore。v1 
 `oneOf`、`allOf`、`not` 或任意 draft-specific keyword。
 
 最小无依赖 Node 示例见
-[`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs)。仓库还提供可选的
-[`plugins/safe-delete`](../plugins/safe-delete/README.zh-CN.md)：它把删除权限限制在配置的
-项目根内，只把单个文件或目录移入系统 Trash / Recycle Bin，不会把永久删除能力加入
-WebCodex 内建工具面。
+[`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs)。另有仅使用标准库的
+[Python 原始协议示例](../plugins/examples/python-raw/README.md)，展示有界 stdio、参数校验
+和确定性的 echo 工具，无需 TypeScript SDK。仓库还提供多个
+first-party SDK dogfood Plugin：[`plugins/safe-delete`](../plugins/safe-delete/README.zh-CN.md)
+把删除权限限制在配置的项目根内，只把单个文件或目录移入系统 Trash / Recycle Bin，
+不会把永久删除能力加入 WebCodex 内建工具面；
+[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md) 是只读 authoring 示例，它唯一的
+`git_summary` 只观察 provider 配置的 repository `cwd`；
+[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 把 bounded
+Browser semantic snapshot 转换成结构化简历填写计划，支持重复 section 和多步骤网申，
+并有意在最终提交之前停止；
+[`plugins/agent-browser`](../plugins/agent-browser/README.zh-CN.md) 则调用 operator 已安装的
+本机 Agent Browser，继承 native profile/config 或连接用户明确授权的当前 Chrome，同时把
+opaque page/snapshot identity、tab ownership 和不确定 effect 的处理限制在 Plugin 边界内。
+
+可选的标准库 Python
+[`Project Knowledge 插件`](../plugins/project-knowledge/README.zh-CN.md) 将配置的单个仓库根目录内
+有界的 Git 已跟踪文本/代码索引到 Project 外的私有 SQLite FTS5 缓存。`index`、`status`、
+`search`、`read` 使用相同原生协议和 `plugin_tool` binding 路径；检索核验当前来源哈希并
+报告索引覆盖范围。它需要 Python 3.10+、FTS5、Git 及相对于目录描述符的 no-follow 文件访问，
+不会写入核心 Memory/指导文件，也不调用 embedding/模型服务。
+
+## 社区原生插件（非官方）
+
+下列插件由社区在 WebCodex 仓库外独立维护，**不代表 WebCodex 官方维护或安全审计**。
+Native Plugin 是受信任的本地可执行程序，安装前应自行检查源码和 Runner 权限。
+
+- [WebCodex × Orca Native Plugin](https://github.com/LonelyHerbivore/webcodex-orca-plugin)
+  （Node.js 18+，集成验证版）：通过 Orca CLI 提供多 Agent Run 编排、Worker 生命周期、
+  Agent 消息传递、不确定结果下的防重复执行恢复及带来源完整性标记的对话分页读取。
+  v0.3.1 自动化测试已通过，但 Claude Code + 两个 Antigravity 的完整协作完成与资源回收
+  尚未通过真实端到端验收。配置方式和已知限制请查阅第三方仓库。
 
 ## 调用与失败语义
 

@@ -1,10 +1,120 @@
 use super::*;
-use crate::webcodex_runner::config::restart_required_fields;
 
 #[test]
-fn runner_config_accepts_legacy_projects_dir_alias_and_normalizes_it() {
+fn runner_cli_server_url_is_explicit_and_has_no_retired_alias() {
+    let _guard = test_env_lock();
+    let action = parse_runner_args([
+        "--config",
+        "/tmp/runner.toml",
+        "--server-url",
+        "http://172.29.32.1:8080",
+    ])
+    .unwrap();
+    assert!(
+        matches!(action, RunnerCliAction::Run { server_url: Some(url), .. } if url == "http://172.29.32.1:8080")
+    );
+    assert!(parse_runner_args(["--server-url"]).is_err());
+    assert!(parse_runner_args(["--server-url-override", "http://localhost"]).is_err());
+    assert!(parse_runner_args([
+        "--server-url",
+        "http://localhost",
+        "--server-url",
+        "http://other"
+    ])
+    .is_err());
+}
+
+#[test]
+fn runner_cli_url_survives_reload_without_changing_persistent_identity() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("agent.toml");
+    let path = tmp.path().join("runner.toml");
+    let initial = format!("server_url = 'http://172.20.0.1:8080'\ntoken = 'private-fixture-token'\nclient_id = 'wsl-runner'\nowner = 'original-owner'\nproject_registry_dir = {:?}\n[policy]\nallow_cwd_anywhere = true\n", tmp.path().join("registry"));
+    std::fs::write(&path, &initial).unwrap();
+    let cfg = crate::webcodex_runner::config::load_config_with_server_url(
+        &path,
+        Some("http://172.29.32.1:8080"),
+    )
+    .unwrap();
+    assert_eq!(cfg.server_url, "http://172.29.32.1:8080");
+    assert_eq!(cfg.token, "private-fixture-token");
+    assert_eq!(cfg.client_id, "wsl-runner");
+    assert_eq!(cfg.owner.as_deref(), Some("original-owner"));
+    assert_eq!(
+        cfg.project_registry_dir.as_deref(),
+        Some(tmp.path().join("registry").as_path())
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
+    let runtime = ReloadableRunnerConfig::new(cfg, path.clone());
+    let edited = initial.replace("172.20.0.1", "172.30.0.1");
+    std::fs::write(&path, &edited).unwrap();
+    let checked = runtime.check_config();
+    assert!(!checked
+        .restart_required_fields
+        .contains(&"server_url".to_string()));
+    let reloaded = runtime.reload_config(1);
+    assert_eq!(reloaded.current_generation, Some(2));
+    assert!(!reloaded
+        .restart_required_fields
+        .contains(&"server_url".to_string()));
+    assert_eq!(runtime.server_url(), "http://172.29.32.1:8080");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+    assert_eq!(
+        load_config(&path).unwrap().server_url,
+        "http://172.30.0.1:8080"
+    );
+}
+
+#[test]
+fn runner_url_validation_is_shared_and_never_falls_back_or_echoes_secrets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("runner.toml");
+    let prefix =
+        "token = 'fixture'\nclient_id = 'wsl-runner'\n[policy]\nallow_cwd_anywhere = true\n";
+    for invalid in [
+        "",
+        "bad-private-value",
+        "ftp://example.com",
+        "http://user:private-password@example.com",
+        "http://example.com/private-path",
+        "http://example.com?private-query",
+        "http://example.com#private-fragment",
+        "http://example.com:0",
+    ] {
+        std::fs::write(&path, format!("server_url = {invalid:?}\n{prefix}")).unwrap();
+        let config_error = load_config(&path).unwrap_err();
+        std::fs::write(
+            &path,
+            format!("server_url = 'http://example.com'\n{prefix}"),
+        )
+        .unwrap();
+        let cli_error =
+            crate::webcodex_runner::config::load_config_with_server_url(&path, Some(invalid))
+                .unwrap_err();
+        assert_eq!(config_error, cli_error);
+        assert!(!cli_error.contains("private-"));
+    }
+}
+
+#[test]
+fn runner_authentication_failure_has_terminal_supervisor_exit_status() {
+    assert_eq!(
+        crate::webcodex_runner::transport::failure_exit_code("authentication failed"),
+        77
+    );
+    assert_eq!(
+        crate::webcodex_runner::transport::failure_exit_code("certificate invalid"),
+        78
+    );
+    assert_eq!(
+        crate::webcodex_runner::transport::failure_exit_code("connection closed"),
+        1
+    );
+}
+
+#[test]
+fn runner_config_rejects_retired_projects_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("runner.toml");
     let registry = tmp.path().join("projects.d");
     std::fs::write(
         &path,
@@ -14,56 +124,31 @@ fn runner_config_accepts_legacy_projects_dir_alias_and_normalizes_it() {
         ),
     )
     .unwrap();
+    let error = load_config(&path).unwrap_err();
+    assert!(error.contains("projects_dir"), "{error}");
+    assert!(error.contains("retired"), "{error}");
+    assert!(error.contains("project_registry_dir"), "{error}");
+}
+
+#[test]
+fn runner_config_accepts_canonical_project_registry_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("runner.toml");
+    let registry = tmp.path().join("project-registry");
+    std::fs::write(
+        &path,
+        format!(
+            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\nproject_registry_dir = {:?}\n[policy]\nallow_cwd_anywhere = true\n",
+            registry.to_string_lossy()
+        ),
+    )
+    .unwrap();
     let cfg = load_config(&path).unwrap();
     assert_eq!(
         cfg.project_registry_dir.as_deref(),
         Some(registry.as_path())
     );
-    assert!(cfg.legacy_projects_dir.is_none());
 }
-
-#[test]
-fn runner_config_alias_only_migration_does_not_require_restart() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("runner.toml");
-    let registry = tmp.path().join("projects.d");
-    let render = |field: &str| {
-        format!(
-            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\n{field} = {:?}\n[policy]\nallow_cwd_anywhere = true\n",
-            registry.to_string_lossy()
-        )
-    };
-
-    std::fs::write(&path, render("projects_dir")).unwrap();
-    let legacy = load_config(&path).unwrap();
-    std::fs::write(&path, render("project_registry_dir")).unwrap();
-    let canonical = load_config(&path).unwrap();
-
-    assert!(legacy.legacy_projects_dir.is_none());
-    assert!(canonical.legacy_projects_dir.is_none());
-    assert_eq!(legacy.project_registry_dir, canonical.project_registry_dir);
-    assert!(restart_required_fields(&legacy, &canonical).is_empty());
-}
-
-#[test]
-fn runner_config_rejects_new_and_legacy_registry_fields_together() {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("agent.toml");
-    let current = tmp.path().join("project-registry");
-    let legacy = tmp.path().join("projects.d");
-    std::fs::write(
-        &path,
-        format!(
-            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\nproject_registry_dir = {:?}\nprojects_dir = {:?}\n[policy]\nallow_cwd_anywhere = true\n",
-            current.to_string_lossy(),
-            legacy.to_string_lossy()
-        ),
-    )
-    .unwrap();
-    let error = load_config(&path).unwrap_err();
-    assert!(error.contains("cannot both be configured"), "{error}");
-}
-
 #[test]
 fn runner_config_defaults_transport_to_websocket_without_quic_section() {
     // No transport field and no [quic] section: default stays websocket.
@@ -86,6 +171,67 @@ client_id = "oe"
     );
     assert_eq!(cfg.mcp_gateway.request_timeout_secs, 30);
     assert!(cfg.mcp_gateway.providers.is_empty());
+}
+
+#[test]
+fn runner_config_skill_roots_default_empty_and_accept_absolute_paths() {
+    let omitted: RunnerConfig = toml::from_str(
+        "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\n",
+    )
+    .unwrap();
+    assert!(omitted.skills.roots.is_empty());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("runner.toml");
+    let live_root = tmp.path().join("live-skills");
+    std::fs::write(
+        &config_path,
+        format!(
+            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\nproject_registry_dir = \"project-registry\"\n[skills]\nroots = [{:?}]\n[policy]\nallow_cwd_anywhere = true\n",
+            live_root.to_string_lossy().as_ref()
+        ),
+    )
+    .unwrap();
+    let configured = load_config(&config_path).unwrap();
+    assert_eq!(configured.skills.roots, vec![live_root]);
+}
+
+#[test]
+fn runner_config_skill_roots_validation_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("runner.toml");
+    let render = |roots: &str| {
+        format!(
+            "server_url = \"http://127.0.0.1:8000\"\ntoken = \"t\"\nclient_id = \"oe\"\nproject_registry_dir = \"project-registry\"\n[skills]\nroots = [{roots}]\n[policy]\nallow_cwd_anywhere = true\n"
+        )
+    };
+
+    std::fs::write(&config_path, render("\"relative/skills\"")).unwrap();
+    let error = load_config(&config_path).unwrap_err();
+    assert!(
+        error.contains("absolute paths without parent traversal"),
+        "{error}"
+    );
+
+    let absolute = std::env::current_dir().unwrap().join("skill-root");
+    let encoded = format!("{:?}", absolute.to_string_lossy().as_ref());
+    let too_many = std::iter::repeat_n(encoded, 17)
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(&config_path, render(&too_many)).unwrap();
+    let error = load_config(&config_path).unwrap_err();
+    assert!(error.contains("at most 16 entries"), "{error}");
+
+    let too_long = std::env::current_dir()
+        .unwrap()
+        .join("x".repeat(crate::webcodex_runner::config::MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES + 1));
+    std::fs::write(
+        &config_path,
+        render(&format!("{:?}", too_long.to_string_lossy().as_ref())),
+    )
+    .unwrap();
+    let error = load_config(&config_path).unwrap_err();
+    assert!(error.contains("at most 4096 bytes"), "{error}");
 }
 
 #[test]
@@ -393,16 +539,53 @@ fn runner_version_output_includes_build_metadata() {
 }
 
 #[test]
-fn runner_cli_legacy_runtime_args_are_preserved() {
+fn runner_cli_explicit_config_path_remains_exact() {
     let _guard = test_env_lock();
     let action = parse_runner_args(["--config", "/tmp/agent.toml", "--once"]).unwrap();
     assert_eq!(
         action,
         RunnerCliAction::Run {
+            server_url: None,
             config_path: PathBuf::from("/tmp/agent.toml"),
             once: true,
             stop_on_stdin_eof: false,
+            computer_session_dir: None,
         }
+    );
+}
+
+#[test]
+fn computer_session_cli_modes_are_explicit_and_do_not_need_runner_config() {
+    let _guard = test_env_lock();
+    assert_eq!(
+        parse_runner_args([
+            "--computer-session-helper",
+            "--session-state-dir",
+            "/tmp/computer-session"
+        ])
+        .unwrap(),
+        RunnerCliAction::ComputerSessionHelper {
+            session_state_dir: PathBuf::from("/tmp/computer-session")
+        }
+    );
+    assert_eq!(
+        parse_runner_args([
+            "--config",
+            "/tmp/runner.toml",
+            "--computer-session-dir",
+            "/tmp/computer-session"
+        ])
+        .unwrap(),
+        RunnerCliAction::Run {
+            server_url: None,
+            config_path: PathBuf::from("/tmp/runner.toml"),
+            once: false,
+            stop_on_stdin_eof: false,
+            computer_session_dir: Some(PathBuf::from("/tmp/computer-session")),
+        }
+    );
+    assert!(
+        parse_runner_args(["--computer-session-helper", "--config", "/tmp/runner.toml"]).is_err()
     );
 }
 
@@ -414,95 +597,61 @@ fn runner_parent_liveness_is_explicit_opt_in() {
     assert_eq!(
         action,
         RunnerCliAction::Run {
+            server_url: None,
             config_path: PathBuf::from("/tmp/runner.toml"),
             once: false,
             stop_on_stdin_eof: true,
+            computer_session_dir: None,
         }
     );
 }
 
 #[test]
-fn runner_cli_config_env_prefers_runner_name_and_keeps_legacy_alias_fail_closed() {
-    let _guard = test_env_lock();
-    let _env = EnvGuard::new()
+fn runner_cli_config_env_uses_only_canonical_name() {
+    IsolatedEnv::new()
         .set("WEBCODEX_RUNNER_CONFIG", "/tmp/runner.toml")
-        .remove("WEBCODEX_AGENT_CONFIG");
-    assert_eq!(
-        parse_runner_args(std::iter::empty::<&str>()).unwrap(),
-        RunnerCliAction::Run {
-            config_path: PathBuf::from("/tmp/runner.toml"),
-            once: false,
-            stop_on_stdin_eof: false,
-        }
-    );
-    drop(_env);
-
-    let _legacy = EnvGuard::new()
-        .remove("WEBCODEX_RUNNER_CONFIG")
-        .set("WEBCODEX_AGENT_CONFIG", "/tmp/agent.toml");
-    assert_eq!(
-        parse_runner_args(std::iter::empty::<&str>()).unwrap(),
-        RunnerCliAction::Run {
-            config_path: PathBuf::from("/tmp/agent.toml"),
-            once: false,
-            stop_on_stdin_eof: false,
-        }
-    );
-    drop(_legacy);
-
-    let _ambiguous = EnvGuard::new()
-        .set("WEBCODEX_RUNNER_CONFIG", "/tmp/runner.toml")
-        .set("WEBCODEX_AGENT_CONFIG", "/tmp/agent.toml");
-    let error = parse_runner_args(std::iter::empty::<&str>()).unwrap_err();
-    assert!(error.contains("cannot both be set"));
-
-    assert_eq!(
-        parse_runner_args(["--config", "/tmp/explicit.toml"]).unwrap(),
-        RunnerCliAction::Run {
-            config_path: PathBuf::from("/tmp/explicit.toml"),
-            once: false,
-            stop_on_stdin_eof: false,
-        },
-        "an explicit --config path must not be blocked by conflicting default-path env aliases"
-    );
-    assert_eq!(
-        parse_runner_args(["--profile", "special"]).unwrap(),
-        RunnerCliAction::Run {
-            config_path: client_profile_runner_config("special").unwrap(),
-            once: false,
-            stop_on_stdin_eof: false,
-        },
-        "an explicit profile must not be blocked by conflicting default-path env aliases"
-    );
+        .set("WEBCODEX_AGENT_CONFIG", "/tmp/agent.toml")
+        .run("canonical-only", || {
+            assert_eq!(
+                parse_runner_args(std::iter::empty::<&str>()).unwrap(),
+                RunnerCliAction::Run {
+                    server_url: None,
+                    config_path: PathBuf::from("/tmp/runner.toml"),
+                    once: false,
+                    stop_on_stdin_eof: false,
+                    computer_session_dir: None,
+                }
+            );
+        });
 }
 
 #[test]
-fn runner_profile_config_resolution_accepts_legacy_only_and_rejects_dual_files() {
-    let _guard = test_env_lock();
+fn runner_profile_config_resolution_uses_only_runner_toml() {
     let tmp = tempfile::tempdir().unwrap();
-    let _env = EnvGuard::new()
+    IsolatedEnv::new()
         .set("XDG_CONFIG_HOME", tmp.path())
         .set("APPDATA", tmp.path())
         .set("USERPROFILE", tmp.path())
         .remove("WEBCODEX_RUNNER_CONFIG")
-        .remove("WEBCODEX_AGENT_CONFIG");
-    let profile_dir = tmp.path().join("webcodex/clients/special");
-    std::fs::create_dir_all(&profile_dir).unwrap();
+        .set("WEBCODEX_AGENT_CONFIG", "/tmp/ignored-agent.toml")
+        .run("canonical-only", || {
+            let profile_dir = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap())
+                .join("webcodex/clients/special");
+            std::fs::create_dir_all(&profile_dir).unwrap();
+            std::fs::write(profile_dir.join("agent.toml"), "retired").unwrap();
 
-    assert_eq!(
-        client_profile_runner_config("special").unwrap(),
-        profile_dir.join("runner.toml")
-    );
-    std::fs::write(profile_dir.join("agent.toml"), "legacy").unwrap();
-    assert_eq!(
-        client_profile_runner_config("special").unwrap(),
-        profile_dir.join("agent.toml")
-    );
-    std::fs::write(profile_dir.join("runner.toml"), "current").unwrap();
-    let error = client_profile_runner_config("special").unwrap_err();
-    assert!(error.contains("refusing to guess"));
+            assert_eq!(
+                client_profile_runner_config("special").unwrap(),
+                profile_dir.join("runner.toml")
+            );
+
+            std::fs::write(profile_dir.join("runner.toml"), "current").unwrap();
+            assert_eq!(
+                client_profile_runner_config("special").unwrap(),
+                profile_dir.join("runner.toml")
+            );
+        });
 }
-
 #[test]
 fn runner_cli_profile_derives_default_config_path() {
     let _guard = test_env_lock();
@@ -510,9 +659,11 @@ fn runner_cli_profile_derives_default_config_path() {
     assert_eq!(
         action,
         RunnerCliAction::Run {
+            server_url: None,
             config_path: client_profile_runner_config("special").unwrap(),
             once: false,
             stop_on_stdin_eof: false,
+            computer_session_dir: None,
         }
     );
 }
@@ -525,9 +676,11 @@ fn runner_cli_explicit_config_overrides_profile() {
     assert_eq!(
         action,
         RunnerCliAction::Run {
+            server_url: None,
             config_path: PathBuf::from("/tmp/agent.toml"),
             once: false,
             stop_on_stdin_eof: false,
+            computer_session_dir: None,
         }
     );
 }

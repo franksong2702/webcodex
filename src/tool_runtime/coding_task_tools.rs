@@ -12,6 +12,7 @@ impl ToolRuntime {
         trusted_recording_session_id: Option<&str>,
         trusted_recording_session_project: Option<&str>,
         correlation: &mut ToolCallCorrelation,
+        bootstrap_context: &mut Option<super::coding_task::BootstrapContext>,
     ) -> ToolResult {
         match call {
             ToolCall::WorkOnProject {
@@ -21,10 +22,14 @@ impl ToolRuntime {
                 mode,
                 base_ref,
                 instruction,
-                include_project_instructions,
-                include_workflow_guidance,
+                guidance_profile,
+                include_extension_catalog,
                 session_id,
             } => {
+                let guidance_profile = self.mcp_host_policy.effective_guidance_profile(
+                    guidance_profile,
+                    matches!(transport, sessions::SessionTransport::Mcp),
+                );
                 self.work_on_project(
                     project,
                     client_id,
@@ -33,19 +38,21 @@ impl ToolRuntime {
                     base_ref,
                     instruction,
                     session_id,
-                    include_project_instructions,
-                    include_workflow_guidance,
+                    guidance_profile,
+                    include_extension_catalog,
                     auth,
                     trusted_recording_session_id,
                     trusted_recording_session_project,
                     transport,
                     correlation,
+                    bootstrap_context,
                 )
                 .await
             }
             ToolCall::FinishCodingTask {
                 project,
                 session_id,
+                outputs,
                 summary_only,
                 include_diff,
                 include_workspace,
@@ -56,6 +63,7 @@ impl ToolRuntime {
                 self.finish_coding_task(
                     project,
                     session_id,
+                    outputs,
                     summary_only,
                     include_diff,
                     include_workspace,

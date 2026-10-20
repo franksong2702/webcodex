@@ -125,6 +125,59 @@ fn default_policy_denies_paths_outside_allowed_roots() {
 }
 
 #[test]
+fn existing_runtime_project_cwd_never_expands_or_restores_removed_root_authority() {
+    let formerly_allowed = tempfile::tempdir().unwrap();
+    let still_allowed = tempfile::tempdir().unwrap();
+    let project_root = formerly_allowed.path().canonicalize().unwrap();
+    let remaining_root = still_allowed.path().canonicalize().unwrap();
+    std::fs::write(project_root.join("history.txt"), "runtime project history").unwrap();
+
+    let before = RunnerPolicy {
+        allowed_roots: vec![project_root.clone(), remaining_root.clone()],
+        ..RunnerPolicy::default()
+    };
+    resolve_requested_path(&before, Some(project_root.to_str().unwrap()), "history.txt")
+        .expect("an existing Project is usable while its filesystem root remains authorized");
+
+    let after = RunnerPolicy {
+        allowed_roots: vec![remaining_root],
+        ..RunnerPolicy::default()
+    };
+    let error = resolve_requested_path(&after, Some(project_root.to_str().unwrap()), "history.txt")
+        .expect_err("Project identity/history must not re-grant a removed allowed root");
+    assert!(error.contains("outside allowed_roots"), "{error}");
+}
+
+#[test]
+fn configured_skill_storage_does_not_expand_generic_file_authority() {
+    let project = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    let project_root = project.path().canonicalize().unwrap();
+    let skill_root = skills.path().canonicalize().unwrap();
+    let outside_file = skill_root.join("outside.txt");
+    std::fs::write(&outside_file, "must stay outside project authority").unwrap();
+
+    let config = RunnerConfig {
+        policy: RunnerPolicy {
+            allowed_roots: vec![project_root.clone()],
+            ..RunnerPolicy::default()
+        },
+        skills: crate::webcodex_runner::config::SkillsConfig {
+            roots: vec![skill_root.clone()],
+        },
+        ..test_config(project_root)
+    };
+    assert_eq!(config.skills.roots, vec![skill_root]);
+    let error = resolve_requested_path(
+        &config.policy,
+        None,
+        outside_file.to_string_lossy().as_ref(),
+    )
+    .expect_err("configured Skill roots must not grant generic file authority");
+    assert!(error.contains("outside allowed_roots"), "{error}");
+}
+
+#[test]
 fn load_config_explicit_allowed_roots_override_home_default() {
     let _guard = test_env_lock();
     let tmp = tempfile::tempdir().unwrap();
@@ -144,13 +197,12 @@ fn load_config_explicit_allowed_roots_override_home_default() {
 
 #[test]
 fn load_config_empty_roots_without_home_and_no_cwd_anywhere_errors() {
-    let _guard = test_env_lock();
     // Windows derives the allowed-root default from USERPROFILE, so both
     // home sources must be absent to exercise the fail-closed branch.
-    let _env = EnvGuard::new()
+    IsolatedEnv::new()
         .remove("HOME")
         .remove("USERPROFILE")
-        .remove("APPDATA");
+        .remove("APPDATA").run("inherited", || {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("runner.toml");
     std::fs::write(
@@ -161,4 +213,5 @@ fn load_config_empty_roots_without_home_and_no_cwd_anywhere_errors() {
     .unwrap();
     let err = load_config(&path).unwrap_err();
     assert!(err.contains("allowed_roots is empty"));
+    });
 }

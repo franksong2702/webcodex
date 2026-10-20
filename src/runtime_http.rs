@@ -3,6 +3,7 @@ use crate::json_error;
 use crate::tool_request_trace::{
     estimate_json_bytes, new_trace_id, scope_active_trace, ToolRequestLifecycle,
 };
+
 use crate::tool_runtime::kernel::{
     ToolCallContext, ToolCallErrorStatus, ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
@@ -10,32 +11,14 @@ use crate::tool_runtime::model_ergonomics_telemetry::ModelErgonomicsCompletion;
 use crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD;
 use crate::tool_runtime::{
     ListToolsOptions, ToolCall, ToolRuntime, TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD,
-    TOOL_CALL_WRAPPER_FIELDS,
 };
 use salvo::prelude::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-mod import_http;
-mod jobs;
-mod project_files;
 mod projects;
-mod runner_config;
 
-pub use import_http::import_conversation_files_to_project;
-pub use jobs::{
-    job_log, job_status, job_stop, job_tail, jobs_list, projects_run_job, projects_run_shell,
-};
-pub use project_files::{
-    projects_apply_unified_diff, projects_discard_untracked, projects_git_diff,
-    projects_git_diff_summary, projects_git_restore_paths, projects_git_status,
-    projects_list_files, projects_read_file, projects_search_text,
-};
-pub use projects::{
-    projects_create, projects_list, projects_register, projects_resolve_or_register,
-    projects_unregister,
-};
-pub use runner_config::{runner_config_check, runner_config_reload};
+pub use projects::projects_resolve_or_register;
 
 fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
     depot.obtain::<Arc<ToolRuntime>>().ok().cloned()
@@ -159,13 +142,16 @@ fn prepare_action_tools_call_response(
     project: Option<String>,
     result: crate::tool_runtime::ToolResult,
     model_ergonomics: Option<&ModelErgonomicsCompletion>,
+    canonical_audit_output: Option<Value>,
+    correlation: &crate::tool_runtime::ToolCallCorrelation,
 ) -> (StatusCode, crate::tool_runtime::ToolResult) {
     let status = if result.success {
         StatusCode::OK
     } else {
         StatusCode::BAD_REQUEST
     };
-    let audit_output = action_audit_output_for_tool(tool, &result.output);
+    let audit_output = canonical_audit_output
+        .unwrap_or_else(|| action_audit_output_for_tool(tool, &result.output));
     let response = result;
     let mut summary = json!({"output": audit_output});
     if let Some(telemetry) = model_ergonomics
@@ -174,9 +160,25 @@ fn prepare_action_tools_call_response(
     {
         summary["model_ergonomics"] = telemetry;
     }
+    if let Some(composition) = correlation.code_mode_composition_audit_summary() {
+        summary["code_mode_composition"] = composition;
+    }
+    if let Some(expectation) = &correlation.failure_expectation_result {
+        summary["failure_expectation_result"] = json!(expectation);
+    }
+    if let Some(job_trace) = correlation.job_audit_summary() {
+        summary["job_trace"] = job_trace;
+    }
     let mut event = ActionAuditRecord::new(tool.to_string(), response.success, status)
         .error(response.error.clone())
         .summary(summary);
+    if response.success {
+        if let Some(ids) =
+            crate::tool_runtime::job_audit::action_audit_job_ids(Some(tool), &response.output)
+        {
+            event = event.ids(ids);
+        }
+    }
     event.project = project;
     audit.record(event);
     (status, response)
@@ -256,10 +258,10 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
         guard.handler_returned(500, estimated, Some(false), None, "error_runtime_missing");
         return;
     };
-    // Parse the body as a raw JSON value so we can apply the params/arguments
-    // precedence rule explicitly and emit field-aware errors that include the
-    // tool name. We never echo the raw body back, so tokens/headers/env never
-    // leak through error messages.
+    // Parse the body as a raw JSON value so we can enforce the explicit
+    // tool/params envelope and emit field-aware errors that include the tool
+    // name. We never echo the raw body back, so tokens/headers/env never leak
+    // through error messages.
     let body: Value = match req.parse_json().await {
         Ok(body) => body,
         Err(e) => {
@@ -277,10 +279,13 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
             return;
         }
     };
-    guard.capture_payload("raw_request_body", &tool_call_trace_raw_body(&body));
+    if let Some(tool) = body.get("tool").and_then(Value::as_str) {
+        guard.capture_request_diagnostic(tool, body.get("params").unwrap_or(&body));
+    }
     let (tool, params) = match extract_tool_call(&body) {
         Ok(pair) => pair,
         Err(msg) => {
+            guard.capture_payload_lazy("raw_request_body", || tool_call_trace_raw_body(&body));
             // Params-level failure: not yet in ToolRuntime.
             guard.parsed("invalid_tool_call");
             let body = serde_json::json!({
@@ -297,13 +302,13 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
         }
     };
     guard.set_tool_name(Some(tool.clone()));
+    guard.capture_payload_lazy("raw_request_body", || tool_call_trace_raw_body(&body));
     let window = crate::client_window::api_window(req, res);
     guard.set_client_window(Some(&window));
     guard.parsed("ok");
-    guard.capture_payload(
-        "effective_arguments",
-        &tool_call_trace_effective_arguments(&tool, &params),
-    );
+    guard.capture_payload_lazy("effective_arguments", || {
+        tool_call_trace_effective_arguments(&tool, &params)
+    });
     // dispatch_started only after argument extraction succeeds and immediately
     // before ToolRuntime dispatch.
     guard.dispatch_started();
@@ -344,8 +349,11 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
                 "insufficient_scope",
             );
             guard.dispatch_finished(false, Some(false), "insufficient_scope");
-            let response_body =
-                crate::auth::scope_forbidden_body(auth.as_ref(), description.clone());
+            let response_body = crate::auth::scope_forbidden_body(
+                auth.as_ref(),
+                required_scope,
+                description.clone(),
+            );
             guard.capture_payload("final_response", &response_body);
             let estimated = estimate_json_bytes(&response_body);
             guard.response_serialized(
@@ -418,6 +426,8 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
                 outcome.project,
                 result,
                 model_ergonomics.as_ref(),
+                outcome.canonical_audit_output,
+                &outcome.correlation,
             );
             let response_value = guard
                 .enabled()
@@ -491,24 +501,19 @@ fn tool_call_trace_effective_arguments(tool: &str, params: &Value) -> Value {
     }
 }
 
-/// Extract `(tool, params)` from a raw `callRuntimeTool` request body.
+/// Extract `(tool, params)` from the generic REST `/api/tools/call` body.
 ///
-/// Accepted shapes (all route to the same tool dispatch):
+/// Accepted shapes:
 /// - `{"tool":"list_tools"}`
 /// - `{"tool":"list_tools","params":null}`
-/// - `{"tool":"git_diff_summary","params":{"project":"agent:c:p"}}`
-/// - `{"tool":"git_diff_summary","project":"agent:c:p"}`
-/// - `{"tool":"git_status","project":"agent:c:p","recording_session_id":"wc_sess_..."}`
+/// - `{"tool":"read_workspace_changes","params":{"project":"agent:c:p"}}`
+/// - `{"tool":"get_git_status","params":{"project":"agent:c:p"},"recording_session_id":"wc_sess_..."}`
 ///
-/// Non-null `params` take precedence over flattened GPT Action fields. A null
-/// `params` wrapper is treated as absent. When `params` is absent/null, every
-/// top-level field except `tool` and reserved metadata like
-/// `recording_session_id` is collected into the params object for GPT Action
-/// compatibility. The retired `arguments` wrapper is rejected explicitly.
-/// Top-level `session_id` is not reserved here; it remains a normal flattened
-/// tool argument for tools such as `session_summary`. Returns a human-readable
-/// error string (never including the raw body) when the body is not a JSON
-/// object or `tool` is missing/not a non-empty string.
+/// `params` is the only tool-argument container. Top-level
+/// `recording_session_id` remains request metadata and is not injected into
+/// tool arguments. Unknown top-level fields fail with migration guidance. The
+/// retired `arguments` wrapper is rejected explicitly. Returns a human-readable
+/// error string (never including the raw body) when the body is invalid.
 fn extract_tool_call(body: &Value) -> Result<(String, Value), String> {
     let obj = body
         .as_object()
@@ -527,31 +532,35 @@ fn extract_tool_call(body: &Value) -> Result<(String, Value), String> {
         }
     };
     if obj.contains_key("arguments") {
-        return Err("field 'arguments' is no longer supported; use 'params' or flattened top-level tool arguments".to_string());
+        return Err(
+            "field 'arguments' is no longer supported; move tool arguments under 'params'"
+                .to_string(),
+        );
     }
-    // Non-null params take precedence over flattened GPT Action fields. Some
-    // Action runtimes emit optional object properties as explicit nulls, which
-    // must not erase valid flattened tool arguments.
-    let params = if let Some(params) = obj
+    let mut unexpected = obj
+        .keys()
+        .filter(|key| {
+            key.as_str() != TOOL_CALL_TOOL_FIELD
+                && key.as_str() != TOOL_CALL_PARAMS_FIELD
+                && key.as_str() != TOOL_CALL_RECORDING_SESSION_ID_FIELD
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    unexpected.sort();
+    if !unexpected.is_empty() {
+        let fields = unexpected
+            .iter()
+            .map(|field| format!("'{field}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "unexpected top-level field(s) {fields}; move tool arguments under 'params'"
+        ));
+    }
+    let params = obj
         .get(TOOL_CALL_PARAMS_FIELD)
-        .filter(|params| !params.is_null())
-    {
-        params.clone()
-    } else {
-        let mut flattened = serde_json::Map::new();
-        for (key, value) in obj {
-            if !TOOL_CALL_WRAPPER_FIELDS.contains(&key.as_str())
-                && key != TOOL_CALL_RECORDING_SESSION_ID_FIELD
-            {
-                flattened.insert(key.clone(), value.clone());
-            }
-        }
-        if flattened.is_empty() {
-            Value::Null
-        } else {
-            Value::Object(flattened)
-        }
-    };
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok((tool, params))
 }
 
@@ -575,13 +584,13 @@ pub async fn runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Resp
     let Some(arguments) = parse_optional_json_body(req, res).await else {
         return;
     };
-    let call = match ToolCall::from_tool_name("runtime_status", arguments) {
+    let call = match ToolCall::from_tool_name("get_runtime_status", arguments) {
         Ok(call) => call,
         Err(error) => {
             render_result(
                 res,
                 &audit,
-                "runtime_status",
+                "get_runtime_status",
                 None,
                 crate::tool_runtime::ToolResult::err(error),
             );
@@ -590,7 +599,7 @@ pub async fn runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Resp
     };
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime.dispatch_with_auth(call, auth.as_ref()).await;
-    render_result(res, &audit, "runtime_status", None, result);
+    render_result(res, &audit, "get_runtime_status", None, result);
 }
 
 #[cfg(test)]

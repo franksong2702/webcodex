@@ -1,6 +1,8 @@
 // Every test in this module is Unix-only; the glob import is only needed there.
 #[cfg(unix)]
 use super::super::support::*;
+#[cfg(target_os = "linux")]
+use crate::webcodex_cli::test_support::executable_test_tempdir;
 
 #[cfg(unix)]
 fn server_env(tmp: &tempfile::TempDir) -> std::path::PathBuf {
@@ -656,7 +658,7 @@ fn verify_systemd_units(units: &[(&str, &str)]) {
     if !available {
         return;
     }
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = executable_test_tempdir();
     let mut paths = Vec::with_capacity(units.len());
     for (name, unit) in units {
         let path = tmp.path().join(name);
@@ -666,6 +668,13 @@ fn verify_systemd_units(units: &[(&str, &str)]) {
     let mut command = std::process::Command::new("systemd-analyze");
     command.arg("verify");
     command.args(&paths);
+    command.env(
+        "SYSTEMD_UNIT_PATH",
+        format!(
+            "{}:/usr/lib/systemd/system:/lib/systemd/system",
+            tmp.path().display()
+        ),
+    );
     let output = command.output().unwrap();
     let names = units
         .iter()
@@ -691,7 +700,7 @@ fn make_executable(path: &std::path::Path) {
 #[cfg(target_os = "linux")]
 #[test]
 fn generated_server_and_runner_units_pass_systemd_analyze_verify() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = executable_test_tempdir();
     let server_bin = tmp.path().join("webcodex-server");
     let runner_bin = tmp.path().join("webcodex-runner");
     make_executable(&server_bin);
@@ -748,8 +757,9 @@ fn generated_server_and_runner_units_pass_systemd_analyze_verify() {
 #[test]
 fn special_supported_paths_pass_systemd_analyze_verify() {
     let tmp = tempfile::tempdir().unwrap();
-    let server_bin = tmp.path().join("webcodex server%p");
-    let runner_bin = tmp.path().join("webcodex runner%p");
+    let executable_tmp = executable_test_tempdir();
+    let server_bin = executable_tmp.path().join("webcodex server%p");
+    let runner_bin = executable_tmp.path().join("webcodex runner%p");
     make_executable(&server_bin);
     make_executable(&runner_bin);
 
@@ -1054,7 +1064,7 @@ async fn runner_status_detects_current_client_online_and_runner_token_boundary()
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
             tx.send(request.clone()).unwrap();
             if i == 0 {
-                let body = r#"{"success":true,"output":{"agents":{"clients":[{"client_id":"alice-laptop","connected":true,"status":"online"}]}}}"#;
+                let body = r#"{"success":true,"output":{"runners":{"clients":[{"client_id":"alice-laptop","connected":true,"status":"online"}]}}}"#;
                 write!(
                     stream,
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",

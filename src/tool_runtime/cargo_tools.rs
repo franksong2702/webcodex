@@ -10,9 +10,39 @@ impl ToolRuntime {
         call: ToolCall,
         ssh_resource: Option<&str>,
         auth: Option<&AuthContext>,
+        structured_handoff_max_secs: Option<u64>,
     ) -> ToolResult {
         let tool_name = call.tool_name();
         let mut result = match call {
+            ToolCall::ProjectValidate {
+                project,
+                session_id,
+                cwd,
+                action,
+                adapter,
+                scope,
+                dependency_policy,
+                dependency_resolution_policy,
+                test,
+                timeout_secs,
+            } => {
+                self.project_validate(
+                    project,
+                    session_id,
+                    cwd,
+                    action,
+                    adapter,
+                    scope,
+                    dependency_policy,
+                    dependency_resolution_policy,
+                    test,
+                    timeout_secs,
+                    structured_handoff_max_secs,
+                    ssh_resource,
+                    auth,
+                )
+                .await
+            }
             ToolCall::CargoFmt {
                 project,
                 session_id,
@@ -42,30 +72,40 @@ impl ToolRuntime {
                 no_default_features,
                 features,
                 package,
+                packages,
                 timeout_secs,
                 sync_wait_secs,
             } => {
-                self.cargo_check_with_context(
-                    project,
-                    cwd,
-                    all_targets,
-                    all_features,
-                    no_default_features,
-                    features,
-                    package,
-                    timeout_secs,
-                    sync_wait_secs,
-                    session_id,
-                    ssh_resource,
-                    auth,
-                )
-                .await
+                match crate::runner_protocol::normalize_cargo_packages(
+                    package.as_deref(),
+                    packages.as_deref(),
+                ) {
+                    Ok(packages) => {
+                        self.cargo_check_with_context(
+                            project,
+                            cwd,
+                            all_targets,
+                            all_features,
+                            no_default_features,
+                            features,
+                            packages,
+                            timeout_secs,
+                            sync_wait_secs,
+                            session_id,
+                            ssh_resource,
+                            auth,
+                        )
+                        .await
+                    }
+                    Err(error) => ToolResult::err(error),
+                }
             }
             ToolCall::CargoTest {
                 project,
                 session_id,
                 cwd,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
@@ -81,6 +121,7 @@ impl ToolRuntime {
                     project,
                     cwd,
                     filter,
+                    lib,
                     all_targets,
                     all_features,
                     no_default_features,

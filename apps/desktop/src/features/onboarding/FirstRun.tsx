@@ -1,373 +1,294 @@
-import { useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { desktopApi, type QuickShareProvider } from "../../lib/desktop-api";
-import { useLocale } from "../../i18n/locale";
-import { TunnelConfigDiagnostics } from "../connection/TunnelConfigDiagnostics";
+import { runnerServerAddress } from "../../lib/runner-server-address";
+import { NativeSelect } from "@mantine/core";
+import { useServiceScopeText } from "../../i18n/service-scope";
+import { FolderOpen, Globe2, Share2 } from "lucide-react";
+import { desktopApi } from "../../lib/desktop-api";
+import { useLocale, type MessageKey } from "../../i18n/locale";
+import { desktopErrorPresentation, normalizeDesktopError } from "../../i18n/presentation";
+import type { DesktopError, DesktopState, SetupProgressStep } from "../../models/topology";
 import { PowerShellInstallGuidance } from "../settings/PowerShellInstallGuidance";
-import {
-  desktopErrorPresentation,
-  normalizeDesktopError,
-} from "../../i18n/presentation";
-import type {
-  DesktopError,
-  DesktopState,
-  ProjectSelection,
-} from "../../models/topology";
+import { QuickShareSetup } from "./QuickShareSetup";
 
-type SetupMode = "local" | "remote" | "share";
+type SetupMode = "create" | "join" | "share";
+const setupProgressLabels: Record<SetupProgressStep, MessageKey> = {
+  preflight: "setup.progress.preflight",
+  server_configuration: "setup.progress.server_configuration",
+  server_service_install: "setup.progress.server_service_install",
+  server_service_start: "setup.progress.server_service_start",
+  server_reachability: "setup.progress.server_reachability",
+  user_authentication: "setup.progress.user_authentication",
+  runner_enrollment: "setup.progress.runner_enrollment",
+  runner_configuration: "setup.progress.runner_configuration",
+  project_registration: "setup.progress.project_registration",
+  runner_service_install: "setup.progress.runner_service_install",
+  runner_service_start: "setup.progress.runner_service_start",
+  readiness: "setup.progress.readiness",
+};
+
+// Match Core's origin-only input contract. A malformed address must never
+// qualify for saved-credential reuse merely because its hostname looks familiar.
+function serverOrigin(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password
+      && url.pathname === "/" && !url.search && !url.hash ? url.origin : null;
+  } catch { return null; }
+}
 
 interface FirstRunProps {
   state: DesktopState;
   onState: (state: DesktopState) => void;
   chooseModeFirst?: boolean;
-  onComplete?: () => void;
+  onComplete?: (state?: DesktopState) => void;
 }
 
 export function FirstRun({ state, onState, chooseModeFirst = false, onComplete }: FirstRunProps) {
   const { t } = useLocale();
-  const initialMode = useMemo<SetupMode | null>(() => {
-    if (chooseModeFirst) return null;
-    if (state.topology?.experience === "quick_share") return "share";
-    if (state.topology?.server.kind === "local") return "local";
-    if (state.topology?.server.kind === "remote") return "remote";
-    return null;
-  }, [chooseModeFirst, state.topology]);
-  const [mode, setMode] = useState<SetupMode | null>(initialMode);
-  const [project, setProject] = useState<ProjectSelection | null>(
-    state.project ?? null,
-  );
-  const [serverUrl, setServerUrl] = useState(
-    state.topology?.server.kind === "remote" ? state.topology.server.url : "",
-  );
+  const scopeText = useServiceScopeText();
+  const setup = state.environment_setup;
+  const savedMode = setup?.mode ?? (state.topology?.experience === "full"
+    ? state.topology.server.kind === "local" ? "create" : "join" : null);
+  const savedRunner = setup?.runner ?? (savedMode ? state.topology?.runner.kind === "local" : true);
+  const savedServer = setup?.server_url ?? (state.topology?.server.kind === "remote" ? state.topology.server.url : "");
+  const savedProject = setup ? setup.project_path : (!state.persistent_environment && savedMode ? state.project?.path ?? null : null);
+  const pending = Boolean(setup && !setup.configured);
+  const contextKey = JSON.stringify([setup ?? null, savedMode, savedRunner, savedServer, savedProject, state.persistent_environment]);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const [activeContext, setActiveContext] = useState(contextKey);
+  const [serviceScope, setServiceScope] = useState<"user" | "system">(setup?.service_scope ?? "user");
+  const [mode, setMode] = useState<SetupMode | null>(chooseModeFirst ? null : savedMode);
+  useEffect(() => { headingRef.current?.focus(); }, [mode]);
+  const [runner, setRunner] = useState(savedRunner);
+  const [serverUrl, setServerUrl] = useState(savedServer);
+  const [runnerName, setRunnerName] = useState(setup?.runner_display_name ?? "");
+  const [projectPath, setProjectPath] = useState<string | null>(savedProject);
+  const [advanced, setAdvanced] = useState(Boolean(savedMode && !savedRunner));
   const [pairingCode, setPairingCode] = useState("");
-  const [remoteEnrollmentNeedsRefresh, setRemoteEnrollmentNeedsRefresh] = useState(false);
-  const [provider, setProvider] = useState<QuickShareProvider>("cloudflare");
-  const [connectAfterSetup, setConnectAfterSetup] = useState(state.openai_tunnel_configured);
+  const [replacePairingCode, setReplacePairingCode] = useState(false);
+  const [userToken, setUserToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<DesktopError | null>(null);
-  const mutationBusy = busy || Boolean(state.current_operation);
-  const canReuseRemoteEnrollment = Boolean(
-    mode === "remote" &&
-      !remoteEnrollmentNeedsRefresh &&
-      state.project?.runtime_project_id &&
-      state.topology?.experience === "full" &&
-      state.topology.server.kind === "remote" &&
-      sameServerOrigin(serverUrl, state.topology.server.url),
-  );
+  const currentContext = useRef(contextKey);
+  currentContext.current = contextKey;
+  const currentSetup = useRef(setup);
+  currentSetup.current = setup;
+  useEffect(() => {
+    if (activeContext === contextKey) return;
+    setActiveContext(contextKey); setMode(chooseModeFirst && !pending && !busy ? null : savedMode);
+    setRunner(savedRunner); setServerUrl(savedServer); setProjectPath(savedProject); setRunnerName(setup?.runner_display_name ?? "");
+    setServiceScope(setup?.service_scope ?? "user"); setAdvanced(Boolean(savedMode && !savedRunner));
+    setPairingCode(""); setUserToken(""); setReplacePairingCode(false); setError(null);
+  }, [activeContext, contextKey, chooseModeFirst, savedMode, savedRunner, savedServer, savedProject, setup?.service_scope, pending, busy]);
+  const mutationBusy = busy || Boolean(state.current_operation) || activeContext !== contextKey;
+  const canChooseServiceScope = !pending && !setup?.configured && !state.persistent_environment && (chooseModeFirst || !savedMode);
+  const canChooseProject = !pending && !state.persistent_environment && !setup?.configured;
+  const origin = serverOrigin(serverUrl);
+  const recordedServer = setup?.mode === "join" ? setup.server_url
+    : state.topology?.experience === "full" && state.topology.server.kind === "remote" ? state.topology.server.url : null;
+  const sameServer = mode === "join" && origin !== null && recordedServer !== null && origin === serverOrigin(recordedServer);
+  const reuseRunner = sameServer && (state.topology?.runner.kind === "local" || Boolean(setup?.configured && setup.runner)) && !replacePairingCode;
+  const reuseViewer = sameServer && Boolean(state.persistent_environment || setup?.configured);
+  const needsCode = mode === "join" && runner && !reuseRunner;
+  const needsToken = mode === "join" && !runner && !reuseViewer;
+  const address = runnerServerAddress(serverUrl);
+  const addressIssue = mode === "join" && !advanced && !savedMode ? address.issue : null;
+  const canChooseName = !pending && !savedMode && !state.persistent_environment;
+  const nameInvalid = Array.from(runnerName).length > 200 || runnerName.includes("\0");
+  const canSubmit = !(runner && canChooseName && nameInvalid) && !mutationBusy && !addressIssue && (mode === "create" || mode === "join" && origin !== null
+    && (!needsCode || Boolean(pairingCode.trim())) && (!needsToken || Boolean(userToken.trim())));
 
+  const clearInputs = () => {
+    setPairingCode(""); setUserToken(""); setReplacePairingCode(false); setError(null);
+  };
+  const chooseMode = (next: SetupMode | null, advancedChoice = false) => {
+    if (mutationBusy) return;
+    if (pending && next && next !== savedMode) return;
+    clearInputs(); setMode(next);
+    if (next) {
+      setAdvanced(advancedChoice || Boolean(savedMode && !savedRunner));
+      if (!savedMode) setRunner(!advancedChoice);
+      else if (advancedChoice && !pending && !savedRunner) setRunner(false);
+    }
+  };
   const chooseProject = async () => {
-    setError(null);
-    const selection = await open({
-      directory: true,
-      multiple: false,
-      title: t("setup.chooseProject"),
-    });
-    if (typeof selection !== "string") return;
+    if (mutationBusy || !canChooseProject) return;
+    const expectedContext = contextKey;
+    setBusy(true); setError(null);
     try {
-      setProject(await desktopApi.inspectProject(selection));
-    } catch (value) {
-      setError(normalizeDesktopError(value));
-    }
+      const path = await open({ directory: true, multiple: false, title: t("setup.chooseProject") });
+      if (typeof path === "string") {
+        const project = await desktopApi.inspectProject(path);
+        if (currentContext.current === expectedContext) setProjectPath(project.path);
+      }
+    } catch (value) { if (currentContext.current === expectedContext) setError(normalizeDesktopError(value)); }
+    finally { setBusy(false); }
   };
-
   const run = async () => {
-    if (!mode || !project || mutationBusy) return;
-    setBusy(true);
-    setError(null);
+    if (!canSubmit) return;
+    const expectedContext = contextKey;
+    setBusy(true); setError(null);
+    const code = pairingCode.trim();
+    const credential = userToken.trim();
+    const submittedIntent = { environmentId: setup?.environment_id, mode, runner, projectPath: runner ? projectPath : null, origin, serviceScope };
+    const stillCurrent = () => {
+      if (currentContext.current === expectedContext) return true;
+      const projected = currentSetup.current;
+      return Boolean(projected && (!submittedIntent.environmentId || projected.environment_id === submittedIntent.environmentId) && projected.mode === submittedIntent.mode && projected.runner === submittedIntent.runner
+        && projected.project_path === submittedIntent.projectPath && projected.service_scope === submittedIntent.serviceScope
+        && (submittedIntent.mode === "create" || serverOrigin(projected.server_url) === submittedIntent.origin));
+    };
+    setPairingCode(""); setUserToken("");
     try {
-      if (mode === "local") {
-        let next = await desktopApi.configureLocal(project.path);
-        onState(next);
-        if (connectAfterSetup && next.openai_tunnel_configured && next.readiness.runtime_ready) {
-          next = await desktopApi.startRegularTunnel();
-          onState(next);
-        }
-        onComplete?.();
-      } else if (mode === "remote") {
-        if (!project) return;
-        const oneTimeCode = pairingCode;
-        setPairingCode("");
-        const next = await desktopApi.configureRemote(
-          serverUrl,
-          oneTimeCode,
-          project.path,
-        );
-        setRemoteEnrollmentNeedsRefresh(false);
-        onState(next);
-        onComplete?.();
-      } else {
-        if (!project) return;
-        onState(await desktopApi.startQuickShare(project.path, provider));
-        onComplete?.();
-      }
-    } catch (value) {
-      const normalized = normalizeDesktopError(value);
-      if (mode === "remote" && normalized.code === "pairing_code_invalid") {
-        // The optimistic reuse hint is based on saved Desktop state. If the
-        // backend proves that connection identity is no longer reusable, expose
-        // the one-shot recovery field instead of trapping the user behind the
-        // stale reuse hint.
-        setRemoteEnrollmentNeedsRefresh(true);
-      }
-      setError(normalized);
-    } finally {
-      setBusy(false);
-    }
+      const next = await desktopApi.configureEnvironment({
+        ...((canChooseServiceScope || pending) ? { serviceScope } : {}),
+        mode, serverUrl: mode === "join" ? origin : null,
+        projectPath: runner ? projectPath : null,
+        runner,
+        ...(runner && canChooseName && runnerName.trim() ? { runnerDisplayName: runnerName.trim() } : {}),
+        pairingCode: needsCode ? code : null,
+        userToken: needsToken ? credential : null,
+        replacePairingCode,
+      });
+      if (stillCurrent()) { setReplacePairingCode(false); onState(next); onComplete?.(next); }
+    } catch (value) { if (stillCurrent()) setError(normalizeDesktopError(value)); }
+    finally { setBusy(false); }
   };
 
-  if (!mode) {
-    return (
-      <section className="first-run" aria-labelledby="first-run-title" data-webcodex-page="first-run">
-        <div className="eyebrow">{t("first.welcome")}</div>
-        <h1 id="first-run-title">{t("first.title")}</h1>
-        <p className="lede">{t("first.description")}</p>
-        <div className="entry-grid">
-          <button className="entry-card recommended" onClick={() => setMode("local")} data-webcodex-action="choose-local-setup">
-            <span className="entry-badge">{t("first.recommended")}</span>
-            <strong>{t("first.localTitle")}</strong>
-            <span>{t("first.localDescription")}</span>
-          </button>
-          <button className="entry-card" onClick={() => setMode("remote")} data-webcodex-action="choose-remote-setup">
-            <strong>{t("first.remoteTitle")}</strong>
-            <span>{t("first.remoteDescription")}</span>
-          </button>
-          <button className="entry-card" onClick={() => setMode("share")} data-webcodex-action="choose-quick-share-setup">
-            <strong>{t("first.shareTitle")}</strong>
-            <span>{t("first.shareDescription")}</span>
-          </button>
-        </div>
-      </section>
-    );
-  }
+  if (mode === "share") return <QuickShareSetup state={state} onState={onState}
+    onBack={() => chooseMode(null)} onComplete={() => onComplete?.()} />;
+
+  if (!mode) return <section className="first-run" aria-labelledby="first-run-title" data-webcodex-page="first-run">
+    <div className="eyebrow">{t("first.welcome")}</div>
+    <h1 id="first-run-title" tabIndex={-1} ref={headingRef}>{t("first.title")}</h1>
+    <p className="lede">{t("first.description")}</p>
+    <div className="entry-grid">
+      <button className="entry-card recommended" disabled={mutationBusy || Boolean((state.persistent_environment || setup?.configured || pending) && savedMode === "join")}
+        onClick={() => chooseMode("create")} data-webcodex-action="choose-local-setup">
+        <span className="entry-badge">{t("first.recommended")}</span>
+        <span className="entry-icon" aria-hidden="true"><FolderOpen /></span>
+        <strong>{t("first.localTitle")}</strong><span>{t("first.localDescription")}</span>
+      </button>
+      <button className="entry-card recommended" disabled={mutationBusy || Boolean((state.persistent_environment || setup?.configured || pending) && savedMode === "create")}
+        onClick={() => chooseMode("join")} data-webcodex-action="choose-remote-setup">
+        <span className="entry-icon" aria-hidden="true"><Globe2 /></span>
+        <strong>{t("first.remoteTitle")}</strong><span>{t("first.remoteDescription")}</span>
+      </button>
+    </div>
+    <details><summary>{t("first.advanced")}</summary>
+      <div className="entry-grid">
+        <button className="entry-card" disabled={mutationBusy || Boolean(savedMode && savedMode !== "create") || Boolean(savedRunner && savedMode)}
+          onClick={() => chooseMode("create", true)} data-webcodex-action="choose-server-only-setup">
+          <strong>{t("first.serverOnlyTitle")}</strong><span>{t("setup.serverOnly")}</span>
+        </button>
+        <button className="entry-card" disabled={mutationBusy || Boolean(savedMode && savedMode !== "join") || Boolean(savedRunner && savedMode)}
+          onClick={() => chooseMode("join", true)} data-webcodex-action="choose-viewer-setup">
+          <strong>{t("first.viewerTitle")}</strong><span>{t("setup.viewerOnly")}</span>
+        </button>
+        <button className="entry-card" disabled={mutationBusy || pending} onClick={() => chooseMode("share")}
+          data-webcodex-action="choose-quick-share-setup">
+          <span className="entry-icon" aria-hidden="true"><Share2 /></span>
+          <strong>{t("first.shareTitle")}</strong><span>{t("first.shareDescription")}</span>
+        </button>
+      </div>
+    </details>
+    {state.persistent_environment && <p className="field-help">{t("setup.savedEnvironment")}</p>}
+  </section>;
 
   const presentation = error ? desktopErrorPresentation(error, t) : null;
-  const serverInvalid = error?.code === "server_url_invalid" || error?.code === "server_unreachable";
-  const pairingInvalid = error?.code === "pairing_code_invalid";
-
-  return (
-    <form
-      className="setup-shell"
-      aria-labelledby="setup-title"
-      aria-busy={mutationBusy}
-      data-webcodex-page="setup"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void run();
-      }}
-    >
-      <button type="button" className="back-button" onClick={() => setMode(null)} data-webcodex-action="show-setup-options">
-        {t("setup.back")}
-      </button>
-      <div className="eyebrow">{modeLabel(mode, t)}</div>
-      <h1 id="setup-title">{setupTitle(mode, t)}</h1>
-      <p className="lede">{setupDescription(mode, t)}</p>
-      <PowerShellInstallGuidance state={state} onState={onState} />
-
-      {mode === "local" && <TunnelConfigDiagnostics state={state} onState={onState} />}
-
-      {mode === "remote" && (
-        <div className="form-card">
-          <div className="field-group">
-            <label htmlFor="setup-server-url">{t("setup.serverUrl")}</label>
-            <input
-              id="setup-server-url"
-              type="url"
-              value={serverUrl}
-              onChange={(event) => setServerUrl(event.target.value)}
-              placeholder="https://webcodex.example.com"
-              disabled={mutationBusy}
-              aria-describedby="setup-server-url-help"
-              aria-invalid={serverInvalid || undefined}
-              aria-errormessage={serverInvalid ? "setup-error" : undefined}
-            />
-            <span className="field-help" id="setup-server-url-help">{t("setup.serverUrlHelp")}</span>
-          </div>
-          {canReuseRemoteEnrollment ? (
-            <div className="enrollment-note">
-              <span className="section-kicker">{t("setup.enrollment")}</span>
-              <strong>{t("setup.reuseEnrollment")}</strong>
-              <span>{t("setup.reuseEnrollmentHelp")}</span>
-            </div>
-          ) : (
-            <div className="field-group">
-              <label htmlFor="setup-pairing-code">{t("setup.pairingCode")}</label>
-              <input
-                id="setup-pairing-code"
-                type="password"
-                value={pairingCode}
-                onChange={(event) => setPairingCode(event.target.value)}
-                placeholder="wc_pair_…"
-                autoComplete="off"
-                spellCheck={false}
-                disabled={mutationBusy}
-                aria-describedby="setup-pairing-code-help"
-                aria-invalid={pairingInvalid || undefined}
-                aria-errormessage={pairingInvalid ? "setup-error" : undefined}
-              />
-              <span className="field-help" id="setup-pairing-code-help">{t("setup.pairingCodeHelp")}</span>
-            </div>
-          )}
-        </div>
-      )}
-
-      {mode === "share" && (
-        <fieldset className="provider-row provider-fieldset" role="radiogroup" aria-labelledby="quick-share-provider-legend">
-          <legend id="quick-share-provider-legend">{t("setup.providerLegend")}</legend>
-          {(["cloudflare", "openai", "none"] as QuickShareProvider[]).map((value) => (
-            <div
-              className={`provider-option ${provider === value ? "selected" : ""}`}
-              key={value}
-            >
-              <input
-                id={`quick-share-provider-${value}`}
-                type="radio"
-                name="quick-share-provider"
-                value={value}
-                checked={provider === value}
-                onChange={() => setProvider(value)}
-                disabled={mutationBusy}
-                aria-describedby={`quick-share-provider-${value}-description`}
-                data-webcodex-control={`quick-share-provider-${value}`}
-              />
-              <label htmlFor={`quick-share-provider-${value}`}>
-                <strong>{providerLabel(value, t)}</strong>
-                <span id={`quick-share-provider-${value}-description`}>{providerDescription(value, t)}</span>
-              </label>
-            </div>
-          ))}
-        </fieldset>
-      )}
-
-      {mode === "local" && state.openai_tunnel_configured && (
-        <label className="setup-choice-card" htmlFor="setup-connect-chatgpt">
-          <input
-            id="setup-connect-chatgpt"
-            type="checkbox"
-            checked={connectAfterSetup}
-            onChange={(event) => setConnectAfterSetup(event.target.checked)}
-            disabled={mutationBusy}
-          />
-          <span>
-            <strong>{t("setup.connectChatGptAfterSetup")}</strong>
-            <small>{t("setup.connectChatGptAfterSetupHelp")}</small>
-          </span>
-        </label>
-      )}
-
-      <div className="project-picker-card">
-        <div>
-          <span className="section-kicker">{t("setup.project")}</span>
-          <strong>{project ? project.path : t("setup.chooseProject")}</strong>
-          {mode === "local" && !project && (
-            <span className="project-meta">{t("setup.projectRequired")}</span>
-          )}
-          {project && (
-            <span className="project-meta">
-              {t("setup.allowedRoot", {
-                root: project.allowed_root,
-                kind: project.is_git_repository ? t("setup.gitRepository") : t("setup.folder"),
-              })}
-            </span>
-          )}
-        </div>
-        <button type="button" className="secondary-button" onClick={chooseProject} disabled={mutationBusy} data-webcodex-action="choose-project">
-          {project ? t("setup.changeFolder") : t("setup.chooseFolder")}
-        </button>
-      </div>
-
-      {mode === "remote" && (
-        <details className="advanced-enrollment">
-          <summary>{t("setup.advancedEnrollment")}</summary>
-          <p>{t("setup.advancedEnrollmentHelp")}</p>
+  return <>
+    <form className="setup-shell" aria-labelledby="setup-title" aria-busy={mutationBusy}
+      data-webcodex-page="setup" onSubmit={event => { event.preventDefault(); void run(); }}>
+      <button type="button" className="back-button" disabled={mutationBusy} onClick={() => chooseMode(null)}
+        data-webcodex-action="show-setup-options">{t("setup.back")}</button>
+      <ol className="setup-route" aria-label={t("completion.title")}>
+        <li aria-current="step">{t("completion.role")}</li><li>{t("completion.connection")}</li><li>{t("completion.read")}</li>
+      </ol>
+      <div className="eyebrow">{mode === "create" ? t("setup.localLabel") : t("setup.remoteLabel")}</div>
+      <h1 id="setup-title" tabIndex={-1} ref={headingRef}>{mode === "create" ? t("setup.localTitle") : t("setup.remoteTitle")}</h1>
+      <p className="lede">{mode === "create" ? t(runner ? "setup.localDescription" : "setup.serverOnly") : t(runner ? "setup.remoteDescription" : "setup.viewerOnly")}</p>
+      {savedMode && !state.persistent_environment && <p className="workspace-notice" role="note">{scopeText("migrationHelp")}</p>}
+      <div className="form-card">
+        <p className="field-help">{runner ? t("setup.localRunnerHelp") : t(mode === "create" ? "setup.serverOnly" : "setup.viewerOnly")}</p>
+        <details open={advanced} onToggle={event => setAdvanced(event.currentTarget.open)}>
+          <summary>{t("first.advanced")}</summary>
+          <label className="checkbox-row"><input type="checkbox" checked={runner}
+            disabled={mutationBusy || pending || Boolean(savedMode && savedRunner)}
+            onChange={event => { clearInputs(); setRunner(event.target.checked); }} />{t("setup.localRunner")}</label>
         </details>
-      )}
-
-      {error && (
-        <div className="error-card" role="alert" id="setup-error">
-          <strong>{presentation?.title}</strong>
-          <span>{presentation?.action}</span>
-          <details>
-            <summary>{t("common.details")}</summary>
-            <code>{error.code}</code>
-            <p>{error.message}</p>
-          </details>
-          {error.code === "project_not_loaded" && (
-            <div className="setup-recovery-actions">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => void run()}
-                disabled={mutationBusy}
-                data-webcodex-action="activate-project"
-              >
-                {t("setup.reloadProject")}
-              </button>
-              <span>{t("setup.reloadProjectHelp")}</span>
-            </div>
-          )}
+      </div>
+      {runner && canChooseName && <div className="form-card field-group">
+        <label htmlFor="setup-runner-name">{t("setup.runnerName")}</label>
+        <input id="setup-runner-name" value={runnerName} disabled={mutationBusy} onChange={event => setRunnerName(event.target.value)} aria-describedby="setup-runner-name-help" />
+        <span id="setup-runner-name-help" className="field-help">{t("setup.runnerNameHelp")}</span>
+        {nameInvalid && <span role="alert" className="field-help">{t("setup.runnerNameInvalid")}</span>}
+      </div>}
+      {runner && canChooseProject && <div className="project-picker-card">
+        <div>
+          <strong>{t("setup.initialProject")}</strong>
+          <p className="field-help">{t("setup.initialProjectHelp")}</p>
+          {projectPath && <code>{projectPath}</code>}
         </div>
-      )}
-
+        <div className="setup-project-actions">
+          <button type="button" className="secondary-button" disabled={mutationBusy} onClick={() => void chooseProject()}
+            data-webcodex-action="choose-project">{t(projectPath ? "setup.changeFolder" : "setup.chooseFolder")}</button>
+          {projectPath && <button type="button" className="secondary-button" disabled={mutationBusy} onClick={() => setProjectPath(null)}
+            data-webcodex-action="clear-project">{t("setup.clearInitialProject")}</button>}
+        </div>
+      </div>}
+      {mode === "join" && <div className="form-card">
+        <div className="field-group">
+          <label htmlFor="setup-server-url">{t("setup.serverUrl")}</label>
+          <input id="setup-server-url" type="url" value={serverUrl} required
+            onChange={event => { clearInputs(); setServerUrl(event.target.value); }}
+            placeholder="https://webcodex.example.com" disabled={mutationBusy} readOnly={Boolean(state.persistent_environment || setup?.configured) || pending}
+            aria-describedby="setup-server-url-help" />
+          <span className="field-help" id="setup-server-url-help">{t(state.persistent_environment ? "setup.savedEnvironment" : "setup.serverUrlHelp")}</span>
+        </div>
+        {addressIssue && serverUrl.trim() && <p className="field-help" role="alert">{t(addressIssue === "loopback"
+          ? "setup.serverUrlLoopback" : addressIssue === "openai" ? "setup.serverUrlOpenai" : "setup.serverUrlInvalid")}</p>}
+        {needsCode ? <div className="field-group">
+          <label htmlFor="setup-pairing-code">{t("setup.pairingCode")}</label>
+          <input id="setup-pairing-code" type="password" value={pairingCode} required
+            onChange={event => setPairingCode(event.target.value)} autoComplete="off" spellCheck={false} disabled={mutationBusy} />
+          <span className="field-help">{t("setup.pairingCodeHelp")}</span>
+        </div> : needsToken ? <div className="field-group">
+          <label htmlFor="setup-user-token">{t("setup.userCredential")}</label>
+          <input id="setup-user-token" type="password" value={userToken} required
+            onChange={event => setUserToken(event.target.value)} autoComplete="off" spellCheck={false} disabled={mutationBusy} />
+          <span className="field-help">{t("setup.userCredentialHelp")}</span>
+        </div> : <div className="field-help"><strong>{t(runner ? "setup.reuseEnrollment" : "setup.reuseViewerCredential")}</strong>
+          <p>{t(runner ? "setup.reuseRunnerRegistrationHelp" : "setup.reuseViewerCredentialHelp")}</p></div>}
+      </div>}
+      {(runner || mode === "create") && (canChooseServiceScope
+        ? <div className="form-card">
+            <strong>{scopeText(serviceScope)}</strong>
+            <p className="field-help">{scopeText(serviceScope === "user" ? "userHelp" : "systemHelp")}</p>
+            <details><summary>{scopeText("advanced")}</summary>
+              <NativeSelect label={scopeText("title")} value={serviceScope} disabled={mutationBusy}
+                data={[{value:"user",label:scopeText("user")},{value:"system",label:scopeText("system")}]}
+                onChange={event => { const value=event.currentTarget.value; if (value === "user" || value === "system") setServiceScope(value); }} />
+            </details>
+          </div>
+        : <p className="field-help">{t("setup.serviceConsent")}</p>)}
+      {error && <div className="error-card" role="alert" id="setup-error">
+        <strong>{presentation?.title}</strong><span>{presentation?.action}</span>
+        <details><summary>{t("common.details")}</summary><code>{error.code}</code><p>{error.message}</p></details>
+        {error.code === "pairing_recovery_required" && <button type="button" className="secondary-button" disabled={mutationBusy}
+          onClick={() => { setReplacePairingCode(true); setError(null); }}>{t("setup.useNewPairingCode")}</button>}
+      </div>}
+      {mutationBusy && state.setup_progress && <div className="field-help" role="status" aria-live="polite">
+        {t("setup.progressCurrent", { step: t(setupProgressLabels[state.setup_progress.step]) })}
+      </div>}
       <div className="setup-actions">
-        <button
-          type="submit"
-          className="primary-button"
-          disabled={
-            mutationBusy ||
-            !project ||
-            (mode === "remote" &&
-              (!serverUrl.trim() || (!canReuseRemoteEnrollment && !pairingCode.trim())))
-          }
-          data-webcodex-action={mode === "local" ? "configure-local" : mode === "remote" ? "configure-remote" : "start-quick-share"}
-        >
-          {mutationBusy ? t("common.checking") : actionLabel(mode, canReuseRemoteEnrollment, t)}
+        <button type="submit" className="primary-button" disabled={!canSubmit}
+          data-webcodex-action={mode === "create" ? "configure-local" : "configure-remote"}>
+          {mutationBusy ? t("common.checking") : mode === "create" ? t("setup.setUp") : t("setup.connect")}
         </button>
-        <span className="action-help">
-          {mutationBusy ? t("setup.verifying") : t("setup.noTerminal")}
-        </span>
+        <span className="action-help">{mutationBusy ? t("setup.verifying") : t("setup.noTerminal")}</span>
       </div>
     </form>
-  );
-}
-
-type Translate = ReturnType<typeof useLocale>["t"];
-
-function modeLabel(mode: SetupMode, t: Translate) {
-  return mode === "local" ? t("setup.localLabel") : mode === "remote" ? t("setup.remoteLabel") : t("setup.shareLabel");
-}
-
-function setupTitle(mode: SetupMode, t: Translate) {
-  return mode === "local"
-    ? t("setup.localTitle")
-    : mode === "remote"
-      ? t("setup.remoteTitle")
-      : t("setup.shareTitle");
-}
-
-function setupDescription(mode: SetupMode, t: Translate) {
-  if (mode === "local") return t("setup.localDescription");
-  if (mode === "remote") return t("setup.remoteDescription");
-  return t("setup.shareDescription");
-}
-
-function actionLabel(mode: SetupMode, canReuseRemoteEnrollment: boolean, t: Translate) {
-  if (mode === "local") return t("setup.setUp");
-  if (mode === "remote") return canReuseRemoteEnrollment ? t("setup.reconnect") : t("setup.connect");
-  return t("setup.startShare");
-}
-
-function sameServerOrigin(left: string, right: string) {
-  return left.trim().replace(/\/+$/, "").toLowerCase() === right.trim().replace(/\/+$/, "").toLowerCase();
-}
-
-function providerLabel(provider: QuickShareProvider, t: Translate) {
-  if (provider === "cloudflare") return "Cloudflare";
-  if (provider === "openai") return "OpenAI Secure Tunnel";
-  return t("common.noChatGpt");
-}
-
-function providerDescription(provider: QuickShareProvider, t: Translate) {
-  if (provider === "cloudflare") return t("provider.cloudflareDescription");
-  if (provider === "openai") return t("provider.openaiDescription");
-  return t("provider.localDescription");
+    {runner && <PowerShellInstallGuidance state={state} onState={onState} />}
+  </>;
 }

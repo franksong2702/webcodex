@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
-use uuid::Uuid;
 use xcap::Window;
 
 #[cfg(windows)]
@@ -52,20 +51,21 @@ use windows::{
         System::Ole::CF_UNICODETEXT,
         UI::Accessibility::{
             CUIAutomation8, IUIAutomation2, IUIAutomationElement, IUIAutomationInvokePattern,
-            IUIAutomationScrollItemPattern, IUIAutomationTreeWalker, IUIAutomationValuePattern,
-            UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId, UIA_ComboBoxControlTypeId,
-            UIA_CustomControlTypeId, UIA_DataGridControlTypeId, UIA_DataItemControlTypeId,
-            UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_GroupControlTypeId,
-            UIA_HeaderControlTypeId, UIA_HeaderItemControlTypeId, UIA_HyperlinkControlTypeId,
-            UIA_InvokePatternId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
-            UIA_MenuControlTypeId, UIA_MenuItemControlTypeId, UIA_PaneControlTypeId,
-            UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId, UIA_ScrollBarControlTypeId,
-            UIA_ScrollItemPatternId, UIA_SeparatorControlTypeId, UIA_SliderControlTypeId,
-            UIA_SpinnerControlTypeId, UIA_StatusBarControlTypeId, UIA_TabControlTypeId,
-            UIA_TabItemControlTypeId, UIA_TableControlTypeId, UIA_TextControlTypeId,
-            UIA_ToolBarControlTypeId, UIA_ToolTipControlTypeId, UIA_TreeControlTypeId,
-            UIA_TreeItemControlTypeId, UIA_ValuePatternId, UIA_WindowControlTypeId,
-            UIA_CONTROLTYPE_ID, UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_PATTERN_ID,
+            IUIAutomationScrollItemPattern, IUIAutomationSelectionPattern, IUIAutomationTreeWalker,
+            IUIAutomationValuePattern, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
+            UIA_ComboBoxControlTypeId, UIA_CustomControlTypeId, UIA_DataGridControlTypeId,
+            UIA_DataItemControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
+            UIA_GroupControlTypeId, UIA_HeaderControlTypeId, UIA_HeaderItemControlTypeId,
+            UIA_HyperlinkControlTypeId, UIA_InvokePatternId, UIA_ListControlTypeId,
+            UIA_ListItemControlTypeId, UIA_MenuControlTypeId, UIA_MenuItemControlTypeId,
+            UIA_PaneControlTypeId, UIA_ProgressBarControlTypeId, UIA_RadioButtonControlTypeId,
+            UIA_ScrollBarControlTypeId, UIA_ScrollItemPatternId, UIA_SelectionPatternId,
+            UIA_SeparatorControlTypeId, UIA_SliderControlTypeId, UIA_SpinnerControlTypeId,
+            UIA_StatusBarControlTypeId, UIA_TabControlTypeId, UIA_TabItemControlTypeId,
+            UIA_TableControlTypeId, UIA_TextControlTypeId, UIA_ToolBarControlTypeId,
+            UIA_ToolTipControlTypeId, UIA_TreeControlTypeId, UIA_TreeItemControlTypeId,
+            UIA_ValuePatternId, UIA_WindowControlTypeId, UIA_CONTROLTYPE_ID,
+            UIA_E_ELEMENTNOTAVAILABLE, UIA_E_NOTSUPPORTED, UIA_PATTERN_ID,
         },
         UI::HiDpi::{
             SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT,
@@ -113,8 +113,8 @@ mod display;
 mod input;
 
 pub(crate) use accessibility::{
-    accessibility_status, accessibility_tree, activate_window, control, element_state,
-    scroll_to_element, uia_semantic_text_input_role, win_hwnd,
+    accessibility_status, accessibility_tree, accessibility_tree_scoped, activate_window, control,
+    element_state, scroll_to_element, uia_semantic_text_input_role, win_hwnd,
 };
 use accessibility::{
     exact_uia_window, resolve_uia_element, uia_element_has_exact_focus, uia_error,
@@ -124,8 +124,8 @@ use accessibility::{
 #[cfg(test)]
 pub(crate) use accessibility::{
     test_uia_is_offscreen, test_windows_focused_element_belongs_to_surface, uia_control_role,
-    uia_semantic_focus_role, windows_control_attempt_error, windows_scroll_attempt_error,
-    windows_window_activation_attempt_error,
+    uia_observes_value, uia_semantic_focus_role, windows_control_attempt_error,
+    windows_scroll_attempt_error, windows_window_activation_attempt_error,
 };
 #[cfg(test)]
 pub(crate) use applications::{

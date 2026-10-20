@@ -1,15 +1,15 @@
 use sha2::{Digest, Sha256};
 use webcodex_core::runner_protocol::{
     validate_process_argv, validate_raw_shell_wire_command, validate_script_request,
-    ProviderCallSummary, RunnerConfigReloadStatus, RunnerProjectSummary, ShellFileOpRequest,
+    ProviderCallSummary, RunnerConfigErrorCode, RunnerConfigErrorField, RunnerConfigErrorReason,
+    RunnerConfigReloadStatus, RunnerProjectLineage, RunnerProjectSummary, ShellFileOpRequest,
     ShellProcessArgv, ShellRunRequest, ShellScriptPayload, ToolProvidersStatus,
     PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
-    PROJECT_INVENTORY_SNAPSHOT_MAX_SERIALIZED_BYTES, RUNNER_CONFIG_RESTART_REQUIRED_FIELDS,
-    STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS,
+    PROJECT_INVENTORY_SNAPSHOT_MAX_SERIALIZED_BYTES, PROJECT_ROOT_FINGERPRINT_PREFIX,
+    RUNNER_CONFIG_RESTART_REQUIRED_FIELDS, STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS,
 };
 
 const MAX_CLIENT_ID_LEN: usize = 80;
-const MAX_RUNNER_FIELD_LEN: usize = 200;
 /// Max length for `agent_instance_id`. A UUID v4 is 36 chars; allow headroom
 /// for future formats but bound it so a malicious peer cannot stash huge
 /// strings in the registry.
@@ -26,14 +26,39 @@ const MAX_COMMAND_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 const MAX_PROVIDER_TEXT_CHARS: usize = 120;
 const MAX_PROVIDER_TOOL_NAMES: usize = 64;
 
+fn parse_config_error_code(value: &str) -> Option<RunnerConfigErrorCode> {
+    serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+}
+
+fn parse_config_error_field(value: &str) -> Option<RunnerConfigErrorField> {
+    serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+}
+
+fn parse_config_error_reason(value: &str) -> Option<RunnerConfigErrorReason> {
+    serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
+}
+
+fn config_reload_error_code_is_safe(value: &str) -> bool {
+    if value == "reload_unsupported" {
+        return true;
+    }
+    parse_config_error_code(value).is_some_and(|code| {
+        matches!(
+            code,
+            RunnerConfigErrorCode::ConfigReadFailed
+                | RunnerConfigErrorCode::ConfigParseFailed
+                | RunnerConfigErrorCode::ConfigValidationFailed
+                | RunnerConfigErrorCode::ProviderConfigInvalid
+                | RunnerConfigErrorCode::PluginReloadFailed
+        )
+    })
+}
+
 pub(super) fn normalize_config_reload(
     status: Option<RunnerConfigReloadStatus>,
 ) -> Option<RunnerConfigReloadStatus> {
     let mut status = status?;
     const RESULTS: &str = "not_attempted success partial failure unsupported";
-    const ERRORS: &str = "config_read_failed config_parse_failed config_validation_failed provider_config_invalid plugin_reload_failed reload_unsupported";
-    const ERROR_FIELDS: &str = "max_concurrent_jobs shell.max_persistent_shells shell.persistent_shell_idle_timeout_secs acp.max_concurrent_runs acp.permission_timeout_secs mcp.request_timeout_secs";
-    const ERROR_REASONS: &str = "out_of_range";
     if status.generation == 0
         || !RESULTS
             .split_whitespace()
@@ -41,7 +66,7 @@ pub(super) fn normalize_config_reload(
         || status
             .last_reload_error_code
             .as_deref()
-            .is_some_and(|code| !ERRORS.split_whitespace().any(|v| v == code))
+            .is_some_and(|code| !config_reload_error_code_is_safe(code))
     {
         return None;
     }
@@ -51,11 +76,22 @@ pub(super) fn normalize_config_reload(
     ) {
         (None, None) => true,
         (Some(field), Some(reason)) => {
-            ERROR_FIELDS.split_whitespace().any(|value| value == field)
-                && ERROR_REASONS
-                    .split_whitespace()
-                    .any(|value| value == reason)
-                && status.last_reload_error_code.as_deref() == Some("config_validation_failed")
+            let field = parse_config_error_field(field);
+            let reason = parse_config_error_reason(reason);
+            let relation_valid = matches!(
+                (field, reason),
+                (Some(_), Some(RunnerConfigErrorReason::OutOfRange))
+                    | (
+                        Some(RunnerConfigErrorField::SkillsRoots),
+                        Some(RunnerConfigErrorReason::InvalidPath)
+                    )
+            );
+            relation_valid
+                && status
+                    .last_reload_error_code
+                    .as_deref()
+                    .and_then(parse_config_error_code)
+                    == Some(RunnerConfigErrorCode::ConfigValidationFailed)
                 && status.last_reload_result == "failure"
         }
         _ => false,
@@ -231,18 +267,7 @@ pub(super) fn validate_runner_instance_id(value: &str) -> Result<(), String> {
 }
 
 pub(super) fn validate_optional_field(value: &Option<String>, field: &str) -> Result<(), String> {
-    if let Some(value) = value {
-        if value.chars().count() > MAX_RUNNER_FIELD_LEN {
-            return Err(format!(
-                "{} is too long; maximum is {} characters",
-                field, MAX_RUNNER_FIELD_LEN
-            ));
-        }
-        if value.contains('\0') {
-            return Err(format!("{} cannot contain NUL bytes", field));
-        }
-    }
-    Ok(())
+    webcodex_core::runner_protocol::validate_optional_runner_field(value, field)
 }
 
 pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), String> {
@@ -251,6 +276,7 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         "read"
         | "write"
         | "list"
+        | "list_page"
         | "project_overview"
         | "delete_project_files"
         | "write_project_file"
@@ -270,7 +296,7 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         | "skill_read_file" => {}
         _ => {
             return Err(
-                "op must be one of read, write, list, project_overview, write_project_file, apply_text_edits, apply_patch, save_project_artifact, read_project_artifact_metadata, read_project_artifact, read_project_artifact_export_chunk, artifact_upload_begin, artifact_upload_chunk, artifact_upload_finish, artifact_upload_abort, checkpoint_create, checkpoint_restore, skill_list_packages, skill_read_file"
+                "op must be one of read, write, list, list_page, project_overview, write_project_file, apply_text_edits, apply_patch, save_project_artifact, read_project_artifact_metadata, read_project_artifact, read_project_artifact_export_chunk, artifact_upload_begin, artifact_upload_chunk, artifact_upload_finish, artifact_upload_abort, checkpoint_create, checkpoint_restore, skill_list_packages, skill_read_file"
                     .to_string(),
             )
         }
@@ -330,7 +356,9 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
     }
 
     if let Some(content) = &body.content {
-        let max_content_bytes = if artifact_payload {
+        let max_content_bytes = if body.op == "list_page" {
+            256
+        } else if artifact_payload {
             MAX_ARTIFACT_PAYLOAD_BYTES
         } else if checkpoint_payload {
             MAX_CHECKPOINT_PAYLOAD_BYTES
@@ -347,6 +375,7 @@ pub(super) fn validate_file_request(body: &ShellFileOpRequest) -> Result<(), Str
         }
         if body.op != "write"
             && body.op != "project_overview"
+            && body.op != "list_page"
             && body.op != "apply_text_edits"
             && !structured_edit_payload
             && !structured_delete_payload
@@ -621,6 +650,16 @@ pub(super) fn trim_string(value: Option<String>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn valid_project_root_fingerprint(value: &str) -> bool {
+    value
+        .strip_prefix(PROJECT_ROOT_FINGERPRINT_PREFIX)
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn valid_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 pub(super) fn validate_project_summary(project: &RunnerProjectSummary) -> Result<(), &'static str> {
     if project.id.is_empty()
         || project.id.len() > 64
@@ -674,6 +713,31 @@ pub(super) fn validate_project_summary(project: &RunnerProjectSummary) -> Result
             .any(|hook| hook.is_empty() || hook.len() > 120 || hook.contains('\0'))
     {
         return Err("project_summary_invalid_hooks");
+    }
+    if project
+        .root_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| !valid_project_root_fingerprint(fingerprint))
+    {
+        return Err("project_summary_invalid_root_fingerprint");
+    }
+    if let Some(RunnerProjectLineage::ManagedWorktreeSource {
+        source_project_id,
+        source_root_fingerprint,
+        base_sha,
+    }) = project.lineage.as_ref()
+    {
+        if source_project_id.is_empty()
+            || source_project_id.len() > 64
+            || source_project_id == &project.id
+            || !source_project_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            || !valid_project_root_fingerprint(source_root_fingerprint)
+            || !valid_git_sha(base_sha)
+        {
+            return Err("project_summary_invalid_lineage");
+        }
     }
     if project.revision.as_deref().is_some_and(|revision| {
         let Some(hex) = revision.strip_prefix("sha256:") else {
@@ -836,6 +900,26 @@ mod provider_status_tests {
             diagnostic.last_reload_error_reason.as_deref(),
             Some("out_of_range")
         );
+
+        let skills_path = normalize_config_reload(Some(RunnerConfigReloadStatus {
+            generation: 4,
+            last_reload_result: "failure".to_string(),
+            last_reload_error_code: Some("config_validation_failed".to_string()),
+            last_reload_error_field: Some("skills.roots".to_string()),
+            last_reload_error_reason: Some("invalid_path".to_string()),
+            restart_required: false,
+            restart_required_fields: vec![],
+        }))
+        .expect("canonical skills.roots invalid_path diagnostic must remain observable");
+        assert_eq!(
+            skills_path.last_reload_error_field.as_deref(),
+            Some("skills.roots")
+        );
+        assert_eq!(
+            skills_path.last_reload_error_reason.as_deref(),
+            Some("invalid_path")
+        );
+
         assert!(normalize_config_reload(Some(RunnerConfigReloadStatus {
             last_reload_result: "raw error follows".to_string(),
             ..RunnerConfigReloadStatus::default()

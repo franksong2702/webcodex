@@ -7,29 +7,62 @@ pub mod artifact_policy;
 pub mod audit_preview;
 pub mod authority;
 pub mod build_info;
+pub mod cargo_test_count;
 pub mod coding_agent;
+pub mod compact;
+pub mod computer_input_contract;
+pub mod desktop_runtime_contract;
+pub mod job_input;
 pub mod job_observation;
 pub mod lsp_bridge;
 pub mod mcp_gateway;
 pub mod memory_contract;
+pub mod model_reference;
 pub mod plugin;
+pub mod project_build;
 pub mod project_context_contract;
+pub mod project_format;
+#[cfg(test)]
+mod project_format_tests;
 pub mod project_instructions;
 pub mod project_listing;
+mod project_operation;
+pub mod project_search;
+pub mod runner_instruction;
 pub mod runner_job_lifecycle;
+pub mod runner_job_receipt;
 pub mod runner_operation;
 pub mod runner_protocol;
+pub mod runner_skill;
 pub mod runtime_contract;
 pub mod sensitive_paths;
 pub mod sensitive_text;
+pub mod server_environment;
 pub mod shell_quote;
 pub mod skill_metadata;
 pub mod skill_store;
 pub mod ssh_resource;
+pub mod task_outputs;
 pub mod validation_bridge;
 pub mod validation_evidence;
 
 #[cfg(test)]
 mod validation_evidence_tests;
 pub mod validation_identity;
+pub mod validation_source;
 pub mod workflow_session_contract;
+
+pub mod project_validation;
+
+#[cfg(test)]
+mod project_validation_tests;
+
+#[cfg(test)]
+mod project_build_tests;
+
+#[cfg(test)]
+mod project_operation_tests;
+
+pub mod directory_page;
+
+pub mod browser_query;

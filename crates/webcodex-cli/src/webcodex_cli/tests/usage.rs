@@ -1,6 +1,24 @@
 use super::support::*;
 
 #[test]
+fn controller_tui_help_describes_read_only_overview_without_stage_labels() {
+    for args in [
+        vec!["controller", "--help"],
+        vec!["controller", "tui", "--help"],
+    ] {
+        match cli_action(args) {
+            CliAction::Exit { code, stdout, .. } => {
+                assert_eq!(code, 0);
+                assert!(stdout.contains("read-only overview"));
+                assert!(stdout.contains("--user-token-file PATH"));
+                assert!(!stdout.contains("V0"));
+            }
+            other => panic!("expected Controller help, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn bare_interactive_repo_defaults_to_share_only_on_supported_desktop_unix() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -156,6 +174,7 @@ fn project_registration_activation_and_login_help_prioritize_user_language() {
     assert!(project_help.contains("allowed_roots"));
     let activate_help = cli_exit(["project", "activate", "--help"]).unwrap();
     assert!(activate_help.contains("Activate one explicitly selected local project"));
+    assert!(activate_help.contains("reuses existing allowed_roots"));
     assert!(activate_help.contains("canonical exact project root"));
     assert!(activate_help.contains("generation CAS"));
     assert!(activate_help.contains("--user-token-file PATH"));
@@ -292,7 +311,6 @@ fn unified_project_and_auth_commands_dispatch() {
         &["setup", "--help"][..],
         &["status", "--help"][..],
         &["doctor", "--help"][..],
-        &["task", "--help"][..],
         &["run", "--help"][..],
         &["share", "--help"][..],
     ] {
@@ -300,6 +318,13 @@ fn unified_project_and_auth_commands_dispatch() {
             cli_action(args.iter().copied()),
             CliAction::Project(_)
         ));
+    }
+    match cli_action(["task", "list"]) {
+        CliAction::Exit { code, stderr, .. } => {
+            assert_eq!(code, 2);
+            assert!(stderr.starts_with("unknown command: task"), "{stderr}");
+        }
+        other => panic!("retired task namespace still dispatched: {other:?}"),
     }
     match cli_action(["auth", "status", "--help"]) {
         CliAction::Exit { code, stdout, .. } => {
@@ -342,6 +367,8 @@ fn webcodex_cli_runner_help_mentions_lifecycle_subcommands() {
             assert!(stdout.contains("Stable Runner client id"));
             assert!(stdout.contains("Human-readable Runner name"));
             assert!(stdout.contains("runner.toml"));
+            assert!(stdout.contains("--project-registry-dir PATH"));
+            assert!(!stdout.contains("--projects-dir PATH"));
         }
         other => panic!("expected Runner init help exit, got {other:?}"),
     }
@@ -557,33 +584,23 @@ fn canonical_plural_admin_actions_dispatch_and_singular_groups_fail_closed() {
 }
 
 #[test]
-fn legacy_agent_tokens_alias_uses_canonical_runner_token_implementation() {
-    assert!(matches!(
-        cli_action([
-            "agent-tokens",
-            "create-local",
-            "--server-url",
-            "https://example.test",
-            "--username",
-            "alice",
-            "--credential",
-            "wc_acct_example",
-            "--client-id",
-            "runner-1",
-        ]),
-        CliAction::RunnerTokenCreateLocal(_)
-    ));
-    assert!(matches!(
-        cli_action([
-            "agent-tokens",
-            "list",
-            "--server-url",
-            "https://example.test",
-            "--username",
-            "alice",
-        ]),
-        CliAction::Admin(_)
-    ));
+fn retired_agent_tokens_alias_reports_canonical_replacement() {
+    for action in ["create-local", "list"] {
+        match cli_action(["agent-tokens", action]) {
+            CliAction::Exit {
+                code,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(code, 2);
+                assert!(stdout.is_empty());
+                assert!(stderr.contains("agent-tokens"), "{stderr}");
+                assert!(stderr.contains("removed"), "{stderr}");
+                assert!(stderr.contains("webcodex runner-tokens"), "{stderr}");
+            }
+            other => panic!("retired agent-tokens alias still dispatched: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -672,6 +689,23 @@ fn removed_user_selection_aliases_are_rejected() {
 }
 
 #[test]
+fn pairing_create_rejects_retired_agent_token_name_flag() {
+    match cli_action(["pairing", "create", "--agent-token-name", "legacy"]) {
+        CliAction::Exit {
+            code,
+            stdout,
+            stderr,
+        } => {
+            assert_eq!(code, 2);
+            assert!(stdout.is_empty());
+            assert!(stderr.contains("--agent-token-name is retired"), "{stderr}");
+            assert!(stderr.contains("--runner-token-name"), "{stderr}");
+        }
+        other => panic!("retired --agent-token-name still dispatched: {other:?}"),
+    }
+}
+
+#[test]
 fn pairing_create_help_marks_client_id_optional_and_explains_matching_device() {
     match cli_action(["pairing", "create", "--help"]) {
         CliAction::Exit { code, stdout, .. } => {
@@ -733,4 +767,27 @@ fn login_print_mcp_config_and_json_are_mutually_exclusive() {
         }
         other => panic!("expected Login dispatch, got {other:?}"),
     }
+}
+
+#[test]
+fn guarded_windows_build_info_attestation_is_additive_and_other_platform_bytes_unchanged() {
+    let info = build_info::machine_build_info("webcodex");
+    let legacy = build_info::build_info_json("webcodex");
+    assert_eq!(
+        management_build_info_json_for_platform(&info, false),
+        legacy
+    );
+    let current = management_build_info_json_for_platform(&info, true);
+    let raw: Value = serde_json::from_str(&current).unwrap();
+    assert_eq!(
+        raw[webcodex_environment::unified_update::WINDOWS_GUARDED_BOOTSTRAP_BUILD_INFO_FIELD],
+        json!(1)
+    );
+    let old: webcodex_core::desktop_runtime_contract::MachineBuildInfo =
+        serde_json::from_str(&current).unwrap();
+    assert_eq!(old, info);
+    assert_eq!(
+        management_build_info_json(),
+        management_build_info_json_for_platform(&info, cfg!(windows))
+    );
 }

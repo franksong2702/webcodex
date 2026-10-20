@@ -1,0 +1,5703 @@
+mod clickable;
+use crate::bridge::ExternalLease;
+use crate::profiles::{ManagedProfile, OwnedProfile};
+use crate::types::{
+    clip_bytes, BrowserError, BrowserKey, BrowserResult, BrowserStability, ControlCapability,
+    FormContext, LAUNCH_TIMEOUT, MAX_NODE_TEXT_BYTES, MAX_PAGES_PER_BROWSER, MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_NODES, REQUEST_TIMEOUT,
+};
+use crate::BrowserOwnership;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+mod socket;
+use socket::CdpSocket;
+use tungstenite::{client::client_with_config, protocol::WebSocketConfig, Message};
+use url::Url;
+use webcodex_process::ManagedChild;
+
+const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CDP_LIST_BYTES: usize = 256 * 1024;
+const DOM_CONTROL_INDEX_DEPTH: i32 = 32;
+
+mod frames;
+use frames::{frame_documents, frame_fence};
+
+pub(crate) trait BackendFactory: Send + Sync {
+    fn available(&self) -> bool;
+    fn launch(&self) -> BrowserResult<Box<dyn BrowserBackend>>;
+    fn launch_managed(&self, _profile: &str) -> BrowserResult<Box<dyn BrowserBackend>> {
+        Err(BrowserError::not_started(
+            "managed_browser_unavailable",
+            "Managed Browser launch is unavailable",
+        ))
+    }
+}
+
+pub(crate) trait BrowserBackend: Send {
+    fn ownership(&self) -> BrowserOwnership {
+        BrowserOwnership::OwnedEphemeral
+    }
+    fn profile_name(&self) -> Option<&str> {
+        None
+    }
+    fn live_process_id(&mut self) -> BrowserResult<u32> {
+        Err(BrowserError::not_started(
+            "browser_surface_unavailable",
+            "This Browser has no verified native process binding",
+        ))
+    }
+    fn live_window_hint(&mut self) -> BrowserResult<crate::BrowserWindowHint> {
+        Ok(crate::BrowserWindowHint {
+            process_id: self.live_process_id()?,
+            bounds: None,
+        })
+    }
+    fn pages(&mut self) -> BrowserResult<Vec<BackendPage>>;
+    fn new_page(&mut self) -> BrowserResult<String>;
+    fn snapshot(&mut self, target_id: &str, max_depth: u32) -> BrowserResult<BackendSnapshot>;
+    fn validate_frame_fence(&mut self, _target_id: &str, _fence: &str) -> BrowserResult<()> {
+        Err(BrowserError::not_started(
+            "stale_element",
+            "Frame document is unavailable",
+        ))
+    }
+    fn screenshot(&mut self, target_id: &str) -> BrowserResult<BackendScreenshot>;
+    fn console(
+        &mut self,
+        target_id: &str,
+    ) -> BrowserResult<BackendEventSnapshot<BackendConsoleEntry>>;
+    fn network(
+        &mut self,
+        target_id: &str,
+    ) -> BrowserResult<BackendEventSnapshot<BackendNetworkEntry>>;
+    fn diagnostics(&mut self, target_id: &str) -> BrowserResult<BackendDiagnosticsSnapshot>;
+    fn clear_diagnostics(&mut self, target_id: &str) -> BrowserResult<()>;
+    fn navigate(&mut self, target_id: &str, url: &str) -> BrowserResult<()>;
+    fn reload(&mut self, target_id: &str) -> BrowserResult<()>;
+    fn click(&mut self, target_id: &str, backend_node_id: i64) -> BrowserResult<()>;
+    fn input_text(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        text: &str,
+    ) -> BrowserResult<()>;
+    fn select_option(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        option: &str,
+    ) -> BrowserResult<()>;
+    fn set_value(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        value: &str,
+    ) -> BrowserResult<()>;
+    fn select_choice(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        path: &[String],
+    ) -> BrowserResult<()>;
+    fn set_date(&mut self, target_id: &str, backend_node_id: i64, value: &str)
+        -> BrowserResult<()>;
+    fn upload_file(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        path: &Path,
+    ) -> BrowserResult<()>;
+    fn key(&mut self, target_id: &str, key: BrowserKey) -> BrowserResult<()>;
+    fn wait_for_stable(
+        &mut self,
+        target_id: &str,
+        timeout: Duration,
+    ) -> BrowserResult<BrowserStability>;
+    fn close_page(&mut self, target_id: &str) -> BrowserResult<()>;
+    fn shutdown(&mut self, timeout: Duration) -> BrowserResult<()>;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendPage {
+    pub(crate) target_id: String,
+    pub(crate) title: String,
+    pub(crate) url: String,
+    pub(crate) document_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendNode {
+    pub(crate) role: String,
+    pub(crate) name: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) value: Option<String>,
+    pub(crate) group_key: Option<String>,
+    pub(crate) group_role: Option<String>,
+    pub(crate) group_label: Option<String>,
+    pub(crate) checked: Option<String>,
+    pub(crate) selected: Option<bool>,
+    pub(crate) required: Option<bool>,
+    pub(crate) disabled: Option<bool>,
+    pub(crate) read_only: Option<bool>,
+    pub(crate) backend_node_id: Option<i64>,
+    pub(crate) capability: ControlCapability,
+    pub(crate) frame_fence: Option<String>,
+    /// Light-DOM `<option>` of a `<select>` that admits `select_option`.
+    /// Compact snapshots keep the label and value, and still issue no element id.
+    pub(crate) select_choice: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendSnapshot {
+    pub(crate) document_id: String,
+    pub(crate) nodes: Vec<BackendNode>,
+    pub(crate) form_context_by_backend_id: HashMap<i64, FormContext>,
+    /// Frame collection omitted source nodes; compaction cannot recover them.
+    pub(crate) source_incomplete: bool,
+    pub(crate) truncated: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendScreenshot {
+    pub(crate) data: String,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendConsoleEntry {
+    pub(crate) sequence: u64,
+    pub(crate) level: String,
+    pub(crate) text: String,
+    pub(crate) source: Option<String>,
+    pub(crate) timestamp: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendNetworkEntry {
+    pub(crate) sequence: u64,
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) resource_type: Option<String>,
+    pub(crate) status: Option<u16>,
+    pub(crate) failed_reason: Option<String>,
+    pub(crate) timestamp: Option<f64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendEventSnapshot<T> {
+    pub(crate) entries: Vec<T>,
+    pub(crate) truncated: bool,
+    pub(crate) cursor: u64,
+    pub(crate) oldest_sequence: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendDiagnosticsSnapshot {
+    pub(crate) console: BackendEventSnapshot<BackendConsoleEntry>,
+    pub(crate) network: BackendEventSnapshot<BackendNetworkEntry>,
+    pub(crate) cursor: u64,
+    pub(crate) cleared_through_cursor: u64,
+}
+
+#[derive(Default)]
+struct CdpEventBuffer {
+    console: VecDeque<BackendConsoleEntry>,
+    console_truncated: bool,
+    network: HashMap<String, BackendNetworkEntry>,
+    network_order: VecDeque<String>,
+    network_truncated: bool,
+    network_events_discarded: bool,
+    pending_network: HashSet<String>,
+    next_sequence: u64,
+    cleared_through_sequence: u64,
+}
+
+impl CdpEventBuffer {
+    fn next_sequence(&mut self) -> u64 {
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence
+    }
+
+    fn push_console(&mut self, mut entry: BackendConsoleEntry) {
+        entry.sequence = self.next_sequence();
+        if self.console.len() >= crate::types::MAX_CONSOLE_ENTRIES {
+            self.console.pop_front();
+            self.console_truncated = true;
+        }
+        self.console.push_back(entry);
+    }
+
+    fn insert_network(&mut self, request_id: String, mut entry: BackendNetworkEntry) {
+        entry.sequence = self.next_sequence();
+        self.pending_network.insert(request_id.clone());
+        if self.network.contains_key(&request_id) {
+            self.network_order
+                .retain(|existing| existing != &request_id);
+        } else if self.network.len() >= crate::types::MAX_NETWORK_ENTRIES {
+            if let Some(oldest) = self.network_order.pop_front() {
+                self.network.remove(&oldest);
+                self.network_truncated = true;
+            }
+        }
+        self.network.insert(request_id.clone(), entry);
+        self.network_order.push_back(request_id);
+    }
+
+    fn update_network<F>(&mut self, request_id: &str, update: F)
+    where
+        F: FnOnce(&mut BackendNetworkEntry),
+    {
+        let sequence = self.next_sequence();
+        if let Some(entry) = self.network.get_mut(request_id) {
+            update(entry);
+            entry.sequence = sequence;
+        }
+    }
+
+    fn finish_network(&mut self, request_id: &str) {
+        self.pending_network.remove(request_id);
+        self.update_network(request_id, |_| {});
+    }
+
+    fn clear(&mut self) {
+        self.cleared_through_sequence = self.next_sequence;
+        self.console.clear();
+        self.console_truncated = false;
+        self.network.clear();
+        self.network_order.clear();
+        self.network_truncated = false;
+        self.network_events_discarded = false;
+        self.pending_network.clear();
+    }
+
+    fn cursor(&self) -> u64 {
+        self.next_sequence
+    }
+
+    fn network_cursor(&self) -> u64 {
+        self.network
+            .values()
+            .map(|entry| entry.sequence)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending_network.len()
+    }
+
+    fn console_oldest_sequence(&self) -> Option<u64> {
+        self.console.front().map(|entry| entry.sequence)
+    }
+
+    fn network_oldest_sequence(&self) -> Option<u64> {
+        self.network.values().map(|entry| entry.sequence).min()
+    }
+}
+
+struct CdpEventCollector {
+    websocket: CdpSocket,
+    events: CdpEventBuffer,
+    reconnect_required: bool,
+}
+
+pub(crate) struct ChromiumFactory;
+
+impl BackendFactory for ChromiumFactory {
+    fn available(&self) -> bool {
+        discover_chromium_executable().is_some()
+    }
+
+    fn launch(&self) -> BrowserResult<Box<dyn BrowserBackend>> {
+        let executable = discover_chromium_executable().ok_or_else(|| {
+            BrowserError::not_started(
+                "browser_unavailable",
+                "no supported Chromium-family browser is installed",
+            )
+        })?;
+        CdpBackend::launch(&executable).map(|backend| Box::new(backend) as Box<dyn BrowserBackend>)
+    }
+
+    fn launch_managed(&self, profile: &str) -> BrowserResult<Box<dyn BrowserBackend>> {
+        let executable = discover_chromium_executable().ok_or_else(|| {
+            BrowserError::not_started(
+                "browser_unavailable",
+                "No supported Chromium browser is installed",
+            )
+        })?;
+        let profile = ManagedProfile::acquire(&crate::profiles::state_root()?, profile)?;
+        CdpBackend::launch_profile(&executable, OwnedProfile::Managed(profile), false)
+            .map(|backend| Box::new(backend) as Box<dyn BrowserBackend>)
+    }
+}
+
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_CHROMIUM_EXECUTABLES: &[&str] = &["msedge.exe", "chrome.exe"];
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_BRAVE_EXECUTABLE: &str = "brave.exe";
+
+#[cfg(any(test, target_os = "macos"))]
+const MACOS_CHROMIUM_RELATIVE_PATHS: &[&str] = &[
+    "Google Chrome.app/Contents/MacOS/Google Chrome",
+    "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "Brave Browser.app/Contents/MacOS/Brave Browser",
+];
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+const LINUX_CHROMIUM_EXECUTABLES: &[&str] = &[
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "brave-browser",
+    "brave",
+];
+
+pub fn discover_chromium_executable() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let bases = ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let candidates = windows_browser_candidates(&bases, std::env::var_os("PATH").as_deref());
+        if let Some(path) = first_existing(candidates) {
+            return Some(path);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let candidates = macos_browser_candidates(Path::new("/Applications"));
+        if let Some(path) = first_existing(candidates) {
+            return Some(path);
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let candidates = browser_candidates_in_path(
+            LINUX_CHROMIUM_EXECUTABLES,
+            std::env::var_os("PATH").as_deref(),
+        );
+        if let Some(path) = first_existing(candidates) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_browser_candidates(bases: &[PathBuf], paths: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(bases.len() * 3 + 4);
+    for base in bases {
+        candidates.push(base.join("Microsoft/Edge/Application/msedge.exe"));
+        candidates.push(base.join("Google/Chrome/Application/chrome.exe"));
+    }
+    candidates.extend(browser_candidates_in_path(
+        WINDOWS_CHROMIUM_EXECUTABLES,
+        paths,
+    ));
+    for base in bases {
+        candidates.push(base.join("BraveSoftware/Brave-Browser/Application/brave.exe"));
+    }
+    candidates.extend(browser_candidates_in_path(
+        &[WINDOWS_BRAVE_EXECUTABLE],
+        paths,
+    ));
+    candidates
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_browser_candidates(root: &Path) -> Vec<PathBuf> {
+    MACOS_CHROMIUM_RELATIVE_PATHS
+        .iter()
+        .map(|relative| root.join(relative))
+        .collect()
+}
+
+#[cfg(any(test, target_os = "windows", all(unix, not(target_os = "macos"))))]
+fn browser_candidates_in_path(
+    executables: &[&str],
+    paths: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let Some(paths) = paths else {
+        return Vec::new();
+    };
+    let paths = std::env::split_paths(paths).collect::<Vec<_>>();
+    executables
+        .iter()
+        .flat_map(|executable| paths.iter().map(move |path| path.join(executable)))
+        .collect()
+}
+
+fn first_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn parse_devtools_active_port(contents: &str) -> Option<(u16, String)> {
+    let mut lines = contents.lines();
+    let port = lines.next()?.parse::<u16>().ok()?;
+    let path = lines.next()?;
+    if port == 0 || !path.starts_with("/devtools/browser/") || path.contains(['\r', '\n']) {
+        return None;
+    }
+    Some((port, path.to_string()))
+}
+
+fn cleanup_failed_launch(child: &mut ManagedChild) {
+    const FAILED_LAUNCH_CLEANUP_TIMEOUT: Duration = Duration::from_millis(500);
+    let _ = child.terminate_tree();
+    let _ = child.wait_tree_exit(FAILED_LAUNCH_CLEANUP_TIMEOUT);
+    let _ = child.try_wait();
+}
+
+enum CdpOwner {
+    Owned {
+        child: ManagedChild,
+        profile: OwnedProfile,
+        endpoint: Url,
+    },
+    External(ExternalLease),
+}
+struct CdpBackend {
+    owner: CdpOwner,
+    next_id: u64,
+    collectors: HashMap<String, CdpEventCollector>,
+}
+pub(crate) fn attach_external(lease: ExternalLease) -> Box<dyn BrowserBackend> {
+    Box::new(CdpBackend {
+        owner: CdpOwner::External(lease),
+        next_id: 1,
+        collectors: HashMap::new(),
+    })
+}
+
+impl CdpBackend {
+    fn launch(executable: &Path) -> BrowserResult<Self> {
+        let profile = tempfile::Builder::new()
+            .prefix("webcodex-browser-")
+            .tempdir()
+            .map_err(|error| {
+                BrowserError::not_started(
+                    "profile_create_failed",
+                    format!("could not create ephemeral Browser profile: {error}"),
+                )
+            })?;
+        Self::launch_profile(executable, OwnedProfile::Ephemeral(profile), true)
+    }
+
+    fn launch_profile(
+        executable: &Path,
+        profile: OwnedProfile,
+        headless: bool,
+    ) -> BrowserResult<Self> {
+        let mut command = Command::new(executable);
+        if headless {
+            command.arg("--headless=new");
+        }
+        command
+            .arg("--window-size=1440,900")
+            .arg("--remote-debugging-address=127.0.0.1")
+            .arg("--remote-debugging-port=0")
+            .arg(format!("--user-data-dir={}", profile.path().display()))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--disable-background-networking")
+            .arg("about:blank")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = ManagedChild::spawn(&mut command).map_err(|error| {
+            BrowserError::not_started(
+                "launch_failed",
+                format!("could not start Browser runtime: {error}"),
+            )
+        })?;
+        let active_port = profile.path().join("DevToolsActivePort");
+        let deadline = Instant::now() + LAUNCH_TIMEOUT;
+        let (port, websocket_path) = loop {
+            // Observe the exact new child before reading a rendezvous file; never
+            // adopt another process via a stale DevToolsActivePort.
+            if child
+                .try_wait()
+                .map_err(|_| {
+                    BrowserError::not_started(
+                        "launch_failed",
+                        "Could not verify the owned Chrome child",
+                    )
+                })?
+                .is_some()
+            {
+                cleanup_failed_launch(&mut child);
+                return Err(BrowserError::not_started(
+                    "launch_failed",
+                    "Browser exited before loopback CDP became ready",
+                ));
+            }
+            if let Ok(contents) = std::fs::read_to_string(&active_port) {
+                if let Some(endpoint) = parse_devtools_active_port(&contents) {
+                    break endpoint;
+                }
+            }
+            if Instant::now() >= deadline {
+                cleanup_failed_launch(&mut child);
+                return Err(BrowserError::not_started(
+                    "launch_timeout",
+                    "Browser did not expose loopback CDP before launch timeout",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let endpoint = match Url::parse(&format!("ws://127.0.0.1:{port}{websocket_path}")) {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                cleanup_failed_launch(&mut child);
+                return Err(BrowserError::not_started(
+                    "cdp_endpoint_invalid",
+                    "Browser returned an invalid loopback CDP endpoint",
+                ));
+            }
+        };
+        if endpoint.host_str() != Some("127.0.0.1") {
+            cleanup_failed_launch(&mut child);
+            return Err(BrowserError::not_started(
+                "cdp_endpoint_invalid",
+                "Browser CDP endpoint was not loopback",
+            ));
+        }
+        Ok(Self {
+            owner: CdpOwner::Owned {
+                child,
+                profile,
+                endpoint,
+            },
+            next_id: 1,
+            collectors: HashMap::new(),
+        })
+    }
+
+    fn browser_call(&mut self, method: &str, params: Value, effect: bool) -> BrowserResult<Value> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.browser_call_until(method, params, effect, deadline)
+    }
+
+    fn browser_call_until(
+        &mut self,
+        method: &str,
+        params: Value,
+        effect: bool,
+        deadline: Instant,
+    ) -> BrowserResult<Value> {
+        match &self.owner {
+            CdpOwner::Owned { endpoint, .. } => cdp_call_until(
+                endpoint,
+                &mut self.next_id,
+                method,
+                params,
+                effect,
+                deadline,
+            ),
+            CdpOwner::External(lease) => lease.browser_call(method, params, effect, deadline),
+        }
+    }
+
+    fn page_descriptors_until(&self, deadline: Instant) -> BrowserResult<Vec<Value>> {
+        match &self.owner {
+            CdpOwner::Owned { endpoint, .. } => {
+                fetch_page_descriptors(endpoint.port().unwrap_or_default(), deadline)
+            }
+            CdpOwner::External(lease) => lease.targets(deadline),
+        }
+    }
+
+    fn page_socket_until(&self, target_id: &str, deadline: Instant) -> BrowserResult<CdpSocket> {
+        remaining_before_dispatch(deadline)?;
+        match &self.owner {
+            CdpOwner::Owned { .. } => {
+                open_loopback_websocket(&self.page_endpoint_until(target_id, deadline)?, deadline)
+            }
+            CdpOwner::External(lease) => lease
+                .socket(Some(target_id))
+                .map(|socket| CdpSocket::Bridge(Box::new(socket))),
+        }
+    }
+
+    fn page_endpoint_until(&self, target_id: &str, deadline: Instant) -> BrowserResult<Url> {
+        let list = self.page_descriptors_until(deadline)?;
+        let websocket_url = list
+            .into_iter()
+            .find(|value| value.get("id").and_then(Value::as_str) == Some(target_id))
+            .and_then(|value| {
+                value
+                    .get("webSocketDebuggerUrl")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| {
+                BrowserError::not_started("stale_page", "page target is no longer available")
+            })?;
+        let endpoint = Url::parse(&websocket_url).map_err(|_| {
+            BrowserError::observed("cdp_endpoint_invalid", "page CDP endpoint is invalid", None)
+        })?;
+        if !matches!(endpoint.host_str(), Some("127.0.0.1") | Some("localhost"))
+            || endpoint.scheme() != "ws"
+            || endpoint.port().is_none()
+        {
+            return Err(BrowserError::observed(
+                "cdp_endpoint_invalid",
+                "page CDP endpoint is not a bounded loopback websocket",
+                None,
+            ));
+        }
+        Ok(endpoint)
+    }
+
+    fn page_call_until(
+        &mut self,
+        target_id: &str,
+        method: &str,
+        params: Value,
+        effect: bool,
+        deadline: Instant,
+    ) -> BrowserResult<Value> {
+        let mut socket = self
+            .page_socket_until(target_id, deadline)
+            .map_err(|error| {
+                if effect {
+                    pre_dispatch_error(error)
+                } else {
+                    error
+                }
+            })?;
+        cdp_call_on_websocket_until(
+            &mut socket,
+            &mut self.next_id,
+            method,
+            params,
+            effect,
+            deadline,
+        )
+    }
+
+    fn ensure_event_collector(&mut self, target_id: &str) -> BrowserResult<()> {
+        if self
+            .collectors
+            .get(target_id)
+            .is_some_and(|collector| !collector.reconnect_required)
+        {
+            return Ok(());
+        }
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let mut websocket = self.page_socket_until(target_id, deadline)?;
+        for method in ["Runtime.enable", "Log.enable", "Network.enable"] {
+            cdp_call_on_websocket_until(
+                &mut websocket,
+                &mut self.next_id,
+                method,
+                json!({}),
+                false,
+                deadline,
+            )?;
+        }
+        if let Some(collector) = self.collectors.get_mut(target_id) {
+            // Retain the bounded event buffer and its diagnostic-loss marker.
+            // Reconnecting a read-only collector must not erase missing network
+            // evidence or replay any pending Browser effect.
+            collector.websocket = websocket;
+            collector.reconnect_required = false;
+        } else {
+            self.collectors.insert(
+                target_id.to_string(),
+                CdpEventCollector {
+                    websocket,
+                    events: CdpEventBuffer::default(),
+                    reconnect_required: false,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Collector setup is read-only, but effect methods run it before any
+    /// command that can change the page. A failure here has not started that
+    /// command, so it must not be reported as `Completed`: tool results treat a
+    /// completed effect error as `state_changed`.
+    fn ensure_event_collector_before_effect(&mut self, target_id: &str) -> BrowserResult<()> {
+        self.ensure_event_collector(target_id)
+            .map_err(pre_dispatch_error)
+    }
+
+    fn drain_target_collector(&mut self, target_id: &str) -> BrowserResult<()> {
+        let result = {
+            let collector = self
+                .collectors
+                .get_mut(target_id)
+                .expect("collector exists");
+            drain_event_collector(collector)
+        };
+        if result.is_err() {
+            let collector = self
+                .collectors
+                .get_mut(target_id)
+                .expect("collector still exists after failed drain");
+            collector.reconnect_required = true;
+            // A lost transport route leaves an unknown diagnostic interval:
+            // preserve bounded evidence until explicit clear_diagnostics.
+            collector.events.next_sequence();
+            collector.events.console_truncated = true;
+            collector.events.network_truncated = true;
+            collector.events.network_events_discarded = true;
+        }
+        result
+    }
+
+    fn page_list_until(&self, deadline: Instant) -> BrowserResult<Vec<BackendPage>> {
+        let list = self.page_descriptors_until(deadline)?;
+        let mut pages = Vec::new();
+        for value in list {
+            if value.get("type").and_then(Value::as_str) != Some("page") {
+                continue;
+            }
+            let Some(target_id) = value.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            pages.push(BackendPage {
+                target_id: target_id.to_string(),
+                title: value
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                url: value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                document_id: value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("about:blank")
+                    .to_string(),
+            });
+            if pages.len() >= MAX_PAGES_PER_BROWSER {
+                break;
+            }
+        }
+        Ok(pages)
+    }
+
+    fn call_element_function_until(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        function_declaration: &'static str,
+        argument: Value,
+        deadline: Instant,
+    ) -> BrowserResult<()> {
+        // Remote object ids are scoped to the DevTools session that created
+        // them. Keep resolveNode and callFunctionOn on one page websocket.
+        let mut websocket = self
+            .page_socket_until(target_id, deadline)
+            .map_err(pre_dispatch_error)?;
+        let resolved = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut self.next_id,
+            "DOM.resolveNode",
+            json!({ "backendNodeId": backend_node_id }),
+            false,
+            deadline,
+        )
+        .map_err(pre_dispatch_error)?;
+        let object_id = resolved
+            .pointer("/object/objectId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserError::not_started(
+                    "element_not_actionable",
+                    "CDP could not resolve the current form control",
+                )
+            })?;
+        let result = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut self.next_id,
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": function_declaration,
+                "arguments": [{ "value": argument }],
+                "awaitPromise": true,
+                "returnByValue": true,
+                "userGesture": true,
+            }),
+            true,
+            deadline,
+        )?;
+        if result.get("exceptionDetails").is_some() {
+            return Err(BrowserError::uncertain(
+                "form_control_script_failed",
+                "form-control effect raised after dispatch",
+                "snapshot",
+            ));
+        }
+        let outcome = result.pointer("/result/value").ok_or_else(|| {
+            BrowserError::uncertain(
+                "form_control_result_invalid",
+                "form-control effect returned no bounded result",
+                "snapshot",
+            )
+        })?;
+        if outcome.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(());
+        }
+        if outcome.get("mutated").and_then(Value::as_bool) == Some(true) {
+            return Err(BrowserError::uncertain(
+                "form_control_outcome_unknown",
+                "form-control state changed before its postcondition failed",
+                "snapshot",
+            ));
+        }
+        let kind = outcome
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("form_control_rejected");
+        let (kind, message) = match kind {
+            "stale_element" => ("stale_element", "the exact widget element is detached; observe a fresh snapshot"),
+            "widget_not_supported" => ("widget_not_supported", "the control has no supported semantic popup or backing value"),
+            "widget_bounds_exceeded" => ("widget_bounds_exceeded", "widget discovery exceeded its bounded DOM or option budget"),
+            "widget_timeout" => ("widget_timeout", "the requested widget state did not appear within the bounded observation budget"),
+            "date_not_found" => ("date_not_found", "the picker did not expose a unique supported path to the requested date"),
+            "element_not_select" => (
+                "element_not_select",
+                "target element is not a native select control",
+            ),
+            "option_not_found" => (
+                "option_not_found",
+                "no option matched the exact normalized value or visible label",
+            ),
+            "option_ambiguous" => (
+                "option_ambiguous",
+                "more than one option matched the requested value or visible label",
+            ),
+            "option_disabled" => ("option_disabled", "the requested option is disabled"),
+            "control_disabled" => (
+                "control_disabled",
+                "target form control is disabled or read-only",
+            ),
+            "element_not_value_control" => (
+                "element_not_value_control",
+                "target element does not support exact Browser value assignment",
+            ),
+            "unsupported_value_control" => (
+                "unsupported_value_control",
+                "target input type is not supported by exact structured value assignment",
+            ),
+            "invalid_control_value" => (
+                "invalid_control_value",
+                "Browser rejected, normalized, or constraint-invalidated the requested native control value",
+            ),
+            _ => (
+                "form_control_rejected",
+                "Browser rejected the requested form-control effect before mutation",
+            ),
+        };
+        Err(BrowserError::not_started(kind, message))
+    }
+}
+
+impl BrowserBackend for CdpBackend {
+    fn ownership(&self) -> BrowserOwnership {
+        match &self.owner {
+            CdpOwner::Owned { profile, .. } if profile.name().is_some() => {
+                BrowserOwnership::OwnedManagedPersistent
+            }
+            CdpOwner::Owned { .. } => BrowserOwnership::OwnedEphemeral,
+            CdpOwner::External(_) => BrowserOwnership::AttachedExternal,
+        }
+    }
+    fn profile_name(&self) -> Option<&str> {
+        match &self.owner {
+            CdpOwner::Owned { profile, .. } => profile.name(),
+            CdpOwner::External(_) => None,
+        }
+    }
+    fn live_process_id(&mut self) -> BrowserResult<u32> {
+        match &mut self.owner {
+            CdpOwner::Owned { child, .. } => {
+                if child
+                    .try_wait()
+                    .map_err(|_| {
+                        BrowserError::not_started(
+                            "browser_surface_unavailable",
+                            "Cannot verify the Browser process",
+                        )
+                    })?
+                    .is_some()
+                {
+                    return Err(BrowserError::not_started(
+                        "stale_browser",
+                        "The exact owned Chrome process has exited",
+                    ));
+                }
+                Ok(child.id())
+            }
+            CdpOwner::External(lease) => lease.live_process_id(),
+        }
+    }
+    fn live_window_hint(&mut self) -> BrowserResult<crate::BrowserWindowHint> {
+        match &mut self.owner {
+            CdpOwner::Owned { .. } => Ok(crate::BrowserWindowHint {
+                process_id: self.live_process_id()?,
+                bounds: None,
+            }),
+            CdpOwner::External(lease) => lease.live_window_hint(),
+        }
+    }
+
+    fn pages(&mut self) -> BrowserResult<Vec<BackendPage>> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let mut pages = self.page_list_until(deadline)?;
+        for page in &mut pages {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Ok(tree) = self.page_call_until(
+                &page.target_id,
+                "Page.getFrameTree",
+                json!({}),
+                false,
+                deadline,
+            ) {
+                if let Some(loader_id) = tree
+                    .pointer("/frameTree/frame/loaderId")
+                    .and_then(Value::as_str)
+                {
+                    page.document_id = loader_id.to_string();
+                }
+            }
+        }
+        Ok(pages)
+    }
+
+    fn new_page(&mut self) -> BrowserResult<String> {
+        let result =
+            self.browser_call("Target.createTarget", json!({ "url": "about:blank" }), true)?;
+        result
+            .get("targetId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                BrowserError::uncertain(
+                    "create_page_result_invalid",
+                    "CDP did not return targetId after page creation",
+                    "pages",
+                )
+            })
+    }
+
+    fn snapshot(&mut self, target_id: &str, max_depth: u32) -> BrowserResult<BackendSnapshot> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let mut websocket = self.page_socket_until(target_id, deadline)?;
+        let frame_tree = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut self.next_id,
+            "Page.getFrameTree",
+            json!({}),
+            false,
+            deadline,
+        )?;
+        let document_id = frame_tree
+            .pointer("/frameTree/frame/loaderId")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown-document")
+            .to_string();
+        let accessibility = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut self.next_id,
+            "Accessibility.getFullAXTree",
+            json!({ "depth": max_depth.clamp(1, 32) }),
+            false,
+            deadline,
+        )?;
+        let raw_nodes = accessibility
+            .get("nodes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // DOM classification is required for structured controls. A failed
+        // document does not grant legacy click to descendants of browser-private
+        // form controls. Nodes omitted from a successful index admit nothing.
+        let dom_root = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut self.next_id,
+            "DOM.getDocument",
+            json!({ "depth": DOM_CONTROL_INDEX_DEPTH, "pierce": true }),
+            false,
+            deadline,
+        )
+        .ok()
+        .and_then(|document| document.get("root").cloned());
+        if dom_root.is_none()
+            && frame_tree
+                .pointer("/frameTree/childFrames")
+                .and_then(Value::as_array)
+                .is_some_and(|frames| !frames.is_empty())
+        {
+            return Err(BrowserError::not_started(
+                "frame_document_unavailable",
+                "Frame classification unavailable; observe again",
+            ));
+        }
+        let (mut nodes, mut truncated) = project_ax_nodes(&raw_nodes, dom_root.as_ref());
+        // One read-only CDP capture, under the existing response-byte and request
+        // deadline bounds. Missing evidence grants nothing; native controls are unchanged.
+        if let Some(root) = dom_root.as_ref() {
+            if clickable::capture_source_is_bounded(root)
+                && nodes
+                    .iter()
+                    .take(crate::MAX_SNAPSHOT_OFFSET + MAX_SNAPSHOT_NODES)
+                    .any(|node| {
+                        matches!(
+                            node.role.as_str(),
+                            "generic" | "group" | "listitem" | "article"
+                        )
+                    })
+            {
+                if let Ok(capture) = cdp_call_on_websocket_until(
+                    &mut websocket,
+                    &mut self.next_id,
+                    "DOMSnapshot.captureSnapshot",
+                    json!({"computedStyles": ["cursor", "visibility", "display", "pointer-events", "opacity"]}),
+                    false,
+                    deadline,
+                ) {
+                    clickable::admit_clickable_cards(&mut nodes, root, &capture);
+                }
+                // Reject document replacement between AX/DOM/layout observations.
+                let current = cdp_call_on_websocket_until(
+                    &mut websocket,
+                    &mut self.next_id,
+                    "Page.getFrameTree",
+                    json!({}),
+                    false,
+                    deadline,
+                )?;
+                if current
+                    .pointer("/frameTree/frame/loaderId")
+                    .and_then(Value::as_str)
+                    != Some(document_id.as_str())
+                {
+                    return Err(BrowserError::not_started(
+                        "stale_element",
+                        "Document changed during snapshot; observe again",
+                    ));
+                }
+            }
+        }
+        let mut form_context_by_backend_id = dom_root
+            .as_ref()
+            .map(index_form_contexts)
+            .unwrap_or_default();
+        let mut source_incomplete = ax_source_incomplete(&raw_nodes);
+        if let Some(root) = dom_root.as_ref() {
+            let documents = frame_documents(&frame_tree, root);
+            let fence = frame_fence(&frame_tree, root);
+            for (index, (frame_id, document)) in documents.iter().take(32).enumerate() {
+                let accessibility = cdp_call_on_websocket_until(
+                    &mut websocket,
+                    &mut self.next_id,
+                    "Accessibility.getFullAXTree",
+                    json!({"frameId": frame_id, "depth": max_depth.clamp(1, 32)}),
+                    false,
+                    deadline,
+                )?;
+                let raw = accessibility
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                source_incomplete |= ax_source_incomplete(&raw);
+                let (mut children, child_truncated) = project_ax_nodes(&raw, Some(document));
+                form_context_by_backend_id.extend(index_form_contexts(document));
+                for node in &mut children {
+                    node.frame_fence = Some(fence.clone());
+                    if let Some(key) = &mut node.group_key {
+                        *key = format!("{frame_id}:{key}");
+                    }
+                }
+                nodes.extend(children);
+                truncated |= child_truncated;
+                // Bound aggregation across frames, including non-actionable content.
+                if nodes.len() >= MAX_SNAPSHOT_NODES {
+                    source_incomplete |= index + 1 < documents.len();
+                    break;
+                }
+            }
+            source_incomplete |= documents.len() > 32;
+            if !documents.is_empty() {
+                let current = read_frame_fence(&mut websocket, &mut self.next_id, deadline)?;
+                if current != fence {
+                    return Err(BrowserError::not_started(
+                        "stale_element",
+                        "Frame changed during snapshot; observe again",
+                    ));
+                }
+            }
+        }
+        apply_custom_widget_contexts(&mut nodes, &form_context_by_backend_id);
+        Ok(BackendSnapshot {
+            document_id,
+            nodes,
+            form_context_by_backend_id,
+            source_incomplete,
+            truncated,
+        })
+    }
+
+    fn validate_frame_fence(&mut self, target_id: &str, fence: &str) -> BrowserResult<()> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let mut websocket = self.page_socket_until(target_id, deadline)?;
+        if read_frame_fence(&mut websocket, &mut self.next_id, deadline)? != fence {
+            let mut error = BrowserError::not_started(
+                "stale_element",
+                "Frame changed; observe a fresh snapshot",
+            );
+            error.recovery_action = Some("snapshot");
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn screenshot(&mut self, target_id: &str) -> BrowserResult<BackendScreenshot> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let metrics = self
+            .page_call_until(
+                target_id,
+                "Page.getLayoutMetrics",
+                json!({}),
+                false,
+                deadline,
+            )
+            .unwrap_or_else(|_| json!({}));
+        let width = viewport_dimension(&metrics, "/cssVisualViewport/clientWidth");
+        let height = viewport_dimension(&metrics, "/cssVisualViewport/clientHeight");
+        let result = self.page_call_until(
+            target_id,
+            "Page.captureScreenshot",
+            json!({
+                "format": "png",
+                "fromSurface": true,
+                "captureBeyondViewport": false
+            }),
+            false,
+            deadline,
+        )?;
+        let data = result
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                BrowserError::observed("invalid_image", "CDP screenshot response had no data", None)
+            })?
+            .to_string();
+        Ok(BackendScreenshot {
+            data,
+            width,
+            height,
+        })
+    }
+
+    fn console(
+        &mut self,
+        target_id: &str,
+    ) -> BrowserResult<BackendEventSnapshot<BackendConsoleEntry>> {
+        self.ensure_event_collector(target_id)?;
+        self.drain_target_collector(target_id)?;
+        let collector = self
+            .collectors
+            .get(target_id)
+            .expect("collector survives successful drain");
+        Ok(BackendEventSnapshot {
+            entries: collector.events.console.iter().cloned().collect(),
+            truncated: collector.events.console_truncated,
+            cursor: collector.events.cursor(),
+            oldest_sequence: collector.events.console_oldest_sequence(),
+        })
+    }
+
+    fn network(
+        &mut self,
+        target_id: &str,
+    ) -> BrowserResult<BackendEventSnapshot<BackendNetworkEntry>> {
+        self.ensure_event_collector(target_id)?;
+        self.drain_target_collector(target_id)?;
+        let collector = self
+            .collectors
+            .get(target_id)
+            .expect("collector survives successful drain");
+        let mut values = collector
+            .events
+            .network
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        values.sort_by(|a, b| {
+            a.timestamp
+                .partial_cmp(&b.timestamp)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(BackendEventSnapshot {
+            entries: values,
+            truncated: collector.events.network_truncated,
+            cursor: collector.events.cursor(),
+            oldest_sequence: collector.events.network_oldest_sequence(),
+        })
+    }
+
+    fn diagnostics(&mut self, target_id: &str) -> BrowserResult<BackendDiagnosticsSnapshot> {
+        self.ensure_event_collector(target_id)?;
+        self.drain_target_collector(target_id)?;
+        let collector = self
+            .collectors
+            .get(target_id)
+            .expect("collector survives successful drain");
+        let cursor = collector.events.cursor();
+        let mut network = collector
+            .events
+            .network
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        network.sort_by_key(|entry| entry.sequence);
+        Ok(BackendDiagnosticsSnapshot {
+            console: BackendEventSnapshot {
+                entries: collector.events.console.iter().cloned().collect(),
+                truncated: collector.events.console_truncated,
+                cursor,
+                oldest_sequence: collector.events.console_oldest_sequence(),
+            },
+            network: BackendEventSnapshot {
+                entries: network,
+                truncated: collector.events.network_truncated,
+                cursor,
+                oldest_sequence: collector.events.network_oldest_sequence(),
+            },
+            cursor,
+            cleared_through_cursor: collector.events.cleared_through_sequence,
+        })
+    }
+
+    fn clear_diagnostics(&mut self, target_id: &str) -> BrowserResult<()> {
+        self.ensure_event_collector_before_effect(target_id)?;
+        let next_id = &mut self.next_id;
+        let collector = self
+            .collectors
+            .get_mut(target_id)
+            .expect("collector exists");
+        clear_event_collector(collector, next_id)
+    }
+
+    fn navigate(&mut self, target_id: &str, url: &str) -> BrowserResult<()> {
+        self.ensure_event_collector_before_effect(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let result = self.page_call_until(
+            target_id,
+            "Page.navigate",
+            json!({ "url": url }),
+            true,
+            deadline,
+        )?;
+        if let Some(reason) = result
+            .get("errorText")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+        {
+            // The command completed, but navigation failed after dispatch. This
+            // does not prove no effects occurred, including when isDownload is
+            // true: a download may have started even though navigation failed.
+            return Err(BrowserError::observed(
+                "navigation_failed",
+                format!("Browser navigation failed: {}", clip_bytes(reason, 256)),
+                Some("snapshot"),
+            ));
+        }
+        // Preserve accepted navigations (including downloads) without errorText.
+        Ok(())
+    }
+
+    fn reload(&mut self, target_id: &str) -> BrowserResult<()> {
+        self.ensure_event_collector_before_effect(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.page_call_until(target_id, "Page.reload", json!({}), true, deadline)
+            .map(|_| ())
+    }
+
+    fn click(&mut self, target_id: &str, backend_node_id: i64) -> BrowserResult<()> {
+        self.ensure_event_collector_before_effect(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        // CDP mouse coordinates are viewport-relative. Ensure off-screen
+        // controls are visible before deriving the box-model click point.
+        self.page_call_until(
+            target_id,
+            "DOM.scrollIntoViewIfNeeded",
+            json!({ "backendNodeId": backend_node_id }),
+            false,
+            deadline,
+        )
+        .map_err(pre_dispatch_error)?;
+        let model = self
+            .page_call_until(
+                target_id,
+                "DOM.getBoxModel",
+                json!({ "backendNodeId": backend_node_id }),
+                false,
+                deadline,
+            )
+            .map_err(pre_dispatch_error)?;
+        let quad = model
+            .pointer("/model/content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                BrowserError::not_started(
+                    "element_not_actionable",
+                    "element has no current box model",
+                )
+            })?;
+        let coordinates = quad.iter().filter_map(Value::as_f64).collect::<Vec<_>>();
+        if coordinates.len() < 8 {
+            return Err(BrowserError::not_started(
+                "element_not_actionable",
+                "element box model is invalid",
+            ));
+        }
+        let x = (coordinates[0] + coordinates[2] + coordinates[4] + coordinates[6]) / 4.0;
+        let y = (coordinates[1] + coordinates[3] + coordinates[5] + coordinates[7]) / 4.0;
+        self.page_call_until(
+            target_id,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mousePressed",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "clickCount": 1
+            }),
+            true,
+            deadline,
+        )?;
+        self.page_call_until(
+            target_id,
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseReleased",
+                "x": x,
+                "y": y,
+                "button": "left",
+                "clickCount": 1
+            }),
+            true,
+            deadline,
+        )
+        .map(|_| ())
+        .map_err(|error| post_effect_error(error, "snapshot"))
+    }
+
+    fn input_text(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        text: &str,
+    ) -> BrowserResult<()> {
+        self.ensure_event_collector_before_effect(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.page_call_until(
+            target_id,
+            "DOM.focus",
+            json!({ "backendNodeId": backend_node_id }),
+            true,
+            deadline,
+        )?;
+        self.page_call_until(
+            target_id,
+            "Input.insertText",
+            json!({ "text": text }),
+            true,
+            deadline,
+        )
+        .map(|_| ())
+        .map_err(|error| post_effect_error(error, "snapshot"))
+    }
+
+    fn select_option(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        option: &str,
+    ) -> BrowserResult<()> {
+        const SELECT_OPTION: &str = r#"function(requested) {
+            if (!(this instanceof HTMLSelectElement)) {
+                return { ok: false, kind: "element_not_select" };
+            }
+            if (this.disabled) {
+                return { ok: false, kind: "control_disabled" };
+            }
+            const options = Array.from(this.options);
+            let matches = options.filter((item) => item.value === requested);
+            if (matches.length === 0) {
+                matches = options.filter((item) => item.text.trim() === requested);
+            }
+            if (matches.length === 0) {
+                return { ok: false, kind: "option_not_found" };
+            }
+            if (matches.length !== 1) {
+                return { ok: false, kind: "option_ambiguous" };
+            }
+            if (matches[0].disabled) {
+                return { ok: false, kind: "option_disabled" };
+            }
+            const selectedValue = matches[0].value;
+            if (this.value === selectedValue && matches[0].selected
+                && options.filter((item) => item.selected).length === 1) {
+                return { ok: true };
+            }
+            this.value = selectedValue;
+            this.dispatchEvent(new Event("input", { bubbles: true }));
+            this.dispatchEvent(new Event("change", { bubbles: true }));
+            if (this.value !== selectedValue) {
+                return { ok: false, kind: "select_postcondition_failed", mutated: true };
+            }
+            return { ok: true };
+        }"#;
+        self.ensure_event_collector_before_effect(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.call_element_function_until(
+            target_id,
+            backend_node_id,
+            SELECT_OPTION,
+            json!(option),
+            deadline,
+        )
+    }
+
+    fn set_value(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        value: &str,
+    ) -> BrowserResult<()> {
+        const SET_VALUE: &str = include_str!("cdp/set_value.js");
+        self.ensure_event_collector_before_effect(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.call_element_function_until(
+            target_id,
+            backend_node_id,
+            SET_VALUE,
+            json!(value),
+            deadline,
+        )
+    }
+
+    fn select_choice(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        path: &[String],
+    ) -> BrowserResult<()> {
+        const SELECT_CHOICE: &str = concat!(
+            "async function(requested) {\n",
+            include_str!("cdp/widgets/common.js"),
+            include_str!("cdp/widgets/choice.js"),
+            "\n}"
+        );
+        self.ensure_event_collector_before_effect(target_id)?;
+        self.call_element_function_until(
+            target_id,
+            backend_node_id,
+            SELECT_CHOICE,
+            json!(path),
+            Instant::now() + REQUEST_TIMEOUT,
+        )
+    }
+
+    fn set_date(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        value: &str,
+    ) -> BrowserResult<()> {
+        const SET_DATE: &str = concat!(
+            "async function(requested) {\n",
+            include_str!("cdp/widgets/common.js"),
+            include_str!("cdp/widgets/date.js"),
+            "\n}"
+        );
+        self.ensure_event_collector_before_effect(target_id)?;
+        self.call_element_function_until(
+            target_id,
+            backend_node_id,
+            SET_DATE,
+            json!(value),
+            Instant::now() + REQUEST_TIMEOUT,
+        )
+    }
+
+    fn upload_file(
+        &mut self,
+        target_id: &str,
+        backend_node_id: i64,
+        path: &Path,
+    ) -> BrowserResult<()> {
+        let upload_path = path.to_str().ok_or_else(|| {
+            BrowserError::not_started(
+                "upload_path_unrepresentable",
+                "Browser upload path is not representable as a CDP UTF-8 path",
+            )
+        })?;
+        self.ensure_event_collector_before_effect(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.page_call_until(
+            target_id,
+            "DOM.setFileInputFiles",
+            json!({
+                "files": [upload_path],
+                "backendNodeId": backend_node_id,
+            }),
+            true,
+            deadline,
+        )
+        .map(|_| ())
+        .map_err(|error| post_effect_error(error, "snapshot"))
+    }
+
+    fn key(&mut self, target_id: &str, key: BrowserKey) -> BrowserResult<()> {
+        self.ensure_event_collector_before_effect(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let (key_name, code, text) = key.cdp();
+        self.page_call_until(
+            target_id,
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyDown",
+                "key": key_name,
+                "code": code,
+                "text": text
+            }),
+            true,
+            deadline,
+        )?;
+        self.page_call_until(
+            target_id,
+            "Input.dispatchKeyEvent",
+            json!({
+                "type": "keyUp",
+                "key": key_name,
+                "code": code
+            }),
+            true,
+            deadline,
+        )
+        .map(|_| ())
+        .map_err(|error| post_effect_error(error, "snapshot"))
+    }
+
+    fn wait_for_stable(
+        &mut self,
+        target_id: &str,
+        timeout: Duration,
+    ) -> BrowserResult<BrowserStability> {
+        const QUIET_PERIOD: Duration = Duration::from_millis(250);
+        const LONG_LIVED_NETWORK_QUIET_PERIOD: Duration = Duration::from_millis(750);
+        const POLL_INTERVAL: Duration = Duration::from_millis(75);
+        const STABILITY_EXPRESSION: &str = r#"JSON.stringify({
+            ready: document.readyState,
+            href: location.href,
+            elements: document.getElementsByTagName("*").length,
+            text: document.body ? document.body.innerText.length : 0
+        })"#;
+
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut last_signature: Option<String> = None;
+        let mut last_network_cursor: Option<u64> = None;
+        let mut quiet_since: Option<Instant> = None;
+        let mut last_reason = "deadline".to_string();
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(BrowserStability {
+                    stable: false,
+                    waited_ms: started.elapsed().as_millis() as u64,
+                    reason: last_reason,
+                });
+            }
+
+            if self.ensure_event_collector(target_id).is_err()
+                || self.drain_target_collector(target_id).is_err()
+            {
+                if matches!(&self.owner, CdpOwner::External(lease) if lease.live_process_id().is_err())
+                {
+                    return Ok(BrowserStability {
+                        stable: false,
+                        waited_ms: started.elapsed().as_millis() as u64,
+                        reason: "attachment_lost".to_string(),
+                    });
+                }
+                last_reason = "collector_recovering".to_string();
+                std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                continue;
+            }
+
+            if self
+                .collectors
+                .get(target_id)
+                .is_some_and(|collector| collector.events.network_events_discarded)
+            {
+                return Ok(BrowserStability {
+                    stable: false,
+                    waited_ms: started.elapsed().as_millis() as u64,
+                    reason: "diagnostic_events_discarded".to_string(),
+                });
+            }
+            let (pending, network_cursor) = self
+                .collectors
+                .get(target_id)
+                .map(|collector| {
+                    (
+                        collector.events.pending_count(),
+                        collector.events.network_cursor(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            let observed = self.page_call_until(
+                target_id,
+                "Runtime.evaluate",
+                json!({
+                    "expression": STABILITY_EXPRESSION,
+                    "returnByValue": true,
+                    "awaitPromise": false
+                }),
+                false,
+                deadline,
+            );
+
+            let Ok(observed) = observed else {
+                last_reason = "document_recovering".to_string();
+                std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                continue;
+            };
+            let Some(signature) = observed
+                .pointer("/result/value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                last_reason = "document_unavailable".to_string();
+                std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                continue;
+            };
+            let ready = serde_json::from_str::<Value>(&signature)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("ready")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|state| state != "loading");
+
+            let dom_unchanged = last_signature.as_deref() == Some(signature.as_str());
+            let network_unchanged = last_network_cursor == Some(network_cursor);
+            if ready && dom_unchanged && network_unchanged {
+                let since = quiet_since.get_or_insert(now);
+                let required_quiet = if pending == 0 {
+                    QUIET_PERIOD
+                } else {
+                    LONG_LIVED_NETWORK_QUIET_PERIOD
+                };
+                if since.elapsed() >= required_quiet {
+                    return Ok(BrowserStability {
+                        stable: true,
+                        waited_ms: started.elapsed().as_millis() as u64,
+                        reason: if pending == 0 {
+                            "dom_and_network_quiet".to_string()
+                        } else {
+                            "dom_quiet_with_long_lived_network".to_string()
+                        },
+                    });
+                }
+                last_reason = if pending == 0 {
+                    "quiet_period".to_string()
+                } else {
+                    "long_lived_network_quiet_period".to_string()
+                };
+            } else {
+                quiet_since = ready.then_some(now);
+                last_reason = if !ready {
+                    "document_loading".to_string()
+                } else if !dom_unchanged {
+                    "dom_changed".to_string()
+                } else {
+                    "network_changed".to_string()
+                };
+            }
+            last_signature = Some(signature);
+            last_network_cursor = Some(network_cursor);
+            std::thread::sleep(
+                POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn close_page(&mut self, target_id: &str) -> BrowserResult<()> {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let result = self
+            .browser_call_until(
+                "Target.closeTarget",
+                json!({ "targetId": target_id }),
+                true,
+                deadline,
+            )
+            .map(|_| ());
+        if result.is_ok() {
+            self.collectors.remove(target_id);
+        }
+        result
+    }
+
+    fn shutdown(&mut self, timeout: Duration) -> BrowserResult<()> {
+        self.collectors.clear();
+        if let CdpOwner::External(lease) = &self.owner {
+            return lease.detach(timeout);
+        }
+        let deadline = Instant::now() + timeout;
+        if !timeout.is_zero() {
+            let _ = self.browser_call_until("Browser.close", json!({}), true, deadline);
+        }
+        let CdpOwner::Owned { child, .. } = &mut self.owner else {
+            unreachable!("external handled above")
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let graceful = child.wait_tree_exit(remaining).unwrap_or(false);
+        if !graceful {
+            child.terminate_tree().map_err(|error| {
+                BrowserError::uncertain(
+                    "browser_shutdown_failed",
+                    format!("could not terminate owned Browser process tree: {error}"),
+                    "browsers",
+                )
+            })?;
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1));
+            let _ = child.wait_tree_exit(remaining);
+        }
+        let _ = child.try_wait();
+        Ok(())
+    }
+}
+
+fn pre_dispatch_error(mut error: BrowserError) -> BrowserError {
+    error.execution_state = crate::types::ExecutionState::NotStarted;
+    error.recovery_action = None;
+    error
+}
+
+fn post_effect_error(error: BrowserError, recovery_action: &'static str) -> BrowserError {
+    if error.execution_state == crate::types::ExecutionState::OutcomeUnknown {
+        error
+    } else {
+        BrowserError::uncertain(
+            "partial_effect_outcome_unknown",
+            format!(
+                "Browser effect partially completed before a later step failed: {}",
+                error.message
+            ),
+            recovery_action,
+        )
+    }
+}
+
+fn viewport_dimension(metrics: &Value, pointer: &str) -> u32 {
+    metrics
+        .pointer(pointer)
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0)
+        .round()
+        .clamp(1.0, 4096.0) as u32
+}
+
+fn read_frame_fence(
+    websocket: &mut CdpSocket,
+    next_id: &mut u64,
+    deadline: Instant,
+) -> BrowserResult<String> {
+    let tree = cdp_call_on_websocket_until(
+        websocket,
+        next_id,
+        "Page.getFrameTree",
+        json!({}),
+        false,
+        deadline,
+    )?;
+    let dom = cdp_call_on_websocket_until(
+        websocket,
+        next_id,
+        "DOM.getDocument",
+        json!({"depth": DOM_CONTROL_INDEX_DEPTH, "pierce": true}),
+        false,
+        deadline,
+    )?;
+    let root = dom
+        .get("root")
+        .ok_or_else(|| BrowserError::not_started("stale_element", "Frame document unavailable"))?;
+    Ok(frame_fence(&tree, root))
+}
+
+// AX depth limits can omit advertised descendants. A query with no match must
+// not turn that partial observation into a claim of absence.
+fn ax_source_incomplete(raw_nodes: &[Value]) -> bool {
+    let ids = raw_nodes
+        .iter()
+        .filter_map(|node| node.get("nodeId").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    raw_nodes.iter().any(|node| {
+        node.get("childIds")
+            .and_then(Value::as_array)
+            .is_some_and(|children| {
+                children
+                    .iter()
+                    .any(|id| id.as_str().is_none_or(|id| !ids.contains(id)))
+            })
+    })
+}
+
+fn parse_ax_snapshot_nodes(raw_nodes: &[Value]) -> (Vec<BackendNode>, bool) {
+    let raw_by_id = raw_nodes
+        .iter()
+        .filter_map(|node| {
+            node.get("nodeId")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_string(), node))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut nodes = Vec::new();
+    let mut estimated_bytes = 0usize;
+    for raw in raw_nodes {
+        let role = ax_value(raw, "role").unwrap_or_else(|| "generic".to_string());
+        if role == "RootWebArea" {
+            continue;
+        }
+        let name = ax_value(raw, "name");
+        let description = ax_value(raw, "description");
+        let value = ax_value(raw, "value");
+        let group = ax_group_context(raw, &raw_by_id);
+        let checked = ax_property_string(raw, "checked");
+        let selected = ax_property_bool(raw, "selected");
+        let required = ax_property_bool(raw, "required");
+        let disabled = ax_property_bool(raw, "disabled");
+        let read_only = ax_property_bool(raw, "readonly");
+        let backend_node_id = raw.get("backendDOMNodeId").and_then(Value::as_i64);
+        estimated_bytes = estimated_bytes
+            .saturating_add(role.len())
+            .saturating_add(name.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(description.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(value.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(
+                group
+                    .as_ref()
+                    .map(|(_, role, label)| role.len() + label.len())
+                    .unwrap_or(0),
+            )
+            .saturating_add(128);
+        nodes.push(BackendNode {
+            role,
+            name,
+            description,
+            value,
+            group_key: group.as_ref().map(|(key, _, _)| key.clone()),
+            group_role: group.as_ref().map(|(_, role, _)| role.clone()),
+            group_label: group.map(|(_, _, label)| label),
+            checked,
+            selected,
+            required,
+            disabled,
+            read_only,
+            backend_node_id,
+            frame_fence: None,
+            capability: ControlCapability::default(),
+            select_choice: false,
+        });
+    }
+    let truncated = nodes.len() > MAX_SNAPSHOT_NODES || estimated_bytes > MAX_SNAPSHOT_BYTES;
+    (nodes, truncated)
+}
+
+pub(crate) fn project_ax_nodes(
+    raw_nodes: &[Value],
+    dom_root: Option<&Value>,
+) -> (Vec<BackendNode>, bool) {
+    let (mut nodes, truncated) = parse_ax_snapshot_nodes(raw_nodes);
+    apply_dom_capabilities(&mut nodes, raw_nodes, dom_root);
+    (nodes, truncated)
+}
+
+#[derive(Debug)]
+struct DomControlFacts {
+    local_name: String,
+    input_type: Option<String>,
+    semantic_label: Option<String>,
+    semantic_group_label: Option<String>,
+    popup_kind: Option<String>,
+    popup_date_semantics: bool,
+    in_native_control_shadow: bool,
+    owning_select_backend_id: Option<i64>,
+    host_backend_node_id: Option<i64>,
+    host_local_name: Option<String>,
+    host_input_type: Option<String>,
+    host_label: Option<String>,
+    host_group_label: Option<String>,
+    host_value: Option<String>,
+    host_disabled: Option<bool>,
+    host_read_only: Option<bool>,
+}
+
+struct ShadowHost {
+    backend_node_id: Option<i64>,
+    local_name: String,
+    input_type: Option<String>,
+    label: Option<String>,
+    group_label: Option<String>,
+    value: Option<String>,
+    disabled: Option<bool>,
+    read_only: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct DomGroupLabel {
+    label: String,
+    index: usize,
+    size: usize,
+}
+
+#[derive(Default)]
+struct DomSemanticIndex {
+    id_text: HashMap<String, String>,
+    labels_for: HashMap<String, String>,
+    container_labels: HashMap<i64, String>,
+    container_group_labels: HashMap<i64, DomGroupLabel>,
+    date_popup_ids: HashSet<String>,
+}
+
+fn apply_dom_capabilities(
+    nodes: &mut Vec<BackendNode>,
+    raw_nodes: &[Value],
+    dom_root: Option<&Value>,
+) {
+    let index = dom_root.map(index_dom_controls);
+    let private_descendants = browser_private_control_descendants(raw_nodes);
+    let known_ids = nodes
+        .iter()
+        .filter_map(|node| node.backend_node_id)
+        .collect::<HashSet<_>>();
+    for node in nodes.iter_mut() {
+        if let (Some(index), Some(backend_node_id)) = (index.as_ref(), node.backend_node_id) {
+            if let Some(facts) = index.get(&backend_node_id) {
+                if node
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+                {
+                    node.name = facts.semantic_label.clone();
+                }
+                if node
+                    .group_label
+                    .as_deref()
+                    .is_none_or(|label| label.trim().is_empty())
+                {
+                    if let Some(group_label) = facts.semantic_group_label.clone() {
+                        node.group_label = Some(group_label);
+                        if node.group_role.is_none() {
+                            node.group_role = Some("group".to_string());
+                        }
+                    }
+                }
+            }
+        }
+        node.capability = gate_published_capability(
+            capability_for_ax_node(node, index.as_ref(), &private_descendants),
+            node.disabled,
+            node.read_only,
+        );
+    }
+    // Promote only when the DOM index proves the owner and the accessibility
+    // tree did not already expose that owner. The added node uses the owner's
+    // role, label, and value; the shadow part keeps its own identity.
+    let Some(index) = index.as_ref() else {
+        return;
+    };
+    let mut promotions: Vec<(i64, usize, u8, ControlCapability)> = Vec::new();
+    for (index_in_snapshot, node) in nodes.iter().enumerate() {
+        let rank = shadow_owner_promotion_rank(&node.role);
+        if rank == u8::MAX {
+            continue;
+        }
+        let Some(backend_node_id) = node.backend_node_id else {
+            continue;
+        };
+        let Some(facts) = index.get(&backend_node_id) else {
+            continue;
+        };
+        if !facts.in_native_control_shadow {
+            continue;
+        }
+        let Some(host_backend_node_id) = facts.host_backend_node_id else {
+            continue;
+        };
+        if known_ids.contains(&host_backend_node_id) {
+            continue;
+        }
+        let raw_host_capability = capability_for_element(
+            facts.host_local_name.as_deref().unwrap_or(""),
+            facts.host_input_type.as_deref(),
+            "",
+        );
+        let host_capability = gate_published_capability(
+            raw_host_capability,
+            facts.host_disabled,
+            facts.host_read_only,
+        );
+        // A disabled or read-only owner is still projected so the snapshot can
+        // show that state. Only an owner that would admit nothing even when
+        // enabled stays omitted.
+        if !raw_host_capability.admits_any() || host_projection(facts, host_capability).is_none() {
+            continue;
+        }
+        match promotions
+            .iter()
+            .position(|(host_id, _, _, _)| *host_id == host_backend_node_id)
+        {
+            Some(position) if rank < promotions[position].2 => {
+                promotions[position] = (
+                    host_backend_node_id,
+                    index_in_snapshot,
+                    rank,
+                    host_capability,
+                );
+            }
+            Some(_) => {}
+            None => promotions.push((
+                host_backend_node_id,
+                index_in_snapshot,
+                rank,
+                host_capability,
+            )),
+        }
+    }
+    let mut additions = Vec::new();
+    for (_, index_in_snapshot, _, host_capability) in promotions {
+        let Some(node) = nodes.get(index_in_snapshot) else {
+            continue;
+        };
+        let Some(backend_node_id) = node.backend_node_id else {
+            continue;
+        };
+        let Some(facts) = index.get(&backend_node_id) else {
+            continue;
+        };
+        let Some(projected) = host_projection(facts, host_capability) else {
+            continue;
+        };
+        additions.push((index_in_snapshot, projected));
+    }
+    additions.sort_by_key(|(index_in_snapshot, _)| *index_in_snapshot);
+    for (offset, (index_in_snapshot, projected)) in additions.into_iter().enumerate() {
+        nodes.insert(index_in_snapshot + offset, projected);
+    }
+    mark_native_select_choices(nodes, index);
+}
+
+fn mark_native_select_choices(nodes: &mut [BackendNode], index: &HashMap<i64, DomControlFacts>) {
+    let admitted_selects = nodes
+        .iter()
+        .filter(|node| node.capability.select_option)
+        .filter_map(|node| node.backend_node_id)
+        .filter(|backend_node_id| {
+            index.get(backend_node_id).is_some_and(|facts| {
+                facts.local_name == "select" && !facts.in_native_control_shadow
+            })
+        })
+        .collect::<HashSet<_>>();
+    for node in nodes.iter_mut() {
+        if node.role != "option" {
+            continue;
+        }
+        let Some(backend_node_id) = node.backend_node_id else {
+            continue;
+        };
+        let Some(facts) = index.get(&backend_node_id) else {
+            continue;
+        };
+        if facts.local_name != "option" || facts.in_native_control_shadow {
+            continue;
+        }
+        node.select_choice = facts
+            .owning_select_backend_id
+            .is_some_and(|select_id| admitted_selects.contains(&select_id));
+    }
+}
+
+fn semantic_label_suggests_date_widget(label: Option<&str>) -> bool {
+    let Some(label) = label.map(str::trim).filter(|label| !label.is_empty()) else {
+        return false;
+    };
+    let lower = label.to_lowercase();
+    if ["日期", "年月", "时间", "生日"]
+        .into_iter()
+        .any(|token| lower.contains(token))
+    {
+        return true;
+    }
+    if label.contains("Date") || label.contains("DATE") {
+        return true;
+    }
+    lower.split(|ch: char| !ch.is_alphanumeric()).any(|part| {
+        matches!(
+            part,
+            "date" | "month" | "year" | "day" | "calendar" | "datepicker" | "monthpicker"
+        )
+    })
+}
+
+fn capability_for_ax_node(
+    node: &BackendNode,
+    index: Option<&HashMap<i64, DomControlFacts>>,
+    private_descendants: &HashSet<i64>,
+) -> ControlCapability {
+    let Some(backend_node_id) = node.backend_node_id else {
+        return ControlCapability::default();
+    };
+    if let Some(index) = index {
+        return match index.get(&backend_node_id) {
+            Some(facts) if facts.in_native_control_shadow => ControlCapability::default(),
+            Some(facts) => {
+                let mut capability = capability_for_element(
+                    &facts.local_name,
+                    facts.input_type.as_deref(),
+                    &node.role,
+                );
+                if facts.popup_kind.as_deref() == Some("dialog")
+                    && matches!(facts.local_name.as_str(), "input" | "button")
+                    && facts
+                        .input_type
+                        .as_deref()
+                        .is_none_or(|kind| matches!(kind, "text" | "search"))
+                    && matches!(node.role.as_str(), "combobox" | "textbox")
+                    && (semantic_label_suggests_date_widget(facts.semantic_label.as_deref())
+                        || facts.popup_date_semantics)
+                {
+                    capability.custom_choice = false;
+                    capability.custom_date = true;
+                }
+                capability
+            }
+            // The document was classified, but this node was omitted. Do not
+            // guess a click target from its accessibility role.
+            None => ControlCapability::default(),
+        };
+    }
+    if private_descendants.contains(&backend_node_id) {
+        return ControlCapability::default();
+    }
+    // Month, week, and datetime-local share this role. Without the owning
+    // input type, role-only admission cannot choose set_value and must not
+    // invent click. The host is not one of its own private descendants.
+    if node.role == "DateTime" {
+        return ControlCapability::default();
+    }
+    legacy_role_capability(&node.role)
+}
+
+fn host_projection(facts: &DomControlFacts, capability: ControlCapability) -> Option<BackendNode> {
+    let role = host_role(
+        facts.host_local_name.as_deref().unwrap_or(""),
+        facts.host_input_type.as_deref(),
+    )?;
+    Some(BackendNode {
+        frame_fence: None,
+        role: role.to_string(),
+        name: facts.host_label.clone(),
+        description: None,
+        value: facts.host_value.clone(),
+        group_key: None,
+        group_role: facts.host_group_label.as_ref().map(|_| "group".to_string()),
+        group_label: facts.host_group_label.clone(),
+        checked: None,
+        selected: None,
+        required: None,
+        disabled: facts.host_disabled,
+        read_only: facts.host_read_only,
+        backend_node_id: facts.host_backend_node_id,
+        capability,
+        select_choice: false,
+    })
+}
+
+fn host_role(local_name: &str, input_type: Option<&str>) -> Option<&'static str> {
+    match (local_name, input_type.unwrap_or("text")) {
+        ("select", _) => Some("combobox"),
+        ("textarea", _) => Some("textbox"),
+        ("input", "number") => Some("spinbutton"),
+        ("input", "range") => Some("slider"),
+        ("input", "date") => Some("Date"),
+        ("input", "time") => Some("InputTime"),
+        ("input", "color") => Some("ColorWell"),
+        ("input", "month" | "week" | "datetime-local") => Some("DateTime"),
+        ("input", "file" | "button" | "submit" | "reset" | "image") => Some("button"),
+        ("input", "checkbox") => Some("checkbox"),
+        ("input", "radio") => Some("radio"),
+        ("input", "text" | "email" | "tel" | "url" | "search" | "password") => Some("textbox"),
+        _ => None,
+    }
+}
+
+/// `Some(true)` is the only state that removes effects. `Some(false)` and
+/// `None` keep the capability already chosen from the owning element or role.
+fn gate_published_capability(
+    capability: ControlCapability,
+    disabled: Option<bool>,
+    read_only: Option<bool>,
+) -> ControlCapability {
+    if disabled == Some(true) {
+        return ControlCapability::default();
+    }
+    if read_only != Some(true) {
+        return capability;
+    }
+    ControlCapability {
+        text_input: false,
+        exact_value: false,
+        ..capability
+    }
+}
+
+fn capability_for_element(
+    local_name: &str,
+    input_type: Option<&str>,
+    role: &str,
+) -> ControlCapability {
+    let mut capability = match local_name {
+        "select" => ControlCapability::select_option(),
+        "option" => ControlCapability::default(),
+        "textarea" => ControlCapability::native_text_input(),
+        "input" => match input_type.unwrap_or("text") {
+            "hidden" => ControlCapability::default(),
+            "file" => ControlCapability::file_upload(),
+            "number" | "range" | "date" | "datetime-local" | "month" | "week" | "time"
+            | "color" => ControlCapability::exact_value(),
+            "checkbox" | "radio" | "button" | "submit" | "reset" | "image" => {
+                ControlCapability::click()
+            }
+            "text" | "email" | "tel" | "url" | "search" | "password" => {
+                ControlCapability::native_text_input()
+            }
+            _ => legacy_role_capability(role),
+        },
+        "button" | "summary" => ControlCapability::click(),
+        "a" => legacy_role_capability(role),
+        _ if role == "option" => ControlCapability::default(),
+        _ => legacy_role_capability(role),
+    };
+    if !matches!(local_name, "select" | "option")
+        && (local_name != "input" || matches!(input_type.unwrap_or("text"), "text" | "search"))
+        && matches!(role, "combobox" | "listbox")
+    {
+        capability.custom_choice = true;
+    }
+    capability
+}
+
+fn legacy_role_capability(role: &str) -> ControlCapability {
+    match role {
+        "textbox" | "searchbox" => ControlCapability::text_input(),
+        "button" | "link" | "checkbox" | "radio" | "switch" | "menuitem" | "tab" | "combobox"
+        | "DateTime" => ControlCapability::click(),
+        _ => ControlCapability::default(),
+    }
+}
+
+fn browser_private_control_descendants(raw_nodes: &[Value]) -> HashSet<i64> {
+    let by_id = raw_nodes
+        .iter()
+        .filter_map(|node| {
+            node.get("nodeId")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_string(), node))
+        })
+        .collect::<HashMap<_, _>>();
+    raw_nodes
+        .iter()
+        .filter(|node| ax_descendant_of_browser_private_control(node, &by_id))
+        .filter_map(|node| node.get("backendDOMNodeId").and_then(Value::as_i64))
+        .collect()
+}
+
+fn ax_descendant_of_browser_private_control(node: &Value, by_id: &HashMap<String, &Value>) -> bool {
+    let mut parent_id = node.get("parentId").and_then(Value::as_str);
+    // No parent link is not evidence that this node is a browser-private part.
+    if parent_id.is_none() {
+        return false;
+    }
+    for _ in 0..32 {
+        let Some(id) = parent_id else {
+            return true;
+        };
+        let Some(parent) = by_id.get(id) else {
+            return true;
+        };
+        let role = ax_value(parent, "role").unwrap_or_default();
+        if is_browser_private_control_role(&role) {
+            return true;
+        }
+        if role == "RootWebArea" {
+            return false;
+        }
+        parent_id = parent.get("parentId").and_then(Value::as_str);
+    }
+    true
+}
+
+fn is_browser_private_control_role(role: &str) -> bool {
+    matches!(
+        role,
+        "Date" | "DateTime" | "InputTime" | "ColorWell" | "spinbutton" | "slider" | "combobox"
+    )
+}
+
+fn shadow_owner_promotion_rank(role: &str) -> u8 {
+    match role {
+        "spinbutton" | "slider" | "Date" | "DateTime" | "InputTime" | "ColorWell" => 0,
+        "button" | "combobox" => 1,
+        _ => u8::MAX,
+    }
+}
+
+fn index_dom_controls(root: &Value) -> HashMap<i64, DomControlFacts> {
+    let semantics = index_dom_semantics(root);
+    let mut index = HashMap::new();
+    walk_dom_controls(root, None, None, None, None, &semantics, &mut index);
+    index
+}
+
+fn walk_dom_controls(
+    node: &Value,
+    host: Option<&ShadowHost>,
+    owning_select: Option<i64>,
+    ancestor_label: Option<&str>,
+    fieldset_label: Option<&str>,
+    semantics: &DomSemanticIndex,
+    index: &mut HashMap<i64, DomControlFacts>,
+) {
+    let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+    let is_shadow_root = node.get("shadowRootType").is_some() || node_type == 11;
+    if is_shadow_root {
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                // Shadow contents are not light-DOM choices of an enclosing select.
+                walk_dom_controls(child, host, None, None, None, semantics, index);
+            }
+        }
+        return;
+    }
+    if node_type != 1 {
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk_dom_controls(
+                    child,
+                    host,
+                    owning_select,
+                    ancestor_label,
+                    fieldset_label,
+                    semantics,
+                    index,
+                );
+            }
+        }
+        return;
+    }
+
+    let local_name = node
+        .get("localName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let input_type = (local_name == "input").then(|| {
+        let raw = dom_attribute(node, "type").unwrap_or_else(|| "text".to_string());
+        if raw.is_empty() {
+            "text".to_string()
+        } else {
+            raw
+        }
+    });
+    let semantic_label = semantic_element_label(node, semantics, ancestor_label);
+    let own_label = (local_name == "label")
+        .then(|| dom_text_content(node))
+        .flatten();
+    let descendant_label = own_label.as_deref().or(ancestor_label);
+    let own_fieldset_label = (local_name == "fieldset")
+        .then(|| fieldset_legend(node))
+        .flatten();
+    let descendant_fieldset_label = own_fieldset_label.as_deref().or(fieldset_label);
+    let in_native_control_shadow = host
+        .as_ref()
+        .is_some_and(|host| matches!(host.local_name.as_str(), "input" | "select" | "textarea"));
+    let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64);
+    let semantic_group_label = fieldset_label.map(ToOwned::to_owned).or_else(|| {
+        backend_node_id
+            .and_then(|id| semantics.container_group_labels.get(&id))
+            .map(|group| group.label.clone())
+    });
+    let popup_date_semantics = dom_attribute_raw(node, "aria-controls").is_some_and(|ids| {
+        ids.split_ascii_whitespace()
+            .any(|id| semantics.date_popup_ids.contains(id))
+    });
+    let child_owning_select = if local_name == "select" && !in_native_control_shadow {
+        backend_node_id
+    } else if in_native_control_shadow {
+        None
+    } else {
+        owning_select
+    };
+    if let Some(backend_node_id) = backend_node_id {
+        index.insert(
+            backend_node_id,
+            DomControlFacts {
+                local_name: local_name.clone(),
+                input_type: input_type.clone(),
+                semantic_label: semantic_label.clone(),
+                semantic_group_label: semantic_group_label.clone(),
+                popup_kind: dom_attribute(node, "aria-haspopup"),
+                popup_date_semantics,
+                in_native_control_shadow,
+                owning_select_backend_id: if local_name == "option" && !in_native_control_shadow {
+                    owning_select
+                } else {
+                    None
+                },
+                host_backend_node_id: host.and_then(|host| host.backend_node_id),
+                host_local_name: host.map(|host| host.local_name.clone()),
+                host_input_type: host.and_then(|host| host.input_type.clone()),
+                host_label: host.and_then(|host| host.label.clone()),
+                host_group_label: host.and_then(|host| host.group_label.clone()),
+                host_value: host.and_then(|host| host.value.clone()),
+                host_disabled: host.and_then(|host| host.disabled),
+                host_read_only: host.and_then(|host| host.read_only),
+            },
+        );
+    }
+    let next_host = ShadowHost {
+        backend_node_id,
+        local_name,
+        input_type,
+        label: semantic_label,
+        group_label: semantic_group_label,
+        value: element_value(node),
+        disabled: dom_boolean_attribute(node, "disabled"),
+        read_only: dom_boolean_attribute(node, "readonly"),
+    };
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            walk_dom_controls(
+                child,
+                host,
+                child_owning_select,
+                descendant_label,
+                descendant_fieldset_label,
+                semantics,
+                index,
+            );
+        }
+    }
+    if let Some(shadow_roots) = node.get("shadowRoots").and_then(Value::as_array) {
+        for shadow_root in shadow_roots {
+            walk_dom_controls(
+                shadow_root,
+                Some(&next_host),
+                None,
+                None,
+                None,
+                semantics,
+                index,
+            );
+        }
+    }
+}
+
+/// HTML boolean attributes are true when present, including `disabled=""`.
+/// Absence stays `None` so a missing attribute is not treated as enabled or
+/// read-only.
+fn dom_boolean_attribute(node: &Value, name: &str) -> Option<bool> {
+    dom_attribute_raw(node, name).map(|_| true)
+}
+
+fn dom_attribute(node: &Value, name: &str) -> Option<String> {
+    dom_attribute_raw(node, name).map(|value| value.to_ascii_lowercase())
+}
+
+fn dom_attribute_raw(node: &Value, name: &str) -> Option<String> {
+    let attributes = node.get("attributes")?.as_array()?;
+    let mut index = 0;
+    while index + 1 < attributes.len() {
+        if attributes[index].as_str() == Some(name) {
+            return attributes[index + 1]
+                .as_str()
+                .map(|value| value.trim().to_string());
+        }
+        index += 2;
+    }
+    None
+}
+
+fn index_dom_semantics(root: &Value) -> DomSemanticIndex {
+    fn walk(node: &Value, semantics: &mut DomSemanticIndex) {
+        let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+        if node_type == 1 {
+            let local_name = node
+                .get("localName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if let Some(id) = dom_attribute_raw(node, "id").filter(|id| !id.is_empty()) {
+                if let Some(text) = dom_text_content(node) {
+                    semantics.id_text.entry(id.clone()).or_insert(text);
+                }
+                if dom_attribute(node, "role").as_deref() == Some("dialog") {
+                    let aria_label = dom_attribute_raw(node, "aria-label");
+                    let title = dom_attribute_raw(node, "title");
+                    let hints = [Some(id.as_str()), aria_label.as_deref(), title.as_deref()];
+                    if hints
+                        .into_iter()
+                        .flatten()
+                        .any(|hint| semantic_label_suggests_date_widget(Some(hint)))
+                    {
+                        semantics.date_popup_ids.insert(id);
+                    }
+                }
+            }
+            if local_name == "label" {
+                if let Some(target) =
+                    dom_attribute_raw(node, "for").filter(|target| !target.is_empty())
+                {
+                    if let Some(text) = dom_text_content(node) {
+                        semantics
+                            .labels_for
+                            .entry(target)
+                            .and_modify(|existing| append_semantic_text(existing, &text))
+                            .or_insert(text);
+                    }
+                }
+            }
+        }
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk(child, semantics);
+            }
+        }
+    }
+
+    let mut semantics = DomSemanticIndex::default();
+    walk(root, &mut semantics);
+    infer_control_container_labels(root, &mut semantics);
+    semantics
+}
+
+fn index_form_contexts(root: &Value) -> HashMap<i64, FormContext> {
+    let semantics = index_dom_semantics(root);
+    let mut contexts = HashMap::new();
+    walk_form_contexts(root, &semantics, None, None, None, None, &mut contexts);
+    contexts
+}
+
+fn walk_form_contexts(
+    node: &Value,
+    semantics: &DomSemanticIndex,
+    ancestor_label: Option<&str>,
+    fieldset_label: Option<&str>,
+    section_label: Option<&str>,
+    component_hint: Option<&str>,
+    contexts: &mut HashMap<i64, FormContext>,
+) {
+    let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+    let is_shadow_root = node.get("shadowRootType").is_some() || node_type == 11;
+    if is_shadow_root {
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk_form_contexts(
+                    child,
+                    semantics,
+                    None,
+                    None,
+                    section_label,
+                    component_hint,
+                    contexts,
+                );
+            }
+        }
+        return;
+    }
+    if node_type != 1 {
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk_form_contexts(
+                    child,
+                    semantics,
+                    ancestor_label,
+                    fieldset_label,
+                    section_label,
+                    component_hint,
+                    contexts,
+                );
+            }
+        }
+        return;
+    }
+
+    let local_name = node
+        .get("localName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let input_type = (local_name == "input").then(|| {
+        dom_attribute(node, "type")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "text".to_string())
+    });
+    let semantic_label = semantic_element_label(node, semantics, ancestor_label);
+    let own_label = (local_name == "label")
+        .then(|| dom_text_content(node))
+        .flatten();
+    let descendant_label = own_label.as_deref().or(ancestor_label);
+    let own_fieldset_label = (local_name == "fieldset")
+        .then(|| fieldset_legend(node))
+        .flatten();
+    let descendant_fieldset_label = own_fieldset_label.as_deref().or(fieldset_label);
+    let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64);
+    let nearby_label = backend_node_id
+        .and_then(|id| semantics.container_labels.get(&id))
+        .map(String::as_str);
+    let nearby_group = backend_node_id.and_then(|id| semantics.container_group_labels.get(&id));
+    let semantic_group_label =
+        fieldset_label.or_else(|| nearby_group.map(|group| group.label.as_str()));
+    let own_section_label = direct_section_heading(node);
+    let descendant_section_label = own_section_label.as_deref().or(section_label);
+    let explicit_component = framework_component_hint(node).filter(|hint| {
+        !matches!(hint.as_str(), "ant-input" | "element-input") || component_hint.is_none()
+    });
+    let effective_component = explicit_component
+        .as_deref()
+        .or(component_hint)
+        .map(ToOwned::to_owned)
+        .or_else(|| native_component_hint(&local_name).map(ToOwned::to_owned));
+
+    if let Some(backend_node_id) = backend_node_id {
+        if let Some(context) = build_form_context(
+            node,
+            &local_name,
+            input_type.as_deref(),
+            semantic_label.as_deref(),
+            semantic_group_label,
+            nearby_label,
+            nearby_group.map(|group| group.index),
+            nearby_group.map(|group| group.size),
+            section_label,
+            effective_component.as_deref(),
+            semantics,
+        ) {
+            contexts.insert(backend_node_id, context);
+        }
+    }
+
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            walk_form_contexts(
+                child,
+                semantics,
+                descendant_label,
+                descendant_fieldset_label,
+                descendant_section_label,
+                effective_component.as_deref(),
+                contexts,
+            );
+        }
+    }
+    if let Some(shadow_roots) = node.get("shadowRoots").and_then(Value::as_array) {
+        for shadow_root in shadow_roots {
+            walk_form_contexts(
+                shadow_root,
+                semantics,
+                None,
+                None,
+                descendant_section_label,
+                effective_component.as_deref(),
+                contexts,
+            );
+        }
+    }
+}
+
+fn build_form_context(
+    node: &Value,
+    local_name: &str,
+    input_type: Option<&str>,
+    semantic_label: Option<&str>,
+    semantic_group_label: Option<&str>,
+    nearby_label: Option<&str>,
+    group_index: Option<usize>,
+    group_size: Option<usize>,
+    section_label: Option<&str>,
+    component_hint: Option<&str>,
+    semantics: &DomSemanticIndex,
+) -> Option<FormContext> {
+    let dom_role = dom_attribute(node, "role");
+    let form_role = dom_role.as_deref().is_some_and(|role| {
+        matches!(
+            role,
+            "textbox"
+                | "searchbox"
+                | "combobox"
+                | "listbox"
+                | "radio"
+                | "checkbox"
+                | "switch"
+                | "spinbutton"
+        )
+    });
+    let native_control = matches!(local_name, "input" | "select" | "textarea" | "button");
+    if !native_control && !form_role {
+        return None;
+    }
+
+    let html_name = dom_attribute_raw(node, "name")
+        .filter(|value| !value.is_empty())
+        .map(|value| clip_bytes(&value, 256));
+    let placeholder = dom_attribute_raw(node, "placeholder")
+        .filter(|value| !value.is_empty())
+        .map(|value| clip_bytes(&value, MAX_NODE_TEXT_BYTES));
+    let autocomplete = dom_attribute_raw(node, "autocomplete")
+        .filter(|value| !value.is_empty())
+        .map(|value| clip_bytes(&value, 128));
+    let aria_invalid = dom_attribute(node, "aria-invalid").and_then(|value| match value.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    });
+    let validation_hint = if aria_invalid == Some(true) {
+        referenced_semantic_text(node, "aria-errormessage", semantics)
+            .or_else(|| referenced_semantic_text(node, "aria-describedby", semantics))
+    } else {
+        None
+    };
+    let option_count = (local_name == "select")
+        .then(|| count_descendant_elements(node, "option").min(256))
+        .filter(|count| *count > 0);
+
+    let group_index_piece = group_index
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let group_size_piece = group_size
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let seed = [
+        local_name,
+        input_type.unwrap_or(""),
+        dom_role.as_deref().unwrap_or(""),
+        semantic_label.unwrap_or(""),
+        semantic_group_label.unwrap_or(""),
+        nearby_label.unwrap_or(""),
+        section_label.unwrap_or(""),
+        html_name.as_deref().unwrap_or(""),
+        placeholder.as_deref().unwrap_or(""),
+        autocomplete.as_deref().unwrap_or(""),
+        component_hint.unwrap_or(""),
+        group_index_piece.as_str(),
+        group_size_piece.as_str(),
+    ]
+    .into_iter()
+    .map(normalize_form_signature_piece)
+    .collect::<Vec<_>>()
+    .join("\u{1f}");
+    let digest = format!("{:x}", Sha256::digest(seed.as_bytes()));
+
+    Some(FormContext {
+        field_signature: digest[..24].to_string(),
+        dom_tag: clip_bytes(local_name, 32),
+        input_type: input_type.map(|value| clip_bytes(value, 32)),
+        html_name,
+        placeholder,
+        autocomplete,
+        nearby_label: nearby_label.map(|value| clip_bytes(value, MAX_NODE_TEXT_BYTES)),
+        group_label: semantic_group_label.map(|value| clip_bytes(value, MAX_NODE_TEXT_BYTES)),
+        group_index,
+        group_size,
+        section_label: section_label.map(|value| clip_bytes(value, MAX_NODE_TEXT_BYTES)),
+        component_hint: component_hint.map(|value| clip_bytes(value, 64)),
+        aria_invalid,
+        validation_hint,
+        option_count,
+    })
+}
+
+fn normalize_form_signature_piece(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn direct_section_heading(node: &Value) -> Option<String> {
+    node.get("children")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|child| {
+            if child.get("nodeType").and_then(Value::as_i64) != Some(1) {
+                return false;
+            }
+            let name = child
+                .get("localName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            matches!(name.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+                || dom_attribute(child, "role").as_deref() == Some("heading")
+        })
+        .and_then(dom_text_content)
+}
+
+fn framework_component_hint(node: &Value) -> Option<String> {
+    let class = dom_attribute_raw(node, "class")?.to_ascii_lowercase();
+    [
+        ("ant-cascader", "ant-cascader"),
+        ("el-cascader", "element-cascader"),
+        ("ant-picker", "ant-datepicker"),
+        ("el-date-editor", "element-datepicker"),
+        ("el-date-picker", "element-datepicker"),
+        ("react-datepicker", "react-datepicker"),
+        ("flatpickr", "flatpickr-datepicker"),
+        ("ant-select", "ant-select"),
+        ("ant-input", "ant-input"),
+        ("el-select", "element-select"),
+        ("el-input", "element-input"),
+        ("ivu-select", "iview-select"),
+        ("arco-select", "arco-select"),
+        ("tdesign", "tdesign"),
+        ("t-select", "tdesign-select"),
+        ("semi-select", "semi-select"),
+        ("sd-select", "sd-select"),
+        ("select2", "select2"),
+    ]
+    .into_iter()
+    .find_map(|(needle, hint)| class.contains(needle).then(|| hint.to_string()))
+}
+
+fn apply_custom_widget_contexts(nodes: &mut [BackendNode], contexts: &HashMap<i64, FormContext>) {
+    for node in nodes {
+        if node.disabled == Some(true) {
+            continue;
+        }
+        let Some(context) = node.backend_node_id.and_then(|id| contexts.get(&id)) else {
+            continue;
+        };
+        // Reuse the existing form-context index; no second selector/semantic system.
+        if !(context.dom_tag == "input" || matches!(node.role.as_str(), "combobox" | "listbox"))
+            || context
+                .input_type
+                .as_deref()
+                .is_some_and(|kind| !matches!(kind, "text" | "search"))
+        {
+            continue;
+        }
+        let hint = context.component_hint.as_deref().unwrap_or("");
+        if hint.contains("datepicker") {
+            node.capability.custom_date = true;
+            node.capability.custom_choice = false;
+        } else if hint.contains("cascader") || hint.ends_with("select") || hint == "select2" {
+            node.capability.custom_choice = true;
+        }
+    }
+}
+
+fn native_component_hint(local_name: &str) -> Option<&'static str> {
+    match local_name {
+        "input" => Some("native-input"),
+        "select" => Some("native-select"),
+        "textarea" => Some("native-textarea"),
+        "button" => Some("native-button"),
+        _ => None,
+    }
+}
+
+fn referenced_semantic_text(
+    node: &Value,
+    attribute: &str,
+    semantics: &DomSemanticIndex,
+) -> Option<String> {
+    let ids = dom_attribute_raw(node, attribute)?;
+    let mut text = String::new();
+    for id in ids.split_ascii_whitespace() {
+        if let Some(value) = semantics.id_text.get(id) {
+            append_semantic_text(&mut text, value);
+        }
+    }
+    (!text.is_empty()).then(|| clip_bytes(&text, MAX_NODE_TEXT_BYTES))
+}
+
+fn count_descendant_elements(node: &Value, local_name: &str) -> usize {
+    fn walk(node: &Value, local_name: &str, count: &mut usize) {
+        if *count >= 256 {
+            return;
+        }
+        if node.get("nodeType").and_then(Value::as_i64) == Some(1)
+            && node
+                .get("localName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(local_name))
+        {
+            *count += 1;
+        }
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk(child, local_name, count);
+                if *count >= 256 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut count = 0;
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            walk(child, local_name, &mut count);
+            if count >= 256 {
+                break;
+            }
+        }
+    }
+    count
+}
+
+fn infer_control_container_labels(root: &Value, semantics: &mut DomSemanticIndex) {
+    const MAX_GROUP_CONTROLS: usize = 8;
+    const MAX_NEARBY_LABEL_CHARS: usize = 120;
+
+    #[derive(Default)]
+    struct ControlSummary {
+        backend_node_ids: Vec<i64>,
+        choice_count: usize,
+        overflow: bool,
+    }
+
+    fn is_hidden_element(node: &Value) -> bool {
+        if node.get("nodeType").and_then(Value::as_i64) != Some(1) {
+            return false;
+        }
+        if dom_attribute_raw(node, "hidden").is_some()
+            || dom_attribute(node, "aria-hidden").as_deref() == Some("true")
+        {
+            return true;
+        }
+        let style = dom_attribute_raw(node, "style")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .replace(' ', "");
+        style.contains("display:none") || style.contains("visibility:hidden")
+    }
+
+    fn is_container_form_control(node: &Value) -> bool {
+        if node.get("nodeType").and_then(Value::as_i64) != Some(1) || is_hidden_element(node) {
+            return false;
+        }
+        let local_name = node
+            .get("localName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let input_type = (local_name == "input")
+            .then(|| dom_attribute(node, "type").unwrap_or_else(|| "text".to_string()));
+        if local_name == "input"
+            && matches!(
+                input_type.as_deref(),
+                Some("hidden" | "button" | "submit" | "reset" | "image")
+            )
+        {
+            return false;
+        }
+        if matches!(local_name.as_str(), "input" | "select" | "textarea") {
+            return true;
+        }
+        dom_attribute(node, "role").is_some_and(|role| {
+            matches!(
+                role.as_str(),
+                "textbox"
+                    | "searchbox"
+                    | "combobox"
+                    | "listbox"
+                    | "radio"
+                    | "checkbox"
+                    | "switch"
+                    | "spinbutton"
+            )
+        })
+    }
+
+    fn is_choice_control(node: &Value) -> bool {
+        if node.get("nodeType").and_then(Value::as_i64) != Some(1) || is_hidden_element(node) {
+            return false;
+        }
+        let local_name = node
+            .get("localName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if local_name == "input" {
+            return matches!(
+                dom_attribute(node, "type").as_deref(),
+                Some("radio" | "checkbox")
+            );
+        }
+        matches!(
+            dom_attribute(node, "role").as_deref(),
+            Some("radio" | "checkbox")
+        )
+    }
+
+    fn clean_label_text(value: &str) -> Option<String> {
+        let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed = normalized
+            .trim_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, '*' | ':' | '：' | '·' | '•')
+            })
+            .trim();
+        if trimmed.is_empty() || trimmed.chars().count() > MAX_NEARBY_LABEL_CHARS {
+            return None;
+        }
+        if !trimmed
+            .chars()
+            .any(|ch| ch.is_alphanumeric() || !ch.is_ascii())
+        {
+            return None;
+        }
+        Some(clip_bytes(trimmed, MAX_NODE_TEXT_BYTES))
+    }
+
+    fn candidate_label_text(node: &Value) -> Option<String> {
+        let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+        if node_type == 3 {
+            return node
+                .get("nodeValue")
+                .and_then(Value::as_str)
+                .and_then(clean_label_text);
+        }
+        if node_type != 1 || is_hidden_element(node) {
+            return None;
+        }
+        let local_name = node
+            .get("localName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            local_name.as_str(),
+            "a" | "button"
+                | "input"
+                | "select"
+                | "textarea"
+                | "option"
+                | "script"
+                | "style"
+                | "noscript"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+        ) {
+            return None;
+        }
+        if local_name == "label"
+            && dom_attribute_raw(node, "for").is_some_and(|value| !value.is_empty())
+        {
+            return None;
+        }
+        if dom_attribute(node, "role").is_some_and(|role| {
+            matches!(
+                role.as_str(),
+                "button"
+                    | "link"
+                    | "textbox"
+                    | "searchbox"
+                    | "combobox"
+                    | "listbox"
+                    | "radio"
+                    | "checkbox"
+                    | "switch"
+                    | "spinbutton"
+            )
+        }) {
+            return None;
+        }
+        dom_text_content(node).and_then(|text| clean_label_text(&text))
+    }
+
+    fn visit(node: &Value, semantics: &mut DomSemanticIndex) -> ControlSummary {
+        let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+        if node.get("shadowRootType").is_some()
+            || node_type == 11
+            || (node_type == 1 && is_hidden_element(node))
+        {
+            return ControlSummary::default();
+        }
+
+        let mut summary = ControlSummary::default();
+        if is_container_form_control(node) {
+            if let Some(backend_node_id) = node.get("backendNodeId").and_then(Value::as_i64) {
+                summary.backend_node_ids.push(backend_node_id);
+                if is_choice_control(node) {
+                    summary.choice_count = 1;
+                }
+            }
+        }
+
+        let children = node.get("children").and_then(Value::as_array);
+        let mut child_summaries = Vec::new();
+        if let Some(children) = children {
+            child_summaries.reserve(children.len());
+            for child in children {
+                let child_summary = visit(child, semantics);
+                if child_summary.overflow {
+                    summary.overflow = true;
+                }
+                summary.choice_count = summary
+                    .choice_count
+                    .saturating_add(child_summary.choice_count);
+                for backend_node_id in child_summary.backend_node_ids.iter().copied() {
+                    if summary.backend_node_ids.len() < MAX_GROUP_CONTROLS + 1 {
+                        summary.backend_node_ids.push(backend_node_id);
+                    } else {
+                        summary.overflow = true;
+                        break;
+                    }
+                }
+                child_summaries.push(child_summary);
+            }
+        }
+
+        if summary.backend_node_ids.len() > MAX_GROUP_CONTROLS {
+            summary.overflow = true;
+        }
+
+        if !summary.overflow && !summary.backend_node_ids.is_empty() {
+            if let Some(children) = children {
+                let first_control_child = child_summaries
+                    .iter()
+                    .position(|child| child.overflow || !child.backend_node_ids.is_empty());
+                if let Some(first_control_child) = first_control_child {
+                    let mut candidate: Option<String> = None;
+                    let mut ambiguous = false;
+                    for child in children.iter().take(first_control_child) {
+                        let Some(text) = candidate_label_text(child) else {
+                            continue;
+                        };
+                        if candidate.is_some() {
+                            ambiguous = true;
+                            break;
+                        }
+                        candidate = Some(text);
+                    }
+                    if !ambiguous
+                        && candidate.is_none()
+                        && summary.backend_node_ids.len() == 1
+                        && summary.choice_count == 1
+                    {
+                        for child in children.iter().skip(first_control_child + 1) {
+                            let Some(text) = candidate_label_text(child) else {
+                                continue;
+                            };
+                            if candidate.is_some() {
+                                ambiguous = true;
+                                break;
+                            }
+                            candidate = Some(text);
+                        }
+                    }
+                    if !ambiguous {
+                        if let Some(label) = candidate {
+                            if summary.backend_node_ids.len() == 1 {
+                                semantics
+                                    .container_labels
+                                    .entry(summary.backend_node_ids[0])
+                                    .or_insert(label);
+                            } else {
+                                let size = summary.backend_node_ids.len();
+                                for (index, backend_node_id) in
+                                    summary.backend_node_ids.iter().copied().enumerate()
+                                {
+                                    semantics
+                                        .container_group_labels
+                                        .entry(backend_node_id)
+                                        .or_insert_with(|| DomGroupLabel {
+                                            label: label.clone(),
+                                            index,
+                                            size,
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        summary
+    }
+
+    let _ = visit(root, semantics);
+}
+
+fn semantic_element_label(
+    node: &Value,
+    semantics: &DomSemanticIndex,
+    ancestor_label: Option<&str>,
+) -> Option<String> {
+    if let Some(value) = dom_attribute_raw(node, "aria-label").filter(|value| !value.is_empty()) {
+        return Some(clip_bytes(&value, MAX_NODE_TEXT_BYTES));
+    }
+    if let Some(labelled_by) =
+        dom_attribute_raw(node, "aria-labelledby").filter(|value| !value.is_empty())
+    {
+        let mut label = String::new();
+        for id in labelled_by.split_ascii_whitespace() {
+            if let Some(text) = semantics.id_text.get(id) {
+                append_semantic_text(&mut label, text);
+            }
+        }
+        if !label.is_empty() {
+            return Some(clip_bytes(&label, MAX_NODE_TEXT_BYTES));
+        }
+    }
+    if let Some(id) = dom_attribute_raw(node, "id").filter(|id| !id.is_empty()) {
+        if let Some(label) = semantics.labels_for.get(&id) {
+            return Some(clip_bytes(label, MAX_NODE_TEXT_BYTES));
+        }
+    }
+    if let Some(backend_node_id) = node.get("backendNodeId").and_then(Value::as_i64) {
+        if let Some(label) = semantics.container_labels.get(&backend_node_id) {
+            return Some(clip_bytes(label, MAX_NODE_TEXT_BYTES));
+        }
+    }
+    if let Some(label) = ancestor_label.filter(|label| !label.trim().is_empty()) {
+        return Some(clip_bytes(label, MAX_NODE_TEXT_BYTES));
+    }
+    dom_attribute_raw(node, "title")
+        .filter(|value| !value.is_empty())
+        .map(|value| clip_bytes(&value, MAX_NODE_TEXT_BYTES))
+}
+
+fn fieldset_legend(node: &Value) -> Option<String> {
+    node.get("children")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|child| {
+            child.get("nodeType").and_then(Value::as_i64) == Some(1)
+                && child
+                    .get("localName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("legend"))
+        })
+        .and_then(dom_text_content)
+}
+
+fn dom_text_content(node: &Value) -> Option<String> {
+    fn collect(node: &Value, output: &mut String) {
+        if output.len() >= MAX_NODE_TEXT_BYTES {
+            return;
+        }
+        let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+        if node_type == 3 {
+            if let Some(value) = node.get("nodeValue").and_then(Value::as_str) {
+                append_semantic_text(output, value);
+            }
+            return;
+        }
+        if node_type == 1 {
+            let local_name = node.get("localName").and_then(Value::as_str).unwrap_or("");
+            if matches!(local_name, "script" | "style" | "noscript") {
+                return;
+            }
+        }
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                collect(child, output);
+                if output.len() >= MAX_NODE_TEXT_BYTES {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut output = String::new();
+    collect(node, &mut output);
+    (!output.is_empty()).then(|| clip_bytes(&output, MAX_NODE_TEXT_BYTES))
+}
+
+fn append_semantic_text(output: &mut String, value: &str) {
+    for part in value.split_whitespace() {
+        if output.len() >= MAX_NODE_TEXT_BYTES {
+            break;
+        }
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(part);
+        if output.len() > MAX_NODE_TEXT_BYTES {
+            *output = clip_bytes(output, MAX_NODE_TEXT_BYTES);
+            break;
+        }
+    }
+}
+
+fn element_value(node: &Value) -> Option<String> {
+    dom_attribute_raw(node, "value")
+        .filter(|value| !value.is_empty())
+        .map(|value| clip_bytes(&value, MAX_NODE_TEXT_BYTES))
+}
+
+fn ax_value(node: &Value, key: &str) -> Option<String> {
+    node.get(key)?
+        .get("value")?
+        .as_str()
+        .map(|value| clip_bytes(value, MAX_NODE_TEXT_BYTES))
+}
+
+fn ax_property<'a>(node: &'a Value, name: &str) -> Option<&'a Value> {
+    node.get("properties")?
+        .as_array()?
+        .iter()
+        .find(|property| property.get("name").and_then(Value::as_str) == Some(name))?
+        .get("value")?
+        .get("value")
+}
+
+fn ax_property_bool(node: &Value, name: &str) -> Option<bool> {
+    match ax_property(node, name)? {
+        Value::Bool(value) => Some(*value),
+        Value::String(value) if value == "true" => Some(true),
+        Value::String(value) if value == "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn ax_property_string(node: &Value, name: &str) -> Option<String> {
+    match ax_property(node, name)? {
+        Value::String(value) => Some(clip_bytes(value, MAX_NODE_TEXT_BYTES)),
+        Value::Bool(value) => Some(value.to_string()),
+        value if value.is_number() => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn ax_group_context(
+    node: &Value,
+    by_id: &HashMap<String, &Value>,
+) -> Option<(String, String, String)> {
+    let mut parent_id = node.get("parentId").and_then(Value::as_str);
+    for _ in 0..8 {
+        let id = parent_id?;
+        let parent = by_id.get(id)?;
+        let role = ax_value(parent, "role").unwrap_or_default();
+        let name = ax_value(parent, "name").unwrap_or_default();
+        if matches!(
+            role.as_str(),
+            "group" | "radiogroup" | "combobox" | "listbox"
+        ) && !name.trim().is_empty()
+        {
+            return Some((id.to_string(), role, name));
+        }
+        parent_id = parent.get("parentId").and_then(Value::as_str);
+    }
+    None
+}
+
+fn fetch_page_descriptors(port: u16, deadline: Instant) -> BrowserResult<Vec<Value>> {
+    let remaining = remaining_before_dispatch(deadline)?;
+    let http = format!("http://127.0.0.1:{port}/json/list");
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(remaining)
+        .build()
+        .map_err(|error| BrowserError::observed("cdp_connect_failed", error.to_string(), None))?;
+    let mut response = client
+        .get(http)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| {
+            BrowserError::observed(
+                "cdp_list_failed",
+                format!("could not observe CDP pages: {error}"),
+                None,
+            )
+        })?;
+    let mut body = Vec::new();
+    response
+        .by_ref()
+        .take((MAX_CDP_LIST_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| {
+            BrowserError::observed(
+                "cdp_list_failed",
+                format!("could not read bounded CDP page list: {error}"),
+                None,
+            )
+        })?;
+    if body.len() > MAX_CDP_LIST_BYTES {
+        return Err(BrowserError::observed(
+            "cdp_list_too_large",
+            "CDP page list exceeded the bounded response size",
+            None,
+        ));
+    }
+    serde_json::from_slice(&body).map_err(|error| {
+        BrowserError::observed(
+            "cdp_list_failed",
+            format!("could not decode CDP page list: {error}"),
+            None,
+        )
+    })
+}
+
+fn remaining_before_dispatch(deadline: Instant) -> BrowserResult<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(BrowserError::not_started(
+            "cdp_timeout",
+            "Browser CDP request exceeded its absolute deadline before dispatch",
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn configure_socket_timeout(websocket: &mut CdpSocket, timeout: Duration) -> BrowserResult<()> {
+    websocket.timeout(timeout)
+}
+
+fn open_loopback_websocket(endpoint: &Url, deadline: Instant) -> BrowserResult<CdpSocket> {
+    if !matches!(endpoint.host_str(), Some("127.0.0.1") | Some("localhost"))
+        || endpoint.scheme() != "ws"
+    {
+        return Err(BrowserError::not_started(
+            "cdp_endpoint_invalid",
+            "Browser CDP transport must be a plain loopback websocket",
+        ));
+    }
+    let port = endpoint.port().ok_or_else(|| {
+        BrowserError::not_started("cdp_endpoint_invalid", "Browser CDP endpoint has no port")
+    })?;
+    let remaining = remaining_before_dispatch(deadline)?;
+    let stream =
+        TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), remaining)
+            .map_err(|error| {
+                BrowserError::not_started(
+                    "cdp_connect_failed",
+                    format!("could not connect to loopback CDP: {error}"),
+                )
+            })?;
+    let _ = stream.set_nodelay(true);
+    stream.set_read_timeout(Some(remaining)).map_err(|error| {
+        BrowserError::not_started(
+            "cdp_timeout_config_failed",
+            format!("could not bound CDP handshake read timeout: {error}"),
+        )
+    })?;
+    stream.set_write_timeout(Some(remaining)).map_err(|error| {
+        BrowserError::not_started(
+            "cdp_timeout_config_failed",
+            format!("could not bound CDP handshake write timeout: {error}"),
+        )
+    })?;
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_CDP_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_CDP_MESSAGE_BYTES));
+    let (websocket, _) =
+        client_with_config(endpoint.as_str(), stream, Some(config)).map_err(|error| {
+            BrowserError::not_started(
+                "cdp_connect_failed",
+                format!("could not complete loopback CDP handshake: {error}"),
+            )
+        })?;
+    let mut websocket = CdpSocket::Loopback(Box::new(websocket));
+    configure_socket_timeout(&mut websocket, remaining_before_dispatch(deadline)?)?;
+    Ok(websocket)
+}
+
+#[cfg(test)]
+fn cdp_call(
+    endpoint: &Url,
+    next_id: &mut u64,
+    method: &str,
+    params: Value,
+    effect: bool,
+) -> BrowserResult<Value> {
+    cdp_call_until(
+        endpoint,
+        next_id,
+        method,
+        params,
+        effect,
+        Instant::now() + REQUEST_TIMEOUT,
+    )
+}
+
+fn clear_event_collector(
+    collector: &mut CdpEventCollector,
+    next_id: &mut u64,
+) -> BrowserResult<()> {
+    // A response on the same ordered CDP websocket is a bounded barrier: all
+    // already-queued diagnostic messages are consumed before this response.
+    // Clearing only after the barrier prevents pre-clear backlog from resurfacing
+    // on the next observation without relying on a best-effort drain duration.
+    cdp_call_on_websocket_until(
+        &mut collector.websocket,
+        next_id,
+        "Page.getFrameTree",
+        json!({}),
+        false,
+        Instant::now() + REQUEST_TIMEOUT,
+    )
+    .map_err(pre_dispatch_error)?;
+    collector.events.clear();
+    Ok(())
+}
+
+fn drain_event_collector(collector: &mut CdpEventCollector) -> BrowserResult<()> {
+    let deadline = Instant::now() + Duration::from_millis(150);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        configure_socket_timeout(&mut collector.websocket, remaining)?;
+        match collector.websocket.read() {
+            Ok(Message::Text(text)) => {
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                record_cdp_event(&mut collector.events, &value);
+            }
+            Ok(Message::Close(_)) => {
+                return Err(BrowserError::observed(
+                    "cdp_receive_closed",
+                    "diagnostic CDP stream closed before observation completed",
+                    Some("pages"),
+                ))
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break
+            }
+            Err(error) => {
+                return Err(BrowserError::observed(
+                    "cdp_receive_failed",
+                    error.to_string(),
+                    None,
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_cdp_event(buffer: &mut CdpEventBuffer, value: &Value) {
+    let method = value.get("method").and_then(Value::as_str);
+    let params = value.get("params").cloned().unwrap_or_default();
+    match method {
+        Some("WebCodex.eventsDiscarded") => {
+            buffer.next_sequence();
+            if params["domain"] == "Network" {
+                buffer.network_truncated = true;
+                buffer.network_events_discarded = true;
+            } else {
+                buffer.console_truncated = true;
+            }
+        }
+        Some("Runtime.consoleAPICalled") => {
+            let level = params.get("type").and_then(Value::as_str).unwrap_or("log");
+            let text = params
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(console_arg_text)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            buffer.push_console(BackendConsoleEntry {
+                sequence: 0,
+                level: clip_bytes(level, 64),
+                text: clip_bytes(&text, crate::types::MAX_DIAGNOSTIC_TEXT_BYTES),
+                source: None,
+                timestamp: params.get("timestamp").and_then(Value::as_f64),
+            });
+        }
+        Some("Runtime.exceptionThrown") => {
+            let details = params.get("exceptionDetails").cloned().unwrap_or_default();
+            buffer.push_console(BackendConsoleEntry {
+                sequence: 0,
+                level: "exception".to_string(),
+                text: clip_bytes(
+                    details
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Uncaught exception"),
+                    crate::types::MAX_DIAGNOSTIC_TEXT_BYTES,
+                ),
+                source: details
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(|url| clip_bytes(url, crate::types::MAX_URL_BYTES)),
+                timestamp: params.get("timestamp").and_then(Value::as_f64),
+            });
+        }
+        Some("Log.entryAdded") => {
+            let entry = value.pointer("/params/entry").cloned().unwrap_or_default();
+            buffer.push_console(BackendConsoleEntry {
+                sequence: 0,
+                level: clip_bytes(
+                    entry.get("level").and_then(Value::as_str).unwrap_or("info"),
+                    64,
+                ),
+                text: clip_bytes(
+                    entry
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    crate::types::MAX_DIAGNOSTIC_TEXT_BYTES,
+                ),
+                source: entry
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(|url| clip_bytes(url, crate::types::MAX_URL_BYTES)),
+                timestamp: entry.get("timestamp").and_then(Value::as_f64),
+            });
+        }
+        Some("Network.requestWillBeSent") => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            let request = params.get("request").cloned().unwrap_or_default();
+            buffer.insert_network(
+                request_id.to_string(),
+                BackendNetworkEntry {
+                    sequence: 0,
+                    method: clip_bytes(
+                        request
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or("GET"),
+                        128,
+                    ),
+                    url: clip_bytes(
+                        request
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        crate::types::MAX_URL_BYTES,
+                    ),
+                    resource_type: params
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(|resource_type| clip_bytes(resource_type, 64)),
+                    status: None,
+                    failed_reason: None,
+                    timestamp: params.get("timestamp").and_then(Value::as_f64),
+                },
+            );
+        }
+        Some("Network.responseReceived") => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            let response = params.get("response").cloned().unwrap_or_default();
+            let status = response
+                .get("status")
+                .and_then(Value::as_f64)
+                .map(|value| value as u16);
+            buffer.update_network(request_id, |entry| entry.status = status);
+        }
+        Some("Network.loadingFailed") => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            let failed_reason = params
+                .get("errorText")
+                .and_then(Value::as_str)
+                .map(|value| clip_bytes(value, 512));
+            buffer.update_network(request_id, |entry| entry.failed_reason = failed_reason);
+            buffer.finish_network(request_id);
+        }
+        Some("Network.loadingFinished") => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            buffer.finish_network(request_id);
+        }
+        _ => {}
+    }
+}
+
+fn console_arg_text(value: &Value) -> Option<String> {
+    value
+        .get("value")
+        .map(|value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .or_else(|| {
+            value
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn cdp_call_until(
+    endpoint: &Url,
+    next_id: &mut u64,
+    method: &str,
+    params: Value,
+    effect: bool,
+    deadline: Instant,
+) -> BrowserResult<Value> {
+    let mut websocket = open_loopback_websocket(endpoint, deadline)?;
+    cdp_call_on_websocket_until(&mut websocket, next_id, method, params, effect, deadline)
+}
+
+fn cdp_call_on_websocket_until(
+    websocket: &mut CdpSocket,
+    next_id: &mut u64,
+    method: &str,
+    params: Value,
+    effect: bool,
+    deadline: Instant,
+) -> BrowserResult<Value> {
+    let id = *next_id;
+    *next_id = next_id.saturating_add(1);
+    let request = json!({ "id": id, "method": method, "params": params }).to_string();
+    configure_socket_timeout(websocket, remaining_before_dispatch(deadline)?)?;
+    websocket
+        .send(Message::Text(request.into()))
+        .map_err(|error| {
+            if effect {
+                BrowserError::uncertain(
+                    "cdp_delivery_uncertain",
+                    format!("effect delivery became uncertain: {error}"),
+                    "snapshot",
+                )
+            } else {
+                BrowserError::observed("cdp_send_failed", error.to_string(), None)
+            }
+        })?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(if effect {
+                BrowserError::uncertain(
+                    "cdp_receive_timeout",
+                    "effect result exceeded the Browser CDP absolute deadline",
+                    "snapshot",
+                )
+            } else {
+                BrowserError::observed(
+                    "cdp_receive_timeout",
+                    "Browser CDP observation exceeded its absolute deadline",
+                    None,
+                )
+            });
+        }
+        configure_socket_timeout(websocket, remaining)?;
+        match websocket.read() {
+            Ok(Message::Text(text)) => {
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if value.get("id").and_then(Value::as_u64) != Some(id) {
+                    continue;
+                }
+                if let Some(error) = value.get("error") {
+                    return Err(if effect {
+                        BrowserError::uncertain(
+                            "cdp_effect_error",
+                            format!(
+                                "CDP effect returned an error after dispatch: {}",
+                                clip_bytes(&error.to_string(), 256)
+                            ),
+                            "snapshot",
+                        )
+                    } else {
+                        BrowserError::observed(
+                            "cdp_error",
+                            format!(
+                                "CDP observation returned an error: {}",
+                                clip_bytes(&error.to_string(), 256)
+                            ),
+                            None,
+                        )
+                    });
+                }
+                return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
+            }
+            Ok(Message::Close(_)) => {
+                return Err(if effect {
+                    BrowserError::uncertain(
+                        "cdp_closed",
+                        "CDP connection closed after effect dispatch",
+                        "snapshot",
+                    )
+                } else {
+                    BrowserError::observed("cdp_closed", "CDP connection closed", None)
+                })
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Socket timeouts vary by platform. Recheck the same absolute
+                // deadline above; never redispatch the request or renew its budget.
+                continue;
+            }
+            Err(error) => {
+                return Err(if effect {
+                    BrowserError::uncertain(
+                        "cdp_receive_uncertain",
+                        format!("effect result became uncertain: {error}"),
+                        "snapshot",
+                    )
+                } else {
+                    BrowserError::observed("cdp_receive_failed", error.to_string(), None)
+                })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::net::TcpListener;
+    use std::thread;
+    use tungstenite::{accept, Message};
+
+    #[test]
+    fn discarded_diagnostics_are_explicit_and_cannot_claim_network_quiet() {
+        let mut buffer = CdpEventBuffer::default();
+        record_cdp_event(
+            &mut buffer,
+            &json!({"method":"WebCodex.eventsDiscarded", "params":{"domain":"Runtime"}}),
+        );
+        assert!(buffer.console_truncated);
+        assert!(!buffer.network_events_discarded);
+        record_cdp_event(
+            &mut buffer,
+            &json!({"method":"WebCodex.eventsDiscarded", "params":{"domain":"Network"}}),
+        );
+        assert!(buffer.network_truncated);
+        assert!(buffer.network_events_discarded);
+        assert_eq!(buffer.cursor(), 2);
+        buffer.clear();
+        assert!(!buffer.network_events_discarded);
+        assert!(!buffer.console_truncated);
+        assert!(!buffer.network_truncated);
+        assert_eq!(buffer.cleared_through_sequence, 2);
+    }
+
+    #[test]
+    fn dom_control_capabilities_follow_the_owning_element() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 1,
+                "children": [
+                    input(13, "text", json!([])),
+                    input(18, "search", json!([])),
+                    input(29, "number", json!([])),
+                    input(35, "range", json!([])),
+                    input(40, "date", json!([
+                        {"nodeType": 1, "localName": "span", "backendNodeId": 44},
+                        {"nodeType": 1, "localName": "div", "backendNodeId": 49, "attributes": ["id", "picker"]}
+                    ])),
+                    input(51, "month", json!([])),
+                    json!({
+                        "nodeType": 1,
+                        "localName": "input",
+                        "backendNodeId": 61,
+                        "attributes": ["type", "week", "aria-label", "Week", "value", "2026-W12"],
+                        "shadowRoots": [{
+                            "nodeType": 11,
+                            "shadowRootType": "user-agent",
+                            "children": [
+                                {"nodeType": 1, "localName": "span", "backendNodeId": 65},
+                                {"nodeType": 1, "localName": "span", "backendNodeId": 67}
+                            ]
+                        }]
+                    }),
+                    input(11, "time", json!([])),
+                    input(80, "datetime-local", json!([])),
+                    input(23, "color", json!([])),
+                    input(99, "file", json!([])),
+                    input(2, "email", json!([])),
+                    input(14, "password", json!([])),
+                    input(15, "checkbox", json!([])),
+                    input(16, "hidden", json!([])),
+                    {
+                        "nodeType": 1,
+                        "localName": "select",
+                        "backendNodeId": 106,
+                        "children": [
+                            {"nodeType": 1, "localName": "option", "backendNodeId": 113}
+                        ]
+                    },
+                    {"nodeType": 1, "localName": "textarea", "backendNodeId": 103},
+                    {"nodeType": 1, "localName": "div", "backendNodeId": 119},
+                    {"nodeType": 1, "localName": "div", "backendNodeId": 120},
+                    {"nodeType": 1, "localName": "button", "backendNodeId": 200},
+                    {"nodeType": 1, "localName": "a", "backendNodeId": 202},
+                    {"nodeType": 1, "localName": "a", "backendNodeId": 203, "attributes": ["href", "https://example.test/"]},
+                    {
+                        "nodeType": 1,
+                        "localName": "ua-like",
+                        "backendNodeId": 201,
+                        "shadowRoots": [{
+                            "nodeType": 11,
+                            "shadowRootType": "open",
+                            "children": [
+                                {"nodeType": 1, "localName": "div", "backendNodeId": 123},
+                                {"nodeType": 1, "localName": "button", "backendNodeId": 124}
+                            ]
+                        }]
+                    }
+                ]
+            }]
+        });
+        let raw_nodes = vec![
+            ax("text", "textbox", Some(13)),
+            ax("search", "searchbox", Some(18)),
+            ax("email", "textbox", Some(2)),
+            ax("password", "textbox", Some(14)),
+            ax("checkbox", "checkbox", Some(15)),
+            ax("hidden", "textbox", Some(16)),
+            ax("number", "spinbutton", Some(29)),
+            ax("range", "slider", Some(35)),
+            ax("date", "Date", Some(40)),
+            ax("date-part", "spinbutton", Some(44)),
+            ax("date-picker", "button", Some(49)),
+            ax("month", "DateTime", Some(51)),
+            ax("time", "InputTime", Some(11)),
+            ax("local", "DateTime", Some(80)),
+            ax("color", "ColorWell", Some(23)),
+            ax("file", "button", Some(99)),
+            ax("select", "combobox", Some(106)),
+            ax("alpha", "option", Some(113)),
+            ax("notes", "textbox", Some(103)),
+            ax("aria-spin", "spinbutton", Some(119)),
+            ax("aria-slider", "slider", Some(120)),
+            ax("button", "button", Some(200)),
+            ax("plain-anchor", "generic", Some(202)),
+            ax("link", "link", Some(203)),
+            ax("shadow-spin", "spinbutton", Some(123)),
+            ax("shadow-button", "button", Some(124)),
+            ax("week-part-a", "spinbutton", Some(65)),
+            ax("week-part-b", "button", Some(67)),
+            ax("legacy-button", "button", Some(4242)),
+            ax("legacy-datetime", "DateTime", Some(4243)),
+            ax("detached-date", "Date", Some(4244)),
+            ax("no-backend", "button", None),
+        ];
+        let (nodes, _) = project_ax_nodes(&raw_nodes, Some(&dom));
+        let by_name = nodes
+            .iter()
+            .map(|node| (node.name.as_deref().unwrap_or(""), node))
+            .collect::<HashMap<_, _>>();
+        let actions = |name: &str| by_name[name].capability.action_names();
+
+        assert_eq!(actions("text"), ["click", "input_text", "set_value"]);
+        assert_eq!(actions("search"), ["click", "input_text", "set_value"]);
+        assert_eq!(actions("email"), ["click", "input_text", "set_value"]);
+        assert_eq!(actions("password"), ["click", "input_text", "set_value"]);
+        assert_eq!(actions("checkbox"), ["click"]);
+        assert!(actions("hidden").is_empty());
+        assert_eq!(actions("notes"), ["click", "input_text", "set_value"]);
+        assert_eq!(actions("number"), ["set_value"]);
+        assert_eq!(actions("range"), ["set_value"]);
+        assert_eq!(actions("date"), ["set_value"]);
+        assert_eq!(actions("month"), ["set_value"]);
+        assert_eq!(actions("time"), ["set_value"]);
+        assert_eq!(actions("local"), ["set_value"]);
+        assert_eq!(actions("color"), ["set_value"]);
+        assert!(actions("date-part").is_empty());
+        assert!(actions("date-picker").is_empty());
+        assert_eq!(by_name["date-part"].backend_node_id, Some(44));
+        assert_eq!(actions("file"), ["upload_file"]);
+        assert_eq!(actions("select"), ["select_option"]);
+        assert!(actions("alpha").is_empty());
+        assert!(actions("aria-spin").is_empty());
+        assert!(actions("aria-slider").is_empty());
+        assert!(actions("shadow-spin").is_empty());
+        assert_eq!(actions("button"), ["click"]);
+        assert!(
+            actions("plain-anchor").is_empty(),
+            "DOM classification must not expand a non-link anchor beyond its accessibility semantics"
+        );
+        assert_eq!(actions("link"), ["click"]);
+        assert_eq!(actions("shadow-button"), ["click"]);
+        assert!(
+            actions("legacy-button").is_empty(),
+            "a node omitted from a successful DOM index does not regain click"
+        );
+        assert!(actions("legacy-datetime").is_empty());
+        assert!(actions("detached-date").is_empty());
+        assert!(actions("no-backend").is_empty());
+        assert_eq!(by_name["no-backend"].backend_node_id, None);
+
+        let week_hosts = nodes
+            .iter()
+            .filter(|node| node.capability.exact_value && node.backend_node_id == Some(61))
+            .collect::<Vec<_>>();
+        assert_eq!(week_hosts.len(), 1, "one missing owner is projected once");
+        assert_eq!(week_hosts[0].role, "DateTime");
+        assert_eq!(week_hosts[0].name.as_deref(), Some("Week"));
+        assert_eq!(week_hosts[0].value.as_deref(), Some("2026-W12"));
+        assert_eq!(week_hosts[0].capability.action_names(), ["set_value"]);
+        assert!(nodes.iter().any(|node| {
+            node.name.as_deref() == Some("week-part-a")
+                && node.role == "spinbutton"
+                && node.backend_node_id == Some(65)
+                && node.capability.action_names().is_empty()
+        }));
+        assert!(nodes.iter().any(|node| {
+            node.name.as_deref() == Some("week-part-b")
+                && node.role == "button"
+                && node.backend_node_id == Some(67)
+                && node.capability.action_names().is_empty()
+        }));
+    }
+
+    #[test]
+    fn dom_semantics_fill_missing_ax_labels_without_overwriting_accessible_names() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 1,
+                "children": [
+                    {
+                        "nodeType": 1,
+                        "localName": "fieldset",
+                        "backendNodeId": 10,
+                        "children": [
+                            {
+                                "nodeType": 1,
+                                "localName": "legend",
+                                "backendNodeId": 11,
+                                "children": [{"nodeType": 3, "nodeValue": "性别"}]
+                            },
+                            {
+                                "nodeType": 1,
+                                "localName": "label",
+                                "backendNodeId": 12,
+                                "attributes": ["for", "gender-male"],
+                                "children": [{"nodeType": 3, "nodeValue": "男"}]
+                            },
+                            {
+                                "nodeType": 1,
+                                "localName": "input",
+                                "backendNodeId": 13,
+                                "attributes": ["type", "radio", "id", "gender-male"]
+                            },
+                            {
+                                "nodeType": 1,
+                                "localName": "label",
+                                "backendNodeId": 14,
+                                "children": [
+                                    {"nodeType": 3, "nodeValue": "女"},
+                                    {
+                                        "nodeType": 1,
+                                        "localName": "input",
+                                        "backendNodeId": 15,
+                                        "attributes": ["type", "radio", "id", "gender-female"]
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "span",
+                        "backendNodeId": 19,
+                        "attributes": ["id", "health-label"],
+                        "children": [{"nodeType": 3, "nodeValue": "健康状况"}]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "select",
+                        "backendNodeId": 20,
+                        "attributes": ["aria-labelledby", "health-label"]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "label",
+                        "backendNodeId": 21,
+                        "attributes": ["for", "candidate-name"],
+                        "children": [{"nodeType": 3, "nodeValue": "真实姓名"}]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "input",
+                        "backendNodeId": 22,
+                        "attributes": ["type", "text", "id", "candidate-name"]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "div",
+                        "backendNodeId": 30,
+                        "children": [
+                            {
+                                "nodeType": 1,
+                                "localName": "label",
+                                "backendNodeId": 31,
+                                "children": [{"nodeType": 3, "nodeValue": "高考生源地"}]
+                            },
+                            {
+                                "nodeType": 1,
+                                "localName": "div",
+                                "backendNodeId": 32,
+                                "children": [{
+                                    "nodeType": 1,
+                                    "localName": "select",
+                                    "backendNodeId": 33
+                                }]
+                            }
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "div",
+                        "backendNodeId": 40,
+                        "children": [
+                            {
+                                "nodeType": 1,
+                                "localName": "label",
+                                "backendNodeId": 41,
+                                "children": [{"nodeType": 3, "nodeValue": "不要猜"}]
+                            },
+                            {
+                                "nodeType": 1,
+                                "localName": "input",
+                                "backendNodeId": 42,
+                                "attributes": ["type", "text"]
+                            },
+                            {
+                                "nodeType": 1,
+                                "localName": "input",
+                                "backendNodeId": 43,
+                                "attributes": ["type", "text"]
+                            }
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "label",
+                        "backendNodeId": 23,
+                        "attributes": ["for", "already-named"],
+                        "children": [{"nodeType": 3, "nodeValue": "DOM 备用名称"}]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "input",
+                        "backendNodeId": 24,
+                        "attributes": ["type", "text", "id", "already-named"]
+                    }
+                ]
+            }]
+        });
+        let raw_nodes = vec![
+            json!({
+                "nodeId": "ax-male",
+                "role": {"value": "radio"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 13
+            }),
+            json!({
+                "nodeId": "ax-female",
+                "role": {"value": "radio"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 15
+            }),
+            json!({
+                "nodeId": "ax-health",
+                "role": {"value": "combobox"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 20
+            }),
+            json!({
+                "nodeId": "ax-name",
+                "role": {"value": "textbox"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 22
+            }),
+            json!({
+                "nodeId": "ax-origin",
+                "role": {"value": "combobox"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 33
+            }),
+            json!({
+                "nodeId": "ax-ambiguous-a",
+                "role": {"value": "textbox"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 42
+            }),
+            json!({
+                "nodeId": "ax-ambiguous-b",
+                "role": {"value": "textbox"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 43
+            }),
+            json!({
+                "nodeId": "ax-preserve",
+                "role": {"value": "textbox"},
+                "name": {"value": "AX wins"},
+                "backendDOMNodeId": 24
+            }),
+        ];
+
+        let (nodes, _) = project_ax_nodes(&raw_nodes, Some(&dom));
+        let by_backend = nodes
+            .iter()
+            .filter_map(|node| node.backend_node_id.map(|id| (id, node)))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(by_backend[&13].name.as_deref(), Some("男"));
+        assert_eq!(by_backend[&13].group_label.as_deref(), Some("性别"));
+        assert_eq!(by_backend[&13].group_role.as_deref(), Some("group"));
+        assert_eq!(by_backend[&15].name.as_deref(), Some("女"));
+        assert_eq!(by_backend[&15].group_label.as_deref(), Some("性别"));
+        assert_eq!(by_backend[&20].name.as_deref(), Some("健康状况"));
+        assert_eq!(by_backend[&22].name.as_deref(), Some("真实姓名"));
+        assert_eq!(by_backend[&33].name.as_deref(), Some("高考生源地"));
+        assert_eq!(by_backend[&42].name.as_deref(), None);
+        assert_eq!(by_backend[&43].name.as_deref(), None);
+        assert_eq!(by_backend[&24].name.as_deref(), Some("AX wins"));
+    }
+
+    #[test]
+    fn form_context_is_bounded_semantic_metadata_and_value_stable() {
+        fn form_dom(value: &str) -> Value {
+            json!({
+                "nodeType": 9,
+                "children": [{
+                    "nodeType": 1,
+                    "localName": "body",
+                    "backendNodeId": 1,
+                    "children": [{
+                        "nodeType": 1,
+                        "localName": "section",
+                        "backendNodeId": 100,
+                        "children": [
+                            {
+                                "nodeType": 1,
+                                "localName": "h3",
+                                "backendNodeId": 101,
+                                "children": [{"nodeType": 3, "nodeValue": "基本信息"}]
+                            },
+                            {
+                                "nodeType": 1,
+                                "localName": "div",
+                                "backendNodeId": 102,
+                                "attributes": ["class", "ant-select ant-form-item"],
+                                "children": [
+                                    {
+                                        "nodeType": 1,
+                                        "localName": "label",
+                                        "backendNodeId": 103,
+                                        "attributes": ["for", "student-origin"],
+                                        "children": [{"nodeType": 3, "nodeValue": "高考生源地"}]
+                                    },
+                                    {
+                                        "nodeType": 1,
+                                        "localName": "select",
+                                        "backendNodeId": 104,
+                                        "attributes": [
+                                            "id", "student-origin",
+                                            "name", "studentOrigin",
+                                            "autocomplete", "address-level1",
+                                            "aria-invalid", "true",
+                                            "aria-errormessage", "origin-error",
+                                            "value", value
+                                        ],
+                                        "children": [
+                                            {
+                                                "nodeType": 1,
+                                                "localName": "option",
+                                                "backendNodeId": 105,
+                                                "children": [{"nodeType": 3, "nodeValue": "辽宁"}]
+                                            },
+                                            {
+                                                "nodeType": 1,
+                                                "localName": "option",
+                                                "backendNodeId": 106,
+                                                "children": [{"nodeType": 3, "nodeValue": "吉林"}]
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "nodeType": 1,
+                                "localName": "span",
+                                "backendNodeId": 107,
+                                "attributes": ["id", "origin-error"],
+                                "children": [{"nodeType": 3, "nodeValue": "请选择高考生源地"}]
+                            }
+                        ]
+                    }]
+                }]
+            })
+        }
+
+        let first = index_form_contexts(&form_dom("辽宁"));
+        let second = index_form_contexts(&form_dom("吉林"));
+        let context = first.get(&104).expect("select form context");
+
+        assert_eq!(context.dom_tag, "select");
+        assert_eq!(context.html_name.as_deref(), Some("studentOrigin"));
+        assert_eq!(context.autocomplete.as_deref(), Some("address-level1"));
+        assert_eq!(context.section_label.as_deref(), Some("基本信息"));
+        assert_eq!(context.component_hint.as_deref(), Some("ant-select"));
+        assert_eq!(context.aria_invalid, Some(true));
+        assert_eq!(context.validation_hint.as_deref(), Some("请选择高考生源地"));
+        assert_eq!(context.option_count, Some(2));
+        assert_eq!(context.field_signature.len(), 24);
+        assert_eq!(
+            context.field_signature,
+            second
+                .get(&104)
+                .expect("same field after value change")
+                .field_signature
+        );
+    }
+
+    #[test]
+    fn nearby_visible_labels_cover_generic_rows_and_groups_without_ambiguous_guessing() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 1,
+                "children": [
+                    {
+                        "nodeType": 1,
+                        "localName": "div",
+                        "backendNodeId": 200,
+                        "children": [
+                            {"nodeType": 1, "localName": "span", "backendNodeId": 201,
+                             "children": [{"nodeType": 3, "nodeValue": "姓名："}]},
+                            {"nodeType": 1, "localName": "div", "backendNodeId": 202,
+                             "children": [{"nodeType": 1, "localName": "input", "backendNodeId": 203,
+                                          "attributes": ["type", "text"]}]}
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "tr",
+                        "backendNodeId": 210,
+                        "children": [
+                            {"nodeType": 1, "localName": "td", "backendNodeId": 211,
+                             "children": [{"nodeType": 3, "nodeValue": "电子邮箱"}]},
+                            {"nodeType": 1, "localName": "td", "backendNodeId": 212,
+                             "children": [{"nodeType": 1, "localName": "input", "backendNodeId": 213,
+                                          "attributes": ["type", "email"]}]}
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "div",
+                        "backendNodeId": 220,
+                        "children": [
+                            {"nodeType": 1, "localName": "span", "backendNodeId": 221,
+                             "children": [{"nodeType": 3, "nodeValue": "性别"}]},
+                            {"nodeType": 1, "localName": "label", "backendNodeId": 222,
+                             "children": [
+                                 {"nodeType": 1, "localName": "input", "backendNodeId": 223,
+                                  "attributes": ["type", "radio"]},
+                                 {"nodeType": 3, "nodeValue": "男"}
+                             ]},
+                            {"nodeType": 1, "localName": "label", "backendNodeId": 224,
+                             "children": [
+                                 {"nodeType": 1, "localName": "input", "backendNodeId": 225,
+                                  "attributes": ["type", "radio"]},
+                                 {"nodeType": 3, "nodeValue": "女"}
+                             ]}
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "div",
+                        "backendNodeId": 230,
+                        "children": [
+                            {"nodeType": 1, "localName": "span", "backendNodeId": 231,
+                             "children": [{"nodeType": 3, "nodeValue": "* 籍贯："}]},
+                            {"nodeType": 1, "localName": "select", "backendNodeId": 232},
+                            {"nodeType": 1, "localName": "select", "backendNodeId": 233}
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "div",
+                        "backendNodeId": 240,
+                        "children": [
+                            {"nodeType": 1, "localName": "span", "backendNodeId": 241,
+                             "children": [{"nodeType": 3, "nodeValue": "开始日期"}]},
+                            {"nodeType": 1, "localName": "span", "backendNodeId": 242,
+                             "children": [{"nodeType": 3, "nodeValue": "结束日期"}]},
+                            {"nodeType": 1, "localName": "input", "backendNodeId": 243,
+                             "attributes": ["type", "text"]},
+                            {"nodeType": 1, "localName": "input", "backendNodeId": 244,
+                             "attributes": ["type", "text"]}
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "div",
+                        "backendNodeId": 250,
+                        "children": [
+                            {"nodeType": 1, "localName": "input", "backendNodeId": 251,
+                             "attributes": ["type", "text"]},
+                            {"nodeType": 1, "localName": "span", "backendNodeId": 252,
+                             "children": [{"nodeType": 3, "nodeValue": "填写后不可修改"}]}
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "div",
+                        "backendNodeId": 260,
+                        "children": [
+                            {"nodeType": 1, "localName": "span", "backendNodeId": 261,
+                             "attributes": ["aria-hidden", "true"],
+                             "children": [{"nodeType": 3, "nodeValue": "隐藏文案"}]},
+                            {"nodeType": 1, "localName": "input", "backendNodeId": 262,
+                             "attributes": ["type", "text"]}
+                        ]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "section",
+                        "backendNodeId": 270,
+                        "children": [
+                            {"nodeType": 1, "localName": "h3", "backendNodeId": 271,
+                             "children": [{"nodeType": 3, "nodeValue": "基本信息"}]},
+                            {"nodeType": 1, "localName": "input", "backendNodeId": 272,
+                             "attributes": ["type", "text"]}
+                        ]
+                    }
+                ]
+            }]
+        });
+        let raw_nodes = [203, 213, 223, 225, 232, 233, 243, 244, 251, 262, 272]
+            .into_iter()
+            .enumerate()
+            .map(|(index, backend)| {
+                json!({
+                    "nodeId": format!("ax-{index}"),
+                    "role": {"value": if matches!(backend, 223 | 225) { "radio" } else if matches!(backend, 232 | 233) { "combobox" } else { "textbox" }},
+                    "name": {"value": ""},
+                    "backendDOMNodeId": backend
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (nodes, _) = project_ax_nodes(&raw_nodes, Some(&dom));
+        let by_backend = nodes
+            .iter()
+            .filter_map(|node| node.backend_node_id.map(|id| (id, node)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_backend[&203].name.as_deref(), Some("姓名"));
+        assert_eq!(by_backend[&213].name.as_deref(), Some("电子邮箱"));
+        assert_eq!(by_backend[&223].name.as_deref(), Some("男"));
+        assert_eq!(by_backend[&223].group_label.as_deref(), Some("性别"));
+        assert_eq!(by_backend[&225].name.as_deref(), Some("女"));
+        assert_eq!(by_backend[&225].group_label.as_deref(), Some("性别"));
+        assert_eq!(by_backend[&232].name.as_deref(), None);
+        assert_eq!(by_backend[&232].group_label.as_deref(), Some("籍贯"));
+        assert_eq!(by_backend[&233].group_label.as_deref(), Some("籍贯"));
+        assert_eq!(by_backend[&243].group_label.as_deref(), None);
+        assert_eq!(by_backend[&244].group_label.as_deref(), None);
+        assert_eq!(by_backend[&251].name.as_deref(), None);
+        assert_eq!(by_backend[&262].name.as_deref(), None);
+        assert_eq!(by_backend[&272].name.as_deref(), None);
+
+        let contexts = index_form_contexts(&dom);
+        assert_eq!(contexts[&203].nearby_label.as_deref(), Some("姓名"));
+        assert_eq!(contexts[&213].nearby_label.as_deref(), Some("电子邮箱"));
+        assert_eq!(contexts[&223].group_label.as_deref(), Some("性别"));
+        assert_eq!(contexts[&223].group_index, Some(0));
+        assert_eq!(contexts[&223].group_size, Some(2));
+        assert_eq!(contexts[&225].group_index, Some(1));
+        assert_eq!(contexts[&232].group_label.as_deref(), Some("籍贯"));
+        assert_eq!(contexts[&232].group_index, Some(0));
+        assert_eq!(contexts[&232].group_size, Some(2));
+        assert_eq!(contexts[&233].group_index, Some(1));
+        assert_ne!(
+            contexts[&232].field_signature, contexts[&233].field_signature,
+            "group position must distinguish structurally identical composite controls"
+        );
+        assert_eq!(contexts[&243].group_label, None);
+        assert_eq!(contexts[&244].group_label, None);
+        assert_eq!(contexts[&251].nearby_label, None);
+        assert_eq!(contexts[&262].nearby_label, None);
+        assert_eq!(contexts[&272].nearby_label, None);
+        assert_eq!(contexts[&272].section_label.as_deref(), Some("基本信息"));
+    }
+
+    #[test]
+    fn choice_controls_accept_one_short_trailing_visible_label() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 1,
+                "children": [{
+                    "nodeType": 1,
+                    "localName": "div",
+                    "backendNodeId": 300,
+                    "children": [
+                        {"nodeType": 1, "localName": "span", "backendNodeId": 301,
+                         "children": [{"nodeType": 3, "nodeValue": "性别"}]},
+                        {"nodeType": 1, "localName": "div", "backendNodeId": 302,
+                         "children": [
+                             {"nodeType": 1, "localName": "input", "backendNodeId": 303,
+                              "attributes": ["type", "radio"]},
+                             {"nodeType": 1, "localName": "span", "backendNodeId": 304,
+                              "children": [{"nodeType": 3, "nodeValue": "男"}]}
+                         ]},
+                        {"nodeType": 1, "localName": "div", "backendNodeId": 305,
+                         "children": [
+                             {"nodeType": 1, "localName": "input", "backendNodeId": 306,
+                              "attributes": ["type", "radio"]},
+                             {"nodeType": 1, "localName": "span", "backendNodeId": 307,
+                              "children": [{"nodeType": 3, "nodeValue": "女"}]}
+                         ]}
+                    ]
+                }]
+            }]
+        });
+        let raw_nodes = vec![
+            json!({
+                "nodeId": "ax-male-custom",
+                "role": {"value": "radio"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 303
+            }),
+            json!({
+                "nodeId": "ax-female-custom",
+                "role": {"value": "radio"},
+                "name": {"value": ""},
+                "backendDOMNodeId": 306
+            }),
+        ];
+
+        let (nodes, _) = project_ax_nodes(&raw_nodes, Some(&dom));
+        let by_backend = nodes
+            .iter()
+            .filter_map(|node| node.backend_node_id.map(|id| (id, node)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_backend[&303].name.as_deref(), Some("男"));
+        assert_eq!(by_backend[&303].group_label.as_deref(), Some("性别"));
+        assert_eq!(by_backend[&306].name.as_deref(), Some("女"));
+        assert_eq!(by_backend[&306].group_label.as_deref(), Some("性别"));
+    }
+
+    #[test]
+    fn failed_dom_query_keeps_ordinary_controls_and_drops_shadow_pickers() {
+        let raw_nodes = vec![
+            ax_child("root", "RootWebArea", Some(1), None),
+            ax_child("Continue", "button", Some(2), Some("ax-root")),
+            ax_child("Name", "textbox", Some(3), Some("ax-root")),
+            ax_child("When", "Date", Some(10), Some("ax-root")),
+            ax_child("picker", "button", Some(11), Some("ax-When")),
+            ax_child("year", "spinbutton", Some(12), Some("ax-When")),
+            ax_child("Author shadow", "button", Some(20), Some("ax-root")),
+            ax_child("Choose", "combobox", Some(40), Some("ax-root")),
+            ax_child("Month", "DateTime", Some(30), Some("ax-root")),
+        ];
+        let (nodes, _) = project_ax_nodes(&raw_nodes, None);
+        let by_name = nodes
+            .iter()
+            .filter_map(|node| node.name.as_deref().map(|name| (name, node)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_name["Continue"].capability.action_names(), ["click"]);
+        assert_eq!(
+            by_name["Name"].capability.action_names(),
+            ["click", "input_text"]
+        );
+        assert_eq!(
+            by_name["Author shadow"].capability.action_names(),
+            ["click"]
+        );
+        assert_eq!(by_name["Choose"].capability.action_names(), ["click"]);
+        assert!(by_name["picker"].capability.action_names().is_empty());
+        assert_eq!(by_name["picker"].backend_node_id, Some(11));
+        assert!(by_name["year"].capability.action_names().is_empty());
+        assert!(by_name["When"].capability.action_names().is_empty());
+        assert!(
+            by_name["Month"].capability.action_names().is_empty(),
+            "a DateTime host has no effect when its input type is unknown"
+        );
+    }
+
+    #[test]
+    fn depth_truncated_shadow_tree_does_not_click_the_picker() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 1,
+                "children": [
+                    json!({
+                        "nodeType": 1,
+                        "localName": "input",
+                        "backendNodeId": 40,
+                        "attributes": ["type", "date", "aria-label", "When"]
+                    }),
+                    {"nodeType": 1, "localName": "button", "backendNodeId": 200},
+                    {
+                        "nodeType": 1,
+                        "localName": "ua-like",
+                        "backendNodeId": 201,
+                        "shadowRoots": [{
+                            "nodeType": 11,
+                            "shadowRootType": "open",
+                            "children": [
+                                {"nodeType": 1, "localName": "button", "backendNodeId": 124}
+                            ]
+                        }]
+                    }
+                ]
+            }]
+        });
+        let raw_nodes = vec![
+            ax_child("root", "RootWebArea", Some(1), None),
+            ax_child("When", "Date", Some(40), Some("ax-root")),
+            ax_child("picker", "button", Some(49), Some("ax-When")),
+            ax_child("Continue", "button", Some(200), Some("ax-root")),
+            ax_child("Author shadow", "button", Some(124), Some("ax-root")),
+        ];
+        let (nodes, _) = project_ax_nodes(&raw_nodes, Some(&dom));
+        let by_name = nodes
+            .iter()
+            .filter_map(|node| node.name.as_deref().map(|name| (name, node)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_name["When"].capability.action_names(), ["set_value"]);
+        assert_eq!(by_name["When"].backend_node_id, Some(40));
+        assert!(by_name["picker"].capability.action_names().is_empty());
+        assert_eq!(by_name["picker"].role, "button");
+        assert_eq!(by_name["picker"].backend_node_id, Some(49));
+        assert_eq!(by_name["Continue"].capability.action_names(), ["click"]);
+        assert_eq!(
+            by_name["Author shadow"].capability.action_names(),
+            ["click"]
+        );
+    }
+
+    #[test]
+    fn disabled_and_read_only_state_removes_only_known_unsupported_effects() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 100,
+                "children": [
+                    {"nodeType": 1, "localName": "input", "backendNodeId": 1, "attributes": ["type", "number", "disabled", ""]},
+                    {"nodeType": 1, "localName": "select", "backendNodeId": 2, "attributes": ["disabled", ""], "children": [
+                        {"nodeType": 1, "localName": "option", "backendNodeId": 3}
+                    ]},
+                    {"nodeType": 1, "localName": "input", "backendNodeId": 4, "attributes": ["type", "text", "readonly", "readonly"]},
+                    {"nodeType": 1, "localName": "input", "backendNodeId": 5, "attributes": ["type", "text"]},
+                    {"nodeType": 1, "localName": "input", "backendNodeId": 6, "attributes": ["type", "number"]},
+                    {"nodeType": 1, "localName": "input", "backendNodeId": 7, "attributes": ["type", "text"]},
+                    {"nodeType": 1, "localName": "input", "backendNodeId": 8, "attributes": ["type", "number"]},
+                    {"nodeType": 1, "localName": "input", "backendNodeId": 11, "attributes": ["type", "number", "readonly", ""]},
+                    {"nodeType": 1, "localName": "input", "backendNodeId": 9, "attributes": ["type", "number", "disabled", "", "aria-label", "Shadow qty"], "shadowRoots": [{
+                        "nodeType": 11,
+                        "shadowRootType": "user-agent",
+                        "children": [{"nodeType": 1, "localName": "button", "backendNodeId": 10}]
+                    }]}
+                ]
+            }]
+        });
+        let raw_nodes = vec![
+            ax_state("Qty", "spinbutton", Some(1), Some(true), None),
+            ax_state("Pick", "combobox", Some(2), Some(true), None),
+            ax_state("Alpha", "option", Some(3), None, None),
+            ax_state("Notes", "textbox", Some(4), None, Some(true)),
+            ax_state("Name", "textbox", Some(5), Some(false), Some(false)),
+            ax_state("Amount", "spinbutton", Some(6), Some(false), None),
+            ax_state("Title", "textbox", Some(7), None, None),
+            ax_state("Count", "spinbutton", Some(8), None, None),
+            ax_state("Locked", "spinbutton", Some(11), None, Some(true)),
+            ax_state("shadow-part", "button", Some(10), None, None),
+        ];
+        let (nodes, _) = project_ax_nodes(&raw_nodes, Some(&dom));
+        let by_name = nodes
+            .iter()
+            .filter_map(|node| node.name.as_deref().map(|name| (name, node)))
+            .collect::<HashMap<_, _>>();
+        let actions = |name: &str| by_name[name].capability.action_names();
+
+        assert_eq!(by_name["Qty"].disabled, Some(true));
+        assert!(actions("Qty").is_empty());
+        assert_eq!(by_name["Pick"].disabled, Some(true));
+        assert!(actions("Pick").is_empty());
+        assert!(actions("Alpha").is_empty());
+        assert!(!by_name["Alpha"].select_choice);
+        assert_eq!(by_name["Locked"].read_only, Some(true));
+        assert!(actions("Locked").is_empty());
+        assert_eq!(by_name["Notes"].read_only, Some(true));
+        assert_eq!(actions("Notes"), ["click"]);
+        assert_eq!(actions("Name"), ["click", "input_text", "set_value"]);
+        assert_eq!(actions("Amount"), ["set_value"]);
+        assert_eq!(actions("Title"), ["click", "input_text", "set_value"]);
+        assert_eq!(by_name["Title"].disabled, None);
+        assert_eq!(by_name["Title"].read_only, None);
+        assert_eq!(actions("Count"), ["set_value"]);
+        assert_eq!(by_name["Count"].disabled, None);
+        assert!(actions("shadow-part").is_empty());
+        let promoted = nodes
+            .iter()
+            .find(|node| node.backend_node_id == Some(9))
+            .expect("disabled owner is still projected");
+        assert_eq!(promoted.disabled, Some(true));
+        assert!(promoted.capability.action_names().is_empty());
+        assert_eq!(promoted.name.as_deref(), Some("Shadow qty"));
+
+        let (legacy, _) = project_ax_nodes(
+            &[
+                ax_state("Go", "button", Some(21), Some(true), None),
+                ax_state("Alias", "textbox", Some(22), None, Some(true)),
+                ax_state("Ok", "button", Some(23), None, None),
+            ],
+            None,
+        );
+        let legacy_actions = |name: &str| {
+            legacy
+                .iter()
+                .find(|node| node.name.as_deref() == Some(name))
+                .unwrap()
+                .capability
+                .action_names()
+        };
+        assert!(legacy_actions("Go").is_empty());
+        assert_eq!(legacy_actions("Alias"), ["click"]);
+        assert_eq!(legacy_actions("Ok"), ["click"]);
+    }
+
+    fn input(backend_node_id: i64, input_type: &str, shadow_children: Value) -> Value {
+        let mut node = json!({
+            "nodeType": 1,
+            "localName": "input",
+            "backendNodeId": backend_node_id,
+            "attributes": ["type", input_type]
+        });
+        if shadow_children
+            .as_array()
+            .is_some_and(|children| !children.is_empty())
+        {
+            node["shadowRoots"] = json!([{
+                "nodeType": 11,
+                "shadowRootType": "user-agent",
+                "children": shadow_children
+            }]);
+        }
+        node
+    }
+
+    fn ax(name: &str, role: &str, backend_node_id: Option<i64>) -> Value {
+        ax_child(name, role, backend_node_id, None)
+    }
+
+    fn ax_state(
+        name: &str,
+        role: &str,
+        backend_node_id: Option<i64>,
+        disabled: Option<bool>,
+        read_only: Option<bool>,
+    ) -> Value {
+        let mut node = ax(name, role, backend_node_id);
+        let mut properties = Vec::new();
+        if let Some(disabled) = disabled {
+            properties.push(json!({"name": "disabled", "value": {"value": disabled}}));
+        }
+        if let Some(read_only) = read_only {
+            properties.push(json!({"name": "readonly", "value": {"value": read_only}}));
+        }
+        if !properties.is_empty() {
+            node["properties"] = json!(properties);
+        }
+        node
+    }
+
+    fn ax_child(
+        name: &str,
+        role: &str,
+        backend_node_id: Option<i64>,
+        parent_id: Option<&str>,
+    ) -> Value {
+        let mut node = json!({
+            "nodeId": format!("ax-{name}"),
+            "role": {"value": role},
+            "name": {"value": name}
+        });
+        if let Some(backend_node_id) = backend_node_id {
+            node["backendDOMNodeId"] = json!(backend_node_id);
+        }
+        if let Some(parent_id) = parent_id {
+            node["parentId"] = json!(parent_id);
+        }
+        node
+    }
+
+    fn fake_cdp_server(reply: Option<Value>) -> (Url, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            let request = websocket.read().unwrap();
+            let Message::Text(text) = request else {
+                panic!("expected CDP text request")
+            };
+            let parsed: Value = serde_json::from_str(&text).unwrap();
+            if let Some(result) = reply {
+                websocket
+                    .send(Message::Text(
+                        json!({"id": parsed["id"], "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .unwrap();
+            } else {
+                websocket.close(None).unwrap();
+            }
+        });
+        (
+            Url::parse(&format!(
+                "ws://127.0.0.1:{}/devtools/page/fake",
+                address.port()
+            ))
+            .unwrap(),
+            handle,
+        )
+    }
+
+    fn fake_cdp_event_flood(events: usize, interval: Duration) -> (Url, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            let request = websocket.read().unwrap();
+            assert!(matches!(request, Message::Text(_)));
+            for sequence in 0..events {
+                thread::sleep(interval);
+                if websocket
+                    .send(Message::Text(
+                        json!({"method": "Runtime.fixtureEvent", "params": {"sequence": sequence}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (
+            Url::parse(&format!(
+                "ws://127.0.0.1:{}/devtools/page/flood",
+                address.port()
+            ))
+            .unwrap(),
+            handle,
+        )
+    }
+
+    fn fake_http_body(body_len: usize) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let header = format!(
+                "HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: {body_len}
+Connection: close
+
+"
+            );
+            use std::io::Write;
+            stream.write_all(header.as_bytes()).unwrap();
+            let chunk = vec![b' '; body_len.min(8192)];
+            let mut remaining = body_len;
+            while remaining > 0 {
+                let count = remaining.min(chunk.len());
+                if stream.write_all(&chunk[..count]).is_err() {
+                    break;
+                }
+                remaining -= count;
+            }
+        });
+        (address.port(), handle)
+    }
+
+    #[test]
+    fn brave_installations_are_discovered_from_standard_relative_paths() {
+        let fixture = tempfile::tempdir().unwrap();
+
+        let windows_base = fixture.path().join("windows");
+        let windows_brave = windows_base.join("BraveSoftware/Brave-Browser/Application/brave.exe");
+        std::fs::create_dir_all(windows_brave.parent().unwrap()).unwrap();
+        std::fs::write(&windows_brave, b"").unwrap();
+        assert_eq!(
+            first_existing(windows_browser_candidates(&[windows_base], None)),
+            Some(windows_brave)
+        );
+
+        let windows_bin = fixture.path().join("windows-bin");
+        let windows_path_brave = windows_bin.join(WINDOWS_BRAVE_EXECUTABLE);
+        std::fs::create_dir_all(&windows_bin).unwrap();
+        std::fs::write(&windows_path_brave, b"").unwrap();
+        let windows_path = std::env::join_paths([windows_bin.as_os_str()]).unwrap();
+        assert_eq!(
+            first_existing(windows_browser_candidates(
+                &[],
+                Some(windows_path.as_os_str()),
+            )),
+            Some(windows_path_brave)
+        );
+
+        let macos_root = fixture.path().join("Applications");
+        let macos_brave = macos_root.join("Brave Browser.app/Contents/MacOS/Brave Browser");
+        std::fs::create_dir_all(macos_brave.parent().unwrap()).unwrap();
+        std::fs::write(&macos_brave, b"").unwrap();
+        assert_eq!(
+            first_existing(macos_browser_candidates(&macos_root)),
+            Some(macos_brave)
+        );
+
+        let linux_bin = fixture.path().join("linux-bin");
+        let linux_brave = linux_bin.join("brave-browser");
+        std::fs::create_dir_all(&linux_bin).unwrap();
+        std::fs::write(&linux_brave, b"").unwrap();
+        let linux_path = std::env::join_paths([linux_bin.as_os_str()]).unwrap();
+        assert_eq!(
+            first_existing(browser_candidates_in_path(
+                LINUX_CHROMIUM_EXECUTABLES,
+                Some(linux_path.as_os_str()),
+            )),
+            Some(linux_brave)
+        );
+    }
+
+    #[test]
+    fn brave_is_appended_to_existing_discovery_order() {
+        let first = PathBuf::from("first");
+        let second = PathBuf::from("second");
+        let first_path = PathBuf::from("first-bin");
+        let second_path = PathBuf::from("second-bin");
+        let joined =
+            std::env::join_paths([first_path.as_os_str(), second_path.as_os_str()]).unwrap();
+        let windows =
+            windows_browser_candidates(&[first.clone(), second.clone()], Some(joined.as_os_str()));
+        assert_eq!(
+            windows,
+            vec![
+                first.join("Microsoft/Edge/Application/msedge.exe"),
+                first.join("Google/Chrome/Application/chrome.exe"),
+                second.join("Microsoft/Edge/Application/msedge.exe"),
+                second.join("Google/Chrome/Application/chrome.exe"),
+                first_path.join("msedge.exe"),
+                second_path.join("msedge.exe"),
+                first_path.join("chrome.exe"),
+                second_path.join("chrome.exe"),
+                first.join("BraveSoftware/Brave-Browser/Application/brave.exe"),
+                second.join("BraveSoftware/Brave-Browser/Application/brave.exe"),
+                first_path.join("brave.exe"),
+                second_path.join("brave.exe"),
+            ]
+        );
+
+        let macos_root = Path::new("/Applications");
+        let macos = macos_browser_candidates(macos_root);
+        assert_eq!(
+            macos,
+            vec![
+                macos_root.join("Google Chrome.app/Contents/MacOS/Google Chrome"),
+                macos_root.join("Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                macos_root.join("Brave Browser.app/Contents/MacOS/Brave Browser"),
+            ]
+        );
+
+        let linux =
+            browser_candidates_in_path(LINUX_CHROMIUM_EXECUTABLES, Some(joined.as_os_str()));
+        assert_eq!(
+            &linux[..4],
+            &[
+                first_path.join("google-chrome"),
+                second_path.join("google-chrome"),
+                first_path.join("google-chrome-stable"),
+                second_path.join("google-chrome-stable"),
+            ]
+        );
+        assert_eq!(linux[8], first_path.join("brave-browser"));
+        assert_eq!(linux[9], second_path.join("brave-browser"));
+        assert_eq!(linux[10], first_path.join("brave"));
+        assert_eq!(linux[11], second_path.join("brave"));
+    }
+
+    #[test]
+    fn devtools_active_port_is_parsed_only_as_loopback_browser_path_input() {
+        assert_eq!(
+            parse_devtools_active_port("9222\n/devtools/browser/opaque\n"),
+            Some((9222, "/devtools/browser/opaque".to_string()))
+        );
+        assert!(parse_devtools_active_port("0\n/devtools/browser/x\n").is_none());
+        assert!(
+            parse_devtools_active_port("9222\nws://evil.example/devtools/browser/x\n").is_none()
+        );
+        assert!(parse_devtools_active_port("9222\n/devtools/page/x\n").is_none());
+    }
+
+    #[test]
+    fn effect_composition_preserves_pre_dispatch_and_partial_effect_certainty() {
+        let pre = pre_dispatch_error(BrowserError::observed("probe_failed", "probe", None));
+        assert_eq!(
+            pre.execution_state,
+            crate::types::ExecutionState::NotStarted
+        );
+        assert_eq!(pre.recovery_action, None);
+
+        let partial = post_effect_error(
+            BrowserError::not_started("second_stage_not_started", "second stage"),
+            "snapshot",
+        );
+        assert_eq!(
+            partial.execution_state,
+            crate::types::ExecutionState::OutcomeUnknown
+        );
+        assert_eq!(partial.recovery_action, Some("snapshot"));
+    }
+
+    #[test]
+    fn ax_form_metadata_extracts_group_and_control_state() {
+        let raw_nodes = [
+            json!({
+                "nodeId":"group-1",
+                "role":{"value":"group"},
+                "name":{"value":"是否接受岗位调剂"},
+                "parentId":"form-1"
+            }),
+            json!({
+                "nodeId":"wrapper-1",
+                "role":{"value":"none"},
+                "parentId":"group-1"
+            }),
+            json!({
+                "nodeId":"radio-1",
+                "role":{"value":"radio"},
+                "name":{"value":"否"},
+                "parentId":"wrapper-1",
+                "properties":[
+                    {"name":"checked","value":{"value":"false"}},
+                    {"name":"required","value":{"value":true}},
+                    {"name":"disabled","value":{"value":false}}
+                ]
+            }),
+        ];
+        let by_id = raw_nodes
+            .iter()
+            .filter_map(|node| {
+                node.get("nodeId")
+                    .and_then(Value::as_str)
+                    .map(|id| (id.to_string(), node))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let group = ax_group_context(&raw_nodes[2], &by_id).unwrap();
+        assert_eq!(group.0, "group-1");
+        assert_eq!(group.1, "group");
+        assert_eq!(group.2, "是否接受岗位调剂");
+        assert_eq!(
+            ax_property_string(&raw_nodes[2], "checked").as_deref(),
+            Some("false")
+        );
+        assert_eq!(ax_property_bool(&raw_nodes[2], "required"), Some(true));
+        assert_eq!(ax_property_bool(&raw_nodes[2], "disabled"), Some(false));
+        assert_eq!(ax_property_bool(&raw_nodes[2], "readonly"), None);
+    }
+
+    #[test]
+    fn ax_snapshot_parser_keeps_late_actionable_nodes_for_compaction() {
+        let mut raw_nodes = (0..=MAX_SNAPSHOT_NODES)
+            .map(|index| {
+                json!({
+                    "nodeId": format!("static-{index}"),
+                    "role": {"value": "paragraph"},
+                    "name": {"value": format!("Static {index}")},
+                })
+            })
+            .collect::<Vec<_>>();
+        raw_nodes.push(json!({
+            "nodeId": "late-action",
+            "role": {"value": "button"},
+            "name": {"value": "Continue"},
+            "backendDOMNodeId": 4242,
+        }));
+
+        let (nodes, truncated) = project_ax_nodes(&raw_nodes, None);
+        assert!(truncated);
+        let late = nodes.last().expect("late actionable node retained");
+        assert_eq!(late.name.as_deref(), Some("Continue"));
+        assert_eq!(late.capability.action_names(), ["click"]);
+        assert_eq!(late.backend_node_id, Some(4242));
+    }
+
+    #[test]
+    fn remote_object_sequence_reuses_one_page_websocket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+
+            let first = websocket.read().unwrap();
+            let Message::Text(first) = first else {
+                panic!("expected first CDP text request")
+            };
+            let first: Value = serde_json::from_str(&first).unwrap();
+            assert_eq!(first["method"], "DOM.resolveNode");
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": first["id"],
+                        "result": {"object": {"objectId": "remote-object-1"}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+
+            let second = websocket.read().unwrap();
+            let Message::Text(second) = second else {
+                panic!("expected second CDP text request")
+            };
+            let second: Value = serde_json::from_str(&second).unwrap();
+            assert_eq!(second["method"], "Runtime.callFunctionOn");
+            assert_eq!(second["params"]["objectId"], "remote-object-1");
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "id": second["id"],
+                        "result": {"result": {"value": {"ok": true}}}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+        });
+
+        let endpoint = Url::parse(&format!(
+            "ws://127.0.0.1:{}/devtools/page/sequence",
+            address.port()
+        ))
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut websocket = open_loopback_websocket(&endpoint, deadline).unwrap();
+        let mut next_id = 1;
+        let resolved = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut next_id,
+            "DOM.resolveNode",
+            json!({"backendNodeId": 42}),
+            false,
+            deadline,
+        )
+        .unwrap();
+        let object_id = resolved["object"]["objectId"].as_str().unwrap();
+        let result = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut next_id,
+            "Runtime.callFunctionOn",
+            json!({"objectId": object_id, "functionDeclaration": "function(){return {ok:true};}"}),
+            true,
+            deadline,
+        )
+        .unwrap();
+        assert_eq!(result["result"]["value"]["ok"], true);
+        assert_eq!(next_id, 3);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn irrelevant_cdp_events_do_not_rearm_the_absolute_deadline() {
+        let (endpoint, handle) = fake_cdp_event_flood(40, Duration::from_millis(20));
+        let mut next_id = 1;
+        let started = Instant::now();
+        let error = cdp_call_until(
+            &endpoint,
+            &mut next_id,
+            "Page.getFrameTree",
+            json!({}),
+            false,
+            started + Duration::from_millis(120),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "non-matching CDP events must not renew the request deadline"
+        );
+        assert_eq!(error.kind, "cdp_receive_timeout");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_cdp_message_fails_before_unbounded_materialization() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            let _ = websocket.read().unwrap();
+            let oversized = "x".repeat(MAX_CDP_MESSAGE_BYTES + 1);
+            let _ = websocket.send(Message::Text(oversized.into()));
+        });
+        let endpoint = Url::parse(&format!(
+            "ws://127.0.0.1:{}/devtools/page/oversized",
+            address.port()
+        ))
+        .unwrap();
+        let mut next_id = 1;
+        let error = cdp_call_until(
+            &endpoint,
+            &mut next_id,
+            "Page.getFrameTree",
+            json!({}),
+            false,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.execution_state,
+            crate::types::ExecutionState::Completed
+        );
+        assert_eq!(error.kind, "cdp_receive_failed");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_cdp_page_list_is_rejected_at_the_transport_bound() {
+        let (port, handle) = fake_http_body(MAX_CDP_LIST_BYTES + 1);
+        let error =
+            fetch_page_descriptors(port, Instant::now() + Duration::from_secs(1)).unwrap_err();
+        assert_eq!(error.kind, "cdp_list_too_large");
+        assert_eq!(
+            error.execution_state,
+            crate::types::ExecutionState::Completed
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn fake_cdp_observation_round_trip_is_deterministic() {
+        let (endpoint, handle) =
+            fake_cdp_server(Some(json!({"frameTree": {"frame": {"loaderId": "doc"}}})));
+        let mut next_id = 1;
+        let result = cdp_call(
+            &endpoint,
+            &mut next_id,
+            "Page.getFrameTree",
+            json!({}),
+            false,
+        )
+        .expect("fake CDP observation");
+        assert_eq!(result["frameTree"]["frame"]["loaderId"], "doc");
+        assert_eq!(next_id, 2);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn closed_diagnostic_stream_is_not_reported_as_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            websocket.close(None).unwrap();
+        });
+        let endpoint = Url::parse(&format!(
+            "ws://127.0.0.1:{}/devtools/page/closed-diagnostics",
+            address.port()
+        ))
+        .unwrap();
+        let websocket =
+            open_loopback_websocket(&endpoint, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut collector = CdpEventCollector {
+            websocket,
+            events: CdpEventBuffer::default(),
+            reconnect_required: false,
+        };
+        collector.events.push_console(BackendConsoleEntry {
+            sequence: 0,
+            level: "error".into(),
+            text: "stale-buffer".into(),
+            source: None,
+            timestamp: None,
+        });
+        let error = drain_event_collector(&mut collector).unwrap_err();
+        assert_eq!(error.kind, "cdp_receive_closed");
+        assert_eq!(
+            error.execution_state,
+            crate::types::ExecutionState::Completed
+        );
+        assert_eq!(error.recovery_action, Some("pages"));
+        assert_eq!(collector.events.console.len(), 1);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn diagnostic_event_metadata_is_byte_bounded() {
+        let mut buffer = CdpEventBuffer::default();
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Runtime.exceptionThrown",
+                "params": {
+                    "exceptionDetails": {
+                        "text": "boom",
+                        "url": format!("https://example.test/{}", "x".repeat(crate::types::MAX_URL_BYTES * 2)),
+                    }
+                }
+            }),
+        );
+        let console = buffer.console.back().unwrap();
+        assert!(console.source.as_ref().unwrap().len() <= crate::types::MAX_URL_BYTES);
+
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "bounded-metadata",
+                    "request": {
+                        "method": "M".repeat(512),
+                        "url": "https://example.test/",
+                    },
+                    "type": "T".repeat(512),
+                }
+            }),
+        );
+        let network = buffer.network.get("bounded-metadata").unwrap();
+        assert!(network.method.len() <= 128);
+        assert!(network.resource_type.as_ref().unwrap().len() <= 64);
+    }
+
+    #[test]
+    fn clear_diagnostics_uses_cdp_barrier_before_resetting_buffer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            let request = websocket.read().unwrap();
+            let Message::Text(request) = request else {
+                panic!("expected clear barrier request");
+            };
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "Page.getFrameTree");
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "method": "Runtime.consoleAPICalled",
+                        "params": {"type": "error", "args": [{"value": "before-clear"}]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({"id": request["id"], "result": {"frameTree": {}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "method": "Runtime.consoleAPICalled",
+                        "params": {"type": "error", "args": [{"value": "after-clear"}]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        let endpoint = Url::parse(&format!(
+            "ws://127.0.0.1:{}/devtools/page/clear",
+            address.port()
+        ))
+        .unwrap();
+        let websocket =
+            open_loopback_websocket(&endpoint, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut collector = CdpEventCollector {
+            websocket,
+            events: CdpEventBuffer::default(),
+            reconnect_required: false,
+        };
+        collector.events.push_console(BackendConsoleEntry {
+            sequence: 0,
+            level: "error".into(),
+            text: "buffered-before-clear".into(),
+            source: None,
+            timestamp: None,
+        });
+        let mut next_id = 1;
+        clear_event_collector(&mut collector, &mut next_id).unwrap();
+        assert!(collector.events.console.is_empty());
+        drain_event_collector(&mut collector).unwrap();
+        assert_eq!(collector.events.console.len(), 1);
+        assert_eq!(
+            collector.events.console.front().unwrap().text,
+            "after-clear"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn clear_diagnostics_barrier_failure_is_not_started_and_preserves_buffer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            let _ = websocket.read().unwrap();
+            // Close without acknowledging the read-only barrier. The diagnostic
+            // reset has not happened, so the caller must see a pre-effect failure.
+        });
+        let endpoint = Url::parse(&format!(
+            "ws://127.0.0.1:{}/devtools/page/clear-failure",
+            address.port()
+        ))
+        .unwrap();
+        let websocket =
+            open_loopback_websocket(&endpoint, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut collector = CdpEventCollector {
+            websocket,
+            events: CdpEventBuffer::default(),
+            reconnect_required: false,
+        };
+        collector.events.push_console(BackendConsoleEntry {
+            sequence: 0,
+            level: "error".into(),
+            text: "must-survive-failed-clear".into(),
+            source: None,
+            timestamp: None,
+        });
+        let mut next_id = 1;
+        let error = clear_event_collector(&mut collector, &mut next_id).unwrap_err();
+        assert_eq!(
+            error.execution_state,
+            crate::types::ExecutionState::NotStarted
+        );
+        assert_eq!(collector.events.console.len(), 1);
+        assert_eq!(
+            collector.events.console.front().unwrap().text,
+            "must-survive-failed-clear"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn diagnostic_event_buffers_roll_forward_instead_of_freezing_at_capacity() {
+        let mut buffer = CdpEventBuffer::default();
+        for index in 0..crate::types::MAX_CONSOLE_ENTRIES + 2 {
+            record_cdp_event(
+                &mut buffer,
+                &json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "params": {
+                        "type": if index + 1 == crate::types::MAX_CONSOLE_ENTRIES + 2 { "error" } else { "log" },
+                        "args": [{"value": format!("console-{index}")}],
+                        "timestamp": index as f64,
+                    }
+                }),
+            );
+        }
+        assert_eq!(buffer.console.len(), crate::types::MAX_CONSOLE_ENTRIES);
+        assert!(buffer.console_truncated);
+        assert_eq!(buffer.console.front().unwrap().text, "console-2");
+        assert_eq!(
+            buffer.console.back().unwrap().level,
+            "error",
+            "a late error must not be starved by earlier benign console traffic"
+        );
+
+        for index in 0..crate::types::MAX_NETWORK_ENTRIES + 2 {
+            record_cdp_event(
+                &mut buffer,
+                &json!({
+                    "method": "Network.requestWillBeSent",
+                    "params": {
+                        "requestId": format!("request-{index}"),
+                        "request": {"method": "GET", "url": format!("https://example.test/{index}")},
+                        "type": "Fetch",
+                        "timestamp": index as f64,
+                    }
+                }),
+            );
+        }
+        assert_eq!(buffer.network.len(), crate::types::MAX_NETWORK_ENTRIES);
+        assert!(buffer.network_truncated);
+        assert!(!buffer.network.contains_key("request-0"));
+        assert!(!buffer.network.contains_key("request-1"));
+        let latest = format!("request-{}", crate::types::MAX_NETWORK_ENTRIES + 1);
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Network.loadingFailed",
+                "params": {"requestId": latest, "errorText": "late failure"}
+            }),
+        );
+        assert_eq!(
+            buffer
+                .network
+                .get(&format!(
+                    "request-{}",
+                    crate::types::MAX_NETWORK_ENTRIES + 1
+                ))
+                .and_then(|entry| entry.failed_reason.as_deref()),
+            Some("late failure"),
+            "a late failed request must remain diagnosable after the buffer fills"
+        );
+    }
+
+    #[test]
+    fn console_activity_does_not_reset_network_quiet_cursor() {
+        let mut buffer = CdpEventBuffer::default();
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "request-1",
+                    "request": {"method": "GET", "url": "https://example.test/api"},
+                    "type": "Fetch",
+                    "timestamp": 1.0,
+                }
+            }),
+        );
+        let network_cursor = buffer.network_cursor();
+        let event_cursor = buffer.cursor();
+
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Runtime.consoleAPICalled",
+                "params": {
+                    "type": "log",
+                    "args": [{"value": "chatty console"}],
+                    "timestamp": 2.0,
+                }
+            }),
+        );
+        assert!(buffer.cursor() > event_cursor);
+        assert_eq!(buffer.network_cursor(), network_cursor);
+
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-1",
+                    "response": {"status": 200},
+                }
+            }),
+        );
+        assert!(buffer.network_cursor() > network_cursor);
+    }
+
+    #[test]
+    fn fake_cdp_close_after_effect_dispatch_is_outcome_unknown() {
+        let (endpoint, handle) = fake_cdp_server(None);
+        let mut next_id = 7;
+        let error = cdp_call(
+            &endpoint,
+            &mut next_id,
+            "Page.navigate",
+            json!({"url": "https://example.test/"}),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.execution_state,
+            crate::types::ExecutionState::OutcomeUnknown
+        );
+        assert_eq!(error.recovery_action, Some("snapshot"));
+        handle.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "cdp/tests/transport.rs"]
+mod transport_tests;
+
+#[cfg(test)]
+#[path = "cdp/tests/widgets.rs"]
+mod widget_tests;

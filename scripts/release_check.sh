@@ -34,27 +34,25 @@ fi
 #   3. cargo check --workspace --all-targets
 #   4. cargo test -p webcodex --lib metadata -- --nocapture
 #   5. cargo test -p webcodex --lib schema -- --nocapture
-#   6. cargo test -p webcodex --lib openapi -- --nocapture
-#   7. cargo test -p webcodex --lib mcp -- --nocapture
-#   8. bash syntax checks for scripts/*.sh
-#   9. release verification tooling self-tests
-#  10. static: test harnesses use current runtime contracts
-#  11. static: no python runtime helper regressions
-#  12. static: no sensitive files tracked or staged by git
-#
+#   6. cargo test -p webcodex --lib mcp -- --nocapture
+#   7. bash syntax checks for scripts/*.sh
+#   8. release verification tooling self-tests
+#   9. static: test harnesses use current runtime contracts
+#  10. static: no python runtime helper regressions
+#  11. static: no sensitive files tracked or staged by git#
 # Final pre-tag acceptance is orchestrated by .github/workflows/release-readiness.yml.
-# The release operator first binds one successful exact-source main-push CI run;
-# that CI already owns the deterministic release/static contract, complete Linux
-# Rust coverage, frontend checks, both native macOS Runner suites, Windows x64
-# runtime/package/Desktop coverage, and lightweight Linux/Windows arm64
-# production-target compilation. Readiness revalidates that exact CI run attempt, then runs only:
+# The release operator binds one successful exact-source source-branch CI run. For
+# release/v* sources, the branch push simultaneously starts release-readiness in
+# source-evidence mode, which precomputes:
+#   - extended native Linux ARM64, macOS Intel/Desktop, and Windows ARM64/Desktop checks
 #   - WebSocket + polling zero-config E2E
 #   - EVAL_MODE=compare bash scripts/eval_coding_loop.sh with prebuilt debug fixtures
 #   - disposable linux/amd64 + linux/arm64 Server-image/runtime/bootstrap validation
-# Six-platform release-profile/ABI/package candidates plus the Windows x64 and
-# both native macOS Desktop artifacts are built exactly once after immutable tagging
-# by release-build.yml.
-#
+# The later operator dispatch revalidates the exact CI + evidence run attempts instead
+# of repeating them. A main-source dispatch keeps the slow evidence fallback so normal
+# main pushes do not consume rare native runners. Six-platform release-profile/package
+# candidates plus primary Desktop artifacts are still built only after immutable
+# tagging by release-build.yml; macOS Intel Desktop is a post-publication supplement.#
 # Usage:
 #   bash scripts/release_check.sh
 #
@@ -84,7 +82,7 @@ die() {
 }
 
 # Sanity: cargo is needed only for the full local release check. Main CI uses
-# --static-only after its separate exact workspace all-targets check.
+# --static-only alongside its complete Linux Rust package test shards.
 if [ "$MODE" = full ] && ! command -v cargo >/dev/null 2>&1; then
     printf '[release] cargo is required\n' >&2
     exit 2
@@ -122,6 +120,13 @@ fi
 # ----------------------------------------------------------------------------
 # Stage 3: cargo check --workspace --all-targets
 # ----------------------------------------------------------------------------
+stage_start "production-only workspace warning gate"
+if python3 scripts/check_production_warnings.py; then
+    ok "production-only workspace warning gate"
+else
+    die "production-only workspace warning gate"
+fi
+
 stage_start "cargo check --workspace --all-targets"
 if cargo check --workspace --all-targets; then
     ok "cargo check --workspace --all-targets"
@@ -149,18 +154,10 @@ else
     die "schema tests"
 fi
 
-# ----------------------------------------------------------------------------
-# Stage 6: focused OpenAPI tests
-# ----------------------------------------------------------------------------
-stage_start "cargo test -p webcodex --lib openapi -- --nocapture"
-if cargo test -p webcodex --lib openapi -- --nocapture; then
-    ok "openapi tests"
-else
-    die "openapi tests"
-fi
+# Maintained MCP and Runtime API contracts are covered by ordinary CI.
 
 # ----------------------------------------------------------------------------
-# Stage 7: focused MCP tests
+# Stage 6: focused MCP tests
 # ----------------------------------------------------------------------------
 stage_start "cargo test -p webcodex --lib mcp -- --nocapture"
 if cargo test -p webcodex --lib mcp -- --nocapture; then
@@ -172,7 +169,7 @@ fi
 
 
 # ----------------------------------------------------------------------------
-# Stage 8: bash syntax checks
+# Stage 7: bash syntax checks
 # ----------------------------------------------------------------------------
 stage_start "bash syntax checks"
 for script in scripts/*.sh; do
@@ -184,7 +181,7 @@ for script in scripts/*.sh; do
 done
 
 # ----------------------------------------------------------------------------
-# Stage 9: release verification tooling self-tests
+# Stage 8: release verification tooling self-tests
 # ----------------------------------------------------------------------------
 stage_start "release verification tooling self-tests"
 if bash scripts/test_python_tooling.sh \
@@ -198,6 +195,10 @@ if bash scripts/test_python_tooling.sh \
     && python3 scripts/release_operator.py collect --help >/dev/null \
     && python3 scripts/release_operator.py stage-npm --help >/dev/null \
     && python3 scripts/release_operator.py verify-draft --help >/dev/null \
+    && python3 scripts/release_operator.py doctor --help >/dev/null \
+    && python3 scripts/release_operator.py release-init --help >/dev/null \
+    && python3 scripts/release_operator.py release-resume --help >/dev/null \
+    && python3 scripts/release_operator.py release-status --help >/dev/null \
     && test -f scripts/prepare_desktop_bundle.ps1 \
     && test -f scripts/desktop_install_windows_smoke.ps1 \
     && test -f scripts/prepare_desktop_bundle_macos.py \
@@ -206,9 +207,30 @@ if bash scripts/test_python_tooling.sh \
     && grep -Fq 'DESKTOP_RESULT' .github/workflows/ci.yml \
     && grep -Fq 'prepare_desktop_bundle_macos.py' .github/workflows/ci.yml \
     && grep -Fq 'desktop_install_macos_smoke.sh' .github/workflows/ci.yml \
+    && grep -Fq 'test-docker-server:' .github/workflows/ci.yml \
+    && grep -Fq 'workflow_dispatch:' .github/workflows/extended-native.yml \
+    && grep -Fq 'macos-15-intel' .github/workflows/extended-native.yml \
+    && grep -Fq 'windows-11-arm' .github/workflows/extended-native.yml \
+    && ! grep -Fq 'macos-15-intel' .github/workflows/ci.yml \
+    && ! grep -Fq 'windows-11-arm' .github/workflows/ci.yml \
+    && grep -Fq -- "      - 'release/**'" .github/workflows/ci.yml \
+    && grep -Fq 'source_ref:' .github/workflows/release-readiness.yml \
+    && grep -Fq 'evidence_run_id:' .github/workflows/release-readiness.yml \
+    && grep -Fq "      - 'release/v*'" .github/workflows/release-readiness.yml \
+    && grep -Fq "github.event_name == 'push' || inputs.source_ref == 'main'" .github/workflows/release-readiness.yml \
+    && grep -Fq 'refs/heads/$INPUT_SOURCE_REF' .github/workflows/release-readiness.yml \
+    && grep -Fq 'refs/tags/$tag' .github/workflows/release-build.yml \
     && grep -Fq 'desktop_artifacts' .github/workflows/release-build.yml \
     && grep -Fq 'prepare_desktop_bundle.ps1' .github/workflows/release-build.yml \
+    && grep -Fq 'win32-arm64-setup.exe' .github/workflows/release-build.yml \
     && grep -Fq 'prepare_desktop_bundle_macos.py' .github/workflows/release-build.yml \
+    && grep -Fq 'desktop_darwin_x64_supplemental' .github/workflows/release-build.yml \
+    && test -f .github/workflows/release-desktop-darwin-x64.yml \
+    && grep -Fq 'types: [published]' .github/workflows/release-desktop-darwin-x64.yml \
+    && grep -Fq 'macos-15-intel' .github/workflows/release-desktop-darwin-x64.yml \
+    && grep -Fq 'webcodex-v$VERSION-$PLATFORM.tar.gz' .github/workflows/release-desktop-darwin-x64.yml \
+    && grep -Fq 'gh release upload' .github/workflows/release-desktop-darwin-x64.yml \
+    && grep -Fq 'desktop_install_macos_smoke.sh' .github/workflows/release-desktop-darwin-x64.yml \
     && python3 scripts/check_markdown_links.py \
     && bash scripts/tests/test_npm_package_smoke_existing_binaries.sh; then
     ok "release verification tooling self-tests"
@@ -217,7 +239,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 10: static — test harnesses use current runtime contracts
+# Stage 9: static — test harnesses use current runtime contracts
 # ----------------------------------------------------------------------------
 stage_start "static: current test harness contracts"
 if grep -En -- '--bin webcodex([[:space:]]|`|$)|target/debug/webcodex([^/-]|$)|include_runtime_status|include_git|include_recent_commits|include_rules|process_local_in_memory|output\.content|numbered_text' \
@@ -244,7 +266,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 11: static — no python runtime helper regressions
+# Stage 10: static — no python runtime helper regressions
 # ----------------------------------------------------------------------------
 stage_start "static: no python runtime helper regressions"
 if grep -R "python3 -c" -n src/tool_runtime src/runner_http crates/webcodex-runner/src; then
@@ -259,7 +281,7 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Stage 12: static — no sensitive files tracked or staged by git
+# Stage 11: static — no sensitive files tracked or staged by git
 # ----------------------------------------------------------------------------
 stage_start "static: no sensitive files tracked/staged"
 # These are git-ignored deployment files that must NEVER be committed. We check
@@ -307,8 +329,8 @@ fi
 # ----------------------------------------------------------------------------
 printf '\n[release] ===== all stages passed =====\n'
 if [ "$MODE" = full ]; then
-    ok "workspace boundaries, fmt, check --all-targets, focused metadata/schema/openapi/mcp tests, bash syntax, release tooling self-tests, harness contracts, static checks"
-    log "final pre-tag acceptance: use exact-main CI evidence plus the release-readiness workflow (see docs/RELEASE_CHECKLIST.md)"
+    ok "workspace boundaries, fmt, check --all-targets, focused metadata/schema/mcp tests, bash syntax, release tooling self-tests, harness contracts, static checks"
+    log "final pre-tag acceptance: use exact-source CI evidence plus the release-readiness workflow (see docs/RELEASE_CHECKLIST.md)"
     log "release readiness local check PASSED"
 else
     ok "bash syntax, release tooling self-tests, harness contracts, static checks"

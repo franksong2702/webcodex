@@ -1,4 +1,4 @@
-use crate::model::MESSAGE_ID_PREFIX;
+use crate::model::{CodingSessionOutcome, MAX_SUMMARY_LIMIT, MESSAGE_ID_PREFIX};
 use crate::*;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -26,7 +26,8 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
     let (read_like, write_like, shell_like, path_hint) = match tool_name {
         "read_file" => (true, false, false, SessionPathHint::SinglePath),
         "write_project_file" => (false, true, false, SessionPathHint::SinglePath),
-        "run_shell" | "session_shell_exec" | "cargo_check" => {
+        "edit_project_files" => (false, true, false, SessionPathHint::PathList),
+        "run_shell" | "execute_session_shell" | "cargo_check" => {
             (false, false, true, SessionPathHint::None)
         }
         _ => (true, false, false, SessionPathHint::None),
@@ -40,9 +41,30 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
         change_summary_like: false,
         project_write: write_like,
         path_hint,
-        accepts_context_ack: false,
-        advances_context_checkpoint: false,
     }
+}
+
+#[test]
+fn compound_search_observation_uses_nested_successful_matches() {
+    let paths = crate::events::observed_paths_for_successful_result(
+        "search_file_context",
+        Vec::new(),
+        &json!({
+            "search": {"matches": [
+                {"path": "src/lib.rs", "line": 2},
+                {"path": "src/lib.rs", "line": 4},
+                {"path": "../outside.rs", "line": 1}
+            ]},
+            "reads": {"items": []}
+        }),
+    );
+    assert_eq!(paths, vec!["src/lib.rs"]);
+    let empty = crate::events::observed_paths_for_successful_result(
+        "search_file_context",
+        Vec::new(),
+        &json!({"search": {"matches": []}, "reads": []}),
+    );
+    assert!(empty.is_empty());
 }
 
 #[test]
@@ -63,6 +85,159 @@ fn session_store_bounds_event_limit() {
     let summary = store.summary(&summary.session_id, Some(50)).unwrap();
     assert_eq!(summary.events.len(), 3);
     assert_eq!(summary.counts.tool_calls, 2);
+    assert_eq!(summary.events_retained, 3);
+    assert_eq!(summary.events_evicted, summary.events_total - 3);
+    assert!(summary.retention_truncated);
+    assert_eq!(
+        summary.ledger_first_retained_sequence,
+        summary.events_evicted
+    );
+}
+
+#[test]
+fn default_session_retention_exceeds_model_summary_window_and_persists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = SessionStore::with_persistence(
+        &ledger,
+        DEFAULT_MAX_SESSIONS,
+        DEFAULT_MAX_EVENTS_PER_SESSION,
+    );
+    assert_eq!(store.status().max_events_per_session, 2000);
+    assert!(DEFAULT_MAX_EVENTS_PER_SESSION > MAX_SUMMARY_LIMIT);
+
+    let session = store.start_session(Some("agent:test:long-session".to_string()), None);
+    for index in 0..160 {
+        let start = store.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Api,
+            "get_runtime_status",
+            &json!({"probe": index}),
+            session_tool_contract("get_runtime_status"),
+        );
+        store.record_tool_call_finished(start, true, &json!({"ok": true}), None, None);
+    }
+    store.flush_persistence();
+
+    let raw: Value = serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    let persisted = raw["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["session_id"] == session.session_id)
+        .unwrap();
+    let persisted_events = persisted["events"].as_array().unwrap().len();
+    assert!(persisted_events > MAX_SUMMARY_LIMIT, "{persisted_events}");
+    assert!(persisted_events <= DEFAULT_MAX_EVENTS_PER_SESSION);
+
+    let summary = store
+        .summary(&session.session_id, Some(usize::MAX))
+        .unwrap();
+    assert_eq!(summary.events_returned, MAX_SUMMARY_LIMIT);
+    assert_eq!(summary.events.len(), MAX_SUMMARY_LIMIT);
+    assert_eq!(summary.events_total, persisted_events);
+    assert_eq!(summary.events_retained, persisted_events);
+    assert_eq!(summary.events_evicted, 0);
+    assert!(!summary.retention_truncated);
+    assert_eq!(summary.ledger_first_retained_sequence, 0);
+    assert!(summary.events_truncated);
+    assert_eq!(
+        summary.first_retained_sequence,
+        persisted_events - MAX_SUMMARY_LIMIT
+    );
+
+    drop(store);
+    let restored = SessionStore::with_persistence(
+        &ledger,
+        DEFAULT_MAX_SESSIONS,
+        DEFAULT_MAX_EVENTS_PER_SESSION,
+    );
+    let restored_summary = restored
+        .summary(&session.session_id, Some(usize::MAX))
+        .unwrap();
+    assert_eq!(restored_summary.events_total, persisted_events);
+    assert_eq!(restored_summary.events_returned, MAX_SUMMARY_LIMIT);
+    assert_eq!(restored.status().max_events_per_session, 2000);
+}
+
+#[test]
+fn retained_task_instruction_identity_survives_summary_tail_and_fences_later_attempt() {
+    let store = SessionStore::new(10, DEFAULT_MAX_EVENTS_PER_SESSION);
+    let request = |resume_session_id: Option<String>, instruction: &str| CodingSessionRequest {
+        project: "agent:test:attempt-fence".to_string(),
+        authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
+        resume_session_id,
+        instruction: Some(instruction.to_string()),
+        mode: SessionMode::Normal,
+        guards: SessionGuards::default(),
+        execution_context: None,
+        project_instructions: None,
+        transport: SessionTransport::Api,
+        context_refreshed: true,
+        write_scope_verified: true,
+    };
+    let created = store
+        .ensure_coding_session_with_git_baseline(
+            request(None, "first attempt"),
+            Some("a".repeat(40)),
+        )
+        .unwrap();
+    let session_id = created.summary.session_id.clone();
+    let first_instruction_id = created
+        .summary
+        .events
+        .iter()
+        .find(|event| event.kind == "task_instruction")
+        .unwrap()
+        .event_id
+        .clone();
+
+    for index in 0..110 {
+        let start = store.record_tool_call_started(
+            Some(&session_id),
+            SessionTransport::Api,
+            "get_runtime_status",
+            &json!({"probe": index}),
+            session_tool_contract("get_runtime_status"),
+        );
+        store.record_tool_call_finished(start, true, &json!({"ok": true}), None, None);
+    }
+    let truncated = store.summary(&session_id, Some(usize::MAX)).unwrap();
+    assert!(truncated.events_truncated);
+    assert!(truncated
+        .events
+        .iter()
+        .all(|event| event.kind != "task_instruction"));
+    let first_attempt_events_total = truncated.events_total;
+    assert_eq!(
+        store.retained_task_instruction_event_id_at(&session_id, first_attempt_events_total),
+        Some(first_instruction_id.clone())
+    );
+
+    let resumed = store
+        .ensure_coding_session_with_git_baseline(
+            request(Some(session_id.clone()), "second attempt"),
+            Some("b".repeat(40)),
+        )
+        .unwrap();
+    let second_instruction_id = resumed
+        .summary
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "task_instruction")
+        .unwrap()
+        .event_id
+        .clone();
+    assert_ne!(second_instruction_id, first_instruction_id);
+    assert_eq!(
+        store.retained_task_instruction_event_id_at(&session_id, first_attempt_events_total),
+        Some(first_instruction_id)
+    );
+    assert_eq!(
+        store.retained_task_instruction_event_id_at(&session_id, resumed.summary.events_total),
+        Some(second_instruction_id)
+    );
 }
 
 #[test]
@@ -72,13 +247,12 @@ fn input_summary_redacts_sensitive_keys() {
     store.record_tool_call_started(
         Some(&summary.session_id),
         SessionTransport::Api,
-        "read_file",
+        "get_runtime_status",
         &json!({
-            "project": "demo",
             "token": "super-secret-token",
             "command": "curl -H 'Authorization: Bearer wc_pat_never_store'"
         }),
-        session_tool_contract("read_file"),
+        session_tool_contract("get_runtime_status"),
     );
     let summary = store.summary(&summary.session_id, Some(10)).unwrap();
     assert_eq!(
@@ -151,6 +325,97 @@ fn session_store_persists_and_restores_basic_session() {
         summary.execution_context,
         SessionExecutionContext::default()
     );
+}
+
+#[test]
+fn coding_git_baseline_and_repository_edit_fact_persist_resume_and_default_legacy_false() {
+    fn request(resume_session_id: Option<String>) -> CodingSessionRequest {
+        CodingSessionRequest {
+            project: "agent:oe:private-drop".to_string(),
+            authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
+            resume_session_id,
+            instruction: Some("final changes persistence".to_string()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context: None,
+            project_instructions: None,
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let baseline = "a".repeat(40);
+    let replacement_candidate = "b".repeat(40);
+    let created = store
+        .ensure_coding_session_with_git_baseline(request(None), Some(baseline.clone()))
+        .unwrap();
+    assert_eq!(
+        created.summary.git_baseline_tree.as_deref(),
+        Some(baseline.as_str())
+    );
+    assert!(!created.summary.repository_edit_observed);
+    let model_facing_summary = serde_json::to_value(&created.summary).unwrap();
+    assert!(model_facing_summary.get("git_baseline_tree").is_none());
+    assert!(model_facing_summary
+        .get("repository_edit_observed")
+        .is_none());
+
+    let session_id = created.summary.session_id.clone();
+    let edit = store
+        .record_tool_call_started(
+            Some(&session_id),
+            SessionTransport::Mcp,
+            "edit_project_files",
+            &json!({"project": "agent:oe:private-drop", "path": "src/lib.rs"}),
+            session_tool_contract("edit_project_files"),
+        )
+        .unwrap();
+    store
+        .record_tool_call_finished(
+            Some(edit),
+            true,
+            &json!({"state_changed": true}),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let restored = flush_and_restore(&store, ledger.clone());
+    let restored_summary = restored.summary(&session_id, Some(20)).unwrap();
+    assert_eq!(
+        restored_summary.git_baseline_tree.as_deref(),
+        Some(baseline.as_str())
+    );
+    assert!(restored_summary.repository_edit_observed);
+
+    let resumed = restored
+        .ensure_coding_session_with_git_baseline(
+            request(Some(session_id.clone())),
+            Some(replacement_candidate),
+        )
+        .unwrap();
+    assert!(resumed.reused);
+    assert_eq!(
+        resumed.summary.git_baseline_tree.as_deref(),
+        Some(baseline.as_str())
+    );
+    assert!(resumed.summary.repository_edit_observed);
+
+    restored.flush_persistence();
+    let mut legacy: Value = serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+    let row = legacy["sessions"][0].as_object_mut().unwrap();
+    row.remove("git_baseline_tree");
+    row.remove("repository_edit_observed");
+    std::fs::write(&ledger, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    let legacy_restored = SessionStore::with_persistence(ledger, 10, 10);
+    let legacy_summary = legacy_restored.summary(&session_id, Some(20)).unwrap();
+    assert_eq!(legacy_summary.git_baseline_tree, None);
+    assert!(!legacy_summary.repository_edit_observed);
 }
 
 #[test]
@@ -403,7 +668,7 @@ fn persistent_shell_evidence_survives_restore_without_command_or_output() {
     let start = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "session_shell_exec",
+        "execute_session_shell",
         &json!({
             "project": "agent:oe:private-drop",
             "session_id": session.session_id.clone(),
@@ -412,7 +677,7 @@ fn persistent_shell_evidence_survives_restore_without_command_or_output() {
             "command_summary": "export PRIVATE_LEDGER_VALUE=secret",
             "command_present": true
         }),
-        session_tool_contract("session_shell_exec"),
+        session_tool_contract("execute_session_shell"),
     );
     store.record_tool_call_finished(
         start,
@@ -998,39 +1263,264 @@ fn unknown_session_mutations_do_not_recreate_session() {
     assert!(matches!(resolve, Err(SessionMessageError::UnknownSession)));
 }
 
-/// Evicted (capacity-bound) sessions stay gone: events must not revive them.
-
 #[test]
-fn evicted_session_is_not_reactivated_by_events_or_messages() {
+fn active_session_survives_capacity_churn_and_keeps_exact_identity_and_fences() {
     let store = SessionStore::new(1, 10);
-    let first = store.start_session(None, Some("first".to_string()));
-    let second = store.start_session(None, Some("second".to_string()));
+    let owner_authority = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let guards = SessionGuards {
+        deny_write_tools: true,
+        deny_shell_tools: true,
+    };
+    let first = store
+        .start_session_with_options(
+            SessionCreateOptions::new(
+                Some("agent:test:durable-a".to_string()),
+                Some("first".to_string()),
+                SessionMode::ReadOnly,
+                guards,
+            )
+            .with_owner_authority_fingerprint(Some(owner_authority.to_string())),
+        )
+        .unwrap();
+    let canonical_id = first.session_id.clone();
 
-    assert!(!store.contains_session(&first.session_id));
-    assert!(store.contains_session(&second.session_id));
+    for index in 0..4 {
+        store.start_session(
+            Some(format!("agent:test:churn-{index}")),
+            Some(format!("churn {index}")),
+        );
+    }
 
-    assert!(store
+    assert!(store.contains_session(&canonical_id));
+    let retained = store.summary(&canonical_id, Some(10)).unwrap();
+    assert_eq!(retained.session_id, canonical_id);
+    assert_eq!(retained.lifecycle, SessionLifecycle::Active);
+    assert_eq!(retained.project.as_deref(), Some("agent:test:durable-a"));
+    assert_eq!(retained.mode, SessionMode::ReadOnly);
+    assert_eq!(retained.guards, guards);
+
+    let start = store
         .record_tool_call_started(
-            Some(&first.session_id),
+            Some(&canonical_id),
             SessionTransport::Api,
             "read_file",
-            &json!({"project": "demo", "path": "a.rs"}),
+            &json!({"project": "agent:test:durable-a", "path": "a.rs"}),
             session_tool_contract("read_file"),
         )
-        .is_none());
-    assert!(!store.contains_session(&first.session_id));
-    assert!(store.summary(&first.session_id, None).is_none());
+        .expect("capacity pressure must not turn an Active Session into unknown");
+    store.record_tool_call_finished(Some(start), true, &json!({"ok": true}), None, None);
 
-    let post = store.post_message(PostSessionMessageInput {
-        session_id: first.session_id.clone(),
-        kind: SessionMessageKind::Note,
-        message: "revive?".to_string(),
-        tags: Vec::new(),
-        reply_to: None,
-        priority: SessionMessagePriority::Normal,
-    });
-    assert!(matches!(post, Err(SessionMessageError::UnknownSession)));
-    assert!(!store.contains_session(&first.session_id));
+    let resume = |project: &str, authority_fingerprint: &str| CodingSessionRequest {
+        project: project.to_string(),
+        authority_fingerprint: authority_fingerprint.to_string(),
+        resume_session_id: Some(canonical_id.clone()),
+        instruction: Some("resume exact identity".to_string()),
+        mode: SessionMode::ReadOnly,
+        guards,
+        execution_context: None,
+        project_instructions: None,
+        transport: SessionTransport::Api,
+        context_refreshed: true,
+        write_scope_verified: true,
+    };
+    let resumed = store
+        .ensure_coding_session_with_git_baseline(
+            resume("agent:test:durable-a", owner_authority),
+            None,
+        )
+        .unwrap();
+    assert!(resumed.reused);
+    assert_eq!(resumed.summary.session_id, canonical_id);
+
+    assert!(matches!(
+        store.ensure_coding_session_with_git_baseline(
+            resume("agent:test:wrong-project", owner_authority,),
+            None,
+        ),
+        Err(CodingSessionError::ResumeProjectMismatch { .. })
+    ));
+    assert!(matches!(
+        store.ensure_coding_session_with_git_baseline(
+            resume(
+                "agent:test:durable-a",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            None,
+        ),
+        Err(CodingSessionError::ResumeAuthorityMismatch { .. })
+    ));
+
+    let status = store.status();
+    assert_eq!(status.hot_session_capacity_target, 1);
+    assert!(status.retained_sessions > status.hot_session_capacity_target);
+    assert_eq!(status.active_sessions, status.retained_sessions);
+    assert_eq!(status.capacity_evictions, 0);
+}
+
+#[test]
+fn active_session_survives_persistence_restart_after_capacity_churn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let owner_authority = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let request =
+        |resume_session_id: Option<String>, project: &str, authority: &str| CodingSessionRequest {
+            project: project.to_string(),
+            authority_fingerprint: authority.to_string(),
+            resume_session_id,
+            instruction: Some("durable active".to_string()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context: None,
+            project_instructions: None,
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        };
+
+    let store = SessionStore::with_persistence(&ledger, 1, 10);
+    let first = store
+        .ensure_coding_session_with_git_baseline(
+            request(None, "agent:test:persistent-active", owner_authority),
+            None,
+        )
+        .unwrap();
+    let canonical_id = first.summary.session_id.clone();
+    for index in 0..4 {
+        store.start_session(
+            Some(format!("agent:test:persist-churn-{index}")),
+            Some(format!("churn {index}")),
+        );
+    }
+    assert!(store.contains_session(&canonical_id));
+    store.flush_persistence();
+    drop(store);
+
+    let restored = SessionStore::with_persistence(&ledger, 1, 10);
+    assert!(restored.contains_session(&canonical_id));
+    assert_eq!(
+        restored.lifecycle_state(&canonical_id),
+        Some(SessionLifecycle::Active)
+    );
+    assert!(restored.status().restored_sessions > 1);
+    assert!(matches!(
+        restored.ensure_coding_session_with_git_baseline(
+            request(
+                Some(canonical_id.clone()),
+                "agent:test:wrong-project",
+                owner_authority,
+            ),
+            None,
+        ),
+        Err(CodingSessionError::ResumeProjectMismatch { .. })
+    ));
+    assert!(matches!(
+        restored.ensure_coding_session_with_git_baseline(
+            request(
+                Some(canonical_id.clone()),
+                "agent:test:persistent-active",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            None,
+        ),
+        Err(CodingSessionError::ResumeAuthorityMismatch { .. })
+    ));
+    let resumed = restored
+        .ensure_coding_session_with_git_baseline(
+            request(
+                Some(canonical_id.clone()),
+                "agent:test:persistent-active",
+                owner_authority,
+            ),
+            None,
+        )
+        .unwrap();
+    assert!(resumed.reused);
+    assert_eq!(resumed.summary.session_id, canonical_id);
+}
+
+#[test]
+fn restore_boundary_preserves_older_active_sessions_beyond_hot_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger, 10, 10);
+    let oldest = store.start_session(
+        Some("agent:test:restore-boundary".to_string()),
+        Some("oldest active".to_string()),
+    );
+    let _middle = store.start_session(
+        Some("agent:test:restore-boundary".to_string()),
+        Some("middle active".to_string()),
+    );
+    let newest = store.start_session(
+        Some("agent:test:restore-boundary".to_string()),
+        Some("newest active".to_string()),
+    );
+    store.flush_persistence();
+    drop(store);
+
+    let restored = SessionStore::with_persistence(&ledger, 1, 10);
+    assert!(restored.contains_session(&oldest.session_id));
+    assert!(restored.contains_session(&newest.session_id));
+    assert_eq!(
+        restored.lifecycle_state(&oldest.session_id),
+        Some(SessionLifecycle::Active)
+    );
+    let status = restored.status();
+    assert_eq!(status.hot_session_capacity_target, 1);
+    assert_eq!(status.retained_sessions, 3);
+    assert_eq!(status.active_sessions, 3);
+    assert_eq!(status.closed_sessions, 0);
+    assert_eq!(status.capacity_evictions, 0);
+}
+
+#[test]
+fn restore_prunes_only_old_closed_history_and_keeps_active_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = SessionStore::with_persistence_limits(&ledger, 10, 10, 10);
+    let active = store.start_session(
+        Some("agent:test:mixed-restore".to_string()),
+        Some("active".to_string()),
+    );
+    let old_closed = store.start_session(
+        Some("agent:test:mixed-restore".to_string()),
+        Some("old closed".to_string()),
+    );
+    store.close_session(&old_closed.session_id).unwrap();
+    let new_closed = store.start_session(
+        Some("agent:test:mixed-restore".to_string()),
+        Some("new closed".to_string()),
+    );
+    store.close_session(&new_closed.session_id).unwrap();
+    store.flush_persistence();
+    drop(store);
+
+    let restored = SessionStore::with_persistence_limits(&ledger, 1, 1, 10);
+    assert!(restored.contains_session(&active.session_id));
+    assert_eq!(
+        restored.lifecycle_state(&active.session_id),
+        Some(SessionLifecycle::Active)
+    );
+    assert!(
+        !restored.contains_session(&old_closed.session_id),
+        "restore-time historical retention should prune the oldest Closed row"
+    );
+    assert!(restored.contains_session(&new_closed.session_id));
+    assert_eq!(
+        restored.lifecycle_state(&new_closed.session_id),
+        Some(SessionLifecycle::Closed)
+    );
+    let status = restored.status();
+    assert_eq!(status.retained_sessions, 2);
+    assert_eq!(status.restored_sessions, 2);
+    assert_eq!(status.active_sessions, 1);
+    assert_eq!(status.closed_sessions, 1);
+    assert_eq!(status.hot_sessions, 0);
+    assert_eq!(status.cold_sessions, 2);
+    assert_eq!(status.active_cold_sessions, 1);
+    assert_eq!(status.hot_session_capacity_target, 1);
+    assert_eq!(status.historical_session_retention_limit, 1);
+    assert_eq!(status.capacity_evictions, 1);
 }
 
 #[test]
@@ -1112,6 +1602,52 @@ fn session_message_create_list_and_resolve_contract() {
         )
         .unwrap();
     assert!(open.is_empty());
+}
+
+#[test]
+fn requires_ack_is_kind_priority_independent_and_survives_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("general-ack-session.json");
+    let store = SessionStore::with_persistence(&ledger, 10, 50);
+    let session = store.start_session(None, None);
+    let question = store
+        .post_message_with_ack(
+            PostSessionMessageInput {
+                session_id: session.session_id.clone(),
+                kind: SessionMessageKind::Question,
+                message: "which implementation path should we take?".to_string(),
+                tags: Vec::new(),
+                reply_to: None,
+                priority: SessionMessagePriority::Normal,
+            },
+            true,
+        )
+        .unwrap();
+    assert!(question.requires_ack);
+
+    let hint = store.inbox_hint(&session.session_id).unwrap();
+    assert_eq!(hint.attention_required, Some(true));
+    assert_eq!(
+        hint.attention_reason,
+        Some(SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON)
+    );
+    drop(store);
+
+    let restored = SessionStore::with_persistence(&ledger, 10, 50);
+    let attention = restored.ack_required_messages(&session.session_id, &[]);
+    assert_eq!(attention.total_open_requires_ack, 1);
+    assert_eq!(attention.messages.len(), 1);
+    assert_eq!(attention.messages[0].message_id, question.message_id);
+    assert!(attention.messages[0].requires_ack);
+
+    let ack = restored.observe_message_acks(
+        &session.session_id,
+        std::slice::from_ref(&question.message_id),
+    );
+    assert_eq!(ack.accepted_ids, vec![question.message_id.clone()]);
+    let suppressed = restored.ack_required_messages(&session.session_id, &ack.accepted_ids);
+    assert_eq!(suppressed.total_open_requires_ack, 1);
+    assert!(suppressed.messages.is_empty());
 }
 
 #[test]
@@ -1353,4 +1889,691 @@ fn validation_job_terminal_projects_typed_runner_lifecycle_without_absorbing_act
             "{status} must not materialize terminal validation evidence"
         );
     }
+}
+
+fn instruction_observation(
+    runner: Option<&str>,
+    project: Option<&str>,
+    runner_complete: bool,
+    project_complete: bool,
+    instance: &str,
+    generation: u64,
+    started_at: std::time::Instant,
+) -> webcodex_core::project_instructions::ProjectInstructionsSnapshot {
+    use webcodex_core::project_instructions::*;
+    let candidate = |scope, path: &str, content: &str| LoadedInstructionCandidate {
+        source_scope: scope,
+        path: path.into(),
+        content: content.into(),
+        total_lines: 1,
+        full_sha256: None,
+    };
+    let runner = ProjectInstructionsSnapshot::from_candidates(
+        runner
+            .map(|body| candidate(InstructionSourceScope::Runner, "runner/0/rules.md", body))
+            .into_iter()
+            .collect(),
+        runner_complete,
+    );
+    let project = ProjectInstructionsSnapshot::from_candidates(
+        project
+            .map(|body| candidate(InstructionSourceScope::Project, "AGENTS.md", body))
+            .into_iter()
+            .collect(),
+        project_complete,
+    );
+    let mut combined =
+        ProjectInstructionsSnapshot::with_runner_files(runner.files, project, runner_complete);
+    combined.scan.as_mut().unwrap().runner = Some(RunnerInstructionObservation {
+        instance_id: instance.into(),
+        generation: Some(generation),
+        started_at,
+        instance_verified_at: started_at,
+    });
+    combined.scan.as_mut().unwrap().project_started_at = Some(started_at);
+    combined
+}
+
+fn commit_instruction_observation(
+    store: &SessionStore,
+    session_id: Option<&str>,
+    snapshot: webcodex_core::project_instructions::ProjectInstructionsSnapshot,
+) -> CodingSessionOutcome {
+    store
+        .ensure_coding_session(CodingSessionRequest {
+            project: "agent:instructions:demo".into(),
+            authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.into(),
+            resume_session_id: session_id.map(str::to_string),
+            instruction: Some("observe instructions".into()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context: None,
+            project_instructions: Some(snapshot),
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        })
+        .unwrap()
+}
+
+#[test]
+fn instruction_scopes_refresh_and_remove_independently_without_persisting_bodies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let at = std::time::Instant::now();
+    let observe = |runner, project, rc, pc| {
+        instruction_observation(runner, project, rc, pc, "instance", 1, at)
+    };
+    let first = commit_instruction_observation(
+        &store,
+        None,
+        observe(
+            Some("global private body"),
+            Some("local private body"),
+            true,
+            true,
+        ),
+    );
+    let id = first.summary.session_id;
+    let resumed = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(None, Some("local edited body"), false, true),
+    );
+    let snapshot = resumed.project_instructions.unwrap();
+    assert!(!snapshot.scan_complete);
+    assert_eq!(snapshot.files[0].content, "global private body");
+    assert_eq!(snapshot.files[1].content, "local edited body");
+    assert_eq!(
+        resumed.summary.project_instructions.unwrap().files[1].fingerprint,
+        snapshot.files[1].fingerprint
+    );
+    let removed =
+        commit_instruction_observation(&store, Some(&id), observe(None, None, true, false));
+    let snapshot = removed.project_instructions.unwrap();
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].content, "local edited body");
+    let removed = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("global updated body"), None, true, true),
+    );
+    let snapshot = removed.project_instructions.unwrap();
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].content, "global updated body");
+    // Confirm the converse: a project failure cannot block a global edit.
+    let updated = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("global newest body"), None, true, false),
+    );
+    assert_eq!(
+        updated.project_instructions.unwrap().files[0].content,
+        "global newest body"
+    );
+    store.flush_persistence();
+    let serialized = std::fs::read_to_string(&ledger).unwrap();
+    for body in [
+        "global private body",
+        "local private body",
+        "local edited body",
+        "global updated body",
+        "global newest body",
+    ] {
+        assert!(!serialized.contains(body));
+    }
+    assert!(!serialized.contains("project_instructions"));
+}
+
+#[test]
+fn instruction_observation_cannot_revive_obsolete_generation_or_runner() {
+    let store = SessionStore::default();
+    let at = std::time::Instant::now();
+    let next = at + std::time::Duration::from_secs(1);
+    let replacement_at = next + std::time::Duration::from_secs(1);
+    let observe = |body, complete, instance, generation, time| {
+        instruction_observation(
+            body,
+            Some("local"),
+            complete,
+            true,
+            instance,
+            generation,
+            time,
+        )
+    };
+    let first =
+        commit_instruction_observation(&store, None, observe(Some("old global"), true, "a", 1, at));
+    let id = first.summary.session_id;
+    // Failure under a newly observed config retires the old config's body.
+    let failed =
+        commit_instruction_observation(&store, Some(&id), observe(None, false, "a", 2, next));
+    assert!(failed
+        .project_instructions
+        .unwrap()
+        .files
+        .iter()
+        .all(|file| file.content != "old global"));
+    let late = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("old global"), true, "a", 1, next),
+    );
+    assert!(late
+        .project_instructions
+        .unwrap()
+        .files
+        .iter()
+        .all(|file| file.content != "old global"));
+    let replacement = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("new runner"), true, "b", 1, replacement_at),
+    );
+    assert_eq!(
+        replacement.project_instructions.unwrap().files[0].content,
+        "new runner"
+    );
+    let late = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(Some("old runner"), true, "a", 3, at),
+    );
+    assert_eq!(
+        late.project_instructions.unwrap().files[0].content,
+        "new runner"
+    );
+    // A transient failure from that same instance/config preserves its rule.
+    let failed = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(None, false, "b", 1, replacement_at),
+    );
+    assert_eq!(
+        failed.project_instructions.unwrap().files[0].content,
+        "new runner"
+    );
+    let replacement_failed = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(
+            None,
+            false,
+            "c",
+            1,
+            replacement_at + std::time::Duration::from_secs(1),
+        ),
+    );
+    assert_eq!(
+        replacement_failed.project_instructions.unwrap().files.len(),
+        1
+    );
+}
+
+#[test]
+fn newer_instruction_generation_wins_even_when_request_started_first() {
+    use webcodex_core::project_instructions::InstructionSourceScope;
+    let at = std::time::Instant::now();
+    let later = at + std::time::Duration::from_secs(1);
+    for complete in [false, true] {
+        let store = SessionStore::default();
+        let first = commit_instruction_observation(
+            &store,
+            None,
+            instruction_observation(
+                Some("revoked"),
+                Some("new local"),
+                true,
+                true,
+                "a",
+                1,
+                later,
+            ),
+        );
+        let id = first.summary.session_id;
+        let refreshed = commit_instruction_observation(
+            &store,
+            Some(&id),
+            instruction_observation(
+                complete.then_some("generation two"),
+                Some("old local"),
+                complete,
+                true,
+                "a",
+                2,
+                at,
+            ),
+        )
+        .project_instructions
+        .unwrap();
+        assert_eq!(
+            refreshed
+                .scan
+                .as_ref()
+                .unwrap()
+                .runner
+                .as_ref()
+                .unwrap()
+                .generation,
+            Some(2)
+        );
+        assert!(!refreshed.scope_complete(InstructionSourceScope::Project));
+        assert_eq!(refreshed.files.last().unwrap().content, "new local");
+        assert!(refreshed.files.iter().all(|file| file.content != "revoked"));
+        assert_eq!(
+            refreshed.scope_complete(InstructionSourceScope::Runner),
+            complete
+        );
+        if complete {
+            assert_eq!(refreshed.files[0].content, "generation two");
+        }
+        // A later-started lower generation and an unknown generation cannot revive it.
+        for generation in [Some(1), None] {
+            let mut late = instruction_observation(
+                Some("revoked"),
+                Some("new local"),
+                true,
+                true,
+                "a",
+                1,
+                later,
+            );
+            late.scan
+                .as_mut()
+                .unwrap()
+                .runner
+                .as_mut()
+                .unwrap()
+                .generation = generation;
+            let late = commit_instruction_observation(&store, Some(&id), late)
+                .project_instructions
+                .unwrap();
+            assert!(!late.scope_complete(InstructionSourceScope::Runner));
+            assert_eq!(
+                late.scan
+                    .as_ref()
+                    .unwrap()
+                    .runner
+                    .as_ref()
+                    .unwrap()
+                    .generation,
+                Some(2)
+            );
+            assert!(late.files.iter().all(|file| file.content != "revoked"));
+        }
+    }
+}
+
+#[test]
+fn replacement_instruction_instance_uses_verification_order_not_request_start() {
+    use webcodex_core::project_instructions::InstructionSourceScope;
+    let at = std::time::Instant::now();
+    let later = at + std::time::Duration::from_secs(1);
+    let verified = later + std::time::Duration::from_secs(1);
+    for complete in [false, true] {
+        let store = SessionStore::default();
+        let first = commit_instruction_observation(
+            &store,
+            None,
+            instruction_observation(Some("retired"), None, true, true, "a", 9, later),
+        );
+        let id = first.summary.session_id;
+        let mut replacement = instruction_observation(
+            complete.then_some("replacement"),
+            None,
+            complete,
+            true,
+            "b",
+            1,
+            at,
+        );
+        replacement
+            .scan
+            .as_mut()
+            .unwrap()
+            .runner
+            .as_mut()
+            .unwrap()
+            .instance_verified_at = verified;
+        let replacement = commit_instruction_observation(&store, Some(&id), replacement)
+            .project_instructions
+            .unwrap();
+        assert_eq!(
+            replacement
+                .scan
+                .as_ref()
+                .unwrap()
+                .runner
+                .as_ref()
+                .unwrap()
+                .instance_id,
+            "b"
+        );
+        assert_eq!(
+            replacement.scope_complete(InstructionSourceScope::Runner),
+            complete
+        );
+        assert!(replacement
+            .files
+            .iter()
+            .all(|file| file.content != "retired"));
+        // This old-instance request started after B's request, but verified A before B.
+        let late = commit_instruction_observation(
+            &store,
+            Some(&id),
+            instruction_observation(Some("retired"), None, true, true, "a", 10, later),
+        )
+        .project_instructions
+        .unwrap();
+        assert_eq!(
+            late.scan
+                .as_ref()
+                .unwrap()
+                .runner
+                .as_ref()
+                .unwrap()
+                .instance_id,
+            "b"
+        );
+        assert!(!late.scope_complete(InstructionSourceScope::Runner));
+        assert!(late.files.iter().all(|file| file.content != "retired"));
+        if complete {
+            assert_eq!(late.files[0].content, "replacement");
+        }
+    }
+}
+
+#[test]
+fn same_instruction_generation_uses_observation_order() {
+    let store = SessionStore::default();
+    let at = std::time::Instant::now();
+    let later = at + std::time::Duration::from_secs(1);
+    let first = commit_instruction_observation(
+        &store,
+        None,
+        instruction_observation(Some("new body"), None, true, true, "a", 1, later),
+    );
+    let mut late = instruction_observation(Some("old body"), None, true, true, "a", 1, at);
+    late.scan
+        .as_mut()
+        .unwrap()
+        .runner
+        .as_mut()
+        .unwrap()
+        .instance_verified_at = later;
+    let late = commit_instruction_observation(&store, Some(&first.summary.session_id), late)
+        .project_instructions
+        .unwrap();
+    assert!(!late.scan_complete);
+    assert_eq!(late.files[0].content, "new body");
+}
+
+#[test]
+fn resumed_project_observation_has_an_independent_freshness_fence() {
+    use webcodex_core::project_instructions::InstructionSourceScope;
+    let at = std::time::Instant::now();
+    let time = |seconds| at + std::time::Duration::from_secs(seconds);
+    // Exercise an unavailable Runner, no Runner capability, and a new generation
+    // that must update the global scope without rolling back the local scope.
+    for runner_case in 0..3 {
+        let store = SessionStore::default();
+        let observe = |body, complete, seconds| {
+            let mut snapshot = instruction_observation(
+                None,
+                body,
+                runner_case == 1,
+                complete,
+                "a",
+                1,
+                time(seconds),
+            );
+            if runner_case < 2 {
+                snapshot.scan.as_mut().unwrap().runner = None;
+            }
+            snapshot
+        };
+        let mut delayed = observe(Some("old local"), true, 0);
+        let first =
+            commit_instruction_observation(&store, None, observe(Some("new local"), true, 1));
+        let id = first.summary.session_id;
+        if runner_case == 2 {
+            delayed = instruction_observation(
+                Some("new global"),
+                Some("old local"),
+                true,
+                true,
+                "a",
+                2,
+                at,
+            );
+        }
+        let delayed = commit_instruction_observation(&store, Some(&id), delayed)
+            .project_instructions
+            .unwrap();
+        assert!(!delayed.scan_complete);
+        assert!(!delayed.scope_complete(InstructionSourceScope::Project));
+        assert_eq!(delayed.files.last().unwrap().content, "new local");
+        if runner_case == 2 {
+            assert_eq!(delayed.files[0].content, "new global");
+            assert!(delayed.scope_complete(InstructionSourceScope::Runner));
+        }
+        let failed = commit_instruction_observation(
+            &store,
+            Some(&id),
+            observe(Some("partial local"), false, 3),
+        );
+        assert_eq!(
+            failed
+                .project_instructions
+                .unwrap()
+                .files
+                .last()
+                .unwrap()
+                .content,
+            "new local"
+        );
+        // The incomplete refresh must not lose the fence when retaining text.
+        let late =
+            commit_instruction_observation(&store, Some(&id), observe(Some("late local"), true, 2));
+        assert_eq!(
+            late.project_instructions
+                .unwrap()
+                .files
+                .last()
+                .unwrap()
+                .content,
+            "new local"
+        );
+        let recovered = commit_instruction_observation(
+            &store,
+            Some(&id),
+            observe(Some("recovered local"), true, 4),
+        )
+        .project_instructions
+        .unwrap();
+        assert!(recovered.scope_complete(InstructionSourceScope::Project));
+        assert_eq!(recovered.files.last().unwrap().content, "recovered local");
+    }
+}
+
+#[test]
+fn retained_project_selection_preserves_global_edit_and_only_persists_metadata() {
+    use webcodex_core::project_instructions::{InstructionSourceScope, MAX_TOTAL_CHARS};
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = persistent_store(ledger.clone());
+    let at = std::time::Instant::now();
+    let observe = |runner, project, rc, pc, seconds| {
+        instruction_observation(
+            runner,
+            project,
+            rc,
+            pc,
+            "a",
+            1,
+            at + std::time::Duration::from_secs(seconds),
+        )
+    };
+    let first = commit_instruction_observation(
+        &store,
+        None,
+        observe(
+            Some("old global private"),
+            Some("short local private"),
+            true,
+            true,
+            0,
+        ),
+    );
+    let id = first.summary.session_id;
+    let large = "界".repeat(MAX_TOTAL_CHARS);
+    let partial = observe(Some("edited global private"), Some(&large), true, false, 1);
+    assert!(partial.files[0].content.is_empty());
+    let selected = commit_instruction_observation(&store, Some(&id), partial)
+        .project_instructions
+        .unwrap();
+    assert_eq!(selected.files[0].content, "edited global private");
+    assert_eq!(selected.files[1].content, "short local private");
+    assert!(!selected.scan_complete);
+    // A successful large Project can hide global text; a later local shrink
+    // must restore its bounded source even if the new global read fails.
+    let expanded = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(None, Some(&large), false, true, 2),
+    )
+    .project_instructions
+    .unwrap();
+    assert!(expanded.files[0].content.is_empty());
+    assert_eq!(expanded.total_chars, MAX_TOTAL_CHARS);
+    let recovered = commit_instruction_observation(
+        &store,
+        Some(&id),
+        observe(None, Some("recovered local private"), false, true, 3),
+    )
+    .project_instructions
+    .unwrap();
+    assert_eq!(recovered.files[0].content, "edited global private");
+    assert_eq!(recovered.files[1].content, "recovered local private");
+    assert!(!recovered.files[0].truncated);
+    for snapshot in [&selected, &expanded, &recovered] {
+        assert!(snapshot.total_chars <= MAX_TOTAL_CHARS);
+        assert_eq!(
+            snapshot.total_chars,
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.content.chars().count())
+                .sum::<usize>()
+        );
+        assert_eq!(
+            snapshot.files[0].source_scope,
+            InstructionSourceScope::Runner
+        );
+        assert!(snapshot.files[0].read_more.is_none());
+        assert!(
+            snapshot
+                .scan
+                .as_ref()
+                .unwrap()
+                .runner_source_files
+                .iter()
+                .map(|file| file.chars)
+                .sum::<usize>()
+                <= MAX_TOTAL_CHARS
+        );
+        let public = serde_json::to_value(snapshot).unwrap();
+        assert!(public.get("scan").is_none());
+        let summary = serde_json::to_string(&snapshot.to_summary()).unwrap();
+        for hidden in [
+            "private",
+            "started_at",
+            "instance_verified_at",
+            "runner_source_files",
+        ] {
+            assert!(!summary.contains(hidden));
+        }
+    }
+    // Even an entirely hidden source body cannot leak through snapshot serialization.
+    let public = serde_json::to_string(&expanded).unwrap();
+    assert!(!public.contains("edited global private"));
+    store.flush_persistence();
+    let durable = std::fs::read_to_string(&ledger).unwrap();
+    for hidden in [
+        "private",
+        "project_instructions",
+        "instance_verified_at",
+        "project_started_at",
+        "runner_source_files",
+    ] {
+        assert!(!durable.contains(hidden));
+    }
+}
+
+#[test]
+fn console_lists_batch_preserves_project_bounds_order_and_cold_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("batch-console.json");
+    let store = SessionStore::with_persistence_limits(&ledger, 20, 20, 10);
+    let mut expected = std::collections::HashMap::new();
+    for project in ["project-a", "project-b", "private-project"] {
+        let mut rows = Vec::new();
+        for index in 0..3 {
+            let session =
+                store.start_session(Some(project.into()), Some(format!("{project}-{index}")));
+            store.close_session(&session.session_id).unwrap();
+            let summary = store.summary(&session.session_id, Some(1)).unwrap();
+            rows.push((summary.session_id, summary.updated_at));
+        }
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        expected.insert(project, rows);
+    }
+    store.flush_persistence();
+    drop(store);
+    let store = SessionStore::with_persistence_limits(&ledger, 1, 20, 10);
+    assert!(store.status().cold_sessions > 0);
+    let validation = ConsoleValidationHooks {
+        event_observes_validation_activity: |_| false,
+        validation_summary_from_events: |_, _| json!({}),
+    };
+    for limit in [Some(1), Some(2), None] {
+        let lists = store.console_lists_for_projects(
+            &["project-a", "project-b", "empty-project", "project-a"],
+            limit,
+            validation,
+        );
+        assert_eq!(lists.len(), 3);
+        assert!(!lists.contains_key("private-project"));
+        for project in ["project-a", "project-b"] {
+            let list = &lists[project];
+            let returned = limit.unwrap_or(3);
+            assert_eq!(list.total, 3);
+            assert_eq!(list.returned, returned);
+            assert_eq!(list.truncated, returned < 3);
+            assert_eq!(
+                list.sessions
+                    .iter()
+                    .map(|s| &s.session_id)
+                    .collect::<Vec<_>>(),
+                expected[project]
+                    .iter()
+                    .take(returned)
+                    .map(|s| &s.0)
+                    .collect::<Vec<_>>()
+            );
+            assert!(list.sessions.iter().all(|s| s.lifecycle == "closed"));
+            assert_eq!(
+                serde_json::to_value(list).unwrap(),
+                serde_json::to_value(store.console_list_for_project(project, limit, validation))
+                    .unwrap()
+            );
+        }
+        assert_eq!(lists["empty-project"].total, 0);
+        assert_eq!(lists["empty-project"].returned, 0);
+        assert!(!lists["empty-project"].truncated);
+    }
+    assert!(store
+        .console_lists_for_projects(&[], None, validation)
+        .is_empty());
 }

@@ -116,6 +116,11 @@ pub struct WindowWorkflowLinkRecord {
 /// Payload-safe durable Window activity row used by Runtime Console queries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WindowActivityEventRecord {
+    /// Server-authored managed OAuth attribution, internal visibility only.
+    #[serde(skip)]
+    pub managed_oauth_identity: Option<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_expectation_result: Option<String>,
     pub event_id: String,
     pub client_window_key: String,
     pub client_window_source: String,
@@ -128,8 +133,21 @@ pub struct WindowActivityEventRecord {
     pub project: Option<String>,
     pub status: String,
     pub meaningful: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub async_job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_job_ids: Vec<String>,
+    /// Exact business Workflow Session captured for this action, when one was
+    /// selected by the canonical tool call. Internal correlation only; never
+    /// project it through Runtime Console payloads.
+    #[serde(skip)]
+    pub business_session_id: Option<String>,
     pub recorder_gap_session_id: Option<String>,
     pub workflow_links: Vec<WindowWorkflowLinkRecord>,
+    /// Bounded Code Mode composition object extracted from sanitized ActionAudit
+    /// summary JSON. Internal only; Runtime Console applies its own typed projection.
+    #[serde(skip)]
+    pub code_mode_composition: Option<serde_json::Value>,
     /// Internal principal correlation is intentionally not serialized by the
     /// Runtime Console projection. It is used only to avoid cross-principal
     /// adjacency when an administrator reads a Window.
@@ -142,12 +160,15 @@ pub struct WindowActivityEventRecord {
     pub window_transition_kind: Option<String>,
     pub response_streaming: Option<bool>,
     pub window_continuity_eligible: Option<bool>,
+    /// HTTP response status from the WebCodex handler, if recorded.
+    pub http_status: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WindowActivitySummaryRecord {
     pub client_window_key: String,
     pub client_window_source: String,
+    pub first_seen_at_ms: i64,
     pub last_seen_at_ms: i64,
     pub last_tool_call_at_ms: Option<i64>,
     pub last_meaningful_activity_at_ms: Option<i64>,
@@ -284,6 +305,9 @@ pub struct PairingCodeRecord {
     pub used_at: Option<i64>,
     pub user_token_name: Option<String>,
     pub agent_token_name: Option<String>,
+    /// Explicit admin-issued enrollment grant. Old codes retain their old scopes.
+    #[serde(default)]
+    pub runner_capabilities: bool,
 }
 
 impl ApiKeyRecord {
@@ -362,6 +386,9 @@ pub struct OAuthClientRecord {
 /// validation. `resource` is reserved for MCP audience binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthAuthorizationCodeRecord {
+    /// Internal grant-time authority; never part of the public OAuth scope string.
+    #[serde(default)]
+    pub admin_authority: bool,
     pub id: String,
     /// SHA-256 hash of the code. Plaintext never stored.
     pub code_hash: String,
@@ -394,6 +421,9 @@ pub struct OAuthAuthorizationCodeRecord {
 /// stored; the plaintext is returned to the client once at creation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthAccessTokenRecord {
+    /// Internal grant-time authority; never part of the public OAuth scope string.
+    #[serde(default)]
+    pub admin_authority: bool,
     pub id: String,
     /// SHA-256 hash of the token. Plaintext never stored.
     pub token_hash: String,
@@ -421,6 +451,9 @@ pub struct OAuthAccessTokenRecord {
 /// `rotated_from_id`. Only the SHA-256 hash is stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthRefreshTokenRecord {
+    /// Internal grant-time authority; never part of the public OAuth scope string.
+    #[serde(default)]
+    pub admin_authority: bool,
     pub id: String,
     /// SHA-256 hash of the token. Plaintext never stored.
     pub token_hash: String,

@@ -23,6 +23,85 @@ For everyday development, follow the [Full Setup guide](PERSONAL_SETUP.md) and u
 
 ## Command map
 
+### Environment configuration
+
+For a new personal machine: `webcodex environment configure --create --runner --scope user`,
+then `webcodex environment configure-tunnel default --host embedded` and
+`webcodex environment status`. Embedded is the recommended persistent ownership:
+the Server loads the profile at startup, while configuration never installs a
+standalone Tunnel service or restarts a running Server implicitly. Local user/Runner
+credentials are created internally; no pairing input is needed. Linux user services
+depend on linger for post-logout persistence; macOS LaunchAgents and Windows
+interactive tasks require a signed-in owner. Scope changes do not adopt existing
+services. [Lifecycle and compatibility details](implementation/personal-environment-lifecycle.md).
+
+`webcodex environment` and Desktop call the same setup core. This namespace configures the machine's persistent environment; the existing project-level `webcodex setup` command keeps its original meaning. Installer availability and native acceptance are tracked in [Unified installation](unified-installation.md) and [Deployment validation](unified-deployment-validation.md).
+
+| Command | Purpose |
+| --- | --- |
+| `webcodex environment configure [--scope user\|system]` | Choose create/join and local Runner/viewer. New environments default to the owner's user service; existing environments keep their saved manager. System scope explicitly requests machine-service authorization. |
+| `configure --create --project PATH` / `configure --create --no-project` | Create or resume local Server + Runner / Server-only setup. |
+| `configure --join URL --project PATH --code-stdin` | Join with a project; read one Runner pairing code from stdin, then save credentials, register the project, install services, and verify readiness. |
+| `configure --join URL --no-project --token-file PATH` | Join as a viewer with a protected user API credential; creates no local Runner identity or service. Omit the file option for hidden terminal input. |
+| `resume` | Reconcile saved progress and complete missing steps without silently rebinding the environment. |
+| `invite` | Create a short-lived Runner invitation on the environment's local Server; the displayed code is sensitive. |
+| `add-project PATH` | Reuse the existing Runner identity; a viewer must complete Runner enrollment first. |
+| `status --json` / `doctor --json` | Inspect saved configuration, Server reachability, Runner/project readiness, and structured diagnostics. |
+| `start COMPONENT` / `stop COMPONENT` / `restart COMPONENT` | Explicitly manage an environment-owned `server`, `runner`, or standalone `tunnel`; use `--profile NAME` for a named standalone Tunnel. |
+| `configure-tunnel [PROFILE] --host embedded\|standalone [--credentials-file PATH]` | Create a named profile directly under the Server lifecycle or as a separate service. Credentials come only from hidden input or a protected file. |
+| `tunnel-status [PROFILE]` | Inspect the exact profile identity, owner, readiness and whether an explicit Server restart is required. |
+| `tunnel-host PROFILE --host embedded\|standalone` | Transfer an existing profile only after the previous owner is cleanly stopped and, for standalone, uninstalled. |
+| `repair-user-credential [--token-file PATH]` | Verify and replace the saved user credential without pairing or changing service state. |
+| `repair-credential runner` | Repair Windows SCM account credentials through hidden input. |
+
+Use `webcodex environment --help` for the complete namespace, including Tunnel profiles and installer upgrade/recovery commands. For installations older than v0.4.6, first use the v0.4.6 bridge described in the [compatibility policy](compatibility-policy.md); v0.5 does not provide the removed pre-Environment Linux migration commands. Public environment commands support `--json` and `--environment-dir PATH`. Do not put tokens, pairing codes, or service passwords in command arguments. When pairing redemption is uncertain, read the recovery diagnostic before explicitly supplying a replacement through `resume --new-pairing-code --code-stdin`; do not replay the old code automatically.
+
+### Local unified updates (Linux terminal)
+
+`webcodex environment update` uses the same official release discovery, private
+Desktop download cache, candidate verifier and Environment transaction as Desktop.
+It updates the local official unified package, including its installed Desktop,
+CLI, Server and Runner files; it never updates remote Runner installations.
+An additional Runner uses this entry without opening a Desktop window. It must
+still have the existing official unified package installed.
+
+| Command | Effects |
+| --- | --- |
+| `environment update status` | Inspect the local installation, cached candidate and recorded transaction. Does not discover a new release or create an unconfigured Environment. |
+| `environment update check` | Discover the latest official stable release; does not download or install. The release notice is advisory until candidate validation. |
+| `environment update download --version VERSION` | Download and validate that stable version into the existing private cache. Does not prepare services or install. |
+| `environment update apply --version VERSION --yes` | Revalidate the exact cached candidate and Environment, check tasks, prepare owned services and dispatch the existing installer helper. |
+| `environment update resume --operation-id ID --yes` | Retry the existing completion mechanism only when Core proves the recorded operation can be safely continued. Never dispatches another installer. |
+| `environment update rollback --operation-id ID --yes` | Restore only when Core proves replacement has not begun, or release maintenance for an already restored operation. Ambiguous/later phases require the existing explicit recovery procedure. |
+
+All commands accept `--environment-dir PATH` and `--json`. JSON stdout is a single
+schema-1 document capped at 64 KiB; action failure returns a nonzero exit status.
+It contains fixed component identities, known phases and static error kinds;
+it excludes raw configuration, owner receipts, service arguments, credentials
+and arbitrary installer output. System authorization prompts use the terminal.
+
+Linux application, continuation and restoration require stdin to be a terminal
+(for SSH, allocate a TTY), explicit `--yes`, and normal system sudo authorization.
+The Environment owner stays unprivileged; only the verified installed installer
+helper is elevated with literal arguments. Non-TTY sessions can inspect, check
+and download, but are rejected before any service-changing operation. A missing
+or ambiguous package format or missing trusted package tools blocks application;
+the updater does not switch between DEB and RPM.
+
+macOS and Windows do not gain a headless application adapter here. Their CLI
+queries and downloads remain available, while application uses the existing
+native Desktop/manual route. Bare Runner, npm, source/dirty builds, custom Runtime,
+missing managed Desktop files and unknown ownership retain their installation
+type and use the documented manual release path.
+
+Installer acknowledgement is distinct from completed replacement and service
+recovery. An uncertain result is not permission to retry installation or race a
+rollback. Inspect the operation with `environment update status --json` and use
+[the existing upgrade/recovery procedure](unified-installation.md). Interrupting
+a download cancels only the download; interrupting after dispatch does not claim
+that installation was canceled. Original service state, configuration, identities,
+projects and Tunnel credentials remain governed by the existing Core transaction.
+
 ### Project / local workflow
 
 These commands work on the current Git project.
@@ -44,13 +123,17 @@ These commands work on the current Git project.
 
 Quick Tunnel origins remain temporary. For an operator-managed stable HTTPS origin, use `--tunnel none --public-url https://share.example` and route that origin to the loopback WebCodex Server yourself; `--public-url` advertises the external origin/issuer and does not create a proxy or tunnel.
 
-`webcodex share --tunnel openai` is the explicit OpenAI Secure MCP Tunnel provider. It requires `CONTROL_PLANE_TUNNEL_ID` plus a Restricted `CONTROL_PLANE_API_KEY` with Tunnels Read + Use and currently supports only `--auth bearer`. WebCodex resolves pinned OpenAI `tunnel-client` v0.0.12 from `WEBCODEX_TUNNEL_CLIENT_BIN`, `PATH`, or a verified managed download; it runs `doctor` before the daemon and waits for `/readyz`. The temporary WebCodex Bearer is written only to the private share directory and referenced by `tunnel-client` through a file-backed MCP `Authorization` header. ChatGPT therefore uses Connection: Tunnel + No authentication. `OPENAI_ADMIN_KEY` and `OPENAI_API_KEY` are explicitly removed from the long-lived daemon environment; the Runtime API key remains the control-plane authority.
+`webcodex share --tunnel openai` uses the native Rust Secure MCP Tunnel client. It requires `CONTROL_PLANE_TUNNEL_ID` and a Restricted `CONTROL_PLANE_API_KEY` with Tunnels Read + Use, and supports `--auth bearer`. The temporary local Bearer stays in memory and is injected only into the fixed local MCP hop. ChatGPT uses Connection: Tunnel + No authentication. Startup verifies local MCP and a successful control-plane poll; no external tunnel-client binary, doctor process or health port is used. Strict deadlines, bounded ingress, no local execution replay and an uncertain-restart latch are described in the [crate contract](../crates/webcodex-openai-tunnel/README.md).
 
 For public `share`, WebCodex best-effort copies only the MCP URL to the clipboard and does not copy the temporary credential in the default Bearer/OAuth modes. The explicit `--auth query-token` mode instead copies the sensitive tokenized URL by design and says so in its status output. Interactive Linux/macOS terminals also offer an Enter shortcut to open ChatGPT App settings. Clipboard/browser integration is convenience-only and never gates runtime readiness. Use `--no-copy-url` to suppress clipboard access.
 
 For supervised machine integration, `webcodex share --json --stop-on-stdin-eof` keeps the same foreground lifecycle but also treats the supervising parent's closed stdin as a stop request. This lets Desktop or another structured process owner ask `share` to clean up its own temporary Server, Runner, and Tunnel without shell-command signaling. The flag is rejected outside `--json` mode.
 
-`webcodex connect <server> --auth oauth --oauth-redirect-uri <exact-callback>` is the ordinary hosted OAuth path. The Runner keeps its existing hosted credential while the MCP client uses OAuth. Add `--oauth-computer-permissions`, `--oauth-local-mcp`, or `--oauth-local-ssh` only when those optional capabilities are actually needed; they are explicit permission changes and can require reauthorization. `--oauth-local-ssh` grants the MCP client the optional `ssh:local` authority needed by the model-facing `ssh_resource` onboarding tool; it does not expose SSH credentials or make a registered resource active without the Runner restart reported by that tool. See [MCP](MCP.md#oauth2) for client setup and [Authentication](AUTH_MODEL.md#oauth2) for the security model.
+`webcodex connect <server> --auth oauth --oauth-redirect-uri <exact-callback>` is the ordinary hosted OAuth path. The Runner keeps its existing hosted credential while the MCP client uses OAuth. Add `--oauth-computer-permissions`, `--oauth-local-mcp`, or `--oauth-local-ssh` only when those optional capabilities are actually needed; they are explicit permission changes and can require reauthorization. `--oauth-local-ssh` grants the MCP client the optional `ssh:local` authority needed by the model-facing `manage_ssh_resource` onboarding tool; it does not expose SSH credentials or make a registered resource active without the Runner restart reported by that tool. See [MCP](MCP.md#oauth2) for client setup and [Authentication](AUTH_MODEL.md#oauth2) for the security model.
+
+Shared-key OAuth delegation for Browser Use requires explicit `--oauth-browser-permissions` on `connect --auth oauth`. It adds only `browser:read`, `browser:control`, and `browser:launch`. The baseline excludes Browser scopes. Browser authority is independent of `--oauth-computer-permissions` and its consent checkboxes. Existing clients never expand automatically; narrow historical profiles gain only the explicitly selected class. Scope ceiling changes revoke old grants and require reauthorization. Reusing a Browser-enabled profile requires the flag again.
+
+For managed OAuth, use a PAT with `account:manage` (or the `admin` super-scope) to create/list/update/revoke OAuth clients; ordinary account managers remain limited to their own clients. OAuth access tokens cannot perform these first-party management operations. Authorize only scopes held by the PAT; `offline_access` is a refresh capability, not a runtime permission. To enable admin diagnostics in a managed OAuth connection, authorize your own managed client with an admin PAT. Existing connections need one reauthorization after upgrade; later refreshes preserve the grant authority. Shared-key `connect --auth oauth` does not grant admin. See [Authentication](AUTH_MODEL.md#oauth2).
 
 The advanced managed identity flow remains available as `--auth managed-oauth --oauth-redirect-uri <exact-callback>` and requires `webcodex login`; `--user` applies only to that mode.
 
@@ -98,7 +181,7 @@ service. `webcodex` and `webcodex-runner` remain separate executables.
 | --- | --- |
 | `webcodex runner init` | Generate a `runner.toml` config manually |
 | `webcodex runner install` | Install, enable, and start the Runner service |
-| `webcodex runner run` | Run `webcodex-runner` in the foreground |
+| `webcodex runner run` | Run `webcodex-runner` in the foreground. Omitting `--profile` and `--config` leaves config resolution to `webcodex-runner`. |
 | `webcodex runner start` | Start a hosted background Runner or installed profile service |
 | `webcodex runner stop` | Stop it |
 | `webcodex runner restart` | Restart it |
@@ -122,6 +205,89 @@ keep their detached-process behavior when `--scope` is omitted.
 | `webcodex server status` | Check authoritative socket/service state, HTTP reachability, and build revisions |
 | `webcodex server logs` | Read the Server service journal |
 | `webcodex server uninstall` | Stop, disable, and remove the managed socket/service pair |
+
+## Controller (CLI management tool)
+
+webcodex controller is a CLI management tool for WSL/Linux/Unix, with command-line operations and a read-only TUI overview using the existing Server, Runner, and OpenAI Tunnel process contracts. The Server may be locally managed or remotely observed; the Runner remains local and Controller-managed; the OpenAI Tunnel is available only for a local Server.
+
+    webcodex controller init
+    webcodex controller doctor
+    webcodex controller install
+
+The default configuration is ~/.config/webcodex/controller.toml. A running Controller exposes a local Unix Socket at $XDG_RUNTIME_DIR/webcodex/controller.sock, falling back to a per-user /tmp runtime directory when XDG_RUNTIME_DIR is unavailable.
+
+Common operations:
+
+    webcodex controller start
+    webcodex controller status
+    webcodex controller restart
+    webcodex controller restart server
+    webcodex controller restart runner
+    webcodex controller restart tunnel
+    webcodex controller logs --lines 100
+    webcodex controller logs -f
+    webcodex controller stop
+    webcodex controller uninstall --confirm
+
+Read-only terminal overview:
+
+    webcodex controller tui
+    webcodex controller tui --config /path/to/controller.toml --service-file /path/to/controller.service --user-token-file /path/to/user-token
+
+The overview shows Controller source and runtime state, systemd service state, Server/Runner/Tunnel state, PID and restart count, project IDs and paths, inventory synchronization and truncation, and live logs below. Status refreshes every 2 seconds and projects every 10 seconds; unavailable queries show their errors and retained data is marked stale. Project queries use the existing credential selection and online Runner checks. The TUI requires interactive stdin/stdout and an 80×24 or larger terminal. Entering or exiting it does not change Controller, service, or project state.
+
+Tab switches project/log focus; arrows and PageUp/PageDown scroll; Space pauses/resumes automatic log scrolling; `r` refreshes status and projects; `q` or Ctrl+C exits. Logs start with 100 recent lines and retain at most 500 lines and 1 MiB; cache eviction, disconnection, and output limits are reported. Disconnections retry every 2 seconds; an older running Controller without log-follow support reports that an update is required and stops retrying. Exiting cleans up the TUI's query/log observation processes and restores the terminal.
+
+Project management:
+
+    webcodex controller project list
+    webcodex controller project register /path/to/project
+    webcodex controller project remove <project-id-or-path>
+
+The [server] section supports mode = "local", mode = "remote", and mode = "wsl2_nat". Local mode requires env_file and the Controller starts/supervises webcodex-server. Remote mode requires url; the Controller only probes that Server, does not start a local Server, and rejects a local regular Tunnel. In local/remote modes the Runner uses the local runner.toml, whose server_url must match the Controller Server target. The Controller refuses duplicate ownership of existing local webcodex.service, webcodex.socket, or webcodex-runner.service instances.
+
+In all three modes, the Controller daemon uses a user API credential to observe the configured Runner immediately after startup and every 10 seconds thereafter. Each query has a 3-second timeout and a 1 MiB response limit. The Runner is `starting` before its first observation, `ready` when the Server confirms it online, `running_offline` when explicitly reported non-online while its process survives, and `running_unverified` when credentials, access, visibility or the query fail. Failures immediately revoke previous online evidence; observations also expire after 30 seconds. Observation never blocks IPC, triggers a restart or rediscovers the WSL gateway. Stopping or replacing the Runner clears old observations.
+
+TUI, `status` and online `doctor` share the daemon's state. Runner snapshots include optional `observed_at` and `observation_error`; text and TUI views also show the observation time and error category. `doctor` distinguishes configuration checks from runtime status; an unavailable daemon leaves Runner online status unknown. Project commands still perform their own online checks and never use the display cache as execution authority.
+
+`wsl2_nat` is exclusively for a Runner inside WSL2 NAT connecting automatically to its Windows Desktop Server. Other VM/network topologies are outside its support contract. Configure the Controller as follows:
+
+```toml
+[server]
+mode = "wsl2_nat"
+interface = "eth0" # Optional; defaults to eth0
+scheme = "http"   # Optional; defaults to http
+port = 8080       # Required
+
+[runner]
+enabled = true
+config = "/home/user/.config/webcodex/clients/wsl2-runner/runner.toml"
+# Optional user API credential; omitted values use automatic selection
+# user_token_file = "/home/user/.config/webcodex/webcodex-user-token"
+
+[tunnel]
+enabled = false
+```
+
+The mode fixes address discovery to the selected interface's IPv4 main-table default gateway, read through Rust Netlink. Omitted interface/scheme values default to `eth0`/`http`; explicit empty or invalid values fail validation. `server.url` and `server.env_file` are forbidden. The Windows Desktop Server must accept connections on the WSL NAT interface, with firewall access restricted to trusted WSL sources. The Runner must already be enrolled on that Server; discovering an address does not establish Server identity or migrate credentials. HTTP requires a trusted host/WSL private link; HTTPS retains certificate verification. Use WebSocket (default), polling, or auto without a QUIC section; fixed QUIC endpoints are rejected.
+
+Discovery and probing run only before a new Runner startup attempt. Missing routes or an unavailable Desktop Server leave the Controller IPC available with `waiting_for_desktop_server` / `waiting_for_server`, using cancellable backoff capped at 30 seconds without consuming the child-crash restart budget. Each actual Runner restart discovers again. A live Runner never triggers route polling, automatic rebinding or a network-driven restart; use `controller restart runner` explicitly after a NAT address change. Authentication/registration failures stop automatic recovery and report `runner_auth_failed`. This mode cannot restart the Windows Server or manage its Tunnel.
+
+The Controller starts the Runner with `webcodex-runner --config PATH --server-url URL --stop-on-stdin-eof`. The standalone Runner's `--server-url` has the same meaning and validation as `runner.toml`'s `server_url`, with CLI precedence for that process, including hot reload. An invalid explicit value fails without falling back. The configuration file, identity, credentials, project registry and policies are preserved. Controller-managed gateway requests bypass proxies through child-local proxy exclusions; global environment variables are unchanged.
+
+`status --json` reports the current target, generation, binding, sampling time and discovery/probe errors in `wsl2_nat_target`. `doctor --json` uses the active snapshot when the Controller is online; offline discovery is marked `candidate`. Reachability, including HTTP 401/403, never proves Runner authentication. Runner online status is maintained by the authenticated observations described above.
+
+`controller install` installs a user service at `~/.config/systemd/user/webcodex-controller.service` by default and manages it through `systemctl --user`. `status` prefers the live Controller Unix Socket and also reports service state; if the socket is unavailable it still reports the installed service. `logs` prefers the Controller's bounded in-memory component logs and falls back to the user journal. Add `-f` or `--follow` to print the recent tail and keep reading new logs until Ctrl+C; `--lines N` controls the initial tail. If an in-memory follower disconnects or falls behind, it reports an error; rerun the command to read the latest logs. `stop` automatically handles a foreground Controller or installed service. A component-less `restart` prefers an installed service and otherwise restarts the foreground runtime; `restart server|runner|tunnel` always uses Controller IPC. `uninstall --confirm` removes only the Controller unit and preserves controller.toml and controller.env.
+
+All `controller project` commands require `runner.enabled=true` and the configured Runner to be online and visible through the Server. In local/remote modes the Controller daemon itself need not be running. In `wsl2_nat` mode the daemon must be running with an active target matching the current configuration. Project operations use that pinned endpoint and check its generation before each request; an unavailable Controller, unresolved target or changed generation fails explicitly. Offline, inaccessible, or unsupported targets fail explicitly; there is no local registry fallback or automatic Runner start.
+
+Credential precedence for project commands and TUI is: CLI `--user-token-file PATH` → `runner.user_token_file` in `controller.toml` → default connection discovery. Discovery matches the original Server URL and Runner ID, preferring the connection containing the configured Runner file. Only zero matches permit a fallback to `webcodex-user-token` beside the Runner configuration path in use; this is not a recursive scan and requires no `server.toml`. Ambiguous connections, an unusable selected connection credential or an invalid explicit file fail without further fallback. Runner transport and Tunnel credentials are not substitutes. The daemon uses the same rules without a CLI credential override; supplying a credential only to TUI does not configure the daemon. Each observation rereads the credential file to support rotation at the same path; changing Controller configuration requires a Controller restart.
+
+In `wsl2_nat` mode default credentials remain bound to the original Runner configuration and enrolled Server connection; the discovered gateway is never used to guess a new credential directory.
+
+When a Runner has more than 100 projects, remove by the full project ID returned by the Server (for example `agent:runner-a:demo`); this uses an exact Server-side inventory filter. Short IDs and paths require an untruncated inventory to reject ambiguous targets safely.
+
+`project list` calls `list_projects` for the configured Runner and reports inventory synchronization and truncation (up to 100 results). `project register PATH` uses the existing online resolve-or-register API within the Runner's current allowed roots; it does not extend `[policy].allowed_roots`. `project remove ID-OR-PATH` resolves a unique project in a complete inventory and calls `unregister_project` with its revision. It unregisters the project without deleting workspace files, shrinking allowed roots, or stopping the Runner. Changes take effect online without a Runner restart. Revision conflicts fail; lost mutation responses are reported as uncertain and are never automatically retried or repaired by deleting local files. With `--json`, successful API output is written to stdout and command failures are JSON on stderr with a nonzero exit status.
 
 On Windows, `server init`, foreground `server run`, and explicit `share` are supported. The managed service lifecycle (`install`, `start`, `stop`, `restart`, `logs`, `uninstall`) remains Linux-only.
 
@@ -147,24 +313,9 @@ For Runner config terminology, `project_registry_dir` is the directory of Projec
 operator use; `--token` can leak into shell history or process lists. `--strict`
 makes a FAIL report exit with status 2.
 
-### Review (host-local decisions)
+### Review and runtime activity
 
-| Command | Purpose |
-| --- | --- |
-| `webcodex task list` | List recent tasks for this project |
-| `webcodex task show <id>` | Show a task's result, approvals, and timeline |
-| `webcodex task accept <id>` | Apply a reviewed result to the checkout |
-| `webcodex task reject <id> [reason]` | Reject the stable result; the reason reaches the model |
-| `webcodex task resume <id>` | Resume a preserved run after a runtime restart |
-| `webcodex task guide <id> <message>` | Send course-correcting guidance to a running task |
-| `webcodex task approve <id> <approval> [reason]` | Approve one exact raw command for one use |
-| `webcodex task deny <id> <approval> [reason]` | Deny it; the reason is shown to the model |
-| `webcodex task activity` | Show recent mutating tool executions (workspace ledger) |
-
-`task` commands operate on the current project by default; use `--root PATH`,
-`--profile NAME`, or `--state-dir PATH` to point at another project. Accept and
-Reject are the two ways a human applies or discards a coding result locally —
-the online model can never accept its own work.
+The legacy `webcodex task` namespace has been removed with the separate Connector Task/Result/Approval lifecycle. Local `webcodex run` prints the Runtime Console URL (`/runtime`). Runtime review uses the canonical Workflow Session, Job, Git/diff, `read_workspace_changes`, and `finish_coding_task` paths rather than a host-side result accept/reject queue.
 
 ### Credentials and accounts
 
@@ -205,7 +356,6 @@ normal entry points.
 - **Server** — authenticates callers, stores shared runtime state, and routes work.
 - **Runner** — runs repository work on the machine that owns the code.
 - **Project** — one repository/workspace registered by a Runner.
-- **Task** — one bounded project-first unit of work that can be reviewed.
 - **Job** — a command or validation that continues after the initiating call returns.
 - **Workflow Session** — bounded coding evidence/continuity used by the runtime. Ordinary users normally do not manage its internal protocol fields.
 
@@ -220,13 +370,13 @@ quick answer.
 
 | Credential | Prefix | Created by | Used for | Do not use for |
 | --- | --- | --- | --- | --- |
-| Server bootstrap token | (env `WEBCODEX_TOKEN`) | `webcodex server init` | server/admin setup, user creation, pairing | GPT Actions, MCP, Runner, daily use |
+| Server bootstrap token | (env `WEBCODEX_TOKEN`) | `webcodex server init` | server/admin setup, user creation, pairing | MCP, Runner, daily use |
 | Shared key | `wck_...` | `webcodex connect` (generated once) | hosted shared-key MCP + Runner | production IAM |
-| Project Credential | (private file) | `webcodex setup` | the one project's Connector + Runner | other projects, admin |
-| Account credential | `wc_acct_...` | `webcodex users create --issue-credential` | local token creation | GPT Actions, MCP, Runner |
-| Personal API token (PAT) | `wc_pat_...` | `webcodex tokens create-local` | GPT Actions, MCP, REST API | Runner connectivity |
-| Runner token | `wc_agent_...` | `webcodex runner-tokens create-local` | `webcodex-runner` transport only | MCP, REST, GPT Actions |
-| OAuth access token | `wc_oat_...` | OAuth2 authorization flow | GPT Actions / MCP when OAuth is enabled | — |
+| Project Credential | (private file) | `webcodex setup` | one ProjectGrant's ordinary runtime API/MCP access | other ProjectGrants, admin, Runner transport |
+| Account credential | `wc_acct_...` | `webcodex users create --issue-credential` | local token creation | MCP, Runner |
+| Personal API token (PAT) | `wc_pat_...` | `webcodex tokens create-local` | MCP, REST API | Runner connectivity |
+| Runner token | `wc_agent_...` | `webcodex runner-tokens create-local` | `webcodex-runner` transport only | MCP, REST |
+| OAuth access token | `wc_oat_...` | OAuth2 authorization flow | MCP when OAuth is enabled | — |
 
 ### Practical credential rules
 
@@ -262,11 +412,8 @@ Local/manual project-bound workflow (advanced/diagnostic):
 ```bash
 webcodex setup
 webcodex doctor
-webcodex run          # keep this terminal open
+webcodex run          # keep this terminal open; output points to /runtime
 webcodex status       # in another terminal
-webcodex task list
-webcodex task show <task-id>
-webcodex task accept <task-id>
 ```
 
 Existing hosted Server:
@@ -296,3 +443,49 @@ CLI requests follow the standard proxy environment by default
 `--no-system-proxy` to ignore proxy environment and connect directly. These
 flags affect only the CLI's own HTTP requests; `webcodex connect` does not
 persist or inject them into the Runner configuration.
+
+### Offline Tunnel diagnostics
+
+`webcodex environment tunnel-diagnose primary --environment-dir /absolute/environment --json`
+reads the selected catalog and private binding without creating an Environment or starting services.
+It reports saved owner state and allowlisted failure codes, both readiness checks, and whether
+the heartbeat is missing/invalid, stale, from another configuration revision or owner PID.
+Catalog-only configurations report `owner_unverified`; saved state is historical evidence,
+not proof of current readiness. Managed Linux/macOS owners must match the manager's current
+PID. Other managers currently fail closed when an exact PID cannot be verified.
+`tunnel_restart_uncertain` requires reconciling prior effects; diagnostics never clear a
+restart fence or replay a write. Readiness schema v1 gains optional `state` and `diagnostic`
+metadata; older files remain readable, with unavailable state omitted.
+
+### Guarded Tunnel recovery
+
+`webcodex environment recover-tunnel primary --environment-dir /absolute/environment --json`
+is diagnostic by default. It reports the exact run, profile revision, Environment identity,
+and the existing owner/standalone service observations. It never stops a running service.
+After reconciling prior effects and stopping the owner using its existing service lifecycle,
+apply the **observed** identifiers:
+
+```
+webcodex environment recover-tunnel primary --environment-dir /absolute/environment \
+  --apply --accept-uncertain-effects --expected-environment-id ENVIRONMENT_ID \
+  --expected-revision REVISION --expected-run-id RUN_ID
+```
+
+Apply retains the Environment lock, validates the private binding and exact owner, and takes
+an identity-wide lock shared by embedded and standalone Tunnel clients. A live or reused
+owner PID, unknown ownership, competing standalone service, changed profile, or changed run
+fails closed. Only the exact old marker is atomically archived with its original bytes.
+The existing service manager starts the stopped owner, and completion requires fresh
+PID/revision-matched Tunnel and local MCP readiness. Failure retains the archive and reports
+a next action; repeating the same stale request cannot archive a new run or replay a write.
+Starting a Server uses its ordinary lifecycle and loads its saved profiles; no other profile's
+fence or configuration is modified. There is no temporary launchctl job or parallel supervisor.
+
+Automatic recovery currently supports Unix user-managed OpenAI Tunnel owners in a complete
+Environment, using the same per-user state directory as their runtime. Catalog-only setups
+are diagnostic only. New runs write a version 2 marker with PID and opaque run ID; older
+binaries still see the existing `.active` latch and cannot overwrite it. Version 1 markers
+are preserved and reported as `tunnel_legacy_owner_unverifiable`: they contain no owner
+identity, so even risk acknowledgment cannot prove that no old executor remains alive.
+They require separate operator reconciliation; this command does not silently migrate or
+remove them. No credential or public execution scope is added.

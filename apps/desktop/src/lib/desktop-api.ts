@@ -1,12 +1,85 @@
+import type { PathInventory, InventoryDocumentKind } from "../models/path-inventory";
+import type { LocalUpdateStatus, UpdateConfirmation } from "../models/runtime-shell";import type { MachineBuildInfo, RuntimeSettings, RuntimeSource, RuntimeSwitchRequest, RuntimeSwitchResult, DiagnosticSnapshot, DiagnosticResource, TraceUpdate, TraceSettings, UpdateStatus, UpdateDownloadStatus } from "../models/runtime-shell";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ActivityEntry,
+  RunnerPaths,
+  SettingsTarget,
+  PluginRegistration,
+  RunnerSettings,
+  ComputerPermissions,
   DesktopState,
+  ProjectInspection,
   ProjectSelection,
   TunnelProxyMode,
 } from "../models/topology";
 
+import type { CloudflareConnectionRequest, CloudflareConnectionStatus, CloudflareOAuthHandoff, McpProviderRequest, TunnelProfileAction, TunnelProfileRequest } from "../models/connections-tools";
+import type { CodingAgentRequest, SshRegisterRequest, SshResourcesSnapshot, SshMutationResult, RunnerCapabilityAuthorizationSnapshot } from "../models/runner-capabilities";
+
 export const desktopApi = {
+  shellRestoreOnly: () => invoke<boolean>("desktop_shell_restore_only"),
+  shellBootstrapComplete: () => invoke<void>("desktop_shell_bootstrap_complete"),
+  readDesktopNavigation: () => invoke<unknown>("read_desktop_navigation"),
+  acknowledgeDesktopNavigation: (sequence: number) => invoke<void>("acknowledge_desktop_navigation", { sequence }),
+  setDesktopLocale: (locale: import("../i18n/locale").Locale) => invoke<void>("set_desktop_locale", { locale }),
+  managedInstructionsRead: () => invoke<import("../models/managed-instructions").ManagedInstructionsSnapshot>("managed_instructions_read"),
+  managedInstructionsSave: (expected_revision: string, content: string) => invoke<import("../models/managed-instructions").ManagedInstructionsSnapshot>("managed_instructions_save", { request: { expected_revision, content } }),
+  managedInstructionsEnable: (target: SettingsTarget, expected: RunnerPaths, expected_revision: string) => invoke<DesktopState>("managed_instructions_enable", { request: { target, expected, expected_revision } }),
+  prepareProjectUnregister: (project: string) => invoke<import("../models/workspace").UnregisterObservation>("prepare_project_unregister", { project }),
+  prepareProjectsUnregister: (projects: string[]) => invoke<import("../models/workspace").UnregisterObservation[]>("prepare_projects_unregister", { projects }),
+  unregisterProject: ({ target, project, expected_revision }: import("../models/workspace").UnregisterObservation) => invoke<DesktopState>("unregister_project", { request: { target, project, expected_revision, confirmed: true } }),
+  unregisterProjects: (items: import("../models/workspace").UnregisterObservation[]) => invoke<import("../models/workspace").BatchUnregisterResult>("unregister_projects", { request: { items: items.map(({ target, project, expected_revision }) => ({ target, project, expected_revision, confirmed: true })) } }),
+  desktopBuildInfo: () => invoke<MachineBuildInfo>("get_desktop_build_info"),
+  runtimeSettings: () => invoke<RuntimeSettings>("get_runtime_settings"),
+  probeRuntime: (source: RuntimeSource) => invoke<RuntimeSettings>("probe_runtime", { source }),
+  recheckRuntime: () => invoke<RuntimeSettings>("recheck_runtime"),
+  switchRuntime: (request: RuntimeSwitchRequest) => invoke<RuntimeSwitchResult>("switch_runtime", { request }),
+  pathInventory: () => invoke<PathInventory>("get_path_inventory"),
+  openInventoryLocation: (entryId: string, expectedRevision: string) => invoke<void>("open_inventory_location", { request: { entry_id: entryId, expected_revision: expectedRevision } }),
+  exportInventoryDocument: (kind: InventoryDocumentKind, path: string, expectedRevision: string) => invoke<void>("export_inventory_document", { request: { kind, path, expected_revision: expectedRevision } }),
+  diagnostics: () => invoke<DiagnosticSnapshot>("get_diagnostics"),
+  setToolRequestTracing: (request: TraceUpdate) => invoke<TraceSettings>("set_tool_request_tracing", { request }),
+  openDiagnosticResource: (kind: DiagnosticResource) => invoke<void>("open_diagnostic_resource", { kind }),
+  copyRuntimeConsoleCredential: (expectedFence: string) => invoke<void>("copy_runtime_console_credential", { expectedFence }),
+  copyDiagnosticReport: () => invoke<void>("copy_diagnostic_report"),
+  exportSupportBundle: (path: string) => invoke<void>("export_support_bundle", { path }),
+  restorePreviousConfiguration: (expectedPrimarySha256: string) => invoke<DesktopState>("restore_previous_configuration", { expectedPrimarySha256 }),
+  checkForUpdates: (manual = false) => invoke<UpdateStatus>("check_for_updates", { manual }),
+  localUpdateStatus: (inspectFiles = false) => invoke<LocalUpdateStatus>("get_local_update_status", { inspectFiles }),
+  updateDownloadState: () => invoke<UpdateDownloadStatus>("get_update_download_state"),
+  downloadUpdate: (version: string) => invoke<UpdateStatus>("download_update", { version }),
+  cancelUpdateDownload: () => invoke<UpdateDownloadStatus>("cancel_update_download"),
+  setAutomaticUpdateDownload: (enabled: boolean) => invoke<UpdateStatus>("set_automatic_update_download", { enabled }),
+  installVerifiedUpdate: (version: string, confirmed: boolean, confirmation: UpdateConfirmation) => invoke<void>("install_verified_update", { version, confirmed, confirmation }),
+  remindUpdateLater: () => invoke<UpdateStatus>("remind_update_later"),
+  openLatestRelease: () => invoke<void>("open_latest_release"),
+  saveCodingAgent: (request: CodingAgentRequest) => invoke<DesktopState>("save_coding_agent", { request }),
+  removeCodingAgent: (target: SettingsTarget, providerId: string, expectedRevision: number) =>
+    invoke<DesktopState>("remove_coding_agent", { request: { target, provider_id: providerId, expected_revision: expectedRevision } }),
+  sshResources: () => invoke<SshResourcesSnapshot>("ssh_resource_list"),
+  runnerCapabilityAuthorization: (expected: SettingsTarget) =>
+    invoke<RunnerCapabilityAuthorizationSnapshot>("runner_capability_authorization", { expected }),
+  authorizeRunnerCapabilities: (expected: SettingsTarget) =>
+    invoke<RunnerCapabilityAuthorizationSnapshot>("authorize_runner_capabilities", { request: { expected, confirmed: true } }),
+  registerSshResource: (request: SshRegisterRequest) => invoke<SshMutationResult>("ssh_resource_register", { request }),
+  removeSshResource: (expected: SettingsTarget, observationId: string, name: string) =>
+    invoke<SshMutationResult>("ssh_resource_remove", { request: { expected, observation_id: observationId, name } }),
+  cloudflareConnection: <T extends CloudflareConnectionStatus | CloudflareOAuthHandoff = CloudflareConnectionStatus>(request: CloudflareConnectionRequest) => invoke<T>("cloudflare_connection", { request }),
+  saveTunnelProfile: (request: TunnelProfileRequest) => invoke<DesktopState>("save_tunnel_profile", { request }),
+  tunnelProfileAction: (profileId: string, action: TunnelProfileAction, expectedRevision?: number, expectedConfigurationId?: string | null) => invoke<DesktopState>("tunnel_profile_action", { profileId, action, ...(expectedRevision === undefined ? {} : { expectedRevision }), ...(expectedConfigurationId == null ? {} : { expectedConfigurationId }) }),
+  saveMcpProvider: (request: McpProviderRequest) => invoke<DesktopState>("save_mcp_provider", { request }),
+  removeMcpProvider: (id: string, expectedRevision: number) => invoke<DesktopState>("remove_mcp_provider", { id, expectedRevision }),
+  runnerSettings: () => invoke<RunnerSettings>("get_runner_settings"),
+  updateRunnerSettings: (target: SettingsTarget, expected: RunnerPaths, paths: RunnerPaths) => invoke<DesktopState>("update_runner_settings", { request: { target, expected, paths } }),
+  updateRunnerAllowedRoots: (target: SettingsTarget, expected: string[], roots: string[]) => invoke<DesktopState>("update_runner_allowed_roots", { request: { target, expected, roots } }),
+  saveRunnerJobConcurrency: (target: SettingsTarget, expected: number | null, limit: number) => invoke<DesktopState>("save_runner_job_concurrency", { request: { target, expected, limit } }),
+  restartOwnedRunner: (target: SettingsTarget) => invoke<DesktopState>("restart_owned_runner", { target }),
+  addRunnerPlugin: (target: SettingsTarget, provider: PluginRegistration) => invoke<DesktopState>("add_runner_plugin", { request: { target, provider } }),
+  computerPermissions: () => invoke<ComputerPermissions>("get_computer_permissions"),
+  requestComputerPermission: (action: "accessibility" | "screen_recording" | "open_settings" | "open_accessibility_settings" | "open_screen_recording_settings" | "show_runner") => invoke<ComputerPermissions>("request_computer_permission", { action }),
+  updateTunnelConfig: (request: { action: "save"; tunnelId: string; apiKey: string | null } | { action: "use_environment" }) =>
+    invoke<DesktopState>("update_tunnel_config", { request }),
   getState: () => invoke<DesktopState>("get_desktop_state"),
   openPowerShellInstallGuide: () => invoke<void>("open_powershell_install_guide"),
   getLaunchAtLogin: () => invoke<boolean>("get_launch_at_login"),
@@ -15,6 +88,7 @@ export const desktopApi = {
   refresh: () => invoke<DesktopState>("refresh_runtime_status"),
   observeChatgptActivity: () => invoke<DesktopState>("observe_chatgpt_activity"),
   resumeSavedRuntime: () => invoke<DesktopState>("resume_saved_runtime"),
+  resumeSavedConnections: () => invoke<DesktopState>("resume_saved_connections"),
   updateTunnelProxy: (mode: TunnelProxyMode, customUrl?: string | null) =>
     invoke<DesktopState>("update_tunnel_proxy", {
       request: { mode, customUrl: customUrl ?? null },
@@ -23,9 +97,37 @@ export const desktopApi = {
     invoke<ProjectSelection>("inspect_project", {
       request: { projectPath },
     }),
-  configureLocal: (projectPath?: string | null) =>
+  inspectProjectAccess: (projectPath: string) =>
+    invoke<ProjectInspection>("inspect_project_access", {
+      request: { projectPath },
+    }),
+  configureLocal: (projectPath?: string) =>
     invoke<DesktopState>("configure_local_setup", {
       request: { projectPath: projectPath ?? null },
+    }),
+  configureEnvironment: (request: {
+    serviceScope?: "user" | "system";
+    mode: "create" | "join";
+    serverUrl?: string | null;
+    projectPath?: string | null;
+    runner?: boolean;
+    runnerDisplayName?: string | null;
+    pairingCode?: string | null;
+    userToken?: string | null;
+    replacePairingCode?: boolean;
+  }) => invoke<DesktopState>("configure_environment", { request }),
+  createEnvironmentInvitation: (environmentId: string) =>
+    invoke<{ environmentId: string; pairingCode: string }>("create_environment_invitation", { request: { environmentId } }),
+  environmentServiceAction: (request: {
+    environmentId: string;
+    component: "server" | "runner";
+    action: "start" | "stop" | "restart" | "repair_credential";
+  }) => invoke<DesktopState>("environment_service_action", { request }),
+  repairEnvironmentUserCredential: (request: { environmentId: string; userToken: string }) =>
+    invoke<DesktopState>("repair_environment_user_credential", { request }),
+  activateLocalProject: (projectPath: string) =>
+    invoke<DesktopState>("activate_local_project", {
+      request: { projectPath },
     }),
   configureRemote: (
     serverUrl: string,
@@ -51,4 +153,3 @@ export const desktopApi = {
 };
 
 export type QuickShareProvider = "cloudflare" | "openai" | "none";
-

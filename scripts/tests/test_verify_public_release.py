@@ -72,6 +72,56 @@ def synthetic_elf(machine: int, glibc: str = "2.17", needed: tuple[str, ...] = (
 
 
 class ManifestTests(unittest.TestCase):
+    def test_unified_installer_manifest_and_asset_set_require_all_eight_canonical_targets(self) -> None:
+        version = "0.3.8"
+        manifest = {
+            "version": version,
+            "binaries": list(verifier.BINARIES),
+            "artifacts": {
+                platform: {"url": verifier.expected_artifact_url(version, platform), "sha256": "a" * 64}
+                for platform in verifier.PLATFORMS
+            },
+            "installers": {
+                target: {
+                    "platform": platform,
+                    "format": package_format,
+                    "filename": verifier.canonical_installer_name(version, target),
+                    "url": verifier.expected_installer_url(version, target),
+                    "sha256": "b" * 64,
+                    "source_manifest_url": f"https://github.com/{verifier.REPO}/releases/download/v{version}/{verifier.canonical_source_manifest_name(version, platform)}",
+                    "source_manifest_sha256": "c" * 64,
+                }
+                for target, (platform, package_format) in verifier.INSTALLER_TARGETS.items()
+            },
+        }
+        validated = verifier.validate_public_installers(manifest, version)
+        self.assertEqual(set(validated), set(verifier.INSTALLER_TARGETS))
+        names = [verifier.canonical_archive_name(version, platform) for platform in verifier.PLATFORMS]
+        names += [verifier.canonical_installer_name(version, target) for target in verifier.INSTALLER_TARGETS]
+        names += [verifier.canonical_source_manifest_name(version, platform) for platform in verifier.PLATFORMS]
+        names += ["SHA256SUMS", "manifest.json"]
+        release = {
+            "tag_name": f"v{version}", "draft": False, "prerelease": False,
+            "assets": [{"name": name, "state": "uploaded", "browser_download_url": "https://example.invalid/" + name} for name in names],
+        }
+        self.assertEqual(set(verifier.validate_github_assets(release, version)), set(names))
+        partial = dict(manifest)
+        partial["installers"] = dict(manifest["installers"])
+        del partial["installers"]["linux-arm64-rpm"]
+        with self.assertRaises(verifier.VerificationError):
+            verifier.validate_public_installers(partial, version)
+
+    def test_unified_installer_checksums_are_included_only_for_the_complete_set(self) -> None:
+        version = "0.3.8"
+        filenames = [verifier.canonical_archive_name(version, platform) for platform in verifier.PLATFORMS]
+        filenames += [verifier.canonical_installer_name(version, target) for target in verifier.INSTALLER_TARGETS]
+        filenames += [verifier.canonical_source_manifest_name(version, platform) for platform in verifier.PLATFORMS]
+        filenames.append("manifest.json")
+        text = "\n".join(f"{'a' * 64}  {name}" for name in filenames) + "\n"
+        self.assertEqual(len(verifier.parse_sha256sums(text, version, unified_installers=True)), 21)
+        with self.assertRaises(verifier.VerificationError):
+            verifier.parse_sha256sums(text, version)
+
     def test_manifest_requires_exact_release_platforms(self) -> None:
         version = "0.3.8"
         manifest = {
@@ -251,32 +301,81 @@ class DesktopReleaseTests(unittest.TestCase):
         self.assertFalse(verifier.desktop_required(version))
         verifier.validate_github_assets(self._release(version), version)
 
-    def test_0_4_0_requires_all_three_desktop_assets(self) -> None:
-        version = "0.4.0"
-        self.assertTrue(verifier.desktop_required(version))
-        with self.assertRaises(verifier.VerificationError):
-            verifier.validate_github_assets(self._release(version), version)
-        validated = verifier.validate_github_assets(
-            self._release(version, desktop_platforms=verifier.DESKTOP_PLATFORMS), version
-        )
-        for platform in verifier.DESKTOP_PLATFORMS:
-            self.assertIn(verifier.canonical_desktop_name(version, platform), validated)
+    def test_0_4_0_and_0_4_1_keep_historical_three_desktop_assets(self) -> None:
+        for version in ("0.4.0", "0.4.1"):
+            expected = verifier.LEGACY_DESKTOP_PLATFORMS
+            with self.subTest(version=version):
+                self.assertTrue(verifier.desktop_required(version))
+                self.assertEqual(verifier.desktop_platforms_for_version(version), expected)
+                validated = verifier.validate_github_assets(
+                    self._release(version, desktop_platforms=expected), version
+                )
+                for platform in expected:
+                    self.assertIn(verifier.canonical_desktop_name(version, platform), validated)
+                self.assertNotIn(verifier.canonical_desktop_name(version, "win32-arm64"), validated)
 
-    def test_0_4_prerelease_rejects_any_missing_desktop_platform(self) -> None:
+    def test_0_4_0_prerelease_rejects_any_missing_legacy_desktop_platform(self) -> None:
         version = "0.4.0-rc.1"
-        self.assertTrue(verifier.desktop_required(version))
-        for missing in verifier.DESKTOP_PLATFORMS:
-            present = tuple(platform for platform in verifier.DESKTOP_PLATFORMS if platform != missing)
+        expected = verifier.desktop_platforms_for_version(version)
+        self.assertEqual(expected, verifier.LEGACY_DESKTOP_PLATFORMS)
+        for missing in expected:
+            present = tuple(platform for platform in expected if platform != missing)
             with self.subTest(missing=missing), self.assertRaises(verifier.VerificationError):
                 verifier.validate_github_assets(self._release(version, desktop_platforms=present), version)
 
+    def test_0_4_2_requires_windows_arm64_desktop(self) -> None:
+        version = "0.4.2"
+        self.assertEqual(verifier.desktop_platforms_for_version(version), verifier.DESKTOP_PLATFORMS)
+        without_arm = tuple(platform for platform in verifier.DESKTOP_PLATFORMS if platform != "win32-arm64")
+        with self.assertRaises(verifier.VerificationError):
+            verifier.validate_github_assets(self._release(version, desktop_platforms=without_arm), version)
+        verifier.validate_github_assets(
+            self._release(version, desktop_platforms=verifier.DESKTOP_PLATFORMS), version
+        )
+
+    def test_0_4_3_moves_intel_desktop_to_optional_supplemental_pair(self) -> None:
+        version = "0.4.3"
+        self.assertEqual(verifier.desktop_platforms_for_version(version), verifier.PRIMARY_DESKTOP_PLATFORMS)
+        self.assertEqual(
+            verifier.supplemental_desktop_platforms_for_version(version),
+            verifier.SUPPLEMENTAL_DESKTOP_PLATFORMS,
+        )
+        release = self._release(version, desktop_platforms=verifier.PRIMARY_DESKTOP_PLATFORMS)
+        validated = verifier.validate_github_assets(release, version)
+        intel_name = verifier.canonical_desktop_name(version, "darwin-x64")
+        checksum_name = verifier.canonical_desktop_checksum_name(version, "darwin-x64")
+        self.assertNotIn(intel_name, validated)
+
+        release["assets"].extend(
+            [
+                {
+                    "name": intel_name,
+                    "state": "uploaded",
+                    "browser_download_url": verifier.expected_desktop_url(version, "darwin-x64"),
+                },
+                {
+                    "name": checksum_name,
+                    "state": "uploaded",
+                    "browser_download_url": verifier.expected_desktop_checksum_url(version, "darwin-x64"),
+                },
+            ]
+        )
+        validated = verifier.validate_github_assets(release, version)
+        self.assertIn(intel_name, validated)
+        self.assertIn(checksum_name, validated)
+
+        release["assets"] = [asset for asset in release["assets"] if asset["name"] != checksum_name]
+        validated = verifier.validate_github_assets(release, version)
+        self.assertIn(intel_name, validated)
+        self.assertNotIn(checksum_name, validated)
+
     def test_0_4_0_missing_darwin_arm64_is_rejected(self) -> None:
-        present = tuple(platform for platform in verifier.DESKTOP_PLATFORMS if platform != "darwin-arm64")
+        present = tuple(platform for platform in verifier.LEGACY_DESKTOP_PLATFORMS if platform != "darwin-arm64")
         with self.assertRaises(verifier.VerificationError):
             verifier.validate_github_assets(self._release("0.4.0", desktop_platforms=present), "0.4.0")
 
     def test_0_4_0_missing_darwin_x64_is_rejected(self) -> None:
-        present = tuple(platform for platform in verifier.DESKTOP_PLATFORMS if platform != "darwin-x64")
+        present = tuple(platform for platform in verifier.LEGACY_DESKTOP_PLATFORMS if platform != "darwin-x64")
         with self.assertRaises(verifier.VerificationError):
             verifier.validate_github_assets(self._release("0.4.0", desktop_platforms=present), "0.4.0")
 
@@ -285,23 +384,34 @@ class DesktopReleaseTests(unittest.TestCase):
         self.assertTrue(verifier.desktop_required("0.4.0-rc.1"))
         self.assertFalse(verifier.desktop_required("0.3.10-rc.1"))
         self.assertTrue(verifier.desktop_required("1.0.0"))
+        self.assertEqual(verifier.desktop_platforms_for_version("0.4.1"), verifier.LEGACY_DESKTOP_PLATFORMS)
+        self.assertEqual(verifier.desktop_platforms_for_version("0.4.2-rc.1"), verifier.DESKTOP_PLATFORMS)
+        self.assertEqual(verifier.desktop_platforms_for_version("0.4.3"), verifier.PRIMARY_DESKTOP_PLATFORMS)
+        self.assertEqual(
+            verifier.supplemental_desktop_platforms_for_version("0.4.3"),
+            verifier.SUPPLEMENTAL_DESKTOP_PLATFORMS,
+        )
 
-    def test_0_4_sha256sums_requires_all_desktop_platforms(self) -> None:
-        version = "0.4.0"
-        archive_lines = [
-            f"{'a' * 64}  {verifier.canonical_archive_name(version, platform)}"
-            for platform in verifier.PLATFORMS
-        ]
-        with self.assertRaises(verifier.VerificationError):
-            verifier.parse_sha256sums("\n".join(archive_lines) + "\n", version)
-        desktop_lines = [
-            f"{'b' * 64}  {verifier.canonical_desktop_name(version, platform)}"
-            for platform in verifier.DESKTOP_PLATFORMS
-        ]
-        parsed = verifier.parse_sha256sums("\n".join([*archive_lines, *desktop_lines]) + "\n", version)
-        self.assertEqual(len(parsed), 9)
-        for platform in verifier.DESKTOP_PLATFORMS:
-            self.assertEqual(parsed[verifier.canonical_desktop_name(version, platform)], "b" * 64)
+    def test_sha256sums_uses_versioned_desktop_platform_contract(self) -> None:
+        for version, desktop_platforms, expected_count in (
+            ("0.4.0", verifier.LEGACY_DESKTOP_PLATFORMS, 9),
+            ("0.4.1", verifier.LEGACY_DESKTOP_PLATFORMS, 9),
+            ("0.4.2", verifier.DESKTOP_PLATFORMS, 10),
+            ("0.4.3", verifier.PRIMARY_DESKTOP_PLATFORMS, 9),
+        ):
+            archive_lines = [
+                f"{'a' * 64}  {verifier.canonical_archive_name(version, platform)}"
+                for platform in verifier.PLATFORMS
+            ]
+            desktop_lines = [
+                f"{'b' * 64}  {verifier.canonical_desktop_name(version, platform)}"
+                for platform in desktop_platforms
+            ]
+            with self.subTest(version=version):
+                parsed = verifier.parse_sha256sums("\n".join([*archive_lines, *desktop_lines]) + "\n", version)
+                self.assertEqual(len(parsed), expected_count)
+                for platform in desktop_platforms:
+                    self.assertEqual(parsed[verifier.canonical_desktop_name(version, platform)], "b" * 64)
 
     def test_desktop_dmg_public_digest_mismatch_is_rejected(self) -> None:
         version = "0.4.0"
@@ -328,6 +438,39 @@ class DesktopReleaseTests(unittest.TestCase):
             return_value=(123, "a" * 64),
         ), self.assertRaises(verifier.VerificationError):
             verifier.verify_desktop_asset(version, platform, asset, sums, Path(temp), 5)
+
+    def test_supplemental_desktop_checksum_is_verified_independently(self) -> None:
+        version = "0.4.3"
+        platform = "darwin-x64"
+        desktop_name = verifier.canonical_desktop_name(version, platform)
+        checksum_name = verifier.canonical_desktop_checksum_name(version, platform)
+        digest = "a" * 64
+        checksum_bytes = f"{digest}  {desktop_name}\n".encode("ascii")
+        assets = {
+            desktop_name: {
+                "name": desktop_name,
+                "browser_download_url": verifier.expected_desktop_url(version, platform),
+                "digest": "sha256:" + digest,
+            },
+            checksum_name: {
+                "name": checksum_name,
+                "browser_download_url": verifier.expected_desktop_checksum_url(version, platform),
+                "digest": "sha256:" + hashlib.sha256(checksum_bytes).hexdigest(),
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(
+            verifier,
+            "fetch_bytes",
+            return_value=checksum_bytes,
+        ), mock.patch.object(
+            verifier,
+            "download_file",
+            return_value=(321, digest),
+        ):
+            self.assertEqual(
+                verifier.verify_supplemental_desktop_asset(version, platform, assets, Path(temp), 5),
+                (321, digest),
+            )
 
 
 class BinaryInspectionTests(unittest.TestCase):

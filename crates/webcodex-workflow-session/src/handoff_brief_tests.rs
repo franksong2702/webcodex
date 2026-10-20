@@ -14,6 +14,120 @@ use webcodex_core::workflow_session_contract::SessionMode;
 
 const PROJECT: &str = "test-project";
 
+#[test]
+fn handoff_brief_size_matches_buffered_json_bytes() {
+    for value in [
+        json!("plain ASCII"),
+        json!("quote=\" slash=\\ control=\n\t"),
+        json!("Unicode 你好 🦀 日本語"),
+        json!({
+            "nested": [null, true, 42, {"escaped": "line\nnext", "unicode": "界"}],
+            "object": {"path": "src/quoted_\\\".rs"}
+        }),
+    ] {
+        assert_eq!(
+            handoff_brief_size(&value),
+            serde_json::to_vec(&value).unwrap().len()
+        );
+    }
+}
+
+#[test]
+fn handoff_brief_restores_recorded_decisions_and_progress_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger, 16, 200);
+    let session_id = start_session(&store, "continue the authorized project");
+    for (kind, message) in [
+        (
+            SessionMessageKind::Decision,
+            "保留当前数据库，先完成迁移测试",
+        ),
+        (
+            SessionMessageKind::Progress,
+            "Migration tests passed; UI review remains",
+        ),
+    ] {
+        store
+            .post_message(PostSessionMessageInput {
+                session_id: session_id.clone(),
+                kind,
+                message: message.to_string(),
+                tags: Vec::new(),
+                reply_to: None,
+                priority: SessionMessagePriority::Normal,
+            })
+            .unwrap();
+    }
+    store.flush_persistence();
+    let restored = SessionStore::with_persistence(&ledger, 16, 200);
+    let brief = brief_for(&restored, &session_id, false, None, false, None, None, true);
+    assert_eq!(brief["task"]["decisions"]["total"], 1);
+    assert_eq!(
+        brief["task"]["decisions"]["items"][0]["excerpt"],
+        "保留当前数据库，先完成迁移测试"
+    );
+    assert_eq!(
+        brief["task"]["recent_progress"]["items"][0]["excerpt"],
+        "Migration tests passed; UI review remains"
+    );
+    assert_eq!(
+        restored
+            .discussion_summary(&session_id, Some(20))
+            .unwrap()
+            .counts
+            .total,
+        2
+    );
+}
+
+#[test]
+fn handoff_brief_notes_redact_secrets_bound_unicode_and_report_missing_history() {
+    let store = store_with_limit(200);
+    let session_id = start_session(&store, "bounded recovery");
+    for index in 0..8 {
+        let message = if index % 2 == 0 {
+            format!("decision {index}: API_KEY=never-disclose-this-secret")
+        } else {
+            format!("decision {index}: {}", "界".repeat(800))
+        };
+        store
+            .post_message(PostSessionMessageInput {
+                session_id: session_id.clone(),
+                kind: SessionMessageKind::Decision,
+                message,
+                tags: Vec::new(),
+                reply_to: None,
+                priority: SessionMessagePriority::Normal,
+            })
+            .unwrap();
+    }
+    let brief = brief_for(&store, &session_id, false, None, false, None, None, true);
+    assert!(handoff_brief_size(&brief) < HANDOFF_BRIEF_HARD_MAX_BYTES);
+    assert!(!brief.to_string().contains("never-disclose-this-secret"));
+    let notes = &brief["task"]["decisions"];
+    assert_eq!(notes["total"], 8);
+    assert_eq!(notes["truncated"], true);
+    assert!(notes["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|note| note["excerpt"].as_str().unwrap().chars().count()
+            <= HANDOFF_INSTRUCTION_MAX_CHARS));
+    assert!(notes["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|note| note["excerpt"].as_str().unwrap().contains('界') && note["truncated"] == true));
+    let unavailable = brief_for(&store, &session_id, false, None, false, None, None, false);
+    assert!(unavailable["task"]["decisions"]["total"].is_null());
+    assert_eq!(unavailable["basis"]["complete"], false);
+    assert!(unavailable["basis"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("discussion_unavailable")));
+}
+
 fn store_with_limit(max_events: usize) -> SessionStore {
     SessionStore::new(16, max_events)
 }
@@ -52,8 +166,6 @@ fn synthetic_read_contract() -> SessionToolContract {
         change_summary_like: false,
         project_write: false,
         path_hint: SessionPathHint::SinglePath,
-        accepts_context_ack: false,
-        advances_context_checkpoint: false,
     }
 }
 
@@ -67,8 +179,6 @@ fn synthetic_write_contract() -> SessionToolContract {
         change_summary_like: false,
         project_write: true,
         path_hint: SessionPathHint::PathList,
-        accepts_context_ack: false,
-        advances_context_checkpoint: false,
     }
 }
 
@@ -224,6 +334,31 @@ fn brief_for(
     jobs: Option<&Value>,
     guidance_available: bool,
 ) -> Value {
+    brief_for_with_external(
+        store,
+        session_id,
+        workspace_requested,
+        workspace,
+        validation_requested,
+        validation_override,
+        jobs,
+        guidance_available,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn brief_for_with_external(
+    store: &SessionStore,
+    session_id: &str,
+    workspace_requested: bool,
+    workspace: Option<&Value>,
+    validation_requested: bool,
+    validation_override: Option<&Value>,
+    jobs: Option<&Value>,
+    guidance_available: bool,
+    external_observations: Option<&Value>,
+) -> Value {
     let summary = store.summary(session_id, Some(200)).unwrap();
     let validation = validation_override
         .cloned()
@@ -260,14 +395,18 @@ fn brief_for(
     });
     build_handoff_brief(HandoffBriefInput {
         session_summary: &summary,
+        discussion: guidance_available.then_some(&discussion),
         continuation_feedback: &continuation,
         workspace_requested,
         workspace,
         validation_requested,
         validation: Some(&validation),
         jobs,
+        external_observations,
         guidance_available,
         existing_suggested_actions: None,
+        session_changed_during_snapshot: false,
+        external_observations_changed_during_snapshot: false,
     })
 }
 
@@ -286,11 +425,17 @@ fn record_read(store: &SessionStore, session_id: &str, path: &str) {
     let start = store.record_tool_call_started(
         Some(session_id),
         SessionTransport::Api,
-        "read_file",
-        &json!({"project": PROJECT, "path": path}),
+        "read_files",
+        &json!({"project": PROJECT, "items": [{"path": path}]}),
         synthetic_read_contract(),
     );
-    store.record_tool_call_finished(start, true, &json!({"path": path}), None, None);
+    store.record_tool_call_finished(
+        start,
+        true,
+        &json!({"items": [{"index": 0, "success": true, "output": {"path": path}}]}),
+        None,
+        None,
+    );
 }
 
 #[test]
@@ -333,6 +478,69 @@ fn handoff_brief_fresh_active_session_is_stable_and_ready() {
     assert_eq!(first["basis"]["complete"], true);
     assert_eq!(first["deterministic"], true);
     assert_eq!(first["llm_summary"], false);
+}
+
+#[test]
+fn handoff_brief_snapshot_races_require_reread_before_continuing() {
+    let store = store_with_limit(200);
+    let session_id = start_session(
+        &store,
+        &format!("{}{}", "\u{0001}".repeat(500), "🦀".repeat(100)),
+    );
+    add_instruction(
+        &store,
+        &session_id,
+        &format!("{}{}", "\u{0002}".repeat(500), "界".repeat(100)),
+    );
+    let summary = store.summary(&session_id, Some(200)).unwrap();
+    let discussion = discussion(&store, &session_id);
+    let workspace = clean_workspace();
+    let validation = passed_validation();
+    let continuation = json!({"status": "available", "attempt": {}});
+    for (session_changed, external_changed, reason) in [
+        (true, false, "session_changed_during_snapshot"),
+        (false, true, "external_observations_changed_during_snapshot"),
+        (true, true, "session_changed_during_snapshot"),
+    ] {
+        for jobs in [empty_jobs(), jobs_summary(1, 0, 0)] {
+            let brief = build_handoff_brief(HandoffBriefInput {
+                session_summary: &summary,
+                discussion: Some(&discussion),
+                continuation_feedback: &continuation,
+                workspace_requested: true,
+                workspace: Some(&workspace),
+                validation_requested: true,
+                validation: Some(&validation),
+                jobs: Some(&jobs),
+                external_observations: None,
+                guidance_available: true,
+                session_changed_during_snapshot: session_changed,
+                external_observations_changed_during_snapshot: external_changed,
+                existing_suggested_actions: None,
+            });
+            assert_eq!(brief["basis"]["complete"], false);
+            assert!(brief["basis"]["reason_codes"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(reason)));
+            assert_eq!(brief["progress"]["state"], "insufficient_evidence");
+            assert_eq!(
+                brief["next_actions"][0],
+                "re-read read_session_handoff for the exact Session before dependent work"
+            );
+            assert!(!brief["next_actions"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("continue with the next task step")));
+            // Snapshot incompleteness must retain the Job observation; it never
+            // supplies authority to replace an execution.
+            assert_eq!(
+                brief["attention"]["blocking_jobs"],
+                jobs["blocking_active_count"]
+            );
+            assert!(handoff_brief_size(&brief) < HANDOFF_BRIEF_HARD_MAX_BYTES);
+        }
+    }
 }
 
 #[test]
@@ -638,6 +846,33 @@ fn handoff_brief_not_requested_and_unavailable_statuses_use_fixed_reasons() {
 }
 
 #[test]
+fn handoff_brief_non_git_workspace_is_available_with_git_not_applicable() {
+    let store = store_with_limit(200);
+    let session_id = start_session(&store, "non-git workspace");
+    let jobs = empty_jobs();
+    let workspace = json!({
+        "git_available": false,
+        "non_git_project": true,
+        "clean": null,
+        "counts": {},
+    });
+    let brief = brief_for(
+        &store,
+        &session_id,
+        true,
+        Some(&workspace),
+        false,
+        None,
+        Some(&jobs),
+        true,
+    );
+    assert_eq!(brief["workspace"]["status"], "available");
+    assert_eq!(brief["workspace"]["reason_code"], "non_git_project");
+    assert!(brief["workspace"]["dirty"].is_null());
+    assert!(brief["workspace"]["conflicted"].is_null());
+}
+
+#[test]
 fn handoff_brief_attempt_boundary_eviction_marks_basis_incomplete() {
     let store = store_with_limit(6);
     let session_id = start_session(&store, "evicted attempt");
@@ -707,21 +942,119 @@ fn handoff_brief_next_action_priority_is_stable() {
     assert!(brief["next_actions"].as_array().unwrap().len() <= HANDOFF_NEXT_ACTIONS_MAX_ITEMS);
 }
 
+fn legacy_pop_instruction_char(brief: &mut Value, pointer: &str) -> bool {
+    let Some(instruction) = brief.pointer_mut(pointer).and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(mut excerpt) = instruction
+        .get("excerpt")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    if excerpt.pop().is_none() {
+        return false;
+    }
+    instruction.insert("excerpt".to_string(), json!(excerpt));
+    instruction.insert("truncated".to_string(), json!(true));
+    true
+}
+
+fn legacy_instruction_reduction(mut brief: Value) -> (Value, usize) {
+    let mut full_measurements = 0;
+    loop {
+        full_measurements += 1;
+        if serde_json::to_vec(&brief).unwrap().len() < HANDOFF_BRIEF_HARD_MAX_BYTES {
+            break;
+        }
+        let root_len = brief
+            .pointer("/task/root_instruction/excerpt")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or(0);
+        let latest_len = brief
+            .pointer("/task/latest_instruction/excerpt")
+            .and_then(Value::as_str)
+            .map(str::len)
+            .unwrap_or(0);
+        if root_len == 0 && latest_len == 0 {
+            break;
+        }
+        let pointer = if root_len >= latest_len {
+            "/task/root_instruction"
+        } else {
+            "/task/latest_instruction"
+        };
+        if !legacy_pop_instruction_char(&mut brief, pointer) {
+            break;
+        }
+    }
+    (brief, full_measurements)
+}
+
+#[test]
+fn handoff_instruction_reduction_matches_legacy_greedy_with_far_fewer_full_measurements() {
+    let root = format!("{}{}", "\"\\\n\t".repeat(110), "界".repeat(160));
+    let latest = format!("{}{}", "\\\"\r\t".repeat(100), "新".repeat(200));
+    assert_eq!(root.chars().count(), HANDOFF_INSTRUCTION_MAX_CHARS);
+    assert_eq!(latest.chars().count(), HANDOFF_INSTRUCTION_MAX_CHARS);
+    let source = json!({
+        "version": 1,
+        "task": {
+            "root_instruction": {"excerpt": root, "truncated": false},
+            "latest_instruction": {"excerpt": latest, "truncated": false},
+        },
+        "fixed_padding": "p".repeat(6_400),
+        "deterministic": true,
+    });
+    assert!(serde_json::to_vec(&source).unwrap().len() >= HANDOFF_BRIEF_HARD_MAX_BYTES);
+
+    let (legacy, legacy_full_measurements) = legacy_instruction_reduction(source.clone());
+    let mut optimized = source;
+    let (removed, optimized_full_measurements) =
+        crate::handoff_brief::reduce_instruction_excerpts_for_test(&mut optimized);
+
+    assert_eq!(
+        optimized, legacy,
+        "optimized reduction must preserve the old greedy result bit-for-bit"
+    );
+    assert!(
+        removed >= 64,
+        "fixture must exercise substantial instruction reduction: {removed}"
+    );
+    assert_eq!(optimized_full_measurements, 1);
+    assert_eq!(legacy_full_measurements, removed + 1);
+    assert!(legacy_full_measurements >= 65);
+    assert!(legacy_full_measurements >= optimized_full_measurements * 64);
+    assert!(serde_json::to_vec(&optimized).unwrap().len() < HANDOFF_BRIEF_HARD_MAX_BYTES);
+    assert_eq!(optimized["task"]["root_instruction"]["truncated"], true);
+    assert_eq!(optimized["task"]["latest_instruction"]["truncated"], true);
+    let root = optimized["task"]["root_instruction"]["excerpt"]
+        .as_str()
+        .unwrap();
+    let latest = optimized["task"]["latest_instruction"]["excerpt"]
+        .as_str()
+        .unwrap();
+    assert!(std::str::from_utf8(root.as_bytes()).is_ok());
+    assert!(std::str::from_utf8(latest.as_bytes()).is_ok());
+}
+
 fn mutate_feedback_to_worst_case(feedback: &mut Value) {
     let long_path =
         |prefix: &str, index: usize| format!("{prefix}/{index:03}_{}.rs", "x".repeat(470));
     feedback["status"] = json!("available");
     feedback["attempt"]["changes"] = json!({"changed_paths": (0..100).map(|i| json!(long_path("src/quoted_\\segment", i))).collect::<Vec<_>>(), "total_changed_paths": 100, "truncated": false});
-    feedback["attempt"]["exploration"] = json!({"observed_paths": (0..100).map(|i| json!(long_path("src/recent_\\segment", i))).collect::<Vec<_>>(), "total_observed_paths": 100, "truncated": false, "read_count": 100, "search_count": 0, "navigation_count": 0, "latest_tool": "read_file", "complete": true});
+    feedback["attempt"]["exploration"] = json!({"observed_paths": (0..100).map(|i| json!(long_path("src/recent_\\segment", i))).collect::<Vec<_>>(), "total_observed_paths": 100, "truncated": false, "read_count": 100, "search_count": 0, "navigation_count": 0, "latest_tool": "read_files", "complete": true});
     feedback["attempt"]["validation"] = json!({"latest_status": "failed", "unresolved_failure_count": 20, "open_failures": (0..20).map(|i| json!({"kind": "test", "name": format!("tests::{}", format!("failure_{i}_").repeat(18))})).collect::<Vec<_>>(), "total_open_failures": 20, "failures_truncated": false, "delta_available": false});
 }
 
 #[test]
 fn handoff_brief_hard_limit_uses_actual_escaped_json_bytes() {
     let store = store_with_limit(200);
-    let root = format!("root {} {}", "\"\\\\\n\t".repeat(180), "界".repeat(600));
+    let root = format!("{}{}", "\u{0001}".repeat(500), "🦀".repeat(100));
     let session_id = start_session(&store, &root);
-    let latest = format!("latest {} {}", "\"\\\\\n\t".repeat(180), "新".repeat(600));
+    let latest = format!("{}{}", "\u{0002}".repeat(500), "界".repeat(100));
     add_instruction(&store, &session_id, &latest);
     let summary = store.summary(&session_id, Some(200)).unwrap();
     let validation = passed_validation();
@@ -746,23 +1079,135 @@ fn handoff_brief_hard_limit_uses_actual_escaped_json_bytes() {
     });
     mutate_feedback_to_worst_case(&mut feedback);
     let mut workspace = dirty_workspace(0);
-    workspace["branch"] = json!(format!("feature/{}", "b".repeat(240)));
+    workspace["branch"] = json!(format!("feature/{}", "🦀".repeat(256)));
     let brief = build_handoff_brief(HandoffBriefInput {
         session_summary: &summary,
+        discussion: Some(&discussion),
         continuation_feedback: &feedback,
         workspace_requested: true,
         workspace: Some(&workspace),
         validation_requested: true,
         validation: Some(&validation),
         jobs: Some(&jobs),
+        external_observations: None,
         guidance_available: true,
         existing_suggested_actions: None,
+        session_changed_during_snapshot: false,
+        external_observations_changed_during_snapshot: false,
     });
     let bytes = handoff_brief_size(&brief);
+    assert_eq!(bytes, serde_json::to_vec(&brief).unwrap().len());
     assert!(bytes < HANDOFF_BRIEF_HARD_MAX_BYTES, "{bytes}");
     assert_eq!(brief["progress"]["recent_files"]["truncated"], true);
     assert_eq!(brief["progress"]["changes"]["truncated"], true);
     assert_eq!(brief["validation"]["open_failures"]["truncated"], true);
+    let root_chars = brief["task"]["root_instruction"]["excerpt"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .count();
+    let latest_chars = brief["task"]["latest_instruction"]["excerpt"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .count();
+    assert!(
+        root_chars < HANDOFF_INSTRUCTION_MAX_CHARS || latest_chars < HANDOFF_INSTRUCTION_MAX_CHARS,
+        "fixture must reach hard-limit instruction reduction: root={root_chars} latest={latest_chars}"
+    );
+}
+
+#[test]
+fn handoff_brief_byte_budget_drops_old_external_claims_before_native_context() {
+    let reports = (0..5)
+        .map(|n| {
+            json!({
+                "adapter_id": "a".repeat(64),
+                "event_id": format!("{n:064x}"),
+                "tool": "Bash",
+                "exit_code": null,
+                "recorded_at": n + 1,
+                "status": "unknown",
+            })
+        })
+        .collect::<Vec<_>>();
+    let make_external = |items: Vec<Value>| {
+        json!({
+            "status": "available",
+            "reason_code": null,
+            "provenance": "external_report",
+            "coverage": {"complete": false, "reason": "source_sequence_unavailable", "ordering": "server_recorded_at_then_identity"},
+            "total": 5,
+            "returned": items.len(),
+            "truncated": items.len() < 5,
+            "unknown_count": 5,
+            "observations": items,
+        })
+    };
+    let empty = make_external(Vec::new());
+    let full = make_external(reports);
+    let workspace = clean_workspace();
+    let jobs = empty_jobs();
+    let validation = passed_validation();
+    for path_length in [250, 300, 350, 400, 450, 500] {
+        let store = store_with_limit(200);
+        let session_id = start_session(&store, &"r".repeat(500));
+        add_instruction(&store, &session_id, &"l".repeat(500));
+        for n in 0..12 {
+            let path = format!("{n}/{}", "p".repeat(path_length));
+            record_write(&store, &session_id, &path);
+            record_read(&store, &session_id, &path);
+            let baseline = brief_for_with_external(
+                &store,
+                &session_id,
+                true,
+                Some(&workspace),
+                true,
+                Some(&validation),
+                Some(&jobs),
+                true,
+                Some(&empty),
+            );
+            let projected = brief_for_with_external(
+                &store,
+                &session_id,
+                true,
+                Some(&workspace),
+                true,
+                Some(&validation),
+                Some(&jobs),
+                true,
+                Some(&full),
+            );
+            let returned = projected["external_observations"]["returned"]
+                .as_u64()
+                .unwrap();
+            if returned == 0 || returned == 5 || baseline["progress"]["changes"]["returned"] == 0 {
+                continue;
+            }
+            assert!(handoff_brief_size(&projected) < HANDOFF_BRIEF_HARD_MAX_BYTES);
+            assert_eq!(projected["progress"], baseline["progress"]);
+            assert_eq!(projected["validation"], baseline["validation"]);
+            assert_eq!(projected["task"], baseline["task"]);
+            assert_eq!(projected["external_observations"]["total"], 5);
+            assert_eq!(projected["external_observations"]["unknown_count"], 5);
+            assert_eq!(projected["external_observations"]["truncated"], true);
+            assert_eq!(
+                projected["external_observations"]["observations"]
+                    .as_array()
+                    .unwrap()
+                    .len() as u64,
+                returned,
+            );
+            assert_eq!(
+                projected["external_observations"]["observations"][returned as usize - 1]
+                    ["event_id"],
+                format!("{:064x}", 4),
+            );
+            return;
+        }
+    }
+    panic!("fixture did not reach a byte budget where external claims must shrink first");
 }
 
 #[test]

@@ -1,11 +1,19 @@
 //! Runtime observability metadata injected into `ToolRuntime`.
 
-use super::registry::registered_tool_specs;
+mod resources;
+
+use super::runtime_compatibility::{
+    build_alignment_name, compatibility_facts_against, SourceAlignmentStatus,
+};
+use super::tool_definition::model_visible_tool_definitions;
 use super::{permissions, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_protocol::{RunnerView, ShellJobInfo};
 use serde_json::{json, Value};
+use webcodex_core::coding_agent::safe_provider_inventory;
+use webcodex_core::desktop_runtime_contract::{ProtocolCompatibility, DESKTOP_RUNTIME_CONTRACT};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_runner_registry::RuntimeJobAggregateSnapshot;
 
 const LIST_RUNNERS_MAX_CLIENT_IDS: usize = 8;
 const TARGET_CLIENT_ID_MAX_CHARS: usize = 128;
@@ -16,10 +24,13 @@ pub(crate) struct ListRunnersOptions {
     pub(crate) client_ids: Option<Vec<String>>,
     pub(crate) include_projects: Option<bool>,
     pub(crate) summary_only: bool,
+    pub(crate) query: Option<String>,
+    pub(crate) status: Option<webcodex_tool_contracts::tool_call::RunnerStatusFilter>,
+    pub(crate) limit: Option<usize>,
 }
 
 /// Lightweight runtime metadata injected into `ToolRuntime` so observability
-/// tools (e.g. `runtime_status`) can report bounded auth/OAuth/public-url state
+/// tools (e.g. `get_runtime_status`) can report bounded auth/OAuth/public-url state
 /// without the runtime holding a full `Config` (which would couple it to HTTP/fs details).
 ///
 /// `configured_public_url` is `None` when `WEBCODEX_PUBLIC_URL` is unset; the
@@ -27,11 +38,33 @@ pub(crate) struct ListRunnersOptions {
 /// see that the public URL has not been configured.
 #[derive(Debug, Clone)]
 pub struct RuntimeInfo {
+    pub(crate) tunnels: crate::server_tunnels::TunnelStatus,
     pub auth_enabled: bool,
+    /// Raw base flag (`WEBCODEX_SHARED_KEY_ENABLED`) captured at Runtime
+    /// construction, before the remote-boundary policy is applied.
+    pub shared_key_configured: bool,
+    /// Effective direct shared-key policy captured at Runtime construction.
+    /// Unlike `shared_key_configured`, this is false at a remote boundary
+    /// unless the explicit remote opt-in is configured.
+    pub shared_key_enabled: bool,
+    /// Raw explicit remote opt-in (`WEBCODEX_SHARED_KEY_REMOTE_ENABLED`)
+    /// captured at Runtime construction.
+    pub shared_key_remote_enabled: bool,
     pub configured_public_url: Option<String>,
     pub oauth2_enabled: bool,
     pub oauth2_shared_key_bridge_enabled: bool,
     pub quic: Option<std::sync::Arc<std::sync::Mutex<crate::config::QuicRuntimeStatus>>>,
+    /// Effective MCP compact-schema mode captured when this Runtime was built.
+    /// MCP request dispatch and `get_runtime_status` read this snapshot rather than
+    /// re-reading process-global environment, so a running Runtime's protocol
+    /// surface does not drift when the environment changes after startup.
+    pub mcp_compact_schemas: bool,
+    /// Effective MCP App exposure flag captured when this Runtime was built.
+    /// Same startup-snapshot semantics as [`Self::mcp_compact_schemas`].
+    pub mcp_apps_enabled: bool,
+    /// Effective MCP text-JSON compatibility projection captured at Runtime
+    /// construction. Ordinary tool-result framing must not re-read ambient env.
+    pub mcp_text_json_compat_enabled: bool,
 }
 
 impl RuntimeInfo {
@@ -54,6 +87,10 @@ impl RuntimeInfo {
             .filter(|s| !s.is_empty());
         Self {
             auth_enabled,
+            tunnels: Default::default(),
+            shared_key_configured: crate::auth::shared_key_enabled(),
+            shared_key_enabled: crate::auth::direct_shared_key_enabled_with_quic(config, quic_cfg),
+            shared_key_remote_enabled: crate::auth::shared_key_remote_enabled(),
             configured_public_url,
             oauth2_enabled: config.oauth2.enabled,
             oauth2_shared_key_bridge_enabled: config.oauth2.enabled
@@ -61,26 +98,36 @@ impl RuntimeInfo {
             quic: Some(std::sync::Arc::new(std::sync::Mutex::new(
                 quic_cfg.runtime_status(),
             ))),
+            mcp_compact_schemas: crate::model_surface::effective_mcp_compact_schemas(
+                crate::config::mcp_compact_schemas_override(),
+            ),
+            mcp_apps_enabled: crate::config::mcp_apps_enabled(),
+            mcp_text_json_compat_enabled: crate::config::mcp_text_json_compat_enabled(),
         }
     }
 }
 
 impl ToolRuntime {
-    fn effective_config_status(&self) -> Value {
-        let lightweight_auth_available = matches!(
-            self.runtime_exposure(),
-            crate::model_surface::RuntimeExposure::Runtime(_)
-        );
+    pub(crate) fn effective_config_status(&self) -> Value {
         json!({
             "auth": {
-                "shared_key_enabled": lightweight_auth_available
-                    && self.runtime_info.auth_enabled
-                    && crate::auth::shared_key_enabled(),
-                "anonymous_enabled": lightweight_auth_available
-                    && self.runtime_info.auth_enabled
+                "shared_key_configured": self.runtime_info.auth_enabled
+                    && self.runtime_info.shared_key_configured,
+                "shared_key_enabled": self.runtime_info.auth_enabled
+                    && self.runtime_info.shared_key_enabled,
+                "shared_key_remote_enabled": self.runtime_info.auth_enabled
+                    && self.runtime_info.shared_key_remote_enabled,
+                "anonymous_enabled": self.runtime_info.auth_enabled
                     && crate::auth::allow_anonymous_enabled(),
                 "oauth2_enabled": self.runtime_info.oauth2_enabled,
                 "oauth2_shared_key_bridge_enabled": self.runtime_info.oauth2_shared_key_bridge_enabled,
+            },
+            "mcp_host": {
+                "profile": self.deployment_mcp_host_policy.profile.as_str(),
+                "host_budget_secs": self.deployment_mcp_host_policy.host_budget_secs,
+                "initial_job_handoff_secs": self.deployment_mcp_host_policy.initial_job_handoff_secs,
+                "max_sync_wait_secs": self.deployment_mcp_host_policy.max_sync_wait_secs,
+                "continuation_wait_secs": self.deployment_mcp_host_policy.continuation_wait_secs,
             },
             "tool_request_trace_mode": crate::config::tool_request_trace_mode().as_str(),
         })
@@ -146,11 +193,34 @@ impl ToolRuntime {
             }
         }
 
+        if options
+            .query
+            .as_ref()
+            .is_some_and(|q| q.chars().count() > 200 || q.chars().any(char::is_control))
+        {
+            return ToolResult::err("invalid_runner_query");
+        }
+        let query = options
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(str::to_lowercase);
         let access = crate::runner_http::runner_access_from_auth(auth);
-        let mut clients = self
-            .runner_registry
-            .list_runners_for_auth(access.as_ref())
-            .await;
+        let (mut clients, project_counts) = if options.summary_only {
+            let snapshot = self
+                .runner_registry
+                .console_registry_snapshot_for_auth(access.as_ref(), true)
+                .await;
+            (snapshot.runners, Some(snapshot.projects_by_runner))
+        } else {
+            (
+                self.runner_registry
+                    .list_runners_for_auth(access.as_ref())
+                    .await,
+                None,
+            )
+        };
         clients.sort_by(|a, b| a.client_id.cmp(&b.client_id));
         clients.retain(|client| {
             if let Some(expected) = options.client_id.as_deref() {
@@ -163,70 +233,98 @@ impl ToolRuntime {
             }
             true
         });
-        let mut runner_jobs = self
-            .runner_registry
-            .list_all_jobs_for_auth(access.as_ref())
-            .await;
-        if options.client_id.is_some() || options.client_ids.is_some() {
-            runner_jobs.retain(|job| {
-                clients
-                    .iter()
-                    .any(|client| client.client_id == job.client_id)
-            });
+        clients.retain(|client| {
+            use webcodex_tool_contracts::tool_call::RunnerStatusFilter;
+            let status_matches = match options.status {
+                None | Some(RunnerStatusFilter::Any) => true,
+                Some(RunnerStatusFilter::Online) => client.connected,
+                Some(RunnerStatusFilter::Offline) => !client.connected,
+                Some(RunnerStatusFilter::Stale) => client.status == "stale",
+            };
+            status_matches
+                && query.as_deref().is_none_or(|q| {
+                    std::iter::once(client.client_id.as_str())
+                        .chain(client.display_name.as_deref())
+                        .chain(client.hostname.as_deref())
+                        .any(|text| text.to_lowercase().contains(q))
+                })
+        });
+        let matched_count = clients.len();
+        if let Some(limit) = options.limit {
+            clients.truncate(limit.clamp(1, 100));
         }
+        let truncated = clients.len() < matched_count;
+        // Both projections need active aggregates, not historical Job bodies.
+        let active_counts = self
+            .runner_registry
+            .active_job_summary_by_runner_for_auth(access.as_ref())
+            .await;
         let now = chrono::Utc::now().timestamp();
         let include_projects = options.include_projects.unwrap_or(true);
         let runners: Vec<Value> = if options.summary_only {
             clients
                 .iter()
                 .map(|client| {
-                    json!({
+                    let counts = active_counts.get(&client.client_id);
+                    let mut value = json!({
                         "client_id": client.client_id,
-                        "agent_instance_id": client.runner_instance_id,
+                        "runner_instance_id": client.runner_instance_id,
                         "display_name": client.display_name,
                         "status": client.status,
                         "connected": client.connected,
-                        "agent_protocol_generation": client.runner_protocol_generation.get(),
+                        "runner_protocol_generation": client.runner_protocol_generation.get(),
                         "transport": client.transport,
                         "last_seen_age_secs": last_seen_age_secs(client, now),
                         "pending_requests": client.pending_requests,
-                        "projects_count": enabled_projects_count(client),
-                        "project_inventory": client.project_inventory,
-                        "active_jobs": active_jobs_for_client(&runner_jobs, &client.client_id),
-                        "job_concurrency": job_concurrency_for_client(client, &runner_jobs),
+                        "projects_count": project_counts.as_ref().and_then(|counts|counts.get(&client.client_id)).copied().unwrap_or(0),
+                        "active_jobs": counts.map_or(0, |counts|counts.active),
+                        "job_concurrency": {"limit":client.job_concurrency_limit,"running":counts.map_or(0,|counts|counts.running),"queued":counts.map_or(0,|counts|counts.queued)},
+                        "coding_agent_providers": safe_provider_inventory(client.coding_agent_providers.as_deref()),
                         "build": client.build,
-                    })
+                    });
+                    if let Some(availability) = client.computer_session_availability {
+                        value["computer_session_availability"] = json!(availability);
+                    }
+                    value
                 })
                 .collect()
         } else {
             clients
                 .iter()
                 .map(|client| {
+                    let counts = active_counts.get(&client.client_id);
                     let mut value = json!({
                         "client_id": client.client_id,
-                        "agent_instance_id": client.runner_instance_id,
+                        "runner_instance_id": client.runner_instance_id,
                         "display_name": client.display_name,
                         "owner": client.owner,
                         "hostname": client.hostname,
                         "host_context": host_context_projection(client.host_context.as_ref()),
                         "status": client.status,
                         "connected": client.connected,
-                        "agent_protocol_generation": client.runner_protocol_generation.get(),
+                        "runner_protocol_generation": client.runner_protocol_generation.get(),
                         "transport": client.transport,
                         "last_seen": client.last_seen,
                         "last_seen_age_secs": last_seen_age_secs(client, now),
                         "pending_requests": client.pending_requests,
                         "projects_count": enabled_projects_count(client),
                         "project_inventory": client.project_inventory,
-                        "active_jobs": active_jobs_for_client(&runner_jobs, &client.client_id),
-                        "job_concurrency": job_concurrency_for_client(client, &runner_jobs),
+                        "active_jobs": counts.map_or(0, |counts| counts.active),
+                        "job_concurrency": {"limit":client.job_concurrency_limit,
+                            "running":counts.map_or(0,|counts|counts.running),
+                            "queued":counts.map_or(0,|counts|counts.queued)},
+                        "build": client.build,
                         "capabilities": client.capabilities,
+                        "coding_agent_providers": safe_provider_inventory(client.coding_agent_providers.as_deref()),
                         "policy": sanitized_policy_summary(client.policy.as_ref()),
                         "shell_profiles": sanitized_shell_profiles_summary(
                             client.policy.as_ref().and_then(|policy| policy.shell_profiles.as_ref())
                         ),
                         "tool_providers": client.policy.as_ref().and_then(|policy| policy.tool_providers.as_ref()),
                     });
+                    if let Some(availability) = client.computer_session_availability {
+                        value["computer_session_availability"] = json!(availability);
+                    }
                     if include_projects {
                         value["projects"] = json!(client.projects);
                     }
@@ -241,8 +339,8 @@ impl ToolRuntime {
                 .filter(|client| client.status == "stale")
                 .count();
             return ToolResult::ok(json!({
-                // Runtime Console, admin/ops, and status projections consume this established key.
-                "agents": runners,
+                // One canonical Runner collection for Console, admin/ops, and model consumers.
+                "runners": runners,
                 "summary": {
                     "count": clients.len(),
                     "online": online,
@@ -250,14 +348,17 @@ impl ToolRuntime {
                     "stale": stale,
                 },
                 "count": clients.len(),
+                "matched_count": matched_count,
+                "truncated": truncated,
             }));
         }
         ToolResult::ok(json!({
-            // Runtime Console, admin/ops, and status projections consume this established key.
-            "agents": runners,
-            "clients": runner_health_clients(&clients, &runner_jobs, now),
-            "summary": runner_health_summary(&clients, &runner_jobs, now),
+            // One canonical Runner collection for Console, admin/ops, and model consumers.
+            "runners": runners,
+            "summary": runner_health_summary(&clients),
             "count": clients.len(),
+            "matched_count": matched_count,
+            "truncated": truncated,
         }))
     }
 
@@ -265,11 +366,34 @@ impl ToolRuntime {
     /// tokens, api keys, full env, complete project path lists, or
     /// stdout/stderr. Returns a structured JSON object with service metadata,
     /// Runner-registered Project status, Runner summaries, and Job counts.
-    pub(crate) async fn runtime_status(&self, auth: Option<&AuthContext>) -> ToolResult {
+    pub(crate) fn runtime_status<'a>(
+        &'a self,
+        auth: Option<&'a AuthContext>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+        // Runtime status aggregates fleet, project, Job, connection, build, and
+        // configuration state. Keep that aggregate future off caller stacks so
+        // nested startup/admin/status flows remain bounded under workspace-wide
+        // dependency feature unification.
+        Box::pin(async move { self.runtime_status_inner(auth, false).await })
+    }
+
+    async fn runtime_status_inner(&self, auth: Option<&AuthContext>, sparse: bool) -> ToolResult {
         let access = crate::runner_http::runner_access_from_auth(auth);
         let clients = self
             .runner_registry
             .list_runners_for_auth(access.as_ref())
+            .await;
+
+        if sparse {
+            let summary = self
+                .runner_registry
+                .runtime_job_aggregate_for_auth(access.as_ref(), None)
+                .await;
+            return ToolResult::ok(self.sparse_runtime_status(&clients, &summary, None));
+        }
+        let runner_jobs = self
+            .runner_registry
+            .list_all_jobs_for_auth(access.as_ref())
             .await;
 
         // -- Projects summary -------------------------------------------------
@@ -301,9 +425,9 @@ impl ToolRuntime {
             "no_projects"
         };
         let projects = json!({
-            // Stable pre-0.4 runtime_status compatibility identities.
-            "mode": "agent_registered",
-            "agent_registered": {
+            // Observation naming is separate from list_projects.source provenance.
+            "mode": "runner_registered",
+            "runner_registered": {
                 "count": runner_registered_count,
                 "online_count": runner_registered_online_count,
             },
@@ -315,11 +439,6 @@ impl ToolRuntime {
         });
 
         let now = chrono::Utc::now().timestamp();
-        let runner_jobs = self
-            .runner_registry
-            .list_all_jobs_for_auth(access.as_ref())
-            .await;
-
         // -- Runners summary --------------------------------------------------
         // Build a trimmed client list so the summary never leaks per-request
         // state. Only carry fields useful for observability. `last_seen` is a
@@ -334,40 +453,15 @@ impl ToolRuntime {
         let stale_count = runner_count.saturating_sub(online_count);
         let clients_summary: Vec<Value> = clients
             .iter()
-            .map(|c| {
-                json!({
-                    "client_id": c.client_id,
-                    "agent_instance_id": c.runner_instance_id,
-                    "display_name": c.display_name,
-                    "owner": c.owner,
-                    "status": c.status,
-                    "host_context": host_context_projection(c.host_context.as_ref()),
-                    "connected": c.connected,
-                    "agent_protocol_generation": c.runner_protocol_generation.get(),
-                    "transport": c.transport,
-                    "last_seen": c.last_seen,
-                    "last_seen_age_secs": last_seen_age_secs(c, now),
-                    "pending_requests": c.pending_requests,
-                    "active_jobs": active_jobs_for_client(&runner_jobs, &c.client_id),
-                    "job_concurrency": job_concurrency_for_client(c, &runner_jobs),
-                    "capabilities": c.capabilities,
-                    "projects_count": enabled_projects_count(c),
-                    "project_inventory": c.project_inventory,
-                    "policy": sanitized_policy_summary(c.policy.as_ref()),
-                    "shell_profiles": sanitized_shell_profiles_summary(
-                        c.policy.as_ref().and_then(|p| p.shell_profiles.as_ref())
-                    ),
-                    "tool_providers": c.policy.as_ref().and_then(|p| p.tool_providers.as_ref()),
-                })
-            })
+            .map(|client| runtime_status_client_summary(client, &runner_jobs, now))
             .collect();
-        let runners = json!({
-            "count": runner_count,
-            "online_count": online_count,
-            "stale_count": stale_count,
-            "clients": clients_summary,
-            "summary": runner_health_summary(&clients, &runner_jobs, now),
-        });
+        let runners = runtime_status_runners_summary(
+            runner_count,
+            online_count,
+            stale_count,
+            clients_summary,
+            runner_health_summary(&clients),
+        );
         let connection_layers = connection_layers(
             &clients,
             runner_registered_count,
@@ -381,55 +475,13 @@ impl ToolRuntime {
         // -- jobs summary -----------------------------------------------------
         // Registered Project jobs are Runner-owned. Active includes same-runner
         // `recovering` jobs during restart/reconnect reconciliation.
-        let runner_known_count = runner_jobs.len();
-        let active_count = runner_jobs
-            .iter()
-            .filter(|j| webcodex_runner_registry::job_status_is_active(&j.status))
-            .count();
-        let recovering_count = runner_jobs
-            .iter()
-            .filter(|job| job.status == "recovering")
-            .count();
-        let running_count = runner_jobs
-            .iter()
-            .filter(|job| job_status_is_running(&job.status))
-            .count();
-        let queued_count = runner_jobs
-            .iter()
-            .filter(|job| job_status_is_runner_queued(&job.status))
-            .count();
-        let reconciled_count = runner_jobs
-            .iter()
-            .filter(|job| job.recovery_state.as_deref() == Some("reconciled"))
-            .count();
-        let lost_after_reconcile_count = runner_jobs
-            .iter()
-            .filter(|job| {
-                job.status == "lost"
-                    && matches!(
-                        job.recovery_reason_code.as_deref(),
-                        Some(
-                            "runner_inventory_missing"
-                                | "runner_instance_replaced"
-                                | "runner_recovery_deadline_exceeded"
-                        )
-                    )
-            })
-            .count();
-        let jobs = json!({
-            "count": runner_known_count,
-            "active_count": active_count,
-            "running_count": running_count,
-            "queued_count": queued_count,
-            "recovering_count": recovering_count,
-            "reconciled_count": reconciled_count,
-            "lost_after_reconcile_count": lost_after_reconcile_count,
-        });
+        let jobs = runtime_job_counts(&runner_jobs);
 
         // -- tools summary ----------------------------------------------------
-        let specs = registered_tool_specs();
-        let tools_count = specs.len();
-        let tools_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
+        let tools_names: Vec<String> = model_visible_tool_definitions()
+            .map(|definition| definition.name.to_string())
+            .collect();
+        let tools_count = tools_names.len();
         let tools = json!({
             "count": tools_count,
             "names": tools_names,
@@ -446,31 +498,69 @@ impl ToolRuntime {
             })
         });
 
-        let mut output = json!({
-            "service": "webcodex",
-            "runtime_exposure": self.runtime_exposure().name(),
-            "mcp_compact_schemas": crate::config::mcp_compact_schemas_enabled(),
-            "effective_config": self.effective_config_status(),
-            "version": env!("CARGO_PKG_VERSION"),
-            "build": crate::build_info::runtime_build_info(),
-            "server_time": now,
-            "pid": std::process::id(),
-            "auth_enabled": self.runtime_info.auth_enabled,
-            "configured_public_url": self.runtime_info.configured_public_url,
-            "projects": projects,
-            // Runtime Console, admin HTTP, and CLI ops consume this established key.
-            "agents": runners,
-            "connection_layers": connection_layers,
-            "version_compatibility": version_compatibility,
-            "jobs": jobs,
-            "tools": tools,
-            "authority": permissions::authority_profile_payload(),
-            "session_store": self.sessions.status(),
-        });
-        if let Some(quic) = quic {
-            output["quic"] = quic;
+        // Keep the top-level status assembly incremental. A single large `json!`
+        // here materially inflates the debug async poll frame on fresh builds and
+        // can overflow the default Tokio worker stack once a Runner is registered.
+        let mut output = serde_json::Map::with_capacity(18);
+        output.insert("service".to_string(), json!("webcodex"));
+        output.insert(
+            "mcp_compact_schemas".to_string(),
+            json!(self.runtime_info.mcp_compact_schemas),
+        );
+        output.insert(
+            "effective_config".to_string(),
+            self.effective_config_status(),
+        );
+        output.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+        output.insert(
+            "desktop_runtime_contract".to_string(),
+            json!(DESKTOP_RUNTIME_CONTRACT),
+        );
+        output.insert(
+            "build".to_string(),
+            json!(crate::build_info::runtime_build_info()),
+        );
+        output.insert("server_time".to_string(), json!(now));
+        output.insert("pid".to_string(), json!(std::process::id()));
+        output.insert(
+            "auth_enabled".to_string(),
+            json!(self.runtime_info.auth_enabled),
+        );
+        output.insert(
+            "configured_public_url".to_string(),
+            json!(self.runtime_info.configured_public_url),
+        );
+        output.insert("projects".to_string(), projects);
+        // Runtime Console, admin HTTP, and CLI ops consume this established key.
+        output.insert("runners".to_string(), runners);
+        output.insert(
+            "connection_layers".to_string(),
+            connection_layers.into_value(),
+        );
+        output.insert(
+            "protocol_compatibility".to_string(),
+            version_compatibility["protocol_compatibility"].clone(),
+        );
+        output.insert(
+            "build_alignment".to_string(),
+            version_compatibility["build_alignment"].clone(),
+        );
+        output.insert("version_compatibility".to_string(), version_compatibility);
+        output.insert("jobs".to_string(), jobs);
+        output.insert("tools".to_string(), tools);
+        output.insert(
+            "authority".to_string(),
+            permissions::authority_profile_payload(),
+        );
+        output.insert("session_store".to_string(), json!(self.sessions.status()));
+        let tunnels = self.runtime_info.tunnels.snapshot();
+        if !tunnels.is_empty() {
+            output.insert("tunnels".into(), json!(tunnels));
         }
-        ToolResult::ok(output)
+        if let Some(quic) = quic {
+            output.insert("quic".to_string(), quic);
+        }
+        ToolResult::ok(Value::Object(output))
     }
 
     pub(crate) async fn runtime_status_with_options(
@@ -480,24 +570,119 @@ impl ToolRuntime {
         summary_only: bool,
         client_id: Option<String>,
     ) -> ToolResult {
-        let result = match client_id {
-            Some(client_id) => self.runtime_status_for_client(auth, client_id).await,
-            None => self.runtime_status(auth).await,
-        };
-        if result.success && (compact || summary_only) {
-            ToolResult {
-                output: compact_runtime_status(&result.output),
-                ..result
+        let sparse = compact || summary_only;
+        let mut result = match client_id {
+            Some(client_id) => {
+                self.runtime_status_for_client(auth, client_id, sparse)
+                    .await
             }
-        } else {
-            result
+            None => Box::pin(self.runtime_status_inner(auth, sparse)).await,
+        };
+        // Only explicitly requested full diagnostics pay for OS/file observation.
+        // The bootstrap runtime_status path and all sparse/error paths stay cheap.
+        if result.success && !sparse {
+            let sessions = self.sessions.clone();
+            let observed = tokio::task::spawn_blocking(move || {
+                (
+                    resources::observe(),
+                    serde_json::to_value(sessions.persistence_observation()),
+                )
+            })
+            .await;
+            if let Some(output) = result.output.as_object_mut() {
+                match observed {
+                    Ok((resources, persistence)) => {
+                        output.insert("resources".into(), resources);
+                        if let Ok(persistence) = persistence {
+                            output.insert("session_persistence".into(), persistence);
+                        }
+                    }
+                    Err(_) => {
+                        output.insert(
+                            "resources".into(),
+                            json!({"scope":"server_process", "status":"unavailable"}),
+                        );
+                    }
+                }
+            }
         }
+        result
+    }
+
+    fn sparse_runtime_status(
+        &self,
+        clients: &[RunnerView],
+        jobs: &RuntimeJobAggregateSnapshot,
+        focus: Option<&RunnerView>,
+    ) -> Value {
+        let build = crate::build_info::runtime_build_info();
+        let projects: usize = clients.iter().map(enabled_projects_count).sum();
+        let online_projects: usize = clients
+            .iter()
+            .filter(|c| c.connected)
+            .map(enabled_projects_count)
+            .sum();
+        let compatibility = version_compatibility_against(
+            clients,
+            env!("CARGO_PKG_VERSION"),
+            build.git_commit,
+            build.git_dirty,
+            Value::Null,
+            false,
+        );
+        let connection = connection_states(clients, projects, online_projects);
+        let mut result = json!({
+            "service": "webcodex",
+            "version": env!("CARGO_PKG_VERSION"),
+            "build": {"git_commit": build.git_commit, "git_dirty": build.git_dirty},
+            "mcp_host": {"profile": self.deployment_mcp_host_policy.profile.as_str()},
+            "projects": {"count": projects, "online_count": online_projects, "status": if projects > 0 { "ok" } else { "no_projects" }},
+            "jobs": {
+                "active_count": jobs.active_count,
+                "running_count": jobs.running_count,
+                "queued_count": jobs.queued_count,
+                "recovering_count": jobs.recovering_count,
+                "lost_after_reconcile_count": jobs.lost_after_reconcile_count
+            },
+            "connection": connection
+        });
+        if let Some(client) = focus {
+            result["focus"] = json!({
+                "client_id": client.client_id,
+                "connected": client.connected,
+                "status": client.status,
+                "project_count": projects,
+                "job_concurrency": {
+                    "limit": client.job_concurrency_limit,
+                    "running": jobs.by_runner.get(&client.client_id).map_or(0, |count| count.running),
+                    "queued": jobs.by_runner.get(&client.client_id).map_or(0, |count| count.queued)
+                },
+                "runner_protocol_generation": client.runner_protocol_generation.get(),
+                "protocol_compatibility": compatibility["protocol_compatibility"],
+                "build_alignment": compatibility["build_alignment"],
+                "source_alignment": compatibility["source_alignment"]["status"]
+            });
+        } else {
+            result["runners"] = json!({
+                "count": clients.len(),
+                "online_count": clients.iter().filter(|c| c.connected).count(),
+                "stale_count": clients.iter().filter(|c| c.status == "stale").count()
+            });
+            result["compatibility"] = json!({
+                "protocol": compatibility["protocol_compatibility"],
+                "build_alignment": compatibility["build_alignment"],
+                "source_alignment": compatibility["source_alignment"]["status"],
+                "mixed_builds_present": compatibility["mixed_builds_present"]
+            });
+        }
+        result
     }
 
     async fn runtime_status_for_client(
         &self,
         auth: Option<&AuthContext>,
         client_id: String,
+        sparse: bool,
     ) -> ToolResult {
         if !valid_target_client_id(&client_id) {
             return ToolResult::err_with_output(
@@ -513,7 +698,6 @@ impl ToolRuntime {
         let Some(client) = visible_clients
             .iter()
             .find(|client| client.client_id == client_id)
-            .cloned()
         else {
             return ToolResult::err_with_output(
                 "unknown_client_id: no caller-visible Runner matches the exact client_id"
@@ -521,20 +705,26 @@ impl ToolRuntime {
                 json!({"error_kind": "unknown_client_id", "client_id": client_id}),
             );
         };
+        let clients = std::slice::from_ref(client);
+        if sparse {
+            let summary = self
+                .runner_registry
+                .runtime_job_aggregate_for_auth(access.as_ref(), Some(&client.client_id))
+                .await;
+            return ToolResult::ok(self.sparse_runtime_status(clients, &summary, Some(client)));
+        }
         let visible_jobs = self
             .runner_registry
             .list_all_jobs_for_auth(access.as_ref())
             .await;
         let selected_jobs: Vec<ShellJobInfo> = visible_jobs
-            .iter()
+            .into_iter()
             .filter(|job| job.client_id == client.client_id)
-            .cloned()
             .collect();
-        let clients = vec![client.clone()];
         let now = chrono::Utc::now().timestamp();
-        let project_count = enabled_projects_count(&client);
+        let project_count = enabled_projects_count(client);
         let online_project_count = if client.connected { project_count } else { 0 };
-        let target_compatibility = version_compatibility(&clients);
+        let target_compatibility = version_compatibility(clients);
         let target_runner = target_compatibility
             .pointer("/runners/0")
             .cloned()
@@ -549,11 +739,11 @@ impl ToolRuntime {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mismatched_agents_count = fleet_runners
+        let mismatched_runners_count = fleet_runners
             .iter()
             .filter(|runner| runner.get("status").and_then(Value::as_str) != Some("compatible"))
             .count();
-        let source_mismatched_agents_count = fleet_runners
+        let source_mismatched_runners_count = fleet_runners
             .iter()
             .filter(|runner| {
                 runner
@@ -562,43 +752,11 @@ impl ToolRuntime {
                     == Some("different")
             })
             .count();
-        let runner_active = selected_jobs
-            .iter()
-            .filter(|job| webcodex_runner_registry::job_status_is_active(&job.status))
-            .count();
-        let running_count = selected_jobs
-            .iter()
-            .filter(|job| job_status_is_running(&job.status))
-            .count();
-        let queued_count = selected_jobs
-            .iter()
-            .filter(|job| job_status_is_runner_queued(&job.status))
-            .count();
-        let recovering_count = selected_jobs
-            .iter()
-            .filter(|job| job.status == "recovering")
-            .count();
-        let reconciled_count = selected_jobs
-            .iter()
-            .filter(|job| job.recovery_state.as_deref() == Some("reconciled"))
-            .count();
-        let lost_after_reconcile_count = selected_jobs
-            .iter()
-            .filter(|job| {
-                job.status == "lost"
-                    && matches!(
-                        job.recovery_reason_code.as_deref(),
-                        Some(
-                            "runner_inventory_missing"
-                                | "runner_instance_replaced"
-                                | "runner_recovery_deadline_exceeded"
-                        )
-                    )
-            })
-            .count();
+        let jobs = runtime_job_counts(&selected_jobs);
+        let runner_active = jobs["active_count"].clone();
         let projects = json!({
-            "mode": "agent_registered",
-            "agent_registered": {
+            "mode": "runner_registered",
+            "runner_registered": {
                 "count": project_count,
                 "online_count": online_project_count,
             },
@@ -614,219 +772,210 @@ impl ToolRuntime {
             "stale_count": usize::from(!client.connected),
             "clients": [{
                 "client_id": client.client_id,
-                "agent_instance_id": client.runner_instance_id,
+                "runner_instance_id": client.runner_instance_id,
                 "display_name": client.display_name,
                 "status": client.status,
                 "connected": client.connected,
-                "agent_protocol_generation": client.runner_protocol_generation.get(),
+                "runner_protocol_generation": client.runner_protocol_generation.get(),
                 "transport": client.transport,
                 "last_seen": client.last_seen,
-                "last_seen_age_secs": last_seen_age_secs(&client, now),
+                "last_seen_age_secs": last_seen_age_secs(client, now),
                 "pending_requests": client.pending_requests,
                 "active_jobs": active_jobs_for_client(&selected_jobs, &client.client_id),
-                "job_concurrency": job_concurrency_for_client(&client, &selected_jobs),
+                "job_concurrency": job_concurrency_for_client(client, &selected_jobs),
                 "projects_count": project_count,
+                "project_inventory": client.project_inventory,
+                "build": client.build,
+                "coding_agent_providers": safe_provider_inventory(client.coding_agent_providers.as_deref()),
             }],
-            "summary": runner_health_summary(&clients, &selected_jobs, now),
+            "summary": runner_health_summary(clients),
         });
-        let jobs = json!({
-            "count": selected_jobs.len(),
-            "active_count": runner_active,
-            "running_count": running_count,
-            "queued_count": queued_count,
-            "recovering_count": recovering_count,
-            "reconciled_count": reconciled_count,
-            "lost_after_reconcile_count": lost_after_reconcile_count,
-        });
-        let specs = registered_tool_specs();
+        let tool_names: Vec<String> = model_visible_tool_definitions()
+            .map(|definition| definition.name.to_string())
+            .collect();
         let tools = json!({
-            "count": specs.len(),
-            "names": specs.iter().map(|spec| spec.name.clone()).collect::<Vec<_>>(),
+            "count": tool_names.len(),
+            "names": tool_names,
         });
         let server_build = crate::build_info::runtime_build_info();
-        ToolResult::ok(json!({
-            "service": "webcodex",
-            "runtime_exposure": self.runtime_exposure().name(),
-            "mcp_compact_schemas": crate::config::mcp_compact_schemas_enabled(),
-            "effective_config": self.effective_config_status(),
+        let focus = json!({
+            "client_id": client.client_id,
+            "connected": client.connected,
+            "status": client.status,
+            "runner_instance_id": client.runner_instance_id,
+            "build": client.build,
+            "coding_agent_providers": safe_provider_inventory(client.coding_agent_providers.as_deref()),
+            "project_count": project_count,
+            "active_jobs": runner_active,
+            "job_concurrency": job_concurrency_for_client(client, &selected_jobs),
+            "compatibility_status": target_runner.get("status").cloned().unwrap_or(Value::Null),
+            "protocol_compatibility": target_runner.get("protocol_compatibility").cloned().unwrap_or(Value::Null),
+            "build_alignment": target_runner.get("build_alignment").cloned().unwrap_or(Value::Null),
+            "runner_protocol_generation": client.runner_protocol_generation.get(),
+            "capabilities": client.capabilities,
+            "source_alignment": source_alignment,
+        });
+        let server = json!({
             "version": env!("CARGO_PKG_VERSION"),
             "build": server_build,
-            "server_time": now,
-            "pid": std::process::id(),
-            "auth_enabled": self.runtime_info.auth_enabled,
-            "configured_public_url": self.runtime_info.configured_public_url,
-            "focus": {
-                "client_id": client.client_id,
-                "connected": client.connected,
-                "status": client.status,
-                "agent_instance_id": client.runner_instance_id,
-                "build": client.build,
-                "project_count": project_count,
-                "active_jobs": runner_active,
-                "job_concurrency": job_concurrency_for_client(&client, &selected_jobs),
-                "compatibility_status": target_runner.get("status").cloned().unwrap_or(Value::Null),
-                "source_alignment": source_alignment,
-            },
-            "server": {
-                "version": env!("CARGO_PKG_VERSION"),
-                "build": server_build,
-            },
-            "fleet_summary": {
-                "visible_runner_count": visible_clients.len(),
-                "mismatched_agents_count": mismatched_agents_count,
-                "source_mismatched_agents_count": source_mismatched_agents_count,
-                "mixed_builds_present": mismatched_agents_count > 0 || source_mismatched_agents_count > 0,
-            },
-            "projects": projects,
-            "agents": runners,
-            "version_compatibility": target_compatibility,
-            "jobs": jobs,
-            "tools": tools,
-            "authority": permissions::authority_profile_payload(),
-        }))
+            "desktop_runtime_contract": DESKTOP_RUNTIME_CONTRACT,
+        });
+        let fleet_summary = json!({
+            "visible_runner_count": visible_clients.len(),
+            "mismatched_runners_count": mismatched_runners_count,
+            "source_mismatched_runners_count": source_mismatched_runners_count,
+            "mixed_builds_present": mismatched_runners_count > 0 || source_mismatched_runners_count > 0,
+        });
+        // As above, avoid one large `json!` in this async poll frame so focused
+        // status requests retain the same bounded worker-stack behavior.
+        let mut output = serde_json::Map::with_capacity(17);
+        output.insert("service".to_string(), json!("webcodex"));
+        output.insert(
+            "mcp_compact_schemas".to_string(),
+            json!(self.runtime_info.mcp_compact_schemas),
+        );
+        output.insert(
+            "effective_config".to_string(),
+            self.effective_config_status(),
+        );
+        output.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+        output.insert(
+            "desktop_runtime_contract".to_string(),
+            json!(DESKTOP_RUNTIME_CONTRACT),
+        );
+        output.insert("build".to_string(), json!(server_build));
+        output.insert("server_time".to_string(), json!(now));
+        output.insert("pid".to_string(), json!(std::process::id()));
+        output.insert(
+            "auth_enabled".to_string(),
+            json!(self.runtime_info.auth_enabled),
+        );
+        output.insert(
+            "configured_public_url".to_string(),
+            json!(self.runtime_info.configured_public_url),
+        );
+        output.insert("focus".to_string(), focus);
+        output.insert("server".to_string(), server);
+        output.insert("fleet_summary".to_string(), fleet_summary);
+        output.insert("projects".to_string(), projects);
+        output.insert("runners".to_string(), runners);
+        output.insert(
+            "protocol_compatibility".to_string(),
+            target_compatibility["protocol_compatibility"].clone(),
+        );
+        output.insert(
+            "build_alignment".to_string(),
+            target_compatibility["build_alignment"].clone(),
+        );
+        output.insert("version_compatibility".to_string(), target_compatibility);
+        output.insert("jobs".to_string(), jobs);
+        output.insert("tools".to_string(), tools);
+        output.insert(
+            "authority".to_string(),
+            permissions::authority_profile_payload(),
+        );
+        ToolResult::ok(Value::Object(output))
     }
 }
 
+/// Startup already needs full status for its owning-Runner brief. Its model
+/// projection shares the sparse field selection without preserving inventories.
 pub(crate) fn compact_runtime_status(status: &Value) -> Value {
-    if status.get("focus").is_some() {
-        return json!({
-            "compact": true,
-            "service": status.get("service").cloned().unwrap_or_else(|| json!("webcodex")),
-            "runtime_exposure": status
-                .get("runtime_exposure")
-                .cloned()
-                .unwrap_or_else(|| json!(crate::model_surface::MODEL_SURFACE_LOCAL_CODING)),
-            "mcp_compact_schemas": status.get("mcp_compact_schemas").cloned().unwrap_or_else(|| json!(false)),
-            "effective_config": status.get("effective_config").cloned().unwrap_or(Value::Null),
-            "auth_enabled": status.get("auth_enabled").cloned().unwrap_or_else(|| json!(false)),
-            "configured_public_url": status.get("configured_public_url").cloned().unwrap_or(Value::Null),
-            "version": status.get("version").cloned().unwrap_or(Value::Null),
-            "focus": status.get("focus").cloned().unwrap_or(Value::Null),
-            "server": status.get("server").cloned().unwrap_or(Value::Null),
-            "fleet_summary": status.get("fleet_summary").cloned().unwrap_or(Value::Null),
-            "projects": {
-                "effective": status.pointer("/projects/effective").cloned().unwrap_or(Value::Null),
-                "agent_registered": status.pointer("/projects/agent_registered").cloned().unwrap_or(Value::Null),
-            },
-            "jobs": {
-                "active_count": status.pointer("/jobs/active_count").cloned().unwrap_or(Value::Null),
-                "running_count": status.pointer("/jobs/running_count").cloned().unwrap_or(Value::Null),
-                "queued_count": status.pointer("/jobs/queued_count").cloned().unwrap_or(Value::Null),
-            },
-            "version_compatibility": {
-                "status": status.pointer("/version_compatibility/status").cloned().unwrap_or_else(|| json!("unknown")),
-                "source_alignment": status.pointer("/version_compatibility/source_alignment").cloned().unwrap_or_else(|| json!({"status": "unknown"})),
-            },
-        });
-    }
-    let mut compact = json!({
-        "compact": true,
-        "service": status.get("service").cloned().unwrap_or_else(|| json!("webcodex")),
-        "runtime_exposure": status
-            .get("runtime_exposure")
-            .cloned()
-            .unwrap_or_else(|| json!(crate::model_surface::MODEL_SURFACE_LOCAL_CODING)),
-        "mcp_compact_schemas": status.get("mcp_compact_schemas").cloned().unwrap_or_else(|| json!(false)),
-        "effective_config": status.get("effective_config").cloned().unwrap_or(Value::Null),
-        "auth_enabled": status.get("auth_enabled").cloned().unwrap_or_else(|| json!(false)),
-        "configured_public_url": status.get("configured_public_url").cloned().unwrap_or(Value::Null),
-        "version": status.get("version").cloned().unwrap_or(Value::Null),
-        "build": {
-            "version": status.get("version").cloned().unwrap_or(Value::Null),
-            "git_commit": status.pointer("/build/git_commit").cloned().unwrap_or(Value::Null),
-            "git_dirty": status.pointer("/build/git_dirty").cloned().unwrap_or(Value::Null),
-        },
-        "tools": {
-            "count": status.pointer("/tools/count").cloned().unwrap_or(Value::Null),
-        },
-        "jobs": {
-            "active_count": status.pointer("/jobs/active_count").cloned().unwrap_or(Value::Null),
-            "running_count": status.pointer("/jobs/running_count").cloned().unwrap_or(Value::Null),
-            "queued_count": status.pointer("/jobs/queued_count").cloned().unwrap_or(Value::Null),
-        },
-        "agents": {
-            "count": status.pointer("/agents/count").cloned().unwrap_or_else(|| json!(0)),
-            "online_count": status.pointer("/agents/online_count").cloned().unwrap_or_else(|| json!(0)),
-            "stale_count": status.pointer("/agents/stale_count").cloned().unwrap_or_else(|| json!(0)),
-            "clients": compact_runner_clients(status),
-            "summary": status.pointer("/agents/summary").cloned().unwrap_or_else(|| json!({
-                "count": 0,
-                "online": 0,
-                "offline": 0,
-                "stale": 0,
-                "clients": [],
-            })),
+    let mut result = json!({
+        "service": status["service"],
+        "version": status["version"],
+        "build": {"git_commit": status["build"]["git_commit"], "git_dirty": status["build"]["git_dirty"]},
+        "mcp_host": {"profile": status["effective_config"]["mcp_host"]["profile"]},
+        "runners": {
+            "count": status["runners"]["count"],
+            "online_count": status["runners"]["online_count"],
+            "stale_count": status["runners"]["stale_count"]
         },
         "projects": {
-            "effective": status.pointer("/projects/effective").cloned().unwrap_or_else(|| json!({
-                "count": 0,
-                "status": "unknown",
-            })),
-            "agent_registered": status.pointer("/projects/agent_registered").cloned().unwrap_or_else(|| json!({
-                "count": 0,
-                "online_count": 0,
-            })),
-            "mode": status.pointer("/projects/mode").cloned().unwrap_or_else(|| json!("agent_registered")),
+            "count": status["projects"]["count"],
+            "online_count": status["projects"]["runner_registered"]["online_count"],
+            "status": status["projects"]["effective"]["status"]
         },
-        "connection_layers": status.get("connection_layers").cloned().unwrap_or_else(|| json!({
-            "runner_process": {"status": "not_observed"},
-            "server_transport": {"status": "not_observed"},
-            "server_registration": {"status": "not_observed"},
-            "project_registry": {"status": "not_observed"},
-            "connector_endpoint": {"status": "not_observed"},
-            "last_successful_tool_call": {"status": "not_observed"},
-        })),
-        "version_compatibility": {
-            "status": status.pointer("/version_compatibility/status").cloned().unwrap_or_else(|| json!("unknown")),
-            "source_alignment": status.pointer("/version_compatibility/source_alignment").cloned().unwrap_or_else(|| json!({"status": "unknown"})),
-        },
-        "authority": status.get("authority").cloned().unwrap_or(Value::Null),
-    });
-    if let Some(object) = compact.as_object_mut() {
-        for field in ["focus", "server", "fleet_summary"] {
-            if let Some(value) = status.get(field) {
-                object.insert(field.to_string(), value.clone());
-            }
+        "compatibility": {
+            "protocol": status["protocol_compatibility"],
+            "build_alignment": status["build_alignment"],
+            "source_alignment": status["version_compatibility"]["source_alignment"]["status"]
         }
-    }
-    compact
+    });
+    result["jobs"] = sparse_job_counts(&status["jobs"]);
+    result["connection"] = sparse_connection_layers(&status["connection_layers"]);
+    result
 }
 
-fn compact_runner_clients(status: &Value) -> Vec<Value> {
-    let runners = status
-        .pointer("/agents/clients")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let compatibility = status
-        .pointer("/version_compatibility/runners")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+fn sparse_job_counts(jobs: &Value) -> Value {
+    let mut result = serde_json::Map::new();
+    for key in [
+        "active_count",
+        "running_count",
+        "queued_count",
+        "recovering_count",
+        "lost_after_reconcile_count",
+    ] {
+        if let Some(value) = jobs.get(key) {
+            result.insert(key.into(), value.clone());
+        }
+    }
+    Value::Object(result)
+}
 
-    runners
+fn sparse_connection_layers(layers: &Value) -> Value {
+    let mut result = serde_json::Map::new();
+    for key in ["runner_process", "server_transport", "project_registry"] {
+        result.insert(key.into(), layers[key]["status"].clone());
+    }
+    Value::Object(result)
+}
+
+fn runtime_job_counts(runner_jobs: &[ShellJobInfo]) -> Value {
+    let runner_known_count = runner_jobs.len();
+    let active_count = runner_jobs
         .iter()
-        .filter_map(|runner| {
-            let client_id = runner.get("client_id")?.as_str()?;
-            let compat = compatibility
-                .iter()
-                .find(|candidate| candidate.get("client_id").and_then(Value::as_str) == Some(client_id));
-            let mut compact = json!({
-                "client_id": client_id,
-                "agent_instance_id": runner.get("agent_instance_id").cloned().unwrap_or(Value::Null),
-                "status": runner.get("status").cloned().unwrap_or(Value::Null),
-                "transport": runner.get("transport").cloned().unwrap_or(Value::Null),
-                "build_git_commit": compat.and_then(|value| value.get("build_git_commit")).cloned().unwrap_or(Value::Null),
-                "build_git_dirty": compat.and_then(|value| value.get("build_git_dirty")).cloned().unwrap_or(Value::Null),
-                "version_matches_server": compat.and_then(|value| value.get("version_matches_server")).cloned().unwrap_or(Value::Null),
-                "source_alignment": compat.and_then(|value| value.get("source_alignment")).cloned().unwrap_or_else(|| json!({"status": "unknown"})),
-            });
-            if status.get("focus").is_none() {
-                compact["host_context"] = runner.get("host_context").cloned().unwrap_or(Value::Null);
-            }
-            Some(compact)
+        .filter(|j| webcodex_runner_registry::job_status_is_active(&j.status))
+        .count();
+    let recovering_count = runner_jobs
+        .iter()
+        .filter(|job| job.status == "recovering")
+        .count();
+    let running_count = runner_jobs
+        .iter()
+        .filter(|job| job_status_is_running(&job.status))
+        .count();
+    let queued_count = runner_jobs
+        .iter()
+        .filter(|job| job_status_is_runner_queued(&job.status))
+        .count();
+    let reconciled_count = runner_jobs
+        .iter()
+        .filter(|job| job.recovery_state.as_deref() == Some("reconciled"))
+        .count();
+    let lost_after_reconcile_count = runner_jobs
+        .iter()
+        .filter(|job| {
+            job.status == "lost"
+                && matches!(
+                    job.recovery_reason_code.as_deref(),
+                    Some(
+                        "runner_inventory_missing"
+                            | "runner_instance_replaced"
+                            | "runner_recovery_deadline_exceeded"
+                    )
+                )
         })
-        .collect()
+        .count();
+    json!({
+        "count": runner_known_count,
+        "active_count": active_count,
+        "running_count": running_count,
+        "queued_count": queued_count,
+        "recovering_count": recovering_count,
+        "reconciled_count": reconciled_count,
+        "lost_after_reconcile_count": lost_after_reconcile_count,
+    })
 }
 
 fn host_context_projection(context: Option<&crate::runner_protocol::RunnerHostContext>) -> Value {
@@ -876,14 +1025,74 @@ fn layer_observation(
     layer
 }
 
-fn connection_layers(
+#[derive(serde::Serialize)]
+struct ConnectionStates {
+    runner_process: &'static str,
+    server_transport: &'static str,
+    project_registry: &'static str,
+}
+
+fn connection_states(
+    clients: &[RunnerView],
+    registered_projects: usize,
+    online_projects: usize,
+) -> ConnectionStates {
+    let online = clients.iter().any(|client| client.connected);
+    ConnectionStates {
+        runner_process: if online {
+            "ready"
+        } else if clients.is_empty() {
+            "not_observed"
+        } else {
+            "stale"
+        },
+        server_transport: if online {
+            "connected"
+        } else if clients.is_empty() {
+            "not_observed"
+        } else {
+            "disconnected"
+        },
+        project_registry: if registered_projects == 0 {
+            "not_configured"
+        } else if online_projects > 0 {
+            "registered"
+        } else {
+            "stale"
+        },
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct RuntimeConnectionLayers {
+    pub(super) runner_process: Value,
+    pub(super) server_transport: Value,
+    pub(super) server_registration: Value,
+    pub(super) project_registry: Value,
+    pub(super) last_successful_tool_call: Value,
+}
+
+impl RuntimeConnectionLayers {
+    fn into_value(self) -> Value {
+        json!({
+            "runner_process": self.runner_process,
+            "server_transport": self.server_transport,
+            "server_registration": self.server_registration,
+            "project_registry": self.project_registry,
+            "last_successful_tool_call": self.last_successful_tool_call,
+        })
+    }
+}
+
+pub(super) fn connection_layers(
     clients: &[RunnerView],
     registered_projects: usize,
     online_projects: usize,
     observations: &super::observations::RuntimeObservations,
     auth: Option<&AuthContext>,
     now: i64,
-) -> Value {
+) -> RuntimeConnectionLayers {
+    let states = connection_states(clients, registered_projects, online_projects);
     // Freshest client drives single-value observations; counts stay explicit.
     let freshest = clients.iter().max_by_key(|c| c.last_seen);
     let online: Vec<&RunnerView> = clients.iter().filter(|c| c.connected).collect();
@@ -900,7 +1109,7 @@ fn connection_layers(
                 ("transport_liveness", Some("process_start_not_reported"))
             };
             layer_observation(
-                "ready",
+                states.runner_process,
                 Some(client.last_seen),
                 source,
                 Some(RUNNER_STALE_AFTER_SECS),
@@ -908,13 +1117,13 @@ fn connection_layers(
                 now,
                 json!({
                     "client_id": client.client_id,
-                    "agent_instance_id": client.runner_instance_id,
+                    "runner_instance_id": client.runner_instance_id,
                     "process_started_at": client.process_started_at,
                 }),
             )
         }
         (None, Some(client)) => layer_observation(
-            "stale",
+            states.runner_process,
             Some(client.last_seen),
             "server_heartbeat_window",
             Some(RUNNER_STALE_AFTER_SECS),
@@ -922,12 +1131,12 @@ fn connection_layers(
             now,
             json!({
                 "client_id": client.client_id,
-                "agent_instance_id": client.runner_instance_id,
+                "runner_instance_id": client.runner_instance_id,
                 "process_started_at": client.process_started_at,
             }),
         ),
         (None, None) => layer_observation(
-            "not_observed",
+            states.runner_process,
             None,
             "server_registry",
             None,
@@ -940,7 +1149,7 @@ fn connection_layers(
     // -- server_transport: real connection lifecycle --------------------------
     let server_transport = match (freshest_online, freshest) {
         (Some(client), _) => layer_observation(
-            "connected",
+            states.server_transport,
             Some(client.last_seen),
             "server_transport_lifecycle",
             Some(RUNNER_STALE_AFTER_SECS),
@@ -955,7 +1164,7 @@ fn connection_layers(
             }),
         ),
         (None, Some(client)) => layer_observation(
-            "disconnected",
+            states.server_transport,
             client.disconnected_at.or(Some(client.last_seen)),
             "server_transport_lifecycle",
             None,
@@ -970,7 +1179,7 @@ fn connection_layers(
             }),
         ),
         (None, None) => layer_observation(
-            "not_observed",
+            states.server_transport,
             None,
             "server_transport_lifecycle",
             None,
@@ -1024,7 +1233,7 @@ fn connection_layers(
     // -- project_registry ------------------------------------------------------
     let project_registry = if registered_projects == 0 {
         layer_observation(
-            "not_configured",
+            states.project_registry,
             None,
             "runner_project_report",
             None,
@@ -1034,7 +1243,7 @@ fn connection_layers(
         )
     } else if online_projects > 0 {
         layer_observation(
-            "registered",
+            states.project_registry,
             freshest_online.map(|c| c.last_seen),
             "runner_project_report",
             Some(RUNNER_STALE_AFTER_SECS),
@@ -1050,7 +1259,7 @@ fn connection_layers(
         // Projects are known but their providing runner connection is gone:
         // a stale registration must not pretend to be callable.
         layer_observation(
-            "stale",
+            states.project_registry,
             freshest.map(|c| c.last_seen),
             "runner_project_report",
             Some(RUNNER_STALE_AFTER_SECS),
@@ -1061,47 +1270,6 @@ fn connection_layers(
                 "online_projects": 0,
             }),
         )
-    };
-
-    // -- connector_endpoint: observed activity, never config inference --------
-    let connector_endpoint = if !observations.connector_configured() {
-        layer_observation(
-            "not_configured",
-            None,
-            "connector_runtime",
-            None,
-            Some("connector_runtime_disabled"),
-            now,
-            json!({}),
-        )
-    } else {
-        match observations.latest_connector_observation() {
-            Some(observation) => {
-                let status = match observation.status.as_str() {
-                    "ready" | "request_succeeded" => "ready",
-                    _ => "unknown",
-                };
-                let reason = (status == "unknown").then_some("last_probe_not_ready");
-                layer_observation(
-                    status,
-                    Some(observation.observed_at),
-                    &observation.source,
-                    Some(ACTIVITY_STALE_AFTER_SECS),
-                    reason,
-                    now,
-                    json!({"last_observation": observation.status}),
-                )
-            }
-            None => layer_observation(
-                "not_observed",
-                None,
-                "connector_runtime",
-                None,
-                Some("no_connector_requests_observed"),
-                now,
-                json!({}),
-            ),
-        }
     };
 
     // -- last_successful_tool_call: scoped meaningful activity ----------------
@@ -1143,20 +1311,27 @@ fn connection_layers(
         ),
     };
 
-    json!({
-        "runner_process": runner_process,
-        "server_transport": server_transport,
-        "server_registration": server_registration,
-        "project_registry": project_registry,
-        "connector_endpoint": connector_endpoint,
-        "last_successful_tool_call": last_successful_tool_call,
-    })
+    RuntimeConnectionLayers {
+        runner_process,
+        server_transport,
+        server_registration,
+        project_registry,
+        last_successful_tool_call,
+    }
 }
 
 /// Mixed-version diagnostics: a connected runner is not automatically
 /// capability-compatible. Reports facts about which side to upgrade without
 /// exposing paths or environment.
-fn version_compatibility(clients: &[RunnerView]) -> Value {
+impl ToolRuntime {
+    /// Reuse build/protocol truth without dispatching full runtime diagnostics
+    /// or materializing Project/Job histories for the Console navigation bar.
+    pub(crate) fn console_runner_alignment(&self, clients: &[RunnerView]) -> Value {
+        version_compatibility(clients)
+    }
+}
+
+pub(super) fn version_compatibility(clients: &[RunnerView]) -> Value {
     let build = crate::build_info::runtime_build_info();
     version_compatibility_against(
         clients,
@@ -1164,6 +1339,7 @@ fn version_compatibility(clients: &[RunnerView]) -> Value {
         build.git_commit,
         build.git_dirty,
         json!(build),
+        true,
     )
 }
 
@@ -1173,104 +1349,107 @@ fn version_compatibility_against(
     server_git_commit: Option<&str>,
     server_git_dirty: Option<bool>,
     server_build: Value,
+    detailed: bool,
 ) -> Value {
-    let mut overall = if clients.is_empty() {
-        "no_runners"
-    } else {
-        "compatible"
-    };
-    let mut source_overall = if clients.is_empty() {
-        "no_runners"
-    } else {
-        "aligned"
-    };
-    let runners: Vec<Value> = clients
-        .iter()
-        .map(|client| {
-            let build_version = client.build.as_ref().and_then(|b| b.version.clone());
-            let build_git_commit = client.build.as_ref().and_then(|b| b.git_commit.clone());
-            let build_git_dirty = client.build.as_ref().and_then(|b| b.git_dirty);
-            let version_matches_server = build_version
-                .as_deref()
-                .map(|version| version == server_version);
-            let git_commit_matches_server = match (build_git_commit.as_deref(), server_git_commit) {
-                (Some(runner), Some(server)) => Some(runner == server),
-                _ => None,
-            };
-            let source_matches_server = match (
-                git_commit_matches_server,
-                build_git_dirty,
-                server_git_dirty,
-            ) {
-                (Some(false), _, _) => Some(false),
-                (Some(true), Some(false), Some(false)) => Some(true),
-                (Some(true), Some(true), _) | (Some(true), _, Some(true)) => Some(false),
-                _ => None,
-            };
-            let (source_status, source_reason_code, source_action) = match source_matches_server {
-                Some(true) => ("aligned", None, None),
-                Some(false) if git_commit_matches_server == Some(false) => (
-                    "different",
-                    Some("runner_git_commit_differs_from_server"),
-                    Some("redeploy the older side when exact dogfood source alignment is required"),
-                ),
-                Some(false) => (
-                    "different",
-                    Some("dirty_build_prevents_exact_source_alignment"),
-                    Some("rebuild clean artifacts before relying on exact source alignment"),
-                ),
-                None => (
-                    "unknown",
-                    Some("build_source_identity_incomplete"),
-                    Some("use builds that report git commit and dirty state for exact source alignment"),
-                ),
-            };
-            match (source_status, source_overall) {
-                ("different", _) => source_overall = "different",
-                ("unknown", "aligned") => source_overall = "unknown",
-                _ => {}
-            }
+    let facts =
+        compatibility_facts_against(clients, server_version, server_git_commit, server_git_dirty);
+    let runners: Vec<Value> = if detailed {
+        clients
+            .iter()
+            .zip(&facts.runners)
+            .map(|(client, facts)| {
+                let (source_reason_code, source_action) = match facts.source_alignment {
+                    SourceAlignmentStatus::Aligned => (None, None),
+                    SourceAlignmentStatus::Different
+                        if facts.git_commit_matches_server == Some(false) => (
+                        Some("runner_git_commit_differs_from_server"),
+                        Some(
+                            "diagnostic only: normal compatible builds may differ in source revision",
+                        ),
+                    ),
+                    SourceAlignmentStatus::Different => (
+                        Some("dirty_build_prevents_exact_source_alignment"),
+                        Some(
+                            "diagnostic only: modified builds remain the operator responsibility",
+                        ),
+                    ),
+                    SourceAlignmentStatus::Unknown | SourceAlignmentStatus::NoRunners => (
+                        Some("build_source_identity_incomplete"),
+                        Some(
+                            "use builds that report git commit and dirty state for exact source alignment",
+                        ),
+                    ),
+                };
+                let (reason_code, action) = match facts.protocol_compatibility {
+                    ProtocolCompatibility::Compatible => (None, None),
+                    ProtocolCompatibility::Incompatible => (
+                        Some("runner_protocol_generation_unsupported"),
+                        Some("use a Runner with a supported protocol generation"),
+                    ),
+                    ProtocolCompatibility::Unknown => (
+                        Some("runner_protocol_generation_unavailable"),
+                        Some("reconnect with an explicit supported protocol generation"),
+                    ),
+                };
+                let build_built_at = client.build.as_ref().and_then(|b| b.built_at.clone());
+                let build_target = client.build.as_ref().and_then(|b| b.target.clone());
+                let build_architecture = client
+                    .build
+                    .as_ref()
+                    .and_then(|b| b.architecture.clone());
 
-            let (status, reason_code, action) = if version_matches_server == Some(false) {
-                (
-                    "version_mismatch",
-                    Some("runner_version_differs_from_server"),
-                    Some("align server and runner package versions (redeploy the older side)"),
-                )
-            } else {
-                ("compatible", None, None)
-            };
-            if status == "version_mismatch" {
-                overall = "version_mismatch";
-            }
-            json!({
-                "client_id": client.client_id,
-                "agent_protocol_generation": client.runner_protocol_generation.get(),
-                "build_version": build_version,
-                "build_git_commit": build_git_commit,
-                "build_git_dirty": build_git_dirty,
-                "version_matches_server": version_matches_server,
-                "status": status,
-                "reason_code": reason_code,
-                "action": action,
-                "source_alignment": {
-                    "status": source_status,
-                    "git_commit_matches_server": git_commit_matches_server,
-                    "source_matches_server": source_matches_server,
-                    "reason_code": source_reason_code,
-                    "action": source_action,
-                },
+                json!({
+                    "client_id": facts.client_id,
+                    "runner_protocol_generation": client.runner_protocol_generation.get(),
+                    "build_version": facts.build_version,
+                    "build_git_commit": facts.build_git_commit,
+                    "build_git_dirty": facts.build_git_dirty,
+                    "build_built_at": build_built_at,
+                    "build_target": build_target,
+                    "build_architecture": build_architecture,
+                    "version_matches_server": facts.version_matches_server,
+                    "protocol_compatibility": facts.protocol_compatibility,
+                    "build_alignment": facts.build_alignment,
+                    "status": facts.status_name(),
+                    "reason_code": reason_code,
+                    "action": action,
+                    "source_alignment": {
+                        "status": facts.source_alignment.as_str(),
+                        "git_commit_matches_server": facts.git_commit_matches_server,
+                        "source_matches_server": facts.source_matches_server,
+                        "reason_code": source_reason_code,
+                        "action": source_action,
+                    },
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let overall = facts.status.status_name();
+    let protocol_compatibility = facts.status.protocol_name();
+    let build_alignment = build_alignment_name(facts.build_alignment);
+    let source_overall = facts.source_alignment.as_str();
+    let mixed_builds_present = facts.mixed_builds_present;
+    if !detailed {
+        return json!({
+            "protocol_compatibility": protocol_compatibility,
+            "build_alignment": build_alignment,
+            "source_alignment": {"status": source_overall},
+            "mixed_builds_present": mixed_builds_present
+        });
+    }
     json!({
         "status": overall,
+        "protocol_compatibility": protocol_compatibility,
+        "build_alignment": build_alignment,
         "source_alignment": {
             "status": source_overall,
         },
         "server": {
             "version": server_version,
             "build": server_build,
+            "desktop_runtime_contract": DESKTOP_RUNTIME_CONTRACT,
         },
         "runners": runners,
     })
@@ -1296,7 +1475,10 @@ pub(crate) fn version_compatibility_for_test(
             "git_commit": server_git_commit,
             "git_dirty": server_git_dirty,
             "built_at": null,
+            "target": null,
+            "architecture": null,
         }),
+        true,
     )
 }
 
@@ -1329,6 +1511,10 @@ fn job_status_is_running(status: &str) -> bool {
     )
 }
 
+fn job_status_occupies_execution_slot(status: &str) -> bool {
+    RunnerJobLifecycle::from_wire(status).is_ok_and(RunnerJobLifecycle::occupies_execution_slot)
+}
+
 fn job_status_is_runner_queued(status: &str) -> bool {
     matches!(
         RunnerJobLifecycle::from_wire(status),
@@ -1343,7 +1529,10 @@ fn job_concurrency_for_client(client: &RunnerView, runner_jobs: &[ShellJobInfo])
         .iter()
         .filter(|job| job.client_id == client.client_id)
     {
-        running += usize::from(job_status_is_running(&job.status));
+        // A stop request does not release the durable execution slot until
+        // termination is observed. Keep capacity distinct from the literal
+        // running-state count used elsewhere in Runtime status.
+        running += usize::from(job_status_occupies_execution_slot(&job.status));
         queued += usize::from(job_status_is_runner_queued(&job.status));
     }
     json!({
@@ -1353,30 +1542,7 @@ fn job_concurrency_for_client(client: &RunnerView, runner_jobs: &[ShellJobInfo])
     })
 }
 
-fn runner_health_clients(
-    clients: &[RunnerView],
-    runner_jobs: &[ShellJobInfo],
-    now: i64,
-) -> Vec<Value> {
-    clients
-        .iter()
-        .map(|client| {
-            json!({
-                "client_id": client.client_id,
-                "status": client.status,
-                "transport": client.transport,
-                "last_seen_age_secs": last_seen_age_secs(client, now),
-                "projects_count": enabled_projects_count(client),
-                "project_inventory": client.project_inventory,
-                "pending_requests": client.pending_requests,
-                "active_jobs": active_jobs_for_client(runner_jobs, &client.client_id),
-                "job_concurrency": job_concurrency_for_client(client, runner_jobs),
-            })
-        })
-        .collect()
-}
-
-fn runner_health_summary(clients: &[RunnerView], runner_jobs: &[ShellJobInfo], now: i64) -> Value {
+fn runner_health_summary(clients: &[RunnerView]) -> Value {
     let online = clients.iter().filter(|client| client.connected).count();
     let stale = clients
         .iter()
@@ -1388,11 +1554,110 @@ fn runner_health_summary(clients: &[RunnerView], runner_jobs: &[ShellJobInfo], n
         "online": online,
         "offline": offline,
         "stale": stale,
-        "clients": runner_health_clients(clients, runner_jobs, now),
     })
 }
 
-/// Build the sanitized policy summary JSON exposed in `runtime_status` and
+fn runtime_status_client_summary(
+    client: &RunnerView,
+    runner_jobs: &[ShellJobInfo],
+    now: i64,
+) -> Value {
+    // Build this projection incrementally rather than through one large `json!`
+    // expression. A current Runner carries a wide capability set plus nested
+    // policy/provider metadata, and materializing the whole object in one macro
+    // can exceed the default Tokio worker stack in debug builds.
+    let mut value = serde_json::Map::with_capacity(22);
+    value.insert("client_id".to_string(), json!(client.client_id));
+    value.insert(
+        "runner_instance_id".to_string(),
+        json!(client.runner_instance_id),
+    );
+    value.insert("display_name".to_string(), json!(client.display_name));
+    value.insert("owner".to_string(), json!(client.owner));
+    value.insert("status".to_string(), json!(client.status));
+    value.insert(
+        "host_context".to_string(),
+        host_context_projection(client.host_context.as_ref()),
+    );
+    value.insert("connected".to_string(), json!(client.connected));
+    value.insert(
+        "runner_protocol_generation".to_string(),
+        json!(client.runner_protocol_generation.get()),
+    );
+    value.insert("transport".to_string(), json!(client.transport));
+    value.insert("last_seen".to_string(), json!(client.last_seen));
+    value.insert(
+        "last_seen_age_secs".to_string(),
+        json!(last_seen_age_secs(client, now)),
+    );
+    value.insert(
+        "pending_requests".to_string(),
+        json!(client.pending_requests),
+    );
+    value.insert(
+        "active_jobs".to_string(),
+        json!(active_jobs_for_client(runner_jobs, &client.client_id)),
+    );
+    value.insert(
+        "job_concurrency".to_string(),
+        job_concurrency_for_client(client, runner_jobs),
+    );
+    value.insert("build".to_string(), json!(client.build));
+    value.insert("capabilities".to_string(), json!(client.capabilities));
+    value.insert(
+        "coding_agent_providers".to_string(),
+        json!(safe_provider_inventory(
+            client.coding_agent_providers.as_deref()
+        )),
+    );
+    value.insert(
+        "projects_count".to_string(),
+        json!(enabled_projects_count(client)),
+    );
+    value.insert(
+        "project_inventory".to_string(),
+        json!(client.project_inventory),
+    );
+    value.insert(
+        "policy".to_string(),
+        sanitized_policy_summary(client.policy.as_ref()),
+    );
+    value.insert(
+        "shell_profiles".to_string(),
+        sanitized_shell_profiles_summary(
+            client
+                .policy
+                .as_ref()
+                .and_then(|policy| policy.shell_profiles.as_ref()),
+        ),
+    );
+    value.insert(
+        "tool_providers".to_string(),
+        json!(client
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.tool_providers.as_ref())),
+    );
+    Value::Object(value)
+}
+
+fn runtime_status_runners_summary(
+    count: usize,
+    online_count: usize,
+    stale_count: usize,
+    clients: Vec<Value>,
+    health_summary: Value,
+) -> Value {
+    let mut value = serde_json::Map::with_capacity(5);
+    value.insert("count".to_string(), json!(count));
+    value.insert("online_count".to_string(), json!(online_count));
+    value.insert("stale_count".to_string(), json!(stale_count));
+    value.insert("clients".to_string(), Value::Array(clients));
+    value.insert("summary".to_string(), health_summary);
+    Value::Object(value)
+}
+
+/// Build the sanitized policy summary JSON exposed in `get_runtime_status` and
 /// `list_runners`. Only the safe fields are carried: `allow_raw_shell`,
 /// `allow_cwd_anywhere`, `allowed_roots`, `max_timeout_secs`,
 /// `max_output_bytes`. The agent token, shell env values, init_script
@@ -1413,7 +1678,7 @@ fn sanitized_policy_summary(policy: Option<&crate::runner_protocol::RunnerPolicy
 }
 
 /// Build the sanitized shell-profiles summary JSON exposed in
-/// `runtime_status`, `list_runners`, and `list_projects`. Only safe metadata is
+/// `get_runtime_status`, `list_runners`, and `list_projects`. Only safe metadata is
 /// carried: default profile name, configured count, prepared-cache count, and
 /// per-profile name / has_init_script (boolean) / env_keys_count / program /
 /// args_count. NEVER includes init_script bodies, env values, tokens, or the
@@ -1455,159 +1720,26 @@ impl Default for RuntimeInfo {
     fn default() -> Self {
         Self {
             auth_enabled: false,
+            tunnels: Default::default(),
+            shared_key_configured: false,
+            shared_key_enabled: false,
+            shared_key_remote_enabled: false,
             configured_public_url: None,
             oauth2_enabled: false,
             oauth2_shared_key_bridge_enabled: false,
             quic: Some(std::sync::Arc::new(std::sync::Mutex::new(
                 crate::config::QuicServerConfig::default().runtime_status(),
             ))),
+            // Product defaults without touching process-global environment:
+            // compact schemas and MCP Apps are on by default, while duplicate
+            // text-JSON compatibility remains opt-in.
+            mcp_compact_schemas: true,
+            mcp_apps_enabled: true,
+            mcp_text_json_compat_enabled: false,
         }
     }
 }
 
 #[cfg(test)]
-mod phase_e2_status_tests {
-    use super::*;
-
-    #[test]
-    fn concurrency_counts_use_only_canonical_running_and_queued_statuses() {
-        for status in ["running", "started"] {
-            assert!(job_status_is_running(status), "{status}");
-            assert!(!job_status_is_runner_queued(status), "{status}");
-        }
-        for status in ["queued", "agent_queued"] {
-            assert!(job_status_is_runner_queued(status), "{status}");
-            assert!(!job_status_is_running(status), "{status}");
-        }
-        for status in [
-            "stop_requested",
-            "recovering",
-            "completed",
-            "failed",
-            "stopped",
-            "lost",
-            "timeout",
-            "timed_out",
-            "cancelled",
-        ] {
-            assert!(!job_status_is_running(status), "{status}");
-            assert!(!job_status_is_runner_queued(status), "{status}");
-        }
-    }
-
-    #[test]
-    fn runner_concurrency_counts_jobs_across_projects_for_one_client() {
-        fn job(job_id: &str, client_id: &str, project_id: &str, status: &str) -> ShellJobInfo {
-            ShellJobInfo {
-                job_id: job_id.to_string(),
-                request_id: None,
-                client_id: client_id.to_string(),
-                kind: "shell".to_string(),
-                project_id: Some(project_id.to_string()),
-                session_id: None,
-                ssh_resource: None,
-                cwd: None,
-                project_cwd: None,
-                purpose: None,
-                shell: None,
-                command_preview: "test".to_string(),
-                status: status.to_string(),
-                created_at: 0,
-                started_at: None,
-                ended_at: None,
-                exit_code: None,
-                duration_ms: None,
-                elapsed_secs: None,
-                error: None,
-                command_execution_state: None,
-                structured_execution: None,
-                codex: None,
-                result: None,
-                validation_progress: None,
-                activity: None,
-                validation: None,
-                recovery_state: None,
-                recovered_after_server_restart: false,
-                reconciled_at: None,
-                recovery_reason_code: None,
-                observation_token: None,
-                last_update_seq: None,
-                stdout_retained_from_line: None,
-                stderr_retained_from_line: None,
-                stdout_log_truncated: false,
-                stderr_log_truncated: false,
-            }
-        }
-
-        let client = RunnerView {
-            client_id: "shared-runner".to_string(),
-            runner_instance_id: "shared-instance".to_string(),
-            display_name: None,
-            owner: None,
-            hostname: None,
-            host_context: None,
-            status: "online".to_string(),
-            connected: true,
-            last_seen: 0,
-            capabilities: Default::default(),
-            coding_agent_providers: None,
-            pending_requests: 0,
-            projects: Vec::new(),
-            project_inventory: None,
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            transport: "websocket".to_string(),
-            policy: None,
-            registered_at: 0,
-            connected_at: 0,
-            disconnected_at: None,
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: Some(2),
-        };
-        let jobs = vec![
-            job(
-                "project-a-running",
-                "shared-runner",
-                "agent:shared:a",
-                "running",
-            ),
-            job(
-                "project-b-queued",
-                "shared-runner",
-                "agent:shared:b",
-                "agent_queued",
-            ),
-            job(
-                "foreign-running",
-                "other-runner",
-                "agent:other:c",
-                "running",
-            ),
-        ];
-
-        assert_eq!(active_jobs_for_client(&jobs, "shared-runner"), 2);
-        assert_eq!(
-            job_concurrency_for_client(&client, &jobs),
-            json!({"limit": 2, "running": 1, "queued": 1})
-        );
-    }
-
-    #[test]
-    fn compact_runtime_status_keeps_minimum_job_state_counts() {
-        let compact = compact_runtime_status(&json!({
-            "jobs": {
-                "active_count": 5,
-                "running_count": 2,
-                "queued_count": 1,
-            }
-        }));
-        assert_eq!(
-            compact["jobs"],
-            json!({
-                "active_count": 5,
-                "running_count": 2,
-                "queued_count": 1,
-            })
-        );
-    }
-}
+#[path = "tests/runtime_info.rs"]
+mod tests;

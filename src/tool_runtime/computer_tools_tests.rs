@@ -1,4 +1,6 @@
+use super::responses::{validate_computer_response, ComputerResponseContext};
 use super::*;
+use crate::tool_runtime::specialized::SpecializedAuthorityRequirement;
 
 fn surface(id: &str) -> Value {
     json!({
@@ -58,8 +60,259 @@ fn application(id: &str, name: &str) -> Value {
     json!({"application_id": id, "display_name": name})
 }
 
-const APPLICATION_ID: &str = "application_0123456789abcdef0123456789abcdef";
-const APPLICATION_ID_2: &str = "application_fedcba9876543210fedcba9876543210";
+const APPLICATION_ID: &str = "application_iavN7wEjRWeJq83v";
+const APPLICATION_ID_2: &str = "application_dlQyEP7cuph2VDIQ";
+
+fn computer_auth(scopes: &[&str]) -> AuthContext {
+    let mut auth = AuthContext::new(crate::auth::AuthKind::ApiToken);
+    auth.scopes
+        .extend(scopes.iter().map(|scope| (*scope).to_string()));
+    auth
+}
+
+fn response_context(kind: &'static str) -> ComputerResponseContext<'static> {
+    ComputerResponseContext {
+        client_id: "msi",
+        kind,
+        list_limit: None,
+        expected_surface_id: Some("surface_test"),
+        accessibility_bounds: None,
+        expected_application_id: Some(APPLICATION_ID.to_string()),
+        expected_display_id: None,
+        expected_element_id: Some("element_child".to_string()),
+        expected_action: Some("focus".to_string()),
+        expected_key: None,
+        expected_key_modifiers: json!([]),
+        expected_text_bytes: None,
+        snapshot_advanced: false,
+        expected_snapshot_region: None,
+        expected_snapshot_max_width: None,
+        expected_snapshot_max_height: None,
+        pointer_context: None,
+        clipboard_write_context: Some(ClipboardWriteContext {
+            text_bytes: Some(5),
+        }),
+    }
+}
+
+#[test]
+fn computer_response_effect_success_is_bound_to_the_original_request() {
+    for (kind, mut receipt, field, mismatch) in [
+        (
+            "computer_control",
+            json!({"platform":"windows","surface_id":"surface_test","element_id":"element_child","action":"focus","success":true}),
+            "action",
+            json!("press"),
+        ),
+        (
+            "computer_launch_application",
+            json!({"platform":"windows","application_id":APPLICATION_ID,"success":true}),
+            "application_id",
+            json!(APPLICATION_ID_2),
+        ),
+        (
+            "computer_write_clipboard",
+            json!({"platform":"windows","text_bytes":5,"success":true}),
+            "text_bytes",
+            json!(6),
+        ),
+    ] {
+        let valid = validate_computer_response(receipt.clone(), response_context(kind));
+        assert!(valid.success, "{kind}: {:?}", valid.output);
+
+        receipt[field] = mismatch;
+        let result = validate_computer_response(receipt.clone(), response_context(kind));
+        assert!(!result.success, "{kind}");
+        assert_eq!(
+            result.output["execution_state"], "outcome_unknown",
+            "{kind}"
+        );
+
+        receipt["native_identity"] = json!("PRIVATE_RECEIPT_MUST_NOT_SURVIVE");
+        let result = validate_computer_response(receipt, response_context(kind));
+        assert!(!result.success, "{kind}");
+        assert!(!result
+            .output
+            .to_string()
+            .contains("PRIVATE_RECEIPT_MUST_NOT_SURVIVE"));
+        assert!(!result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("PRIVATE_RECEIPT_MUST_NOT_SURVIVE"));
+    }
+}
+
+#[test]
+fn computer_gateway_parser_accepts_every_closed_action_and_rejects_legacy_or_ambiguous_input() {
+    let observe = [
+        json!({"action":"targets"}),
+        json!({"action":"windows","client_id":"mini"}),
+        json!({"action":"displays","client_id":"mini"}),
+        json!({"action":"applications","client_id":"mini"}),
+        json!({"action":"accessibility_status","client_id":"mini"}),
+        json!({"action":"accessibility_tree","client_id":"mini","surface_id":"surface_test"}),
+        json!({"action":"find_elements","client_id":"mini","surface_id":"surface_test","role":"AXButton"}),
+        json!({"action":"element_state","client_id":"mini","surface_id":"surface_test","element_id":"element_test"}),
+        json!({"action":"snapshot_window","client_id":"mini","surface_id":"surface_test"}),
+        json!({"action":"snapshot_display","client_id":"mini","display_id":"display_test"}),
+        json!({"action":"read_clipboard","client_id":"mini"}),
+    ];
+    for arguments in observe {
+        let call = ToolCall::from_tool_name("observe_computer", arguments.clone())
+            .unwrap_or_else(|error| panic!("observe {arguments} failed: {error}"));
+        assert!(matches!(call, ToolCall::ComputerObserve(_)));
+    }
+
+    let control = [
+        json!({"action":"launch_application","client_id":"mini","application_id":APPLICATION_ID}),
+        json!({"action":"activate_window","client_id":"mini","surface_id":"surface_test"}),
+        json!({"action":"press","client_id":"mini","surface_id":"surface_test","element_id":"element_test"}),
+        json!({"action":"focus","client_id":"mini","surface_id":"surface_test","element_id":"element_test"}),
+        json!({"action":"scroll_to_element","client_id":"mini","surface_id":"surface_test","element_id":"element_test"}),
+        json!({"action":"key","client_id":"mini","surface_id":"surface_test","key":"enter"}),
+        json!({"action":"input_text","client_id":"mini","surface_id":"surface_test","element_id":"element_test","text":"hello"}),
+        json!({"action":"pointer_move","client_id":"mini","display_id":"display_test","snapshot_generation":1,"x":1,"y":2}),
+        json!({"action":"pointer_click","client_id":"mini","display_id":"display_test","snapshot_generation":1,"x":1,"y":2}),
+        json!({"action":"write_clipboard","client_id":"mini","text":"hello"}),
+    ];
+    for arguments in control {
+        let call = ToolCall::from_tool_name("control_computer", arguments.clone())
+            .unwrap_or_else(|error| panic!("control {arguments} failed: {error}"));
+        assert!(matches!(call, ToolCall::ComputerControl(_)));
+    }
+
+    for arguments in [
+        json!({"action":"unknown","client_id":"mini"}),
+        json!({"action":"windows"}),
+        json!({"action":"windows","client_id":"mini","text":"unrelated"}),
+    ] {
+        assert!(ToolCall::from_tool_name("observe_computer", arguments).is_err());
+    }
+    assert!(ToolCall::from_tool_name(
+        "control_computer",
+        json!({"action":"pointer_click","client_id":"mini"})
+    )
+    .is_err());
+    assert!(
+        ToolCall::from_tool_name("computer_list_windows", json!({"client_id":"mini"})).is_err()
+    );
+}
+
+#[test]
+fn computer_gateway_action_policies_preserve_exact_independent_authority() {
+    let windows = computer_observe_policy(&ComputerObserveToolCall::Windows {
+        client_id: "mini".to_string(),
+        limit: None,
+    });
+    assert_eq!(
+        windows.authority,
+        SpecializedAuthorityRequirement::Scope(SCOPE_COMPUTER_READ)
+    );
+
+    let display = computer_observe_policy(&ComputerObserveToolCall::SnapshotDisplay {
+        client_id: "mini".to_string(),
+        display_id: "display_test".to_string(),
+        max_width: None,
+        max_height: None,
+    });
+    assert_eq!(
+        display.authority,
+        SpecializedAuthorityRequirement::All(&[SCOPE_COMPUTER_READ, SCOPE_COMPUTER_DISPLAY_READ])
+    );
+    let read_only = computer_auth(&[SCOPE_COMPUTER_READ]);
+    assert_eq!(
+        display.authority.first_missing(Some(&read_only)),
+        Some(SCOPE_COMPUTER_DISPLAY_READ)
+    );
+
+    let clipboard_read = computer_observe_policy(&ComputerObserveToolCall::ReadClipboard {
+        client_id: "mini".to_string(),
+    });
+    assert_eq!(
+        clipboard_read.authority,
+        SpecializedAuthorityRequirement::All(&[SCOPE_COMPUTER_READ, SCOPE_COMPUTER_CLIPBOARD_READ])
+    );
+    assert_eq!(
+        clipboard_read.authority.first_missing(Some(&read_only)),
+        Some(SCOPE_COMPUTER_CLIPBOARD_READ)
+    );
+
+    let launch = computer_control_policy(&ComputerControlToolCall::LaunchApplication {
+        client_id: "mini".to_string(),
+        application_id: APPLICATION_ID.to_string(),
+    });
+    assert_eq!(
+        launch.authority,
+        SpecializedAuthorityRequirement::Scope(SCOPE_COMPUTER_LAUNCH)
+    );
+
+    let pointer = computer_control_policy(&ComputerControlToolCall::PointerClick {
+        client_id: "mini".to_string(),
+        display_id: "display_test".to_string(),
+        snapshot_generation: 1,
+        x: 1,
+        y: 2,
+    });
+    assert_eq!(
+        pointer.authority,
+        SpecializedAuthorityRequirement::All(&[
+            SCOPE_COMPUTER_READ,
+            SCOPE_COMPUTER_DISPLAY_READ,
+            SCOPE_COMPUTER_CONTROL,
+            SCOPE_COMPUTER_POINTER_CONTROL,
+        ])
+    );
+    assert_eq!(
+        pointer.authority.first_missing(Some(&read_only)),
+        Some(SCOPE_COMPUTER_DISPLAY_READ),
+        "computer:read alone must not authorize pointer control"
+    );
+    assert_eq!(
+        pointer.authority.first_missing(None),
+        None,
+        "unauthenticated compatibility must remain equivalent to the legacy Computer tools"
+    );
+    let generic_control = computer_auth(&[SCOPE_COMPUTER_CONTROL]);
+    assert_eq!(
+        pointer.authority.first_missing(Some(&generic_control)),
+        Some(SCOPE_COMPUTER_READ),
+        "generic computer:control must not imply pointer authority"
+    );
+
+    let clipboard_write = computer_control_policy(&ComputerControlToolCall::WriteClipboard {
+        client_id: "mini".to_string(),
+        text: "hello".to_string(),
+    });
+    assert_eq!(
+        clipboard_write.authority,
+        SpecializedAuthorityRequirement::All(&[
+            SCOPE_COMPUTER_CONTROL,
+            SCOPE_COMPUTER_CLIPBOARD_WRITE,
+        ])
+    );
+    assert_eq!(
+        clipboard_write
+            .authority
+            .first_missing(Some(&generic_control)),
+        Some(SCOPE_COMPUTER_CLIPBOARD_WRITE),
+        "generic computer:control must not imply clipboard-write authority"
+    );
+}
+
+fn assert_computer_suggested_call(result: &ToolResult, tool: &str, arguments: Value) {
+    let suggested = &result.output["suggested_call"];
+    assert_eq!(suggested["tool"], tool);
+    assert_eq!(suggested["arguments"], arguments);
+    assert!(suggested.get("authority").is_none());
+    assert!(result.output.get("recovery_tool").is_none());
+    assert!(result.output.get("reconcile_with").is_none());
+    ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .expect("Computer suggested_call must parse through the canonical ToolCall parser");
+}
 
 #[test]
 fn computer_application_id_and_public_argument_shape_are_closed() {
@@ -69,23 +322,29 @@ fn computer_application_id_and_public_argument_shape_are_closed() {
         "application_",
         "application_0123456789ABCDEF0123456789ABCDEF",
         "application_0123456789abcdef0123456789abcdeg",
-        "surface_0123456789abcdef0123456789abcdef",
+        "surface_iavN7wEjRWeJq83v",
     ] {
         assert!(!valid_application_id(invalid), "{invalid}");
     }
 
     let list = ToolCall::from_tool_name(
-        "computer_list_applications",
-        json!({"client_id": "msi", "limit": 4}),
+        "observe_computer",
+        json!({"action": "applications", "client_id": "msi", "limit": 4}),
     )
     .unwrap();
-    assert!(matches!(list, ToolCall::ComputerListApplications { .. }));
+    assert!(matches!(
+        list,
+        ToolCall::ComputerObserve(ComputerObserveToolCall::Applications { .. })
+    ));
     let launch = ToolCall::from_tool_name(
-        "computer_launch_application",
-        json!({"client_id": "msi", "application_id": APPLICATION_ID}),
+        "control_computer",
+        json!({"action": "launch_application", "client_id": "msi", "application_id": APPLICATION_ID}),
     )
     .unwrap();
-    assert!(matches!(launch, ToolCall::ComputerLaunchApplication { .. }));
+    assert!(matches!(
+        launch,
+        ToolCall::ComputerControl(ComputerControlToolCall::LaunchApplication { .. })
+    ));
     for forbidden in [
         "path",
         "argv",
@@ -95,11 +354,11 @@ fn computer_application_id_and_public_argument_shape_are_closed() {
         "script",
         "url",
     ] {
-        let mut args = json!({"client_id": "msi", "application_id": APPLICATION_ID});
+        let mut args = json!({"action": "launch_application", "client_id": "msi", "application_id": APPLICATION_ID});
         args.as_object_mut()
             .unwrap()
             .insert(forbidden.to_string(), json!("forbidden"));
-        let error = ToolCall::from_tool_name("computer_launch_application", args).unwrap_err();
+        let error = ToolCall::from_tool_name("control_computer", args).unwrap_err();
         assert!(error.contains("unknown field"), "{error}");
     }
 }
@@ -199,13 +458,17 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
     assert!(!invalid.success);
     let unknown = computer_application_effect_outcome_unknown(
         "Runner returned inconsistent successful launch metadata",
+        "msi",
         APPLICATION_ID,
     );
     assert_eq!(unknown.output["error_kind"], "outcome_unknown");
     assert_eq!(unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(unknown.output["reconcile_with"], "computer_list_windows");
-    assert_eq!(unknown.output["recovery_kind"], "reobserve");
-    assert_eq!(unknown.output["recovery_tool"], "computer_list_windows");
+    assert!(unknown.output.get("recovery_kind").is_none());
+    assert_computer_suggested_call(
+        &unknown,
+        "observe_computer",
+        json!({"action": "windows", "client_id": "msi"}),
+    );
     assert!(unknown.output.get("state_changed").is_none());
     assert!(!serde_json::to_string(&unknown.output)
         .unwrap()
@@ -219,13 +482,19 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
         let result = computer_application_effect_delivery_failure(
             "launch transport lost",
             dispatched,
+            "msi",
             APPLICATION_ID,
         );
         assert_eq!(result.output["error_kind"], expected);
         if expected == "not_started" {
             assert_eq!(result.output["state_changed"], false);
         } else {
-            assert_eq!(result.output["reconcile_with"], "computer_list_windows");
+            assert_eq!(result.output["execution_state"], "outcome_unknown");
+            assert_computer_suggested_call(
+                &result,
+                "observe_computer",
+                json!({"action": "windows", "client_id": "msi"}),
+            );
         }
     }
 
@@ -233,13 +502,18 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
         "stale_application: PRIVATE_NATIVE_ID",
         "application_failed: PRIVATE_NATIVE_ID",
     ] {
-        let result = computer_application_launch_runner_error(error, Some(true), APPLICATION_ID);
+        let result =
+            computer_application_launch_runner_error(error, Some(true), "msi", APPLICATION_ID);
         assert_eq!(result.output["execution_state"], "not_started");
         assert_eq!(result.output["state_changed"], false);
         let serialized = serde_json::to_string(&result.output).unwrap();
         if error.starts_with("stale_application") {
-            assert_eq!(result.output["recovery_kind"], "reobserve");
-            assert_eq!(result.output["recovery_tool"], "computer_list_applications");
+            assert!(result.output.get("recovery_kind").is_none());
+            assert_computer_suggested_call(
+                &result,
+                "observe_computer",
+                json!({"action": "applications", "client_id": "msi"}),
+            );
         } else {
             assert!(result.output.get("recovery_kind").is_none());
         }
@@ -253,27 +527,33 @@ fn computer_application_launch_lifecycle_is_exact_and_never_blindly_retryable() 
     let malformed = computer_application_effect_not_started(
         "invalid_application",
         "application_id is invalid",
+        "msi",
         &"x".repeat(512),
     );
     assert!(malformed.output["application_id"].is_null());
     assert_eq!(malformed.output["execution_state"], "not_started");
 }
 
-const DISPLAY_ID: &str = "display_0123456789abcdef0123456789abcdef";
+const DISPLAY_ID: &str = "display_iavN7wEjRWeJq83v";
 
 #[test]
 fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
     let context = PointerRequestContext {
+        client_id: "msi".to_string(),
         display_id: DISPLAY_ID.to_string(),
         snapshot_generation: 7,
         x: 123,
         y: 456,
     };
-    for tool in ["computer_pointer_move", "computer_pointer_click"] {
-        assert!(computer_request_is_effect(tool));
+    for (runner_kind, action) in [
+        ("computer_pointer_move", "pointer_move"),
+        ("computer_pointer_click", "pointer_click"),
+    ] {
+        assert!(computer_request_is_effect(runner_kind));
         let call = ToolCall::from_tool_name(
-            tool,
+            "control_computer",
             json!({
+                "action": action,
                 "client_id": "msi",
                 "display_id": DISPLAY_ID,
                 "snapshot_generation": 7,
@@ -284,7 +564,10 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
         .unwrap();
         assert!(matches!(
             call,
-            ToolCall::ComputerPointerMove { .. } | ToolCall::ComputerPointerClick { .. }
+            ToolCall::ComputerControl(
+                ComputerControlToolCall::PointerMove { .. }
+                    | ComputerControlToolCall::PointerClick { .. }
+            )
         ));
         for forbidden in ["global_x", "global_y", "button", "region", "surface_id"] {
             let mut args = json!({
@@ -297,7 +580,8 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
             args.as_object_mut()
                 .unwrap()
                 .insert(forbidden.to_string(), json!(1));
-            assert!(ToolCall::from_tool_name(tool, args)
+            args["action"] = json!(action);
+            assert!(ToolCall::from_tool_name("control_computer", args)
                 .unwrap_err()
                 .contains("unknown field"));
         }
@@ -329,9 +613,10 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
     assert!(!spent_not_started.success);
     assert_eq!(spent_not_started.output["execution_state"], "not_started");
     assert_eq!(spent_not_started.output["state_changed"], false);
-    assert_eq!(
-        spent_not_started.output["reconcile_with"],
-        "computer_snapshot_display"
+    assert_computer_suggested_call(
+        &spent_not_started,
+        "observe_computer",
+        json!({"action": "snapshot_display", "client_id": "msi", "display_id": DISPLAY_ID}),
     );
     assert!(spent_not_started
         .error
@@ -345,18 +630,20 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
     );
     assert!(!runner_unknown.success);
     assert_eq!(runner_unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(
-        runner_unknown.output["reconcile_with"],
-        "computer_snapshot_display"
+    assert_computer_suggested_call(
+        &runner_unknown,
+        "observe_computer",
+        json!({"action": "snapshot_display", "client_id": "msi", "display_id": DISPLAY_ID}),
     );
 
     let unknown =
         computer_pointer_effect_delivery_failure("maybe dispatched", Some(true), &context);
     assert!(!unknown.success);
     assert_eq!(unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(
-        unknown.output["reconcile_with"],
-        "computer_snapshot_display"
+    assert_computer_suggested_call(
+        &unknown,
+        "observe_computer",
+        json!({"action": "snapshot_display", "client_id": "msi", "display_id": DISPLAY_ID}),
     );
     assert!(unknown
         .error
@@ -416,7 +703,7 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
     for invalid_output in [
         json!({
             "platform": "macos",
-            "display_id": "display_ffffffffffffffffffffffffffffffff",
+            "display_id": "display_________________",
             "snapshot_generation": 7,
             "x": 123,
             "y": 456,
@@ -477,22 +764,46 @@ fn computer_pointer_public_shape_and_effect_lifecycle_are_closed() {
 }
 
 #[test]
+fn computer_snapshot_dimension_budgets_clamp_only_oversized_positive_values() {
+    assert_eq!(effective_snapshot_dimension_bound(None), Ok(None));
+    assert_eq!(
+        effective_snapshot_dimension_bound(Some(1024)),
+        Ok(Some(1024))
+    );
+    assert_eq!(
+        effective_snapshot_dimension_bound(Some(10_000)),
+        Ok(Some(MAX_IMAGE_DIMENSION as u32))
+    );
+    assert_eq!(
+        effective_snapshot_dimension_bound(Some(u32::MAX)),
+        Ok(Some(MAX_IMAGE_DIMENSION as u32))
+    );
+    assert_eq!(effective_snapshot_dimension_bound(Some(0)), Err(()));
+}
+
+#[test]
 fn computer_display_public_shape_and_read_only_semantics_are_closed() {
     assert!(valid_display_id(DISPLAY_ID));
     assert!(!computer_request_is_effect("computer_list_displays"));
     assert!(!computer_request_is_effect("computer_snapshot_display"));
     let list = ToolCall::from_tool_name(
-        "computer_list_displays",
-        json!({"client_id": "msi", "limit": 2}),
+        "observe_computer",
+        json!({"action": "displays", "client_id": "msi", "limit": 2}),
     )
     .unwrap();
-    assert!(matches!(list, ToolCall::ComputerListDisplays { .. }));
+    assert!(matches!(
+        list,
+        ToolCall::ComputerObserve(ComputerObserveToolCall::Displays { .. })
+    ));
     let snapshot = ToolCall::from_tool_name(
-        "computer_snapshot_display",
-        json!({"client_id": "msi", "display_id": DISPLAY_ID, "max_width": 960}),
+        "observe_computer",
+        json!({"action": "snapshot_display", "client_id": "msi", "display_id": DISPLAY_ID, "max_width": 960}),
     )
     .unwrap();
-    assert!(matches!(snapshot, ToolCall::ComputerSnapshotDisplay { .. }));
+    assert!(matches!(
+        snapshot,
+        ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay { .. })
+    ));
     for forbidden in [
         "region",
         "x",
@@ -502,11 +813,12 @@ fn computer_display_public_shape_and_read_only_semantics_are_closed() {
         "click",
         "monitor_id",
     ] {
-        let mut args = json!({"client_id": "msi", "display_id": DISPLAY_ID});
+        let mut args =
+            json!({"action": "snapshot_display", "client_id": "msi", "display_id": DISPLAY_ID});
         args.as_object_mut()
             .unwrap()
             .insert(forbidden.to_string(), json!(1));
-        let error = ToolCall::from_tool_name("computer_snapshot_display", args).unwrap_err();
+        let error = ToolCall::from_tool_name("observe_computer", args).unwrap_err();
         assert!(error.contains("unknown field"), "{error}");
     }
 }
@@ -578,6 +890,44 @@ fn computer_display_snapshot_validator_enforces_identity_geometry_and_privacy() 
     assert!(valid.success, "{:?}", valid.output);
     assert_eq!(valid.output["client_id"], "msi");
 
+    // The model-facing request may be larger, but response correlation is against
+    // the single effective bound sent to the Runner. 5000x4000 stays under the
+    // raw-capture byte ceiling and downscales to 4096x3276 at the hard limit.
+    let effective = effective_snapshot_dimension_bound(Some(10_000)).unwrap();
+    assert_eq!(effective, Some(MAX_IMAGE_DIMENSION as u32));
+    let bounded_source = json!({
+        "display_id": DISPLAY_ID,
+        "snapshot_generation": 8,
+        "source_width": 5000,
+        "source_height": 4000,
+        "width": 4096,
+        "height": 3276,
+        "mime_type": "image/jpeg",
+        "file_bytes": image.len(),
+        "sha256": sha256_hex(&image),
+        "captured_at_unix_ms": 1_700_000_000_001u64,
+        "content_base64": general_purpose::STANDARD.encode(image)
+    });
+    let bounded = validate_display_snapshot(
+        bounded_source.clone(),
+        DISPLAY_ID,
+        "msi",
+        effective.map(u64::from),
+        None,
+    );
+    assert!(bounded.success, "{:?}", bounded.output);
+    let mut over_effective = bounded_source;
+    over_effective["width"] = json!(4097);
+    let rejected = validate_display_snapshot(
+        over_effective,
+        DISPLAY_ID,
+        "msi",
+        effective.map(u64::from),
+        None,
+    );
+    assert!(!rejected.success);
+    assert_eq!(rejected.output["error_kind"], "invalid_runner_response");
+
     for (field, value) in [
         ("native_identity", json!("PRIVATE")),
         ("device_path", json!("PRIVATE")),
@@ -618,6 +968,32 @@ fn computer_display_snapshot_validator_enforces_identity_geometry_and_privacy() 
 fn computer_accessibility_tree_validator_accepts_bounded_parent_first_tree() {
     let result = validate_accessibility_tree(accessibility_tree(), "surface_test", 2, 8);
     assert!(result.success, "{:?}", result.output);
+}
+
+#[test]
+fn computer_subtree_scope_requires_exact_runner_receipt_and_keeps_legacy_wire() {
+    let legacy = accessibility_tree_payload("surface_test", None, 8, 256).unwrap();
+    assert_eq!(
+        legacy,
+        json!({"surface_id":"surface_test", "max_depth":8, "max_nodes":256})
+    );
+    let scoped = accessibility_tree_payload("surface_test", Some("element_root"), 8, 256).unwrap();
+    assert_eq!(scoped["root_element_id"], "element_root");
+    for invalid in ["", "element_", "surface_root"] {
+        assert!(accessibility_tree_payload("surface_test", Some(invalid), 8, 256).is_err());
+    }
+    let mut tree = accessibility_tree();
+    assert!(normalize_accessibility_scope(&mut tree, Some("element_root")).is_err());
+    assert!(normalize_accessibility_scope(&mut tree, None).is_ok());
+    for receipt in [json!("element_other"), Value::Null, json!(12)] {
+        tree["root_element_id"] = receipt;
+        assert!(normalize_accessibility_scope(&mut tree, Some("element_root")).is_err());
+        assert!(normalize_accessibility_scope(&mut tree, None).is_err());
+    }
+    tree["root_element_id"] = json!("element_root");
+    assert!(normalize_accessibility_scope(&mut tree, Some("element_root")).is_ok());
+    assert!(tree.get("root_element_id").is_none());
+    assert!(validate_accessibility_tree(tree, "surface_test", 2, 8).success);
 }
 
 #[test]
@@ -990,6 +1366,26 @@ fn computer_scroll_validator_is_exact_and_post_dispatch_mismatch_is_unknown() {
 
 #[test]
 fn computer_key_input_normalizes_closed_vocabulary_and_modifiers() {
+    let modifiers = COMPUTER_KEY_INPUT_MODIFIERS
+        .iter()
+        .map(|modifier| modifier.to_string())
+        .collect::<Vec<_>>();
+    for key in COMPUTER_KEY_INPUT_KEYS {
+        assert_eq!(
+            normalize_computer_key_input(key, None).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            normalize_computer_key_input(key, Some(vec![])).unwrap(),
+            Vec::<String>::new()
+        );
+        let mut reversed = modifiers.clone();
+        reversed.reverse();
+        assert_eq!(
+            normalize_computer_key_input(key, Some(reversed)).unwrap(),
+            modifiers
+        );
+    }
     assert_eq!(
         normalize_computer_key_input(
             "tab",
@@ -1005,6 +1401,7 @@ fn computer_key_input_normalizes_closed_vocabulary_and_modifiers() {
     )
     .is_err());
     assert!(normalize_computer_key_input("enter", Some(vec!["caps_lock".to_string()]),).is_err());
+    assert!(normalize_computer_key_input("tab", Some(vec!["shift".to_string(); 5])).is_err());
 }
 
 #[test]
@@ -1147,7 +1544,7 @@ fn computer_input_text_runner_errors_never_echo_text() {
             "outcome_unknown",
         ),
     ] {
-        let result = computer_text_input_runner_error(&error, dispatched);
+        let result = computer_text_input_runner_error(&error, dispatched, "msi");
         let serialized = serde_json::to_string(&result.output).unwrap();
         assert_eq!(result.output["error_kind"], expected_kind);
         assert!(!serialized.contains(secret));
@@ -1159,16 +1556,20 @@ fn computer_input_text_runner_errors_never_echo_text() {
 fn computer_input_text_utf8_byte_bound_rejects_empty_nul_and_oversize() {
     let valid = "你好🙂";
     assert_eq!(validate_input_text(valid).unwrap(), valid.len());
-    let encoded = serde_json::to_value(ToolCall::ComputerInputText {
-        client_id: "mini".to_string(),
-        surface_id: "surface_test".to_string(),
-        element_id: "element_test".to_string(),
-        text: valid.to_string(),
-    })
+    let encoded = serde_json::to_value(ToolCall::ComputerControl(
+        ComputerControlToolCall::InputText {
+            client_id: "mini".to_string(),
+            surface_id: "surface_test".to_string(),
+            element_id: "element_test".to_string(),
+            text: valid.to_string(),
+        },
+    ))
     .unwrap();
     let decoded: ToolCall = serde_json::from_value(encoded).unwrap();
     match decoded {
-        ToolCall::ComputerInputText { text, .. } => assert_eq!(text, valid),
+        ToolCall::ComputerControl(ComputerControlToolCall::InputText { text, .. }) => {
+            assert_eq!(text, valid)
+        }
         other => panic!(
             "expected computer input text call, got {}",
             other.tool_name()
@@ -1257,27 +1658,39 @@ fn computer_control_runner_errors_preserve_structured_error_kinds() {
 
 #[test]
 fn stale_computer_identities_expose_bounded_reobserve_targets() {
-    for (error_kind, recovery_tool) in [
-        ("stale_element", "computer_find_elements"),
-        ("stale_surface", "computer_list_windows"),
-        ("stale_application", "computer_list_applications"),
-        ("stale_display", "computer_list_displays"),
+    for error_kind in [
+        "stale_element",
+        "stale_surface",
+        "stale_application",
+        "stale_display",
     ] {
         let result = computer_error(error_kind, "stale observed identity");
         assert!(!result.success);
         assert_eq!(result.output["error_kind"], error_kind);
         assert_eq!(result.output["recovery_kind"], "reobserve");
-        assert_eq!(result.output["recovery_tool"], recovery_tool);
-        assert!(matches!(
-            result.output["recovery_tool"].as_str().unwrap(),
-            "computer_find_elements"
-                | "computer_list_windows"
-                | "computer_list_applications"
-                | "computer_list_displays"
-        ));
+        assert_eq!(result.output["reconcile_with"], "observe_computer");
+        assert!(result.output.get("suggested_call").is_none());
+        assert!(result.output.get("recovery_tool").is_none());
+    }
+
+    let stale_element =
+        computer_error_with_client("stale_element", "stale observed identity", Some("msi"));
+    assert_eq!(stale_element.output["reconcile_with"], "observe_computer");
+    assert!(stale_element.output.get("suggested_call").is_none());
+
+    for (error_kind, action) in [
+        ("stale_surface", "windows"),
+        ("stale_application", "applications"),
+        ("stale_display", "displays"),
+    ] {
+        let result = computer_error_with_client(error_kind, "stale observed identity", Some("msi"));
+        assert_computer_suggested_call(
+            &result,
+            "observe_computer",
+            json!({"action": action, "client_id": "msi"}),
+        );
     }
 }
-
 #[test]
 fn computer_window_list_validator_rejects_more_than_requested_limit() {
     let result = validate_window_list(
@@ -1531,14 +1944,11 @@ fn computer_save_snapshot_lifecycle_distinguishes_not_started_from_unknown() {
     assert!(!unknown.success);
     assert_eq!(unknown.output["error_kind"], "outcome_unknown");
     assert_eq!(unknown.output["execution_state"], "outcome_unknown");
-    assert_eq!(
-        unknown.output["reconcile_with"],
-        "read_project_artifact_metadata"
-    );
-    assert_eq!(unknown.output["recovery_kind"], "reconcile");
-    assert_eq!(
-        unknown.output["recovery_tool"],
-        "read_project_artifact_metadata"
+    assert!(unknown.output.get("recovery_kind").is_none());
+    assert_computer_suggested_call(
+        &unknown,
+        "read_project_artifact_metadata",
+        json!({"project": "agent:target:demo", "path": "artifacts/ui.jpg"}),
     );
     assert_eq!(unknown.output["project"], "agent:target:demo");
     assert_eq!(unknown.output["path"], "artifacts/ui.jpg");

@@ -1,221 +1,399 @@
 use super::*;
 
-#[test]
-fn runtime_command_inherits_only_tunnel_authority_not_server_bootstrap_or_openai_admin_keys() {
-    let prerequisites = OpenAiTunnelPrerequisites {
-        binary: PathBuf::from("tunnel-client"),
-        tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".to_string(),
-    };
-    let mut command = Command::new("tunnel-client");
-    configure_runtime_command(
-        &mut command,
+fn prepared_client(
+    root: &Path,
+    credential: &str,
+    recovery: OpenAiTunnelRecovery,
+) -> Result<(TunnelClient, webcodex_openai_tunnel::run_fence::RunFence), ProductError> {
+    let prerequisites = OpenAiTunnelPrerequisites::bound(
+        "tunnel_0123456789abcdef0123456789abcdef".into(),
+        "fixture-control".into(),
+        ControlPlaneProxy::Direct,
+    )?;
+    OpenAiTunnel::prepare_client(
         &prerequisites,
         "http://127.0.0.1:8080/mcp",
-        Path::new("authorization"),
-    );
-
-    let env = command.as_std().get_envs().collect::<Vec<_>>();
-    for key in ["WEBCODEX_TOKEN", "OPENAI_ADMIN_KEY", "OPENAI_API_KEY"] {
-        assert!(env
-            .iter()
-            .any(|(name, value)| { name.to_str() == Some(key) && value.is_none() }));
-    }
-    assert!(env.iter().any(|(name, value)| {
-        name.to_str() == Some("CONTROL_PLANE_TUNNEL_ID")
-            && value.and_then(|value| value.to_str()) == Some(prerequisites.tunnel_id.as_str())
-    }));
+        credential,
+        root,
+        recovery,
+    )
 }
 
 #[test]
-fn tunnel_ids_are_strict_and_runtime_key_never_part_of_the_id_contract() {
+fn temporary_share_restarts_cleanly_with_a_fresh_local_credential() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    for credential in ["first-share", "second-share"] {
+        let (client, guard) =
+            prepared_client(&root, credential, OpenAiTunnelRecovery::TemporaryShare).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(guard.path()).unwrap())
+                .unwrap()["version"],
+            2
+        );
+        drop(client);
+        guard.finish().unwrap();
+    }
+}
+
+#[test]
+fn temporary_share_preserves_uncertain_and_protected_history() {
+    for recovery in [
+        OpenAiTunnelRecovery::TemporaryShare,
+        OpenAiTunnelRecovery::Durable,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (client, guard) = prepared_client(&root, "old-credential", recovery).unwrap();
+        let path = guard.path().to_owned();
+        let saved = std::fs::read(&path).unwrap();
+        drop(client);
+        drop(guard);
+        assert!(prepared_client(
+            &root,
+            "new-credential",
+            OpenAiTunnelRecovery::TemporaryShare
+        )
+        .is_err());
+        assert_eq!(std::fs::read(path).unwrap(), saved);
+    }
+}
+
+#[test]
+fn clean_durable_history_cannot_be_rebound_or_downgraded_for_a_share() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (client, guard) =
+        prepared_client(&root, "old-credential", OpenAiTunnelRecovery::Durable).unwrap();
+    let path = guard.path().to_owned();
+    drop(client);
+    guard.finish().unwrap();
+    drop(guard);
+    let history = std::fs::read(path.with_extension("lock")).unwrap();
+    for recovery in [
+        OpenAiTunnelRecovery::TemporaryShare,
+        OpenAiTunnelRecovery::Durable,
+    ] {
+        assert!(prepared_client(&root, "new-credential", recovery).is_err());
+    }
+    assert!(!path.exists());
+    assert_eq!(std::fs::read(path.with_extension("lock")).unwrap(), history);
+}
+
+#[tokio::test]
+async fn cancelled_stop_retains_the_owned_task_for_drop_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let guard = acquire_guard(temp.path(), "cancelled-stop").unwrap();
+    let (stop, _rx) = oneshot::channel();
+    // A task that cannot complete before this owner observes it or aborts it.
+    let task = tokio::spawn(std::future::pending::<Result<(), Error>>());
+    let abort = task.abort_handle();
+    let marker_path = guard.path().to_path_buf();
+    let mut tunnel = OpenAiTunnel {
+        task: Some(task),
+        stop: Some(stop),
+        health: Health::default(),
+        guard,
+        terminal: None,
+    };
+    tokio::select! {
+        biased;
+        _ = tunnel.stop() => panic!("pending task completed"),
+        _ = std::future::ready(()) => {},
+    }
+    assert!(
+        tunnel.task.is_some(),
+        "cancelling stop must not detach the owned task"
+    );
+    drop(tunnel);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !abort.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        marker_path.exists(),
+        "unobserved shutdown must retain the restart fence"
+    );
+}
+
+#[test]
+fn tunnel_id_is_a_fixed_validated_binding() {
     assert!(valid_tunnel_id("tunnel_0123456789abcdef0123456789abcdef"));
     for invalid in [
-        "0123456789abcdef0123456789abcdef",
+        "",
+        "tunnel_x",
         "tunnel_0123456789ABCDEF0123456789ABCDEF",
-        "tunnel_0123456789abcdef",
-        "tunnel_0123456789abcdef0123456789abcdef0",
-        "tunnel_0123456789abcdef0123456789abcdeg",
+        "../other",
     ] {
-        assert!(
-            !valid_tunnel_id(invalid),
-            "accepted invalid tunnel id {invalid}"
-        );
+        assert!(!valid_tunnel_id(invalid));
+    }
+}
+#[test]
+fn restart_guard_blocks_concurrent_owner_and_unclean_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("runs");
+    let marker = acquire_guard(&root, "tunnel_fixture").unwrap();
+    assert_eq!(
+        acquire_guard(&root, "tunnel_fixture").unwrap_err().code,
+        "tunnel_restart_uncertain"
+    );
+    assert!(acquire_guard(&root, "tunnel_another").is_ok());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(marker.path()).unwrap())
+            .unwrap()["version"],
+        2
+    );
+    // Only an observed clean stop or explicit operator resolution clears this latch.
+    marker.finish().unwrap();
+    drop(marker);
+    assert!(acquire_guard(&root, "tunnel_fixture").is_ok());
+}
+#[test]
+fn diagnostics_do_not_contain_authority_material() {
+    for error in [Error::Authentication, Error::Uncertain, Error::Transport] {
+        let product = tunnel_error(error);
+        assert!(!product.message.contains("Bearer"));
+        assert!(!product.message.contains("https://"));
     }
 }
 
 #[test]
-fn official_release_assets_and_extracted_binaries_are_pinned_per_supported_platform() {
-    let linux_amd64 = tunnel_client_asset_for("linux", "x86_64").unwrap();
-    assert_eq!(
-        linux_amd64.file_name,
-        "tunnel-client-v0.0.12-linux-amd64.zip"
-    );
-    assert_eq!(
-        linux_amd64.archive_sha256,
-        "2bb693bd7b5cd28da7ce09cd9e309529dbb33b7cc9dc0058e62a064688f92c81"
-    );
-    assert_eq!(
-        linux_amd64.binary_sha256,
-        "ee9d4a75bc0b42f36f345aa96231e0db1ab00488122f34ebc99d6db055b6603e"
-    );
-
-    let linux_arm64 = tunnel_client_asset_for("linux", "aarch64").unwrap();
-    assert_eq!(
-        linux_arm64.binary_sha256,
-        "0a48e6696de0df5951c013e40be81ce775e6644e209758c48795a0ecbda06406"
-    );
-    let darwin_amd64 = tunnel_client_asset_for("macos", "x86_64").unwrap();
-    assert_eq!(
-        darwin_amd64.binary_sha256,
-        "4133dab2575223252732a998210c34b7ed96a51765cf5ea835a8e24cf2be1272"
-    );
-    let darwin_arm64 = tunnel_client_asset_for("macos", "aarch64").unwrap();
-    assert_eq!(
-        darwin_arm64.binary_sha256,
-        "b1757220cf4722cec9085ee4a908cf0ee4c1a499a33bd99979b9a9c7669e29b1"
-    );
-    assert_eq!(darwin_arm64.target, "darwin-arm64");
-
-    let windows_amd64 = tunnel_client_asset_for("windows", "x86_64").unwrap();
-    assert_eq!(windows_amd64.target, "windows-amd64");
-    assert_eq!(windows_amd64.member_name, "tunnel-client.exe");
-    assert_eq!(
-        windows_amd64.archive_sha256,
-        "2a2804933924e38a502d62b61f0266cb80d56d65744f4c29876b2bf9c1544356"
-    );
-    assert_eq!(
-        windows_amd64.binary_sha256,
-        "6649169733686805ca16cccd91774594d0c017fd729c37ad4ce1cd18323d9ae8"
-    );
-    let windows_arm64 = tunnel_client_asset_for("windows", "aarch64").unwrap();
-    assert_eq!(windows_arm64.target, "windows-arm64");
-    assert_eq!(windows_arm64.member_name, "tunnel-client.exe");
-    assert_eq!(
-        windows_arm64.archive_sha256,
-        "65ab54221554481bb1c23b6015b99abe0b7f79b08593f4fb17a9e2e25532281d"
-    );
-    assert_eq!(
-        windows_arm64.binary_sha256,
-        "480684ec1031fc2985c7e87f9d669e7dfda4012a8ecdab21eabe1b5deafdd656"
-    );
+fn automatic_recovery_never_treats_the_live_host_or_zero_pid_as_absent() {
+    let mut identity = webcodex_openai_tunnel::run_fence::RunIdentity {
+        version: 3,
+        run_id: uuid::Uuid::new_v4().to_string(),
+        owner_pid: 0,
+        receipt_binding: Some("0".repeat(64)),
+        owner_started: current_owner_started(),
+    };
+    assert!(!owner_absent(&identity));
+    identity.owner_pid = std::process::id();
+    assert!(!owner_absent(&identity));
+    #[cfg(windows)]
+    {
+        let started = identity
+            .owner_started
+            .expect("Windows process creation time");
+        identity.owner_started = Some(started + 1);
+        assert!(
+            owner_absent(&identity),
+            "a reused PID is a different process instance"
+        );
+        identity.owner_pid = u32::MAX;
+        assert!(owner_absent(&identity));
+    }
 }
 
-#[test]
-fn managed_root_prefers_private_xdg_then_home() {
-    let temp = tempfile::tempdir().unwrap();
-    let state = temp.path().join("state");
-    let home = temp.path().join("home");
-    let local = temp.path().join("local");
-    assert_eq!(
-        managed_tunnel_client_root_from(
-            Some(state.as_os_str()),
-            Some(home.as_os_str()),
-            Some(local.as_os_str()),
+// Dedicated adapter lifecycle fixture. The crate's domain tests own wire behavior.
+async fn pending_tunnel(root: &Path) -> (OpenAiTunnel, tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TunnelClient::new(
+        ControlPlaneIdentity::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            "fixture",
+            Credential::bearer("fixture-control").unwrap(),
         )
         .unwrap(),
-        state.join("webcodex/tools/tunnel-client")
-    );
-    assert_eq!(
-        managed_tunnel_client_root_from(None, Some(home.as_os_str()), Some(local.as_os_str()),)
-            .unwrap(),
-        home.join(".local/state/webcodex/tools/tunnel-client")
-    );
-    assert_eq!(
-        managed_tunnel_client_root_from(None, None, Some(local.as_os_str())).unwrap(),
-        local.join("WebCodex/tools/tunnel-client")
-    );
-    assert!(managed_tunnel_client_root_from(None, None, None).is_err());
-    assert!(managed_tunnel_client_root_from(
-        Some(OsStr::new("relative")),
-        Some(home.as_os_str()),
-        None,
-    )
-    .is_err());
-}
-
-#[test]
-fn health_url_accepts_only_bounded_loopback_http_origins() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("health.url");
-    for valid in [
-        "http://127.0.0.1:12345\n",
-        "http://localhost:43210/\n",
-        "http://[::1]:3000\n",
-    ] {
-        fs::write(&path, valid).unwrap();
-        let result = read_loopback_health_url(&path).unwrap();
-        assert!(result.starts_with("http://"));
-    }
-    for invalid in [
-        "https://127.0.0.1:12345",
-        "http://example.com:12345",
-        "http://127.0.0.1",
-        "http://user:secret@127.0.0.1:12345",
-        "http://127.0.0.1:12345/readyz",
-        "http://127.0.0.1:12345?secret=value",
-    ] {
-        fs::write(&path, invalid).unwrap();
-        assert!(
-            read_loopback_health_url(&path).is_err(),
-            "accepted {invalid}"
-        );
-    }
-}
-
-#[test]
-fn zip_extraction_reads_only_the_exact_tunnel_client_member() {
-    let temp = tempfile::tempdir().unwrap();
-    let archive_path = temp.path().join("client.zip");
-    let file = File::create(&archive_path).unwrap();
-    let mut archive = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default();
-    archive.start_file("../tunnel-client", options).unwrap();
-    archive.write_all(b"wrong").unwrap();
-    archive.start_file("tunnel-client", options).unwrap();
-    archive.write_all(b"expected-binary").unwrap();
-    archive.finish().unwrap();
-
-    let destination = temp.path().join("extracted");
-    extract_tunnel_client(&archive_path, &destination, "tunnel-client").unwrap();
-    assert_eq!(fs::read(&destination).unwrap(), b"expected-binary");
-    assert!(!temp.path().join("tunnel-client").exists());
-
-    let windows_archive_path = temp.path().join("windows-client.zip");
-    let file = File::create(&windows_archive_path).unwrap();
-    let mut archive = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default();
-    archive.start_file("../tunnel-client.exe", options).unwrap();
-    archive.write_all(b"wrong-windows").unwrap();
-    archive.start_file("tunnel-client.exe", options).unwrap();
-    archive.write_all(b"expected-windows-binary").unwrap();
-    archive.finish().unwrap();
-    let windows_destination = temp.path().join("extracted.exe");
-    extract_tunnel_client(
-        &windows_archive_path,
-        &windows_destination,
-        "tunnel-client.exe",
+        FixedMcpTarget::new(
+            "http://127.0.0.1:9/mcp",
+            Credential::bearer("fixture-local").unwrap(),
+        )
+        .unwrap(),
+        DeadlinePolicy::default(),
+        Limits::default(),
     )
     .unwrap();
-    assert_eq!(
-        fs::read(&windows_destination).unwrap(),
-        b"expected-windows-binary"
-    );
-    assert!(!temp.path().join("tunnel-client.exe").exists());
+    let guard = acquire_guard(root, "fixture").unwrap();
+    let health = client.health();
+    let (tx, rx) = oneshot::channel();
+    let task = tokio::spawn(client.run(async {
+        let _ = rx.await;
+    }));
+    let tunnel = OpenAiTunnel {
+        task: Some(task),
+        stop: Some(tx),
+        health,
+        guard,
+        terminal: None,
+    };
+    let socket = tokio::time::timeout(Duration::from_secs(5), async {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 8192];
+        let n = socket.read(&mut buf).await.unwrap();
+        assert!(n > 0);
+        socket
+    })
+    .await
+    .expect("fixture did not begin the first control-plane poll");
+    assert!(!tunnel.health.is_ready());
+    (tunnel, socket)
 }
 
-#[cfg(unix)]
+async fn idle_tunnel(root: &Path) -> OpenAiTunnel {
+    use tokio::io::AsyncWriteExt;
+    let (mut tunnel, mut socket) = pending_tunnel(root).await;
+    socket
+        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    if tokio::time::timeout(Duration::from_secs(5), async {
+        while !tunnel.health.is_ready() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        tunnel.stop().await;
+        panic!("fixture did not reach poll readiness");
+    }
+    tunnel
+}
+
 #[tokio::test]
-async fn version_verification_requires_the_pinned_client_line() {
-    use std::os::unix::fs::PermissionsExt;
-
+async fn parent_shutdown_during_initial_poll_settles_startup_owner() {
     let temp = tempfile::tempdir().unwrap();
-    let good = temp.path().join("good");
-    fs::write(&good, "#!/bin/sh\necho '0.0.12+test (git sha: abc)'\n").unwrap();
-    fs::set_permissions(&good, fs::Permissions::from_mode(0o700)).unwrap();
-    verify_tunnel_client_version(&good).await.unwrap();
+    // Hold the first real control-plane request without a response. No command
+    // has been admitted, and readiness cannot win this cancellation race.
+    let (tunnel, _socket) = pending_tunnel(temp.path()).await;
+    let marker = tunnel.guard.path().to_path_buf();
+    let abort = tunnel.task.as_ref().unwrap().abort_handle();
+    let (polled_tx, polled_rx) = oneshot::channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let startup = tokio::spawn(finish_openai_tunnel_startup(
+        tunnel,
+        Instant::now() + Duration::from_secs(60),
+        async {
+            polled_tx.send(()).unwrap();
+            let _ = stop_rx.await;
+        },
+    ));
+    polled_rx.await.unwrap();
+    stop_tx.send(()).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), startup)
+        .await
+        .expect("parent shutdown must not await initial poll readiness")
+        .unwrap()
+        .unwrap();
+    assert!(outcome.is_none());
+    assert!(abort.is_finished(), "shutdown must observe task completion");
+    assert!(
+        !marker.exists(),
+        "clean startup shutdown must retire its fence"
+    );
+    assert!(acquire_guard(temp.path(), "fixture").is_ok());
+}
 
-    let wrong = temp.path().join("wrong");
-    fs::write(&wrong, "#!/bin/sh\necho '0.0.13'\n").unwrap();
-    fs::set_permissions(&wrong, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(verify_tunnel_client_version(&wrong).await.is_err());
+#[tokio::test]
+async fn startup_shutdown_retains_fence_when_task_cannot_settle_cleanly() {
+    let temp = tempfile::tempdir().unwrap();
+    let guard = acquire_guard(temp.path(), "uncertain-startup").unwrap();
+    let (stop, rx) = oneshot::channel();
+    let task = tokio::spawn(async {
+        let _ = rx.await;
+        Err(Error::Uncertain)
+    });
+    let marker_path = guard.path().to_path_buf();
+    let tunnel = OpenAiTunnel {
+        task: Some(task),
+        stop: Some(stop),
+        health: Health::default(),
+        guard,
+        terminal: None,
+    };
+    let result = finish_openai_tunnel_startup(
+        tunnel,
+        Instant::now() + Duration::from_secs(60),
+        std::future::ready(()),
+    )
+    .await;
+    assert_eq!(result.err().unwrap().code, "tunnel_restart_uncertain");
+    assert!(marker_path.exists(), "uncertain startup must stay fenced");
+}
+
+#[tokio::test]
+async fn startup_readiness_transfers_owner_until_observed_shutdown() {
+    let temp = tempfile::tempdir().unwrap();
+    let tunnel = idle_tunnel(temp.path()).await;
+    let marker = tunnel.guard.path().to_path_buf();
+    let mut tunnel = finish_openai_tunnel_startup(
+        tunnel,
+        Instant::now() + Duration::from_secs(5),
+        std::future::pending(),
+    )
+    .await
+    .unwrap()
+    .expect("a ready connection should transfer its owner");
+    assert!(marker.exists());
+    tunnel.stop_with_outcome().await.unwrap();
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn startup_timeout_settles_idle_owner_before_reporting_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let (tunnel, _socket) = pending_tunnel(temp.path()).await;
+    let marker = tunnel.guard.path().to_path_buf();
+    let result = finish_openai_tunnel_startup(tunnel, Instant::now(), std::future::pending()).await;
+    assert_eq!(
+        result.err().unwrap().code,
+        "tunnel_control_plane_unreachable"
+    );
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn observed_idle_shutdown_clears_restart_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut tunnel = idle_tunnel(temp.path()).await;
+    let marker = tunnel.guard.path().to_path_buf();
+    tunnel.stop().await;
+    assert!(!marker.exists());
+    assert!(!tunnel.health.is_ready());
+}
+#[tokio::test]
+async fn observed_task_error_is_not_a_clean_join_and_keeps_restart_fence() {
+    let temp = tempfile::tempdir().unwrap();
+    let guard = acquire_guard(temp.path(), "failed-fixture").unwrap();
+    let task = tokio::spawn(async { Err(Error::Protocol) });
+    let marker_path = guard.path().to_path_buf();
+    let mut tunnel = OpenAiTunnel {
+        task: Some(task),
+        stop: None,
+        health: Health::default(),
+        guard,
+        terminal: None,
+    };
+    assert!(tunnel.wait_for_exit().await.is_err());
+    assert!(tunnel.stop_with_outcome().await.is_err());
+    assert!(
+        marker_path.exists(),
+        "Ok(Err(...)) is not a clean task result"
+    );
+}
+
+#[tokio::test]
+async fn clean_owner_stop_allows_reacquiring_the_same_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut tunnel = idle_tunnel(temp.path()).await;
+    assert!(tunnel.stop_with_outcome().await.is_ok());
+    assert!(tunnel.stop_with_outcome().await.is_ok());
+    assert!(acquire_guard(temp.path(), "fixture").is_ok());
+}
+
+#[tokio::test]
+async fn dropping_owner_retains_restart_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let tunnel = idle_tunnel(temp.path()).await;
+    let marker = tunnel.guard.path().to_path_buf();
+    drop(tunnel);
+    assert!(marker.exists());
+    assert_eq!(
+        acquire_guard(temp.path(), "fixture").unwrap_err().code,
+        "tunnel_restart_uncertain"
+    );
 }

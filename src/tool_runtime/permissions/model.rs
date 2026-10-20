@@ -10,7 +10,7 @@ pub(crate) const DEFAULT_PERMISSION_RECENT_LIMIT: usize = 20;
 /// Environment variable for the canonical authority mode.
 pub(crate) const AUTHORITY_MODE_ENV: &str = "WEBCODEX_AUTHORITY_MODE";
 
-/// Legacy operator configuration; unambiguous values migrate to authority modes.
+/// Retired setting detected only to fail closed, never translated or ignored.
 pub(crate) const LEGACY_PERMISSION_MODE_ENV: &str = "WEBCODEX_PERMISSION_MODE";
 
 /// Canonical authority mode (soft policy; never overrides hard safety).
@@ -38,8 +38,8 @@ impl AuthorityMode {
     /// Parse a mode name (case-sensitive, trimmed by caller).
     pub(crate) fn parse(raw: &str) -> Result<Self, AuthorityModeParseError> {
         match raw {
-            "trusted_agent" | "dev_auto_approve" => Ok(Self::TrustedAgent),
-            "restricted" | "require_approval" => Ok(Self::Restricted),
+            "trusted_agent" => Ok(Self::TrustedAgent),
+            "restricted" => Ok(Self::Restricted),
             other => Err(AuthorityModeParseError {
                 value: other.to_string(),
             }),
@@ -93,7 +93,7 @@ pub(crate) fn new_permission_decision(
     PermissionDecision {
         required: true,
         policy: policy.into(),
-        request_id: format!("wc_perm_{}", uuid::Uuid::new_v4().simple()),
+        request_id: format!("wc_perm_{}", webcodex_core::compact::random_suffix::<12>()),
         status: outcome.as_str().to_string(),
         reason: reason.into(),
         risk: risk.into(),

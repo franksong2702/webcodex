@@ -1,11 +1,16 @@
 use super::client_handoff_service::{copy_text_to_clipboard, mcp_url, ClipboardCopyOutcome};
-use super::openai_tunnel_service::{prepare_openai_tunnel, start_openai_tunnel};
-use super::setup_service::{create_private_dir, write_new_private};
+use super::openai_tunnel_service::{
+    prepare_openai_tunnel, start_openai_tunnel_with_stop, OpenAiTunnelRecovery,
+};
+use super::setup_service::create_private_dir;
 use super::ProductError;
 use serde_json::{json, Value};
+use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+#[path = "project_entry_regular_tunnel/health_events.rs"]
+mod health_events;
 
 const REGULAR_TUNNEL_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -14,6 +19,7 @@ pub(crate) struct RegularServerTunnelOptions {
     pub(crate) local_server_url: String,
     pub(crate) bootstrap_token: String,
     pub(crate) runtime_parent: PathBuf,
+    pub(crate) stop_on_stdin_eof: bool,
 }
 
 struct RegularTunnelSession {
@@ -28,18 +34,6 @@ impl RegularTunnelSession {
         create_private_dir(&directory)?;
         Ok(Self { directory })
     }
-
-    fn write_authorization_file(&self, bootstrap_token: &str) -> Result<PathBuf, ProductError> {
-        let token = bootstrap_token.trim();
-        if token.is_empty() {
-            return Err(tunnel_auth_error(
-                "the local Server bootstrap credential is unavailable",
-            ));
-        }
-        let path = self.directory.join("openai-mcp-authorization");
-        write_new_private(&path, format!("Bearer {token}").as_bytes())?;
-        Ok(path)
-    }
 }
 
 impl Drop for RegularTunnelSession {
@@ -48,25 +42,72 @@ impl Drop for RegularTunnelSession {
     }
 }
 
-pub(crate) async fn run_regular_server_tunnel(
+pub(crate) async fn run_regular_server_tunnel_with_stop(
     options: &RegularServerTunnelOptions,
+    stop: impl Future<Output = ()>,
+) -> Result<(), ProductError> {
+    match run_regular_server_tunnel_inner(options, stop).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            println!("{}", machine_regular_tunnel_failure_event(&error));
+            Err(error)
+        }
+    }
+}
+
+async fn run_regular_server_tunnel_inner(
+    options: &RegularServerTunnelOptions,
+    stop: impl Future<Output = ()>,
 ) -> Result<(), ProductError> {
     let local_server_url = validate_local_server_url(&options.local_server_url)?;
+    let startup_clock = Instant::now();
     let session = RegularTunnelSession::create(&options.runtime_parent)?;
-    let authorization_file = session.write_authorization_file(&options.bootstrap_token)?;
-    let prerequisites = prepare_openai_tunnel().await?;
+    // The parent lease covers preparation and connection startup too. Waiting
+    // until readiness to observe EOF can leave the owner fenced on Windows exit.
+    let stop = async {
+        tokio::select! {
+            _ = stop => {},
+            _ = wait_for_regular_tunnel_stop_signal(options.stop_on_stdin_eof) => {},
+        }
+    };
+    tokio::pin!(stop);
+    let prerequisites = tokio::select! {
+        biased;
+        _ = &mut stop => return Ok(()),
+        result = prepare_openai_tunnel() => result?,
+    };
     let deadline = Instant::now() + REGULAR_TUNNEL_STARTUP_TIMEOUT;
-    let mut tunnel = start_openai_tunnel(
+    let mcp_endpoint = mcp_url(&local_server_url);
+    let Some(mut tunnel) = start_openai_tunnel_with_stop(
         &prerequisites,
-        &mcp_url(&local_server_url),
-        &authorization_file,
-        &session.directory,
+        &mcp_endpoint,
+        &options.bootstrap_token,
+        OpenAiTunnelRecovery::Durable,
         deadline,
+        &mut stop,
     )
-    .await?;
+    .await?
+    else {
+        return Ok(());
+    };
 
-    let clipboard = copy_text_to_clipboard(&prerequisites.tunnel_id, true).await;
-    let ready = machine_regular_tunnel_ready_event(clipboard);
+    // Managed profiles use explicit Copy ID controls; concurrent starts must not
+    // race over the user's clipboard. Keep CLI handoff for an unmanaged invocation.
+    let managed = std::env::var("WEBCODEX_TUNNEL_PROFILE_ID").is_ok();
+    let clipboard = copy_text_to_clipboard(&prerequisites.tunnel_id, !managed).await;
+    let mut ready = machine_regular_tunnel_ready_event(clipboard);
+    let health = tunnel.health();
+    let poll_details = health.initial_poll_details();
+    ready["startup_timings_ms"] = json!({
+        "cli_total": startup_clock.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        "initial_poll": health.initial_poll_ms(),
+        "poll_attempts": poll_details.map(|(attempts, _)| attempts),
+        "poll_request_ms": poll_details.map(|(_, request_ms)| request_ms),
+    });
+    ready["runtime"] = json!({
+        "directory": session.directory,
+        "local_mcp_url": mcp_url(&local_server_url),
+    });
     let encoded = serde_json::to_string(&ready).map_err(|_| {
         ProductError::new(
             "machine_output_failed",
@@ -76,12 +117,88 @@ pub(crate) async fn run_regular_server_tunnel(
     })?;
     println!("{encoded}");
 
+    let health = tunnel.health();
+    let local_mcp_url = mcp_url(&local_server_url);
+    let readiness_path = options.runtime_parent.join("readiness.json");
+    let service_readiness = managed
+        .then_some(readiness_path)
+        .filter(|path| path.is_file());
     let outcome = tokio::select! {
-        _ = wait_for_regular_tunnel_stop_signal() => Ok(()),
+        _ = &mut stop => Ok(()),
         result = tunnel.wait_for_exit() => result,
+        result = report_regular_tunnel_health(&health, &local_mcp_url, &options.bootstrap_token, service_readiness.as_deref(), options.stop_on_stdin_eof) => result,
     };
-    tunnel.stop().await;
-    outcome
+    if let Some(path) = service_readiness {
+        let _ = webcodex_environment::write_tunnel_health(&path, false, false);
+    }
+    let stopped = tunnel.stop_with_outcome().await;
+    outcome.and(stopped)
+}
+
+/// A running daemon is not sufficient proof of a usable local MCP endpoint.
+/// No response body, credential, or network error text crosses the machine channel.
+async fn report_regular_tunnel_health(
+    health: &webcodex_openai_tunnel::Health,
+    local_mcp_url: &str,
+    bootstrap: &str,
+    service_readiness: Option<&Path>,
+    parent_heartbeat: bool,
+) -> Result<(), ProductError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(1))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|_| tunnel_auth_error("Local connection health monitoring is unavailable"))?;
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut events = health_events::HealthEvents::new(parent_heartbeat);
+    loop {
+        interval.tick().await;
+        let tunnel_ready = health.is_ready();
+        let local_mcp_ready = probe_local_mcp(&client, local_mcp_url, bootstrap).await;
+        if let Some(path) = service_readiness {
+            webcodex_environment::write_tunnel_health(path, tunnel_ready, local_mcp_ready)
+                .map_err(|_| tunnel_auth_error("Could not persist service connection health"))?;
+        }
+        if events.should_emit(Instant::now(), tunnel_ready, local_mcp_ready) {
+            println!(
+                "{}",
+                json!({"event":"health", "schema_version":1, "tunnel_ready":tunnel_ready, "local_mcp_ready":local_mcp_ready})
+            );
+        }
+    }
+}
+
+pub(crate) async fn probe_local_mcp(
+    client: &reqwest::Client,
+    local_mcp_url: &str,
+    bootstrap: &str,
+) -> bool {
+    let Ok(mut response) = client
+        .get(local_mcp_url)
+        .bearer_auth(bootstrap.trim())
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_success() || response.content_length().is_some_and(|size| size > 8192)
+    {
+        return false;
+    }
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) if body.len() + chunk.len() <= 8192 => body.extend_from_slice(&chunk),
+            Ok(None) => break,
+            _ => return false,
+        }
+    }
+    serde_json::from_slice::<Value>(&body).is_ok_and(|value| {
+        value["name"] == "webcodex" && value["protocol"] == "mcp" && value["endpoint"] == "/mcp"
+    })
 }
 
 fn machine_regular_tunnel_ready_event(clipboard: ClipboardCopyOutcome) -> Value {
@@ -92,15 +209,41 @@ fn machine_regular_tunnel_ready_event(clipboard: ClipboardCopyOutcome) -> Value 
     };
     json!({
         "event": "ready",
-        "schema_version": 1,
+        "schema_version": 2,
         "provider": "openai",
-        "ready_for_chatgpt": clipboard == ClipboardCopyOutcome::Copied,
+        "ready_for_chatgpt": true,
+        "client_connection": "not_observed",
         "connection": {
             "kind": "openai_tunnel",
             "clipboard_state": clipboard_state,
             "clipboard_contains": "tunnel_id",
         }
     })
+}
+
+fn machine_regular_tunnel_failure_event(error: &ProductError) -> Value {
+    let (failure_stage, reason_code) = tunnel_failure_evidence(&error.code);
+    json!({
+        "event": "failure",
+        "schema_version": 1,
+        "provider": "openai",
+        "failure_stage": failure_stage,
+        "reason_code": reason_code,
+    })
+}
+
+fn tunnel_failure_evidence(code: &str) -> (&'static str, &'static str) {
+    match code {
+        "tunnel_auth_rejected" => ("tunnel_control_plane", "tunnel_auth_rejected"),
+        "tunnel_restart_uncertain" => ("tunnel_recovery", "tunnel_restart_uncertain"),
+        "tunnel_capacity_exhausted" => ("tunnel_capacity", "tunnel_capacity_exhausted"),
+        "tunnel_protocol_failed" => ("tunnel_protocol", "tunnel_protocol_failed"),
+        "tunnel_control_plane_unreachable" => {
+            ("tunnel_control_plane", "tunnel_control_plane_unreachable")
+        }
+        "local_mcp_unavailable" | "tunnel_auth_invalid" => ("local_mcp", "local_mcp_unavailable"),
+        _ => ("tunnel_startup", "tunnel_startup_failed"),
+    }
 }
 
 fn validate_local_server_url(value: &str) -> Result<String, ProductError> {
@@ -130,10 +273,32 @@ fn validate_local_server_url(value: &str) -> Result<String, ProductError> {
     Ok(value.to_string())
 }
 
-async fn wait_for_regular_tunnel_stop_signal() {
-    tokio::select! {
-        _ = wait_for_platform_stop_signal() => {},
-        _ = wait_for_stdin_eof() => {},
+pub(crate) async fn wait_for_regular_tunnel_stop_signal(stop_on_stdin_eof: bool) {
+    wait_for_regular_tunnel_stop_signal_with(
+        stop_on_stdin_eof,
+        wait_for_platform_stop_signal(),
+        wait_for_stdin_eof(),
+    )
+    .await;
+}
+
+async fn wait_for_regular_tunnel_stop_signal_with<S, E>(
+    stop_on_stdin_eof: bool,
+    stop_signal: S,
+    stdin_eof: E,
+) where
+    S: Future<Output = ()>,
+    E: Future<Output = ()>,
+{
+    if stop_on_stdin_eof {
+        tokio::select! {
+            _ = stop_signal => {},
+            _ = stdin_eof => {},
+        }
+    } else {
+        // Do not even poll stdin in persistent mode: daemons commonly inherit
+        // an already-closed stdin descriptor.
+        stop_signal.await;
     }
 }
 
@@ -157,7 +322,16 @@ async fn wait_for_stdin_eof() {
 
 #[cfg(not(windows))]
 async fn wait_for_platform_stop_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate.recv() => {},
+    }
 }
 
 #[cfg(windows)]
@@ -184,12 +358,50 @@ fn tunnel_auth_error(message: &str) -> ProductError {
 }
 
 #[cfg(test)]
+#[path = "project_entry_regular_tunnel_startup_tests.rs"]
+mod startup_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn persistent_tunnel_does_not_poll_stdin_eof() {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(wait_for_regular_tunnel_stop_signal_with(
+            false,
+            async move {
+                let _ = stop_rx.await;
+            },
+            async { panic!("persistent tunnel polled stdin EOF") },
+        ));
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        stop_tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parent_liveness_mode_stops_on_stdin_eof() {
+        let (_stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_regular_tunnel_stop_signal_with(
+                true,
+                async move {
+                    let _ = stop_rx.await;
+                },
+                std::future::ready(()),
+            ),
+        )
+        .await
+        .expect("stdin EOF should stop parent-owned tunnel mode");
+    }
 
     #[test]
     fn machine_ready_event_contains_only_safe_handoff_metadata() {
         let event = machine_regular_tunnel_ready_event(ClipboardCopyOutcome::Copied);
+        assert_eq!(event["schema_version"], 2);
         let encoded = serde_json::to_string(&event).unwrap();
         assert!(encoded.contains("\"provider\":\"openai\""));
         assert!(encoded.contains("\"clipboard_contains\":\"tunnel_id\""));
@@ -201,6 +413,38 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_readiness_is_not_clipboard_delivery_or_verified_client_use() {
+        for outcome in [
+            ClipboardCopyOutcome::Copied,
+            ClipboardCopyOutcome::Unavailable,
+            ClipboardCopyOutcome::Disabled,
+        ] {
+            let value = machine_regular_tunnel_ready_event(outcome);
+            assert_eq!(value["ready_for_chatgpt"], true);
+            assert_eq!(value["client_connection"], "not_observed");
+            assert!(value["connection"]["clipboard_state"].is_string());
+        }
+    }
+
+    #[test]
+    fn machine_failure_event_is_typed_bounded_and_secret_free() {
+        let error = ProductError::new(
+            "tunnel_auth_rejected",
+            "private runtime key and tunnel id must never cross the machine channel",
+            Some("private recovery text"),
+        );
+        let event = machine_regular_tunnel_failure_event(&error);
+        assert_eq!(event["event"], "failure");
+        assert_eq!(event["failure_stage"], "tunnel_control_plane");
+        assert_eq!(event["reason_code"], "tunnel_auth_rejected");
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(!encoded.contains("private runtime key"));
+        assert!(!encoded.contains("private recovery"));
+        assert!(!encoded.contains("Authorization"));
+        assert!(!encoded.contains("Bearer"));
+    }
+
+    #[test]
     fn regular_tunnel_rejects_non_loopback_server_origins() {
         assert!(validate_local_server_url("http://127.0.0.1:8080").is_ok());
         assert!(validate_local_server_url("http://localhost:8080").is_ok());
@@ -209,33 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn authorization_file_is_private_distinct_and_cleaned_up() {
+    fn regular_tunnel_session_directory_is_distinct_and_cleaned_up() {
         let temp = tempfile::tempdir().unwrap();
-        let bootstrap_token = "wc_boot_test_secret";
-        let session = RegularTunnelSession::create(temp.path()).unwrap();
-        let session_dir = session.directory.clone();
-        let authorization_file = session.write_authorization_file(bootstrap_token).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&authorization_file).unwrap(),
-            format!("Bearer {bootstrap_token}")
-        );
-        drop(session);
-        assert!(!session_dir.exists());
-        assert!(!authorization_file.exists());
-    }
-
-    #[test]
-    fn authorization_file_rejects_empty_bootstrap_credentials() {
-        let temp = tempfile::tempdir().unwrap();
-        for value in ["", "   "] {
-            let session = RegularTunnelSession::create(temp.path()).unwrap();
-            let error = session.write_authorization_file(value).unwrap_err();
-            assert_eq!(error.code, "tunnel_auth_invalid");
-            assert_eq!(
-                error.message,
-                "the local Server bootstrap credential is unavailable"
-            );
-            drop(session);
-        }
+        let first = RegularTunnelSession::create(temp.path()).unwrap();
+        let second = RegularTunnelSession::create(temp.path()).unwrap();
+        assert_ne!(first.directory, second.directory);
+        let directory = first.directory.clone();
+        drop(first);
+        assert!(!directory.exists());
+        assert!(second.directory.is_dir());
     }
 }

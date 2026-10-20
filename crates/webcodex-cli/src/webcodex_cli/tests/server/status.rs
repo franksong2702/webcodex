@@ -79,7 +79,8 @@ fn server_status_reports_revision_mismatch() {
     assert!(detail.starts_with("warning:"));
     assert!(detail.contains("local CLI commit 81f322d5b580"));
     assert!(detail.contains("server runtime commit fd156ba92fc7"));
-    assert!(detail.contains("deploy/update one side before debugging old behavior"));
+    assert!(detail.contains("build identity is diagnostic"));
+    assert!(detail.contains("compatibility depends on protocol generation and capabilities"));
 }
 
 #[test]
@@ -164,7 +165,7 @@ async fn server_status_parses_env_token_posts_and_does_not_print_token() {
         let n = stream.read(&mut buf).unwrap();
         let request = String::from_utf8_lossy(&buf[..n]).to_string();
         tx.send(request.clone()).unwrap();
-        let body = r#"{"success":true,"output":{"service":"webcodex","auth_enabled":true,"configured_public_url":"https://example.test","tools":{"count":12},"agents":{"online_count":2}}}"#;
+        let body = r#"{"success":true,"output":{"service":"webcodex","auth_enabled":true,"configured_public_url":"https://example.test","tools":{"count":12},"runners":{"online_count":2}}}"#;
         write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
@@ -200,7 +201,7 @@ async fn server_status_parses_env_token_posts_and_does_not_print_token() {
     assert!(output.contains("auth_enabled:          true"));
     assert!(output.contains("configured_public_url: https://example.test"));
     assert!(output.contains("tools.count:           12"));
-    assert!(output.contains("agents.online_count:   2"));
+    assert!(output.contains("runners.online_count:   2"));
 }
 
 #[tokio::test]
@@ -214,7 +215,7 @@ async fn server_status_token_file_takes_priority_over_env_file() {
         let n = stream.read(&mut buf).unwrap();
         tx.send(String::from_utf8_lossy(&buf[..n]).to_string())
             .unwrap();
-        let body = r#"{"success":true,"output":{"auth_enabled":true,"configured_public_url":null,"tools":{"count":0},"agents":{"online_count":0}}}"#;
+        let body = r#"{"success":true,"output":{"auth_enabled":true,"configured_public_url":null,"tools":{"count":0},"runners":{"online_count":0}}}"#;
         write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",

@@ -1,311 +1,76 @@
-//! Model-facing runtime tool discovery groups, recommended flows, and intents.
+//! Canonical category projection, recommended flows, and task intents.
 
-use super::tool_definition::{ToolDiscoveryGroup, ToolManifestIntent, ToolRecommendedFlow};
+use super::tool_definition::{ToolManifestIntent, ToolRecommendedFlow};
+use super::tool_policy::lookup_tool_definition;
+use std::collections::BTreeMap;
 
-pub const TOOL_DISCOVERY_GROUP_CHECKPOINT: &str = "checkpoint";
-pub const TOOL_DISCOVERY_GROUP_CLEANUP: &str = "cleanup";
-pub const TOOL_DISCOVERY_GROUP_CODING_AGENT: &str = "coding_agent";
-pub const TOOL_DISCOVERY_GROUP_COMMUNICATION: &str = "communication";
-pub const TOOL_DISCOVERY_GROUP_AGENT_TASK: &str = "agent_task";
-pub const TOOL_DISCOVERY_GROUP_EDIT: &str = "edit";
-pub const TOOL_DISCOVERY_GROUP_FILE_TRANSFER: &str = "file_transfer";
-pub const TOOL_DISCOVERY_GROUP_GIT: &str = "git";
-pub const TOOL_DISCOVERY_GROUP_INSPECT: &str = "inspect";
-pub const TOOL_DISCOVERY_GROUP_JOBS: &str = "jobs";
-pub const TOOL_DISCOVERY_GROUP_PATCH: &str = "patch";
-pub const TOOL_DISCOVERY_GROUP_PROJECTS: &str = "projects";
-pub const TOOL_DISCOVERY_GROUP_REVIEW: &str = "review";
-pub const TOOL_DISCOVERY_GROUP_RUNTIME: &str = "runtime";
-pub const TOOL_DISCOVERY_GROUP_SHELL: &str = "shell";
-pub const TOOL_DISCOVERY_GROUP_VALIDATION: &str = "validation";
+/// Group an already-admitted selection by each ToolDefinition's sole category.
+/// This is presentation, not admission: callers own visibility, protocol and
+/// authority filtering. Unknown names are omitted; repeated names are deduplicated.
+/// Both categories and members are sorted so registry order cannot cause drift.
+pub fn group_tool_names_by_category<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<&'static str, Vec<&'a str>> {
+    let mut categories: BTreeMap<&'static str, Vec<&'a str>> = BTreeMap::new();
+    for name in names {
+        if let Some(definition) = lookup_tool_definition(name) {
+            categories
+                .entry(definition.category)
+                .or_default()
+                .push(name);
+        }
+    }
+    for members in categories.values_mut() {
+        members.sort_unstable();
+        members.dedup();
+    }
+    categories
+}
+/// Hidden editing specialists that remain available only through exact
+/// read_tool_manifest lookup followed by the canonical gateway. They are excluded
+/// from ordinary tools/list, intent ranking, and recommended edit routing.
+pub const EXACT_MANIFEST_SPECIALIST_TOOL_NAMES: &[&str] =
+    &["apply_patch", "apply_unified_diff", "write_project_file"];
 
-pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_INSPECT,
-        tools: &[
-            "list_tools",
-            "list_projects",
-            "list_runners",
-            "runtime_status",
-            "work_on_project",
-            "project_overview",
-            "list_project_tracked_files",
-            "read_file",
-            "read_files",
-            "run_process",
-            "run_script",
-            "run_shell",
-            "search_project_text",
-            "search_project_texts",
-            "document_symbols",
-            "document_diagnostics",
-            "hover",
-            "workspace_symbols",
-            "goto_definition",
-            "find_references",
-            "call_hierarchy",
-            "lsp_status",
-            "list_project_files",
-            "show_changes",
-            "git_status",
-            "git_diff",
-            "git_diff_summary",
-            "git_review_summary",
-            "git_diff_hunks",
-            "git_log",
-            "workspace_checkpoint_list",
-            "workspace_checkpoint_show",
-            "computer_list_targets",
-            "computer_list_windows",
-            "computer_list_displays",
-            "computer_list_applications",
-            "computer_launch_application",
-            "computer_accessibility_status",
-            "computer_accessibility_tree",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_activate_window",
-            "computer_control",
-            "computer_scroll_to_element",
-            "computer_key_input",
-            "computer_read_clipboard",
-            "computer_write_clipboard",
-            "computer_pointer_move",
-            "computer_pointer_click",
-            "computer_input_text",
-            "computer_snapshot",
-            "computer_snapshot_display",
-            "computer_save_snapshot",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_AGENT_TASK,
-        tools: &[
-            "create_agent_task",
-            "list_agent_tasks",
-            "read_agent_task",
-            "assign_agent_task",
-            "start_agent_task_attempt",
-            "start_agent_task_coding_run",
-            "reconcile_agent_task_coding_run",
-            "heartbeat_agent_task_attempt",
-            "complete_agent_task_attempt",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_COMMUNICATION,
-        tools: &[
-            "create_agent_identity",
-            "list_agent_identities",
-            "update_agent_identity",
-            "attach_agent_endpoint",
-            "bootstrap_agent_conversation",
-            "detach_agent_endpoint",
-            "create_conversation",
-            "list_conversations",
-            "read_conversation",
-            "post_conversation_message",
-            "list_agent_inbox",
-            "consume_agent_deliveries",
-            "consume_agent_wake",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_PROJECTS,
-        tools: &[
-            "list_projects",
-            "register_project",
-            "unregister_project",
-            "create_project",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_GIT,
-        tools: &[
-            "git_commit_paths",
-            "git_status",
-            "git_diff",
-            "git_diff_summary",
-            "git_review_summary",
-            "git_diff_hunks",
-            "git_log",
-            "show_changes",
-            "git_restore_paths",
-            "discard_untracked",
-            "workspace_checkpoint_create",
-            "workspace_checkpoint_restore",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_REVIEW,
-        tools: &[
-            "finish_coding_task",
-            "show_changes",
-            "git_review_summary",
-            "git_diff_hunks",
-            "workspace_hygiene_check",
-            "git_diff_summary",
-            "git_log",
-            "git_status",
-            "git_diff",
-            "workspace_checkpoint_show",
-            "workspace_checkpoint_list",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_VALIDATION,
-        tools: &[
-            "cargo_fmt",
-            "cargo_check",
-            "cargo_test",
-            "go_test",
-            "validation_summary",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_PATCH,
-        tools: &["apply_patch", "apply_unified_diff"],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_EDIT,
-        tools: &[
-            "apply_text_edits",
-            "apply_patch",
-            "apply_unified_diff",
-            "write_project_file",
-            "save_project_artifact",
-            "read_project_artifact_metadata",
-            "read_project_artifact",
-            "import_conversation_files_to_project",
-            "export_project_artifact",
-            "artifact_upload_begin",
-            "artifact_upload_chunk",
-            "artifact_upload_finish",
-            "artifact_upload_abort",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_FILE_TRANSFER,
-        tools: &[
-            "import_conversation_files_to_project",
-            "export_project_artifact",
-            "save_project_artifact",
-            "read_project_artifact_metadata",
-            "read_project_artifact",
-            "artifact_upload_begin",
-            "artifact_upload_chunk",
-            "artifact_upload_finish",
-            "artifact_upload_abort",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_SHELL,
-        tools: &[
-            "cargo_fmt",
-            "cargo_check",
-            "cargo_test",
-            "run_process",
-            "run_detached_process",
-            "run_script",
-            "run_shell",
-            "open_session_shell",
-            "session_shell_exec",
-            "session_shell_status",
-            "close_session_shell",
-            "run_job",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_JOBS,
-        tools: &[
-            "open_session_shell",
-            "session_shell_exec",
-            "session_shell_status",
-            "close_session_shell",
-            "run_detached_process",
-            "run_job",
-            "stop_job",
-            "job_status",
-            "job_log",
-            "observe_jobs",
-            "list_jobs",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_RUNTIME,
-        tools: &[
-            "list_tools",
-            "work_on_project",
-            "finish_coding_task",
-            "session_summary",
-            "update_session_context",
-            "close_session",
-            "post_session_message",
-            "list_session_messages",
-            "get_session_assignment",
-            "observe_session_messages",
-            "resolve_session_message",
-            "complete_session_message",
-            "session_discussion_summary",
-            "session_handoff_summary",
-            "workspace_checkpoint_create",
-            "workspace_checkpoint_list",
-            "workspace_checkpoint_show",
-            "workspace_checkpoint_restore",
-            "workspace_checkpoint_delete",
-            "list_projects",
-            "list_runners",
-            "runtime_status",
-            "runner_config_check",
-            "runner_config_reload",
-            "tool_manifest",
-            "plugin_tool",
-            "ssh_resource",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_CODING_AGENT,
-        tools: &[
-            "coding_agent_start",
-            "coding_agent_observe",
-            "coding_agent_cancel",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_CLEANUP,
-        tools: &[
-            "delete_project_files",
-            "git_restore_paths",
-            "discard_untracked",
-            "workspace_checkpoint_delete",
-        ],
-    },
-    ToolDiscoveryGroup {
-        name: TOOL_DISCOVERY_GROUP_CHECKPOINT,
-        tools: &[
-            "workspace_checkpoint_create",
-            "workspace_checkpoint_list",
-            "workspace_checkpoint_show",
-            "workspace_checkpoint_restore",
-            "workspace_checkpoint_delete",
-        ],
-    },
+/// Model-visible read specialists omitted from ordinary direct routing.
+pub const EXACT_DISCOVERY_SPECIALIST_TOOL_NAMES: &[&str] =
+    &["read_git_diff_hunks", "read_git_review_summary"];
+
+/// Review specialists omitted from ordinary intent ranking/recommended flows.
+/// Category and exact discovery retain them behind the canonical gateway.
+pub const ORDINARY_DISCOVERY_DEMOTED_REVIEW_TOOL_NAMES: &[&str] = &[
+    "read_git_diff_hunks",
+    "read_git_review_summary",
+    "read_workspace_changes",
 ];
+
+/// Retain domain recipes without recommending an unavailable model operation.
+/// This projection follows static ToolDefinition visibility, never workflow
+/// guidance or environment settings. Re-admitting a descriptor restores its
+/// complete recipes without a second continuation allowlist.
+pub fn model_visible_recommended_flows() -> impl Iterator<Item = &'static ToolRecommendedFlow> {
+    TOOL_RECOMMENDED_FLOWS.iter().filter(|flow| {
+        flow.tools.iter().all(|name| {
+            lookup_tool_definition(name)
+                .is_some_and(|definition| definition.visibility.is_model_visible())
+        })
+    })
+}
 
 pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
     ToolRecommendedFlow {
         name: "discovery",
-        summary: "Discovery: if the user gives an exact Runner client_id, use runtime_status/list_projects for that Runner before treating it as absent. Otherwise use bounded runtime/project discovery, then batch-capable structured search/read.",
+        summary: "Discovery: if the user gives an exact Runner client_id, resolve its registered path/query before treating it as absent. Use resolve_workspace without Session creation, get_runtime_status/list_projects for that Runner, Workbench for explicit context, and list_runners only for an unknown machine.",
         manifest_purpose:
-            "Exact Runner targeting: with client_id use runtime_status(client_id=...) or list_projects(client_id=...); use list_runners only for broad fleet discovery, then inspect/search the resolved project.",
+            "Exact Runner targeting: resolve_workspace locates registered paths without Session creation; get_runtime_status(client_id=...) inspects health and list_projects(client_id=...) lists candidates. Use list_runners for an unknown machine. Ambiguity needs explicit choice, never automatic first-match selection.",
         tools: &[
-            "runtime_status",
+            "resolve_workspace",
+            "open_webcodex_workbench",
+            "get_runtime_status",
             "list_runners",
             "list_projects",
-            "project_overview",
-            "read_file",
+            "read_project_overview",
             "read_files",
-            "search_project_text",
             "search_project_texts",
             "run_process",
             "run_script",
@@ -313,258 +78,294 @@ pub const TOOL_RECOMMENDED_FLOWS: &[ToolRecommendedFlow] = &[
         ],
     },
     ToolRecommendedFlow {
-        name: "persistent_shell",
-        summary: "Persistent shell: primarily reuse one shell for repeated commands on an active named SSH resource and keep remote shell state. New target: ssh_resource list/register -> restart -> list -> bind -> open/reuse. Local persistent shell is only for true same-process state; one-shot SSH uses run_process.",
-        manifest_purpose:
-            "Persistent shell is SSH-resource-primary: use ssh_resource list to discover safe logical names. If a new SSH target should persist, ssh_resource register it and stop for Runner restart; after restart list again, update_session_context binds the active Runner-local named SSH resource, open_session_shell once, and session_shell_exec repeatedly preserves remote cwd/env/exports/functions/umask. A managed resource is not an arbitrary host; the SSH target does not run WebCodex Runner. Local persistent shell remains supported only when same local-process state is required; several ordinary local commands are not enough. Use session_shell_status only when needed, close_session_shell for cleanup, and run_process for explicit one-shot/no-persistence SSH.",
+        name: "agent_continuation_setup",
+        summary: "New durable Agent window setup: create identity -> create/rotate Endpoint -> present continuation card -> normal final assistant response -> later verify production_auto_resume_available.",
+        manifest_purpose: "Use create_agent_identity, then rotate_agent_continuation_endpoint, then present_agent_continuation. Presentation success is not Host readiness. Produce a normal final assistant response and let the current turn finalize promptly; the card/tool result alone does not end it. On a later turn verify the exact Agent through list_agent_identities.production_auto_resume_available. Keep durable Agent identity independent from the Host window.",
         tools: &[
-            "ssh_resource",
+            "create_agent_identity",
+            "rotate_agent_continuation_endpoint",
+            "present_agent_continuation",
+            "list_agent_identities",
+        ],
+    },
+    ToolRecommendedFlow {
+        name: "single_window_goal_workflow",
+        summary: "Optional durable Goal workflow; current webcodex.workflow guidance owns selection. Reuse an exact active Goal, or explicitly admit Goal + Session. Present/checkpoint only for established Goal work, verify/review and explicitly complete. Host continuation is separate.",
+        manifest_purpose: "Optional cross-repository workflow; consult current webcodex.workflow context for selection, not tool availability or task size alone. work_on_project may return sparse goal_context for active Goals explicitly correlated to the exact authorized Workflow Session. Reuse one exact candidate by calling get_goal and present_goal_plan; with multiple candidates, read candidate details through exact get_goal calls and explicitly choose one before present_goal_plan. Never auto-select or infer from Project, Window, title, or recency. Only after selecting durable Goal work, and without reusable active Goal context, call prepare_goal_workflow with the exact Workflow Session, bounded completion_conditions/steps and optional explicit controller Agent, then present_goal_plan. available=false is inconclusive evidence, not proof of zero active Goals. prepare_goal_workflow is durable admission only: Host carrier setup/readiness remains separate. The agent_continuation_setup flow is usable only while its dedicated presentation descriptor is advertised; when that descriptor is absent, do not repeat discovery for a Host carrier. Use revise_goal_plan when evidence changes unfinished milestones; preserve completed entries and completion intent. Use checkpoint_goal at recovery-worthy boundaries; finish_coding_task returns the same sparse active Goal representation as goal_follow_up. After fresh validation/review explicitly complete all steps and update_goal. Low-level create_goal and associate_goal_workflow_session remain available for advanced composition. Tiny reads/trivial edits do not require Goal setup.",
+        tools: &[
+            "work_on_project", "get_goal", "prepare_goal_workflow", "present_goal_plan",
+            "checkpoint_goal", "revise_goal_plan", "finish_coding_task", "update_goal",
+        ],
+    },
+    ToolRecommendedFlow {
+        name: "goal_agent_wait_orchestration",
+        summary: "Goal-scoped AgentWait orchestration: ready Coordinator/Workers -> create controlled Goal -> create/associate exact Tasks -> register any|all Wait before workers terminalize -> start Attempt + Endpoint continuation -> on resume bootstrap/consume Wake and reconcile Wait/Goal/Tasks.",
+        manifest_purpose: "For bounded Goal fan-in, keep identities explicit. First establish exact Coordinator/Worker Agents and continuation readiness. Create the Goal with an explicit controller, create exact AgentTasks with explicit workers, and associate each selected Task to that exact Goal. Then call wait_for_agent_events with goal_id plus an explicit 1..8 Task selector list before any selected worker can terminalize; use any for first-result continuation or all for fan-in. Only after registration start each worker with start_agent_task_attempt followed by start_agent_task_endpoint_continuation. On a fresh resumed Coordinator turn bootstrap the exact Wake, consume it immediately, read_agent_wait(wait_id), get_goal(goal_id), re-read every authoritative source Task, and explicitly decide/update Goal state from current durable truth. Never derive the Wait source list from Goal correlations and do not treat this flow as a scheduler, dependency DAG, auto-spawn rule, or automatic Goal progression.",
+        tools: &[
+            "create_agent_identity",
+            "rotate_agent_continuation_endpoint",
+            "present_agent_continuation",
+            "list_agent_identities",
+            "create_goal",
+            "create_agent_task",
+            "associate_goal_agent_task",
+            "wait_for_agent_events",
+            "start_agent_task_attempt",
+            "start_agent_task_endpoint_continuation",
+            "bootstrap_agent_conversation",
+            "consume_agent_wake",
+            "read_agent_wait",
+            "get_goal",
+            "read_agent_task",
+            "update_goal",
+        ],
+    },
+    ToolRecommendedFlow {
+        name: "persistent_shell",
+        summary: "Persistent shell: primarily reuse one shell and keep remote shell state on an active named SSH resource. New target: manage_ssh_resource list/register -> restart -> list -> bind -> open/reuse. Local shell is only for same-process state; one-shot SSH uses run_process.",
+        manifest_purpose:
+            "Persistent shell is SSH-resource-primary: use manage_ssh_resource list to discover safe logical names. If a new SSH target should persist, manage_ssh_resource register it and stop for Runner restart; after restart list again, update_session_context binds the active Runner-local named SSH resource, open_session_shell once, and execute_session_shell repeatedly preserves remote cwd/env/exports/functions/umask. A managed resource is not an arbitrary host; the SSH target does not run WebCodex Runner. Local persistent shell remains supported only when same local-process state is required; several ordinary local commands are not enough. Use get_session_shell_status only when needed, close_session_shell for cleanup, and run_process for explicit one-shot/no-persistence SSH.",
+        tools: &[
+            "manage_ssh_resource",
             "update_session_context",
             "open_session_shell",
-            "session_shell_exec",
-            "session_shell_status",
+            "execute_session_shell",
+            "get_session_shell_status",
             "close_session_shell",
             "run_process",
         ],
     },
     ToolRecommendedFlow {
         name: "execution_lifetime",
-        summary: "Execution lifetime: run_process/run_job stay Runner-owned. If accepted native work must outlive the current Runner process across exit, restart, upgrade, or replacement, discover run_detached_process and observe its supervisor-owned Job; never use an expired detached key as a retry token.",
+        summary: "Execution selection: run_process/run_script/run_shell and structured validation are Runner-owned sync-first; run_job is Runner-owned immediate async; run_detached_process is supervisor-owned immediate async; execute_session_shell continues an existing Session shell.",
         manifest_purpose:
-            "Choose execution by lifetime ownership: ordinary process/shell Jobs remain owned by the current Runner, while run_detached_process explicitly hands accepted native argv work to a narrow supervisor so it can outlive the initiating Runner and be recovered by a replacement Runner only under the detached reconciliation contract.",
+            "Choose execution by form, lifetime, start mode, and continuation rather than duration. Runner-owned sync-first run_process/run_script/run_shell and structured validation keep the same execution when handed off and continue with observe_jobs. run_job is Runner-owned immediate async. run_detached_process is supervisor-owned immediate async and is only for a native child that must survive Runner restart/upgrade/stop/replacement; duration alone is not a reason to detach. execute_session_shell continues an existing persistent Session shell instead of creating a Job.",
         tools: &[
             "run_process",
+            "run_script",
+            "run_shell",
             "run_job",
             "run_detached_process",
+            "execute_session_shell",
             "observe_jobs",
             "stop_job",
         ],
     },
     ToolRecommendedFlow {
         name: "inspect",
-        summary: "Inspect: on Adaptive Runtime prefer search_project_texts/read_files even for one query/range. Use run_process for native argv, run_shell for a short tightly related shell chain, run_script for program-like shell content, then show_changes to review.",
+        summary: "Inspect: choose the simplest sufficient primitive. Native commands are first-class for small bounded observations; use search_project_texts/read_files when batching, path policy, bounded structured results, snapshot/continuation, or portable Runtime semantics help.",
         manifest_purpose:
-            "Prefer batch-capable search_project_texts/read_files for Adaptive inspection even with one item; singular search_project_text/read_file remain valid simple primitives. Use run_process for one native argv call, run_shell only for shell semantics or one tightly related observation goal, and run_script for loops/conditionals/functions/traps/multi-stage logic before reviewing the worktree.",
+            "For small bounded observations, native commands are first-class: run_process for one literal-argv executable, run_shell for shell grammar or a short related chain, and run_script for program-like supported scripts. Use search_project_texts/read_files when their batching, path policy, bounded structured result, read_revision, snapshot continuation, or portable Runtime semantics materially help.",
         tools: &[
-            "search_project_text",
             "search_project_texts",
-            "read_file",
             "read_files",
+            #[cfg(feature = "experimental-code-mode")]
+            "execute_code_mode",
             "run_process",
             "run_script",
             "run_shell",
-            "show_changes",
+            "review_changes",
         ],
     },
     ToolRecommendedFlow {
         name: "edit",
         summary:
-            "Edit: after read_file/read_files, apply_text_edits with current SHA is the default for ordinary model-generated edits, even when many lines change. Use apply_patch only when contextual/large multi-hunk patch form is materially clearer; external diffs use apply_unified_diff.",
+            "Edit: read_files → edit_project_files → structured validation → review_changes → finish_coding_task. Existing-file changes use read_revision fences; exact and deterministic range edits share one primary editor; legacy Git review specialists require exact-name discovery.",
         manifest_purpose:
-            "Read current files first; SHA-guarded apply_text_edits is the canonical default even when many lines change. Use apply_patch only when contextual or multi-hunk form is materially clearer. Repetitive patch targets need stable unique containing function/impl/type/test/module context. On matching_mode_rejected, do not weaken the guard or switch to first_match: reread and prefer apply_text_edits if exact edits are easy. If patch form remains clearer, consume bounded read_files recovery and preserve the requested guard: unique retries use matching_mode=unique with unique context; exact_unique retries remain matching_mode=exact_unique and never downgrade the stale-context/concurrency fence. context_mismatch requires bounded reread and regeneration from current source, never blind retry. External raw diffs use apply_unified_diff; whole-file writes are only for intentional rewrites.",
+            "Use read_files for the exact source/read_revision, edit_project_files for mutation, structured validation for execution evidence, then review_changes for one authoritative Git snapshot and bounded diff page before finish_coding_task. read_workspace_changes, read_git_review_summary, and read_git_diff_hunks remain exact-name specialists/internal building blocks rather than ordinary routing choices.",
         tools: &[
             "read_files",
-            "apply_text_edits",
-            "apply_patch",
-            "apply_unified_diff",
-            "write_project_file",
+            "edit_project_files",
+            "project_validate",
+            "review_changes",
+            "finish_coding_task",
         ],
     },
     ToolRecommendedFlow {
         name: "file_transfer",
-        summary: "File transfer: host/conversation attachment -> import_conversation_files_to_project; project artifact -> export_project_artifact; caller-held bounded binary -> save_project_artifact/artifact_upload_*; bounded inspection -> read_project_artifact.",
-        manifest_purpose: "Use host-native transfer at the boundary: import_conversation_files_to_project moves current host attachments into a Project without model Base64; export_project_artifact returns an authenticated ResourceLink for complete project-to-host/user transfer. Use save_project_artifact or artifact_upload_* only when bounded binary data is already held by the caller, and read_project_artifact only for bounded inspection.",
+        summary: "File transfer: Host -> import_host_files -> Project; Project -> inspect_project_artifact -> Host/model; Project A -> transfer_project_artifact -> Project B. inspect for one bounded segment, image for MCP image delivery, export for complete ResourceLink delivery.",
+        manifest_purpose: "Keep directions explicit: import_host_files is the Host-to-Project write boundary. transfer_project_artifact is the direct Project-to-Project path and streams the exact source bytes/SHA snapshot through Control without Host attachments or model-facing base64. inspect_project_artifact is the preferred Project-to-model/host read facade: metadata observes artifact facts, inspect reads one bounded snapshot-fenced segment, image uses supported native MCP image delivery, and export uses an authenticated ResourceLink for complete transfer. Do not loop inspect chunks to transfer a whole file. save_project_artifact/artifact_upload_* remain low-level caller-held binary write primitives.",
         tools: &[
-            "import_conversation_files_to_project",
-            "export_project_artifact",
+            "import_host_files",
+            "transfer_project_artifact",
+            "inspect_project_artifact",
             "save_project_artifact",
-            "artifact_upload_begin",
-            "artifact_upload_chunk",
-            "artifact_upload_finish",
-            "artifact_upload_abort",
-            "read_project_artifact_metadata",
-            "read_project_artifact",
+            "begin_artifact_upload",
+            "upload_artifact_chunk",
+            "finish_artifact_upload",
+            "abort_artifact_upload",
         ],
+    },
+    ToolRecommendedFlow {
+        name: "build",
+        summary:
+            "Build: prefer project_build for portable Rust/Go/Python/Node builds; use native execution only outside the canonical gateway.",
+        manifest_purpose:
+            "Use project_build for canonical Rust cargo build, Go go build, Python pyproject packaging via installed build --no-isolation, and manifest-declared Node build scripts (detected npm/pnpm/yarn/bun; no installation). Python rejects scope; Node rejects scope/dependency policy; Rust/Go support portable bounded package or all-packages scope. dependency_policy.mode=locked prevents adapter-managed dependency selection updates without implying offline execution. It preserves Runner-owned recipe resolution, provenance, and same-execution Job admission. Use run_process only when the required build is outside this closed contract.",
+        tools: &["project_build", "observe_jobs", "run_process"],
     },
     ToolRecommendedFlow {
         name: "validate",
         summary:
-            "Validate: use cargo_check / cargo_test / go_test; long validation continues as a Job. Prefer structured validation tools. Use run_shell only for shell-specific validation and keep independent validation/effect boundaries separate.",
+            "Validate: use structured validators when their canonical diagnostics, evidence/test-count, validation identity, or same-execution Job semantics help; native execution is first-class when the command is outside or awkward for that contract. Prefer project_validate for portable common validation.",
         manifest_purpose:
-            "Use structured Rust or Go validation; long checks become Jobs. run_shell remains available for shell-specific validation, but do not combine validation, commit, push, deploy, restart, or other independent failure/permission boundaries into one shell chain.",
+            "For portable project validation, prefer project_validate; dependency_policy.mode=locked prevents adapter-managed dependency selection updates for check/test without implying offline execution. For Rust check/test, dependency_resolution_policy=offline requests Runner-owned Cargo --offline for dependency resolution (not an OS network sandbox); omitted defaults are unchanged. Keep cargo_fmt for explicit formatting semantics; cargo_check/cargo_test/go_test remain exact-name advanced specialists rather than ordinary routing choices. Native validation is first-class when the command is outside or awkward for that structured contract: prefer run_process for one literal-argv executable, run_shell when shell grammar/output shaping is required, and run_script for program-like supported scripts. Keep independent failure/permission boundaries separate. cargo_fmt check=false retains ensure-format mutation truth; check=true stays read-only.",
         tools: &[
-            "cargo_check",
-            "cargo_test",
-            "go_test",
+            "project_validate",
+            "cargo_fmt",
             "observe_jobs",
-            "job_status",
-            "validation_summary",
+            "read_validation_summary",
             "run_process",
             "run_script",
             "run_shell",
         ],
     },
     ToolRecommendedFlow {
-        name: "computer_observe",
-        summary: "Computer observe: discover a caller-visible capable Runner, list its exact windows, then inspect accessibility or capture one exact surface. Read-only; no control actions.",
+        name: "browser",
+        summary: "Browser/CDP: launch managed/ephemeral or attach an extension-shared tab. Use opaque ids/snapshot actions. User handoff holds an exact managed Browser for a Session question/todo; finish needs original fence and fresh snapshot. External close detaches. Observe after uncertainty.",
+        manifest_purpose: "Use observe_browser for targets/browsers/pages/snapshot/screenshot/diagnostics and control_browser for Browser effects. begin_user_handoff holds an exact visible managed Browser for an authorized Session question/todo; finish requires the original fence and a fresh snapshot. Replies/deadlines never resume input. Observe browsers/user_handoff after uncertain delivery. Use batch for 1..32 ordered input_text/select_option/set_value/click/upload_file/select_choice/set_date operations admitted by one current snapshot on one Browser/page. select_choice(choice_path) chooses 1..4 exact semantic levels; set_date(value) fills a custom ISO date/month picker. Both open, choose and verify internally without intermediate model snapshots. Native controls keep select_option/set_value. Ordinary field effects preserve sibling element ids; navigation, document replacement and new snapshots stale prior authority. Batch checks freshness between effects, settles once, and stops on rejection, document change or uncertainty. Read completion counts and stopped certainty before observing recovery; never blindly retry outcome_unknown. Take a fresh verification snapshot after filling and after structural/page changes. Snapshot query filters fields/text/role/group/section before bounded pagination and returns one fresh generation for batch use. truncated makes absence inconclusive. Without query, auto compacts large pages. Diagnostics since_cursor returns only later events.",
+        tools: &["observe_browser", "control_browser"],
+    },
+    ToolRecommendedFlow {
+        name: "observe_computer",
+        summary: "Computer observe: one guaranteed read-only gateway for Runner/desktop discovery, accessibility inspection, clipboard read, and window/display snapshots. Choose a closed action; no control effects are admitted.",
         manifest_purpose:
-            "Discover a Computer-capable Runner, list its windows, then inspect accessibility or capture one exact surface.",
-        tools: &[
-            "computer_list_targets",
-            "computer_list_windows",
-            "computer_accessibility_status",
-            "computer_accessibility_tree",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_snapshot",
-        ],
+            "Use observe_computer with the smallest read-only action needed: targets/windows/displays/applications, accessibility_status/accessibility_tree/find_elements/element_state, snapshot_window/snapshot_display, or read_clipboard. Exact action scopes and Runner capabilities remain fenced.",
+        tools: &["observe_computer"],
     },
     ToolRecommendedFlow {
         name: "computer_application_launch",
-        summary: "Computer application launch: discover fresh bounded opaque application IDs, launch exactly one ID, then re-list windows and activate an exact surface only if needed.",
+        summary: "Computer application launch: observe_computer(action=applications), control_computer(action=launch_application), then observe_computer(action=windows) and control_computer(action=activate_window) only if activation is needed.",
         manifest_purpose:
-            "Discover a macOS or Windows application, submit its exact native launch request, then re-observe windows before any follow-up UI effect.",
-        tools: &[
-            "computer_list_applications",
-            "computer_launch_application",
-            "computer_list_windows",
-            "computer_activate_window",
-        ],
+            "Discover a fresh opaque application_id with observe_computer, launch exactly that id through control_computer, then re-observe windows before any follow-up activation/control effect.",
+        tools: &["observe_computer", "control_computer"],
     },
     ToolRecommendedFlow {
         name: "commit",
-        summary: "Commit: inspect git_status/show_changes, copy show_changes.head.commit into git_commit_paths.expected_head, and pass explicit changed file paths. It rejects pre-existing staged state and never pushes; keep run_process for unusual Git operations outside this narrow contract.",
+        summary: "Commit: inspect get_git_status/read_workspace_changes, copy read_workspace_changes.head.commit into commit_git_paths.expected_head, and pass explicit changed file paths. It rejects pre-existing staged state and never pushes; keep run_process for unusual Git operations outside this narrow contract.",
         manifest_purpose:
-            "Commit route: inspect with show_changes, copy head.commit to expected_head, then call git_commit_paths with explicit paths. Requires project:write + job:run because clean filters may run; isolated exact-tree commit bypasses hooks, rejects staged state, never pushes.",
-        tools: &["git_status", "show_changes", "git_commit_paths"],
+            "Commit route: inspect with read_workspace_changes, copy head.commit to expected_head, then call commit_git_paths with explicit paths. Requires project:write + job:run because clean filters may run; isolated exact-tree commit bypasses hooks, rejects staged state, never pushes.",
+        tools: &["get_git_status", "read_workspace_changes", "commit_git_paths"],
     },
     ToolRecommendedFlow {
         name: "review",
-        summary: "Review: start with show_changes for the bounded worktree overview; if hunks truncate, continue/focus with git_diff_hunks. For committed ranges, map with git_review_summary then inspect exact-range git_diff_hunks; use workspace_hygiene_check before final response.",
-        manifest_purpose: "Map committed review ranges, inspect targeted diffs, and check workspace hygiene before the final response.",
+        summary: "Review: use review_changes as the primary ordinary workspace or committed review surface; continue only with its same-snapshot token when needed. Old review tools remain specialists; hygiene stays authoritative and separate.",
+        manifest_purpose: "Use review_changes for ordinary read-only Git review: one exact snapshot returns summary, signals, file metadata, and the first bounded diff page; follow only its returned continuation. read_workspace_changes, read_git_review_summary, and read_git_diff_hunks remain exact-discovery specialists/internal projections. check_workspace_hygiene remains separate and authoritative.",
         tools: &[
-            "git_review_summary",
-            "show_changes",
-            "git_diff_hunks",
-            "workspace_hygiene_check",
+            "review_changes",
+            "check_workspace_hygiene",
+            "run_process",
         ],
     },
     ToolRecommendedFlow {
         name: "handoff",
-        summary: "Handoff: use session_summary / session_handoff_summary; coordinator posts a todo, worker reads it once with get_session_assignment, then passes its fence to complete_session_message. Use observe_session_messages only for later generic deltas.",
-        manifest_purpose: "Coordinate independent Workflow Sessions through atomic assignment snapshots, required assignment-fenced completions, and explicit generic message-state delta observation without sharing execution history, authority, subscriptions, or automatic wake-up.",
+        summary: "Handoff/recovery only: list_sessions(project) -> choose exact Session. read_session_summary reads ledger; read_session_handoff only for missing task context or transfer, never routine progress polling. Save decisions/progress. get_session_assignment -> complete_session_message with fence.",
+        manifest_purpose: "Recover missing Session identity with caller-authorized list_sessions(project), explicitly choose a returned identity, then read read_session_handoff; discovery never resumes work. Save explicit decisions/progress with post_session_message. Coordinate independent Workflow Sessions through atomic assignment snapshots, required assignment-fenced completions, and explicit generic message-state delta observation without sharing execution history, authority, subscriptions, or automatic wake-up.",
         tools: &[
-            "session_summary",
+            "list_sessions",
+            "read_session_summary",
             "post_session_message",
-            "session_handoff_summary",
+            "read_session_handoff",
             "list_session_messages",
             "get_session_assignment",
             "observe_session_messages",
             "complete_session_message",
-            "session_discussion_summary",
-            "validation_summary",
+            "read_session_discussion_summary",
+            "read_validation_summary",
             "finish_coding_task",
         ],
     },
 ];
 
-/// Single ordered, unique source of truth for the `local_coding` MCP surface
-/// and `tool_manifest(intent="coding")`. The order is both the MCP tools/list
-/// order and the coding manifest ranking.
-pub const LOCAL_CODING_TOOL_NAMES: &[&str] = &[
-    // entry
+/// Ordered selection for ordinary coding discovery under Adaptive Runtime.
+///
+/// This ranks useful capabilities for `read_tool_manifest(intent="coding")`; it does
+/// not define direct admission. ToolDefinition rank remains the direct SSOT.
+pub const CODING_INTENT_TOOL_NAMES: &[&str] = &[
     "work_on_project",
-    "list_projects",
-    "plugin_tool",
-    // exact coordinator assignment read + atomic completion
-    "get_session_assignment",
-    "complete_session_message",
-    // delegated ACP coding-agent Runs (explicit coding_agent:run authority)
-    "coding_agent_start",
-    "coding_agent_observe",
-    "coding_agent_cancel",
-    // project discovery + read
-    "project_overview",
-    "list_project_tracked_files",
-    "list_project_files",
-    "search_project_text",
+    "read_project_overview",
+    "search_file_context",
     "search_project_texts",
-    "read_file",
     "read_files",
-    // LSP navigation
-    "lsp_status",
-    "document_symbols",
-    "document_diagnostics",
-    "hover",
-    "workspace_symbols",
-    "goto_definition",
+    "inspect_project_artifact",
+    #[cfg(feature = "experimental-code-mode")]
+    "execute_code_mode",
+    // Distinct semantic navigation capabilities remain useful even though they
+    // are long-tail Adaptive gateway targets.
+    "list_document_symbols",
+    "read_document_diagnostics",
+    "read_symbol_hover",
+    "list_workspace_symbols",
+    "find_definition",
     "find_references",
-    "call_hierarchy",
-    // guarded edits
-    "apply_text_edits",
-    "apply_patch",
-    "apply_unified_diff",
-    // structured process, shell semantics/scripts, and jobs
+    "read_call_hierarchy",
+    // Canonical project editor. Patch/diff/whole-file specialists require
+    // exact-name discovery and are intentionally absent from ordinary coding.
+    "edit_project_files",
+    #[cfg(feature = "experimental-code-mode")]
+    "execute_mutating_code_mode",
+    // Portable project build plus ordinary execution specialists.
+    "project_build",
+    "project_format",
     "run_process",
     "run_script",
     "run_shell",
-    "run_job",
     "observe_jobs",
-    "job_status",
-    "job_log",
-    "list_jobs",
-    "stop_job",
-    // validation
+    // Portable common validation plus explicit formatting semantics. Ecosystem
+    // validators remain exact-name advanced specialists rather than ordinary coding choices.
+    "project_validate",
     "cargo_fmt",
-    "cargo_check",
-    "cargo_test",
-    "go_test",
-    "validation_summary",
-    // git review
-    "git_status",
-    "git_log",
-    "git_review_summary",
-    "git_diff",
-    "git_diff_hunks",
-    "show_changes",
-    "workspace_hygiene_check",
-    // finish
+    #[cfg(feature = "experimental-code-mode")]
+    "execute_effectful_code_mode",
+    // Primary ordinary review plus authoritative hygiene/closeout.
+    "review_changes",
+    "check_workspace_hygiene",
     "finish_coding_task",
 ];
 
-/// Stable task-intent views for `tool_manifest(intent=...)`.
+/// Stable task-intent views for `read_tool_manifest(intent=...)`.
 /// Ordered lists are ranked for model selection; not a substitute for category.
 /// Intent views only filter and rank discovery output; they do not change tool
 /// behavior, policy, permissions, execution, or finish verdict semantics.
 pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
     ToolManifestIntent {
+        name: "maintenance",
+        purpose: "Locate exact Runners/Projects, inspect health and cached Git, then explicitly preview or mutate registration/configuration. No automatic cleanup or Session creation.",
+        tools: &["resolve_workspace", "list_runners", "list_projects", "get_runtime_status",
+            "open_webcodex_workbench", "get_git_status", "check_runner_config",
+            "unregister_projects", "unregister_project", "reload_runner_config"],
+    },
+    ToolManifestIntent {
+        name: "resources",
+        purpose: "Explicit Project/Session context and bounded file, Goal and artifact references; not execution or implicit authority.",
+        tools: &["open_webcodex_workbench", "resolve_workspace", "search_webcodex_resources",
+            "read_webcodex_resource", "list_sessions", "read_project_overview", "inspect_project_artifact"],
+    },
+
+    ToolManifestIntent {
         name: "coding",
-        purpose: "Default coding loop: start, inspect, structured edit, validate, review, report.",
-        tools: LOCAL_CODING_TOOL_NAMES,
+        purpose: "Default coding loop: start, inspect, make reliable scoped changes, validate, review, report.",
+        tools: CODING_INTENT_TOOL_NAMES,
     },
     ToolManifestIntent {
         name: "audit",
-        purpose: "Review/audit without Project mutation or command execution: establish bounded Workflow context, inspect, read git history/diff, check hygiene, finish or handoff.",
+        purpose: "Read-only audit: locate existing work, inspect code/Git and hygiene without creating a Workflow Session. Native observations may run read-only commands.",
         tools: &[
-            "work_on_project",
-            "project_overview",
+            "resolve_workspace",
+            "read_project_overview",
             "list_project_tracked_files",
-            "read_file",
             "read_files",
-            "search_project_text",
             "search_project_texts",
+            #[cfg(feature = "experimental-code-mode")]
+            "execute_code_mode",
             "list_project_files",
-            "git_status",
-            "git_log",
-            "git_review_summary",
-            "git_diff_summary",
-            "git_diff_hunks",
-            "show_changes",
-            "workspace_hygiene_check",
-            "finish_coding_task",
-            "session_handoff_summary",
-            "validation_summary",
-            "tool_manifest",
+            "get_git_status",
+            "read_git_log",
+            "review_changes",
+            "check_workspace_hygiene",
+            "read_session_handoff",
+            "read_validation_summary",
+            "read_tool_manifest",
         ],
     },
     ToolManifestIntent {
@@ -572,49 +373,46 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
         purpose: "Light repository exploration without shell/jobs or default write paths.",
         tools: &[
             "list_projects",
-            "runtime_status",
-            "project_overview",
+            "get_runtime_status",
+            "read_project_overview",
             "list_project_tracked_files",
             "list_project_files",
-            "search_project_text",
             "search_project_texts",
-            "read_file",
             "read_files",
-            "git_status",
-            "git_log",
-            "tool_manifest",
+            #[cfg(feature = "experimental-code-mode")]
+            "execute_code_mode",
+            "get_git_status",
+            "read_git_log",
+            "read_tool_manifest",
         ],
     },
     ToolManifestIntent {
         name: "file_transfer",
-        purpose: "Move files across the host/Project boundary without routing complete binary payloads through model text.",
+        purpose: "Move files across Host/Project and Project/Project boundaries without routing complete binary payloads through model text.",
         tools: &[
-            "import_conversation_files_to_project",
-            "export_project_artifact",
+            "import_host_files",
+            "transfer_project_artifact",
+            "inspect_project_artifact",
             "save_project_artifact",
-            "artifact_upload_begin",
-            "artifact_upload_chunk",
-            "artifact_upload_finish",
-            "artifact_upload_abort",
-            "read_project_artifact_metadata",
-            "read_project_artifact",
+            "begin_artifact_upload",
+            "upload_artifact_chunk",
+            "finish_artifact_upload",
+            "abort_artifact_upload",
         ],
     },
     ToolManifestIntent {
         name: "release",
         purpose: "Release closeout checks: hygiene, validation, jobs status, changes, finish.",
         tools: &[
-            "runtime_status",
-            "git_status",
-            "git_diff_summary",
-            "workspace_hygiene_check",
+            "get_runtime_status",
+            "get_git_status",
+            "check_workspace_hygiene",
+            "project_validate",
             "cargo_fmt",
-            "cargo_check",
-            "cargo_test",
-            "validation_summary",
+            "read_validation_summary",
             "observe_jobs",
             "list_jobs",
-            "show_changes",
+            "review_changes",
             "finish_coding_task",
         ],
     },
@@ -622,12 +420,15 @@ pub const TOOL_MANIFEST_INTENTS: &[ToolManifestIntent] = &[
         name: "discovery",
         purpose: "Runtime and project discovery before choosing a work intent.",
         tools: &[
-            "tool_manifest",
+            "read_tool_manifest",
             "list_tools",
-            "runtime_status",
+            "resolve_workspace",
+            "open_webcodex_workbench",
+            "search_webcodex_resources",
+            "get_runtime_status",
             "list_runners",
             "list_projects",
-            "project_overview",
+            "read_project_overview",
         ],
     },
 ];

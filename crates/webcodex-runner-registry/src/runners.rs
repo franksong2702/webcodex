@@ -7,7 +7,7 @@ use super::reconciliation::{
     preflight_inventory_locked, reconcile_inventory_locked, terminate_instance_jobs_locked,
     validate_job_inventory_without_project_membership,
 };
-use super::requests::resolve_disconnected_sync_requests_locked;
+use super::requests::{resolve_disconnected_sync_requests_locked, retire_job_request_locked};
 use super::state::{
     JobLifecycleState, JobRecoveryReason, NotifierEntry, RunnerRecord, RunnerRegistryInner,
     RunnerSemanticView,
@@ -43,7 +43,11 @@ fn validate_coding_agent_registration(
     inventory: Option<&CodingAgentRunInventory>,
 ) -> Result<(), String> {
     match (capability, providers, inventory) {
-        (false, None, None) => return Ok(()),
+        // Older/no-ACP Runners may serialize the optional provider list as []
+        // instead of null/absent. Empty discovery grants no execution capability.
+        (false, providers, None) if providers.is_none_or(|providers| providers.is_empty()) => {
+            return Ok(())
+        }
         (false, _, _) => {
             return Err(
                 "coding-agent provider/inventory metadata requires coding_agent_runs capability"
@@ -254,14 +258,6 @@ impl RunnerRegistry {
                 "apply_patch_match_metadata capability requires apply_patch capability".to_string(),
             );
         }
-        if runner_features.supports(RunnerFeature::ApplyPatchStrictMatching)
-            && !runner_features.supports(RunnerFeature::ApplyPatchMatchMetadata)
-        {
-            return Err(
-                "apply_patch_strict_matching capability requires apply_patch_match_metadata capability"
-                    .to_string(),
-            );
-        }
         if runner_features.supports(RunnerFeature::ApplyPatchMatchingMode)
             && !runner_features.supports(RunnerFeature::ApplyPatchMatchMetadata)
         {
@@ -305,11 +301,13 @@ impl RunnerRegistry {
         let record = RunnerRecord {
             client_id: client_id.clone(),
             runner_instance_id: runner_instance_id.clone(),
+            registration_observation_epoch: uuid::Uuid::new_v4().to_string(),
             display_name: trim_string(body.display_name),
             owner: trim_string(body.owner),
             hostname: trim_string(body.hostname),
             host_context,
             runner_features: runner_features.clone(),
+            computer_session_availability: body.computer_session_availability,
             projects,
             project_inventory,
             last_seen: now,
@@ -432,6 +430,24 @@ impl RunnerRegistry {
             inner.runners.get(&client_id),
             &runner_instance_id,
             &runner_features,
+            RunnerFeature::StructuredCargoTestLib,
+        )?;
+        reject_same_instance_feature_downgrade(
+            inner.runners.get(&client_id),
+            &runner_instance_id,
+            &runner_features,
+            RunnerFeature::StructuredScriptJavascript,
+        )?;
+        reject_same_instance_feature_downgrade(
+            inner.runners.get(&client_id),
+            &runner_instance_id,
+            &runner_features,
+            RunnerFeature::StructuredScriptTypescript,
+        )?;
+        reject_same_instance_feature_downgrade(
+            inner.runners.get(&client_id),
+            &runner_instance_id,
+            &runner_features,
             RunnerFeature::NativeToolPlugins,
         )?;
         if inner.runners.get(&client_id).is_some_and(|existing| {
@@ -441,21 +457,6 @@ impl RunnerRegistry {
             return Err(
                 "same runner instance cannot change ACP coding-agent provider inventory"
                     .to_string(),
-            );
-        }
-        if inner.runners.get(&client_id).is_some_and(|existing| {
-            existing.runner_instance_id == runner_instance_id
-                && existing
-                    .policy
-                    .as_ref()
-                    .and_then(|policy| policy.mcp_gateway_providers.as_ref())
-                    != record
-                        .policy
-                        .as_ref()
-                        .and_then(|policy| policy.mcp_gateway_providers.as_ref())
-        }) {
-            return Err(
-                "same runner instance cannot change MCP gateway provider inventory".to_string(),
             );
         }
         // A successful different-instance registration is an explicit lease
@@ -578,6 +579,8 @@ impl RunnerRegistry {
                 &runner_instance_id,
                 auth_group,
                 self.observation_epoch.clone(),
+                self.inner.capture_candidates(),
+                self.inner.capture_terminal_event_candidates(),
                 inventory,
                 now,
             );
@@ -706,50 +709,64 @@ impl RunnerRegistry {
         Ok(())
     }
 
-    /// Apply sanitized provider metadata to the active Runner record. Optional
-    /// metadata is best-effort: malformed/unknown state is ignored by the
-    /// normalizer and never changes transport or tool completion semantics.
-    /// Polling-transport `RuntimeMetadata` uses this path.
-    pub async fn update_tool_providers(
+    /// Atomically apply changed-only runtime metadata to the exact active Runner.
+    /// MCP inventory is routing authority, so an invalid inventory rejects the
+    /// entire metadata update before the registry record is touched. `None`
+    /// preserves that metadata family while `Some([])` explicitly clears it.
+    pub async fn update_runtime_metadata(
         &self,
         client_id: &str,
         runner_instance_id: &str,
-        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        tool_providers: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        mcp_gateway_providers: Option<Vec<webcodex_core::mcp_gateway::McpGatewayProvider>>,
     ) -> Result<(), String> {
-        self.update_tool_providers_checked(client_id, runner_instance_id, None, status)
-            .await
-    }
-
-    /// Connection-scoped `RuntimeMetadata` for long-lived transports. A stale
-    /// same-instance connection must not overwrite the current connection's
-    /// provider metadata or refresh its liveness: when the connection no
-    /// longer holds the lease the update is rejected with a stable error.
-    pub async fn update_tool_providers_for_connection(
-        &self,
-        client_id: &str,
-        runner_instance_id: &str,
-        connection_id: &str,
-        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
-    ) -> Result<(), String> {
-        self.update_tool_providers_checked(
+        self.update_runtime_metadata_checked(
             client_id,
             runner_instance_id,
-            Some(connection_id),
-            status,
+            None,
+            tool_providers,
+            mcp_gateway_providers,
         )
         .await
     }
 
-    async fn update_tool_providers_checked(
+    /// Connection-scoped runtime metadata for long-lived transports. The exact
+    /// connection lease prevents a superseded same-instance stream from
+    /// overwriting current routing authority.
+    pub async fn update_runtime_metadata_for_connection(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: &str,
+        tool_providers: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        mcp_gateway_providers: Option<Vec<webcodex_core::mcp_gateway::McpGatewayProvider>>,
+    ) -> Result<(), String> {
+        self.update_runtime_metadata_checked(
+            client_id,
+            runner_instance_id,
+            Some(connection_id),
+            tool_providers,
+            mcp_gateway_providers,
+        )
+        .await
+    }
+
+    async fn update_runtime_metadata_checked(
         &self,
         client_id: &str,
         runner_instance_id: &str,
         expected_connection_id: Option<&str>,
-        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        tool_providers: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+        mcp_gateway_providers: Option<Vec<webcodex_core::mcp_gateway::McpGatewayProvider>>,
     ) -> Result<(), String> {
-        let Some(status) = normalize_tool_providers(status) else {
+        let tool_providers = normalize_tool_providers(tool_providers);
+        if let Some(providers) = mcp_gateway_providers.as_ref() {
+            validate_providers(providers)
+                .map_err(|error| format!("invalid MCP gateway provider inventory: {error}"))?;
+        }
+        if tool_providers.is_none() && mcp_gateway_providers.is_none() {
             return Ok(());
-        };
+        }
         validate_runner_instance_id(runner_instance_id)?;
         let mut inner = self.inner.lock().await;
         let Some(runner) = inner.runners.get_mut(client_id) else {
@@ -770,10 +787,81 @@ impl RunnerRegistry {
             }
         }
         if let Some(policy) = runner.policy.as_mut() {
-            policy.tool_providers = Some(status);
+            if let Some(status) = tool_providers {
+                policy.tool_providers = Some(status);
+            }
+            if let Some(providers) = mcp_gateway_providers {
+                policy.mcp_gateway_providers = Some(providers);
+            }
         }
         runner.last_seen = now_ts();
         Ok(())
+    }
+
+    /// Update only brokered Computer availability for the exact active lease.
+    /// A missing field leaves legacy/transient behavior unchanged.
+    pub async fn update_computer_session_availability(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: Option<&str>,
+        availability: Option<bool>,
+    ) -> Result<(), String> {
+        let Some(availability) = availability else {
+            return Ok(());
+        };
+        validate_runner_instance_id(runner_instance_id)?;
+        let mut inner = self.inner.lock().await;
+        let runner = inner
+            .runners
+            .get_mut(client_id)
+            .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
+        if runner.runner_instance_id != runner_instance_id
+            || connection_id.is_some_and(|id| runner.connection_id.as_deref() != Some(id))
+        {
+            return Err("computer session availability has a stale Runner lease".to_string());
+        }
+        if runner.computer_session_availability.is_none() {
+            return Err("computer session availability requires registration opt-in".to_string());
+        }
+        runner.computer_session_availability = Some(availability);
+        runner.last_seen = now_ts();
+        Ok(())
+    }
+
+    /// Apply sanitized provider metadata to the active Runner record. Optional
+    /// metadata is best-effort: malformed/unknown state is ignored by the
+    /// normalizer and never changes transport or tool completion semantics.
+    /// Polling-transport `RuntimeMetadata` uses this path.
+    pub async fn update_tool_providers(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+    ) -> Result<(), String> {
+        self.update_runtime_metadata(client_id, runner_instance_id, status, None)
+            .await
+    }
+
+    /// Connection-scoped `RuntimeMetadata` for long-lived transports. A stale
+    /// same-instance connection must not overwrite the current connection's
+    /// provider metadata or refresh its liveness: when the connection no
+    /// longer holds the lease the update is rejected with a stable error.
+    pub async fn update_tool_providers_for_connection(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: &str,
+        status: Option<webcodex_core::runner_protocol::ToolProvidersStatus>,
+    ) -> Result<(), String> {
+        self.update_runtime_metadata_for_connection(
+            client_id,
+            runner_instance_id,
+            connection_id,
+            status,
+            None,
+        )
+        .await
     }
 
     /// Test-only hook to force a runner's `last_seen` so liveness/stale
@@ -1053,11 +1141,7 @@ impl RunnerRegistry {
                 }
             }
             if let Some(request_id) = request_id {
-                inner.pending_by_id.remove(&request_id);
-                inner.request_to_job.remove(&request_id);
-                if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
-                    queue.retain(|id| id != &request_id);
-                }
+                retire_job_request_locked(&mut inner, client_id, &request_id);
             }
         }
         // Drop any additional job-backed control request (for example an
@@ -1072,11 +1156,7 @@ impl RunnerRegistry {
             .map(|(request_id, _)| request_id.clone())
             .collect::<Vec<_>>();
         for request_id in extra_job_requests {
-            inner.pending_by_id.remove(&request_id);
-            inner.request_to_job.remove(&request_id);
-            if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
-                queue.retain(|id| id != &request_id);
-            }
+            retire_job_request_locked(&mut inner, client_id, &request_id);
         }
         // Synchronous tool requests (run_shell/read_file/write/lsp/project ops)
         // carry a live oneshot waiter but no job_id, so the job loop above skips
@@ -1170,24 +1250,81 @@ impl RunnerRegistry {
         &self,
         auth: Option<&crate::RunnerAccess>,
     ) -> Vec<RunnerSemanticView> {
+        self.list_project_semantic_views_for_auth(auth, None, None)
+            .await
+    }
+
+    /// Filter exact selection before cloning Project inventories. Selection is
+    /// applied under the same canonical authorization snapshot, never cached.
+    pub async fn list_project_semantic_views_for_auth(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        client_id: Option<&str>,
+        project: Option<&str>,
+    ) -> Vec<RunnerSemanticView> {
         let now = now_ts();
         let mut inner = self.inner.lock().await;
         self.prune_expired_shared_key_runners_locked(&mut inner, now);
-        for runner in inner.runners.values_mut() {
-            expire_staging(runner, now);
-        }
-        let mut ids = inner.runners.keys().cloned().collect::<Vec<_>>();
+        let mut ids = inner
+            .runners
+            .keys()
+            .filter(|id| client_id.is_none_or(|expected| id.as_str() == expected))
+            .cloned()
+            .collect::<Vec<_>>();
         ids.sort();
-        ids.into_iter()
-            .filter(|id| {
-                inner
-                    .runners
-                    .get(id)
-                    .map(|runner| runner_visible_to_access(auth, runner))
-                    .unwrap_or(false)
-            })
-            .filter_map(|id| Self::runner_semantic_view_locked(&inner, &id))
-            .collect()
+        let mut selected = Vec::new();
+        for id in ids {
+            let runner = inner
+                .runners
+                .get_mut(&id)
+                .expect("selected registered Runner");
+            if !runner_visible_to_access(auth, runner) {
+                continue;
+            }
+            expire_staging(runner, now);
+            let projects = runner
+                .projects
+                .iter()
+                .filter(|entry| {
+                    project.is_none_or(|expected| expected == format!("agent:{id}:{}", entry.id))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if project.is_some() && projects.is_empty() {
+                continue;
+            }
+            let runner_features = runner.runner_features.clone();
+            let mut view = Self::runner_view_with_projects_locked(&inner, &id, false)
+                .expect("selected registered Runner");
+            view.projects = projects;
+            selected.push(RunnerSemanticView {
+                view,
+                observed_at: std::time::Instant::now(),
+                runner_features,
+            });
+        }
+        selected
+    }
+
+    /// Exact Project visibility from the registered Runner snapshot. This is
+    /// deliberately read-only: diagnostic observations must not reconcile Jobs
+    /// or prune Runner records as a side effect of checking visibility.
+    pub async fn exact_project_visible_for_auth_snapshot(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        project: &str,
+    ) -> bool {
+        let now = now_ts();
+        let inner = self.inner.read().await;
+        inner.runners.values().any(|runner| {
+            if !self.runner_visible_for_snapshot(auth, &inner, runner, now) {
+                return false;
+            }
+            runner
+                .projects
+                .iter()
+                .any(|entry| project == format!("agent:{}:{}", runner.client_id, entry.id))
+        })
     }
 
     /// Return a complete canonical Runner/Project observation only when both
@@ -1431,11 +1568,20 @@ impl RunnerRegistry {
         let view = Self::runner_view_locked(inner, client_id)?;
         Some(RunnerSemanticView {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         })
     }
 
     fn runner_view_locked(inner: &RunnerRegistryInner, client_id: &str) -> Option<RunnerView> {
+        Self::runner_view_with_projects_locked(inner, client_id, true)
+    }
+
+    pub(crate) fn runner_view_with_projects_locked(
+        inner: &RunnerRegistryInner,
+        client_id: &str,
+        include_projects: bool,
+    ) -> Option<RunnerView> {
         let runner = inner.runners.get(client_id)?;
         let pending_requests = inner
             .queues_by_runner
@@ -1455,10 +1601,15 @@ impl RunnerRegistry {
             connected,
             last_seen: runner.last_seen,
             capabilities: runner.runner_features.wire_capabilities().clone(),
+            computer_session_availability: runner.computer_session_availability,
             coding_agent_providers: (!runner.coding_agent_providers.is_empty())
                 .then(|| runner.coding_agent_providers.clone()),
             pending_requests,
-            projects: runner.projects.clone(),
+            projects: if include_projects {
+                runner.projects.clone()
+            } else {
+                Vec::new()
+            },
             project_inventory: Some(runner.project_inventory.status.clone()),
             runner_protocol_generation: runner.accepted_protocol.generation(),
             transport: runner.transport.as_str().to_string(),

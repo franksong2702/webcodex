@@ -1,0 +1,1619 @@
+use super::sessions::SessionTransport;
+use super::specialized::{
+    SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
+};
+use super::tool_call::{BrowserActToolCall, BrowserBatchOperation, BrowserObserveToolCall};
+use super::{SuggestedToolCall, ToolCall, ToolResult, ToolRuntime};
+use crate::auth::{
+    AuthContext, SCOPE_BROWSER_CONTROL, SCOPE_BROWSER_LAUNCH, SCOPE_BROWSER_READ,
+    SCOPE_COMPUTER_READ, SCOPE_PROJECT_READ, SCOPE_RUNTIME_READ,
+};
+use crate::runner_http::RunnerFeature;
+use serde_json::{json, Value};
+use std::time::Duration;
+use webcodex_core::runner_operation::RunnerBrowserOperationKind;
+
+const BROWSER_WAIT_SECS: u64 = 30;
+const MAX_BROWSER_TARGETS: usize = 64;
+const MAX_BROWSER_PAGES: usize = 32;
+
+fn browser_snapshot_payload(
+    browser_id: &str,
+    page_id: &str,
+    mode: &str,
+    max_nodes: Option<usize>,
+    max_depth: Option<u32>,
+    node_offset: Option<usize>,
+    query: Option<&webcodex_core::browser_query::BrowserSnapshotQuery>,
+) -> Value {
+    let mut payload = json!({
+        "browser_id": browser_id,
+        "page_id": page_id,
+    });
+    if mode != "auto" {
+        payload["mode"] = json!(mode);
+    }
+    if let Some(max_nodes) = max_nodes {
+        payload["max_nodes"] = json!(max_nodes);
+    }
+    if let Some(max_depth) = max_depth {
+        payload["max_depth"] = json!(max_depth);
+    }
+    if let Some(node_offset) = node_offset {
+        payload["node_offset"] = json!(node_offset);
+    }
+    if let Some(query) = query {
+        payload["query"] = json!(query);
+    }
+    payload
+}
+
+fn browser_diagnostics_payload(
+    browser_id: &str,
+    page_id: &str,
+    include_all_console: bool,
+    include_all_network: bool,
+    since_cursor: Option<u64>,
+) -> Value {
+    let mut payload = json!({
+        "browser_id": browser_id,
+        "page_id": page_id,
+        "include_all_console": include_all_console,
+        "include_all_network": include_all_network,
+    });
+    if let Some(since_cursor) = since_cursor {
+        payload["since_cursor"] = json!(since_cursor);
+    }
+    payload
+}
+
+fn browser_session_selector_error(error: super::SessionSelectorError) -> ToolResult {
+    match error {
+        super::SessionSelectorError::UnknownRef(message) => {
+            browser_error("unknown_session_ref", &message, "not_started", false, None)
+        }
+        super::SessionSelectorError::RetentionExpired { session_id } => {
+            super::session_context::session_retention_expired_result(&session_id)
+        }
+    }
+}
+
+fn browser_observe_policy(call: &BrowserObserveToolCall) -> SpecializedOperationPolicy {
+    if matches!(call, BrowserObserveToolCall::Surface { .. }) {
+        return SpecializedOperationPolicy::read_all(
+            SpecializedSource::Browser,
+            call.action_name(),
+            &[SCOPE_BROWSER_READ, SCOPE_COMPUTER_READ],
+        );
+    }
+    SpecializedOperationPolicy::read(
+        SpecializedSource::Browser,
+        call.action_name(),
+        SCOPE_BROWSER_READ,
+    )
+}
+
+fn browser_act_policy(call: &BrowserActToolCall) -> SpecializedOperationPolicy {
+    match call {
+        BrowserActToolCall::BeginUserHandoff { .. } => {
+            SpecializedOperationPolicy::consequential_all(
+                SpecializedSource::Browser,
+                call.action_name(),
+                &[
+                    SCOPE_BROWSER_CONTROL,
+                    SCOPE_COMPUTER_READ,
+                    SCOPE_RUNTIME_READ,
+                ],
+                "browser_control",
+            )
+        }
+        BrowserActToolCall::Launch { .. } => SpecializedOperationPolicy::consequential(
+            SpecializedSource::Browser,
+            call.action_name(),
+            SCOPE_BROWSER_LAUNCH,
+            "browser_control",
+        ),
+        BrowserActToolCall::UploadFile { .. } => SpecializedOperationPolicy::consequential_all(
+            SpecializedSource::Browser,
+            call.action_name(),
+            &[SCOPE_BROWSER_CONTROL, SCOPE_PROJECT_READ],
+            "browser_file_upload",
+        ),
+        BrowserActToolCall::Batch { operations, .. }
+            if operations
+                .iter()
+                .any(|o| matches!(o, BrowserBatchOperation::UploadFile { .. })) =>
+        {
+            SpecializedOperationPolicy::consequential_all(
+                SpecializedSource::Browser,
+                call.action_name(),
+                &[SCOPE_BROWSER_CONTROL, SCOPE_PROJECT_READ],
+                "browser_file_upload",
+            )
+        }
+        _ => SpecializedOperationPolicy::consequential(
+            SpecializedSource::Browser,
+            call.action_name(),
+            SCOPE_BROWSER_CONTROL,
+            "browser_control",
+        ),
+    }
+}
+
+impl ToolRuntime {
+    pub(crate) async fn invoke_browser_observe_gateway(
+        &self,
+        call: BrowserObserveToolCall,
+        recording_session_id: Option<&str>,
+        auth: Option<&AuthContext>,
+        transport: SessionTransport,
+    ) -> Result<ToolResult, SpecializedGovernanceDenial> {
+        let policy = browser_observe_policy(&call);
+        let identity = json!({"action": call.action_name()});
+        let permit = self
+            .govern_specialized_invocation(
+                "observe_browser",
+                policy,
+                transport,
+                recording_session_id,
+                auth,
+                &identity,
+            )
+            .await?;
+        let result = self
+            .dispatch_browser_tool(ToolCall::BrowserObserve(call), auth)
+            .await;
+        let (dispatch_certainty, failure_kind) = super::specialized::specialized_terminal(&result);
+        self.finish_specialized_invocation(
+            permit,
+            result.success,
+            dispatch_certainty,
+            failure_kind,
+        );
+        Ok(result)
+    }
+
+    pub(crate) async fn invoke_browser_act_gateway(
+        &self,
+        call: BrowserActToolCall,
+        recording_session_id: Option<&str>,
+        auth: Option<&AuthContext>,
+        transport: SessionTransport,
+    ) -> Result<ToolResult, SpecializedGovernanceDenial> {
+        let policy = browser_act_policy(&call);
+        let identity = json!({"action": call.action_name()});
+        let permit = self
+            .govern_specialized_invocation(
+                "control_browser",
+                policy,
+                transport,
+                recording_session_id,
+                auth,
+                &identity,
+            )
+            .await?;
+        let result = self
+            .dispatch_browser_tool(ToolCall::BrowserAct(call), auth)
+            .await;
+        let (dispatch_certainty, failure_kind) = super::specialized::specialized_terminal(&result);
+        self.finish_specialized_invocation(
+            permit,
+            result.success,
+            dispatch_certainty,
+            failure_kind,
+        );
+        Ok(result)
+    }
+
+    pub(super) async fn dispatch_browser_tool(
+        &self,
+        call: ToolCall,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        match call {
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Targets) => {
+                self.browser_list_targets(auth).await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Discover { client_id }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_discover",
+                    json!({}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::browsers(&client_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Surface {
+                client_id,
+                browser_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_surface",
+                    json!({"browser_id": browser_id}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::browsers(&client_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Browsers { client_id }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_list_browsers",
+                    json!({}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::browsers(&client_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Pages {
+                client_id,
+                browser_id,
+                limit,
+            }) => {
+                let limit = limit
+                    .unwrap_or(MAX_BROWSER_PAGES)
+                    .clamp(1, MAX_BROWSER_PAGES);
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_list_pages",
+                    json!({"browser_id": browser_id, "limit": limit}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::pages(&client_id, &browser_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Snapshot {
+                client_id,
+                browser_id,
+                page_id,
+                mode,
+                max_nodes,
+                max_depth,
+                node_offset,
+                query,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_snapshot",
+                    browser_snapshot_payload(
+                        &browser_id,
+                        &page_id,
+                        mode.as_str(),
+                        max_nodes,
+                        max_depth,
+                        node_offset,
+                        query.as_ref(),
+                    ),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Console {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_console",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Network {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_network",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Diagnostics {
+                client_id,
+                browser_id,
+                page_id,
+                include_all_console,
+                include_all_network,
+                since_cursor,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_diagnostics",
+                    browser_diagnostics_payload(
+                        &browser_id,
+                        &page_id,
+                        include_all_console,
+                        include_all_network,
+                        since_cursor,
+                    ),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Screenshot {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_screenshot",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Batch {
+                client_id,
+                browser_id,
+                page_id,
+                operations,
+            }) => {
+                if operations.is_empty() || operations.len() > 32 {
+                    return browser_error(
+                        "invalid_batch_count",
+                        "batch requires 1..32 operations",
+                        "not_started",
+                        false,
+                        None,
+                    );
+                }
+                let mut payload_operations = Vec::with_capacity(operations.len());
+                for operation in operations {
+                    let mut payload =
+                        serde_json::to_value(&operation).expect("serializable Browser operation");
+                    if let BrowserBatchOperation::UploadFile { project, .. } = &operation {
+                        let resolved = match self.resolve_project_for_auth(project, auth).await {
+                            Ok(resolved) => resolved,
+                            Err(_) => {
+                                return browser_error(
+                                    "project_access_denied",
+                                    "caller cannot access the upload source project",
+                                    "not_started",
+                                    false,
+                                    None,
+                                )
+                            }
+                        };
+                        if resolved.client_id != client_id {
+                            return browser_error("project_runner_mismatch", "upload source project does not belong to the target Browser Runner", "not_started", false, None);
+                        }
+                        let object = payload.as_object_mut().expect("operation object");
+                        object.remove("project");
+                        object.insert("project_root".into(), json!(resolved.path));
+                    }
+                    payload_operations.push(payload);
+                }
+                self.dispatch_browser_request(&client_id, "browser_batch",
+                    json!({"browser_id": browser_id, "page_id": page_id, "operations": payload_operations}),
+                    auth, true, BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id)).await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::BeginUserHandoff {
+                client_id,
+                browser_id,
+                session_id,
+                message_id,
+            }) => {
+                let session_id =
+                    match self.canonicalize_explicit_session_selector(&session_id, auth) {
+                        Ok(session_id) => session_id,
+                        Err(error) => return browser_session_selector_error(error),
+                    };
+                if let Err(result) = self
+                    .authorize_session_target(&session_id, "control_browser", auth)
+                    .await
+                {
+                    return result;
+                }
+                if self.sessions.lifecycle_state(&session_id)
+                    != Some(super::sessions::SessionLifecycle::Active)
+                {
+                    return browser_error(
+                        "browser_user_handoff_attention_required",
+                        "User handoff requires an active authorized Session",
+                        "not_started",
+                        false,
+                        None,
+                    );
+                }
+                let attention = self.sessions.list_messages(
+                    &session_id,
+                    super::sessions::ListSessionMessagesFilter {
+                        message_id: Some(message_id.clone()),
+                        status: Some(super::sessions::SessionMessageStatus::Open),
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                );
+                if !attention.is_ok_and(|messages| {
+                    messages.iter().any(|m| {
+                        matches!(
+                            m.kind,
+                            super::sessions::SessionMessageKind::Question
+                                | super::sessions::SessionMessageKind::Todo
+                        )
+                    })
+                }) {
+                    return browser_error("browser_user_handoff_attention_required", "An exact existing open question or todo in the authorized Session is required", "not_started", false, None);
+                }
+                self.dispatch_browser_request(&client_id, "browser_begin_user_handoff",
+                    json!({"browser_id": browser_id, "session_id": session_id, "message_id": message_id}),
+                    auth, true, BrowserRecoveryContext::browsers(&client_id)).await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::FinishUserHandoff {
+                client_id,
+                browser_id,
+                session_id,
+                handoff_fence,
+            }) => {
+                let session_id =
+                    match self.canonicalize_explicit_session_selector(&session_id, auth) {
+                        Ok(session_id) => session_id,
+                        Err(error) => return browser_session_selector_error(error),
+                    };
+                if let Err(result) = self
+                    .authorize_session_target(&session_id, "control_browser", auth)
+                    .await
+                {
+                    return result;
+                }
+                self.dispatch_browser_request(&client_id, "browser_finish_user_handoff",
+                    json!({"browser_id": browser_id, "session_id": session_id, "handoff_fence": handoff_fence}),
+                    auth, true, BrowserRecoveryContext::browsers(&client_id)).await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Attach {
+                client_id,
+                attachment_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_attach",
+                    json!({"attachment_id": attachment_id}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::browsers(&client_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Launch {
+                client_id,
+                mode,
+                profile,
+            }) => {
+                let managed = mode.is_some_and(|mode| mode.as_str() == "managed");
+                if managed != profile.is_some() {
+                    return browser_error("invalid_request", "managed mode requires a profile name; ephemeral mode does not accept a profile", "not_started", false, None);
+                }
+                self.dispatch_browser_request(
+                    &client_id,
+                    if managed {
+                        "browser_launch_managed"
+                    } else {
+                        "browser_launch"
+                    },
+                    profile.map_or_else(|| json!({}), |profile| json!({"profile": profile})),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::browsers(&client_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::NewPage {
+                client_id,
+                browser_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_new_page",
+                    json!({"browser_id": browser_id}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::pages(&client_id, &browser_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Navigate {
+                client_id,
+                browser_id,
+                page_id,
+                url,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_navigate",
+                    json!({"browser_id": browser_id, "page_id": page_id, "url": url}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Reload {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_reload",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Click {
+                client_id,
+                browser_id,
+                page_id,
+                element_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_click",
+                    json!({
+                        "browser_id": browser_id,
+                        "page_id": page_id,
+                        "element_id": element_id
+                    }),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::InputText {
+                client_id,
+                browser_id,
+                page_id,
+                element_id,
+                text,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_input_text",
+                    json!({
+                        "browser_id": browser_id,
+                        "page_id": page_id,
+                        "element_id": element_id,
+                        "text": text
+                    }),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::SelectOption {
+                client_id,
+                browser_id,
+                page_id,
+                element_id,
+                option,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_select_option",
+                    json!({
+                        "browser_id": browser_id,
+                        "page_id": page_id,
+                        "element_id": element_id,
+                        "option": option
+                    }),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::SelectChoice {
+                client_id,
+                browser_id,
+                page_id,
+                element_id,
+                choice_path,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_select_choice",
+                    json!({
+                        "browser_id": browser_id,
+                        "page_id": page_id,
+                        "element_id": element_id,
+                        "choice_path": choice_path
+                    }),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::SetDate {
+                client_id,
+                browser_id,
+                page_id,
+                element_id,
+                value,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_set_date",
+                    json!({
+                        "browser_id": browser_id,
+                        "page_id": page_id,
+                        "element_id": element_id,
+                        "value": value
+                    }),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::SetValue {
+                client_id,
+                browser_id,
+                page_id,
+                element_id,
+                value,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_set_value",
+                    json!({
+                        "browser_id": browser_id,
+                        "page_id": page_id,
+                        "element_id": element_id,
+                        "value": value
+                    }),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::UploadFile {
+                client_id,
+                browser_id,
+                page_id,
+                element_id,
+                project,
+                path,
+            }) => {
+                let resolved = match self.resolve_project_for_auth(&project, auth).await {
+                    Ok(resolved) => resolved,
+                    Err(_) => {
+                        return browser_error(
+                            "project_access_denied",
+                            "caller cannot access the upload source project",
+                            "not_started",
+                            false,
+                            None,
+                        )
+                    }
+                };
+                if resolved.client_id != client_id {
+                    return browser_error(
+                        "project_runner_mismatch",
+                        "upload source project does not belong to the target Browser Runner",
+                        "not_started",
+                        false,
+                        None,
+                    );
+                }
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_upload_file",
+                    json!({
+                        "browser_id": browser_id,
+                        "page_id": page_id,
+                        "element_id": element_id,
+                        "project_root": resolved.path,
+                        "path": path
+                    }),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Key {
+                client_id,
+                browser_id,
+                page_id,
+                key,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_key",
+                    json!({
+                        "browser_id": browser_id,
+                        "page_id": page_id,
+                        "key": key.as_str()
+                    }),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::ClearDiagnostics {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_clear_diagnostics",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::ClosePage {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_close_page",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::pages(&client_id, &browser_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::CloseBrowser {
+                client_id,
+                browser_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_close",
+                    json!({"browser_id": browser_id}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::browsers(&client_id),
+                )
+                .await
+            }
+            _ => browser_error(
+                "invalid_request",
+                "unsupported Browser request",
+                "not_started",
+                false,
+                None,
+            ),
+        }
+    }
+
+    async fn browser_list_targets(&self, auth: Option<&AuthContext>) -> ToolResult {
+        let clients = self
+            .runner_registry
+            .list_runner_semantic_views_for_auth(
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+            )
+            .await;
+        let mut total_count = 0usize;
+        let mut targets = Vec::new();
+        for client in clients {
+            let browser_observe = client.supports(RunnerFeature::BrowserObserve);
+            let browser_control = client.supports(RunnerFeature::BrowserControl);
+            let browser_element_action_admission =
+                client.supports(RunnerFeature::BrowserElementActionAdmission);
+            let browser_launch = client.supports(RunnerFeature::BrowserLaunch);
+            let browser_batch = client.supports(RunnerFeature::BrowserBatch);
+            let browser_semantic_query = client.supports(RunnerFeature::BrowserSemanticQuery);
+            let browser_complex_controls = client.supports(RunnerFeature::BrowserComplexControls);
+            let browser_managed_profile = client.supports(RunnerFeature::BrowserManagedProfile);
+            let browser_extension_bridge = client.supports(RunnerFeature::BrowserExtensionBridge);
+            let browser_surface_handoff = client.supports(RunnerFeature::BrowserSurfaceHandoff);
+            let browser_user_handoff = client.supports(RunnerFeature::BrowserUserHandoff);
+            if !browser_observe && !browser_control && !browser_launch {
+                continue;
+            }
+            total_count = total_count.saturating_add(1);
+            if targets.len() >= MAX_BROWSER_TARGETS {
+                continue;
+            }
+            let view = client.view;
+            targets.push(json!({
+                "client_id": view.client_id,
+                "display_name": view.display_name,
+                "connected": view.connected,
+                "capabilities": {
+                    "browser_observe": browser_observe,
+                    "browser_control": browser_control,
+                    "browser_element_action_admission": browser_element_action_admission,
+                    "browser_batch": browser_batch,
+                    "browser_semantic_query": browser_semantic_query,
+                    "browser_complex_controls": browser_complex_controls,
+                    "browser_managed_profile": browser_managed_profile,
+                    "browser_extension_bridge": browser_extension_bridge,
+                    "browser_surface_handoff": browser_surface_handoff,
+                    "browser_user_handoff": browser_user_handoff,
+                    "browser_launch": browser_launch,
+                }
+            }));
+        }
+        let count = targets.len();
+        ToolResult::ok(json!({
+            "execution_state": "completed",
+            "state_changed": false,
+            "targets": targets,
+            "count": count,
+            "total_count": total_count,
+            "truncated": total_count > count,
+        }))
+    }
+
+    async fn dispatch_browser_request(
+        &self,
+        client_id: &str,
+        kind: &'static str,
+        payload: Value,
+        auth: Option<&AuthContext>,
+        effect: bool,
+        recovery: BrowserRecoveryContext,
+    ) -> ToolResult {
+        if client_id.is_empty() || client_id.len() > 128 {
+            return browser_error(
+                "invalid_client",
+                "client_id is invalid",
+                "not_started",
+                false,
+                None,
+            );
+        }
+        let requires_element_action_admission = matches!(
+            kind,
+            "browser_snapshot"
+                | "browser_click"
+                | "browser_input_text"
+                | "browser_select_option"
+                | "browser_select_choice"
+                | "browser_set_date"
+                | "browser_set_value"
+                | "browser_upload_file"
+                | "browser_batch"
+        );
+        let required_feature = match kind {
+            "browser_list_browsers"
+            | "browser_list_pages"
+            | "browser_snapshot"
+            | "browser_screenshot"
+            | "browser_console"
+            | "browser_network"
+            | "browser_diagnostics" => RunnerFeature::BrowserObserve,
+            "browser_launch" => RunnerFeature::BrowserLaunch,
+            "browser_launch_managed" => RunnerFeature::BrowserManagedProfile,
+            "browser_discover" | "browser_attach" => RunnerFeature::BrowserExtensionBridge,
+            "browser_surface" => RunnerFeature::BrowserSurfaceHandoff,
+            "browser_begin_user_handoff" | "browser_finish_user_handoff" => {
+                RunnerFeature::BrowserUserHandoff
+            }
+            "browser_new_page"
+            | "browser_navigate"
+            | "browser_reload"
+            | "browser_click"
+            | "browser_input_text"
+            | "browser_select_option"
+            | "browser_select_choice"
+            | "browser_set_date"
+            | "browser_set_value"
+            | "browser_upload_file"
+            | "browser_batch"
+            | "browser_key"
+            | "browser_close_page"
+            | "browser_clear_diagnostics"
+            | "browser_close" => RunnerFeature::BrowserControl,
+            _ => {
+                return browser_error(
+                    "invalid_request",
+                    "unsupported Browser request kind",
+                    "not_started",
+                    false,
+                    None,
+                )
+            }
+        };
+        let client = match self
+            .runner_registry
+            .get_runner_semantic_view_checked_for_auth(
+                client_id,
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+            )
+            .await
+        {
+            Ok(client) => client,
+            Err(_) => {
+                return browser_error(
+                    "client_access_denied",
+                    "caller cannot access the target Browser Runner",
+                    "not_started",
+                    false,
+                    None,
+                )
+            }
+        };
+        if !client.supports(required_feature) {
+            return browser_error(
+                "capability_unavailable",
+                &format!(
+                    "target Runner does not advertise {}",
+                    required_feature.as_wire_name()
+                ),
+                "not_started",
+                false,
+                None,
+            );
+        }
+        if kind == "browser_surface" && !client.supports(RunnerFeature::ComputerObserve) {
+            return browser_error(
+                "capability_unavailable",
+                "target Runner does not advertise computer_observe",
+                "not_started",
+                false,
+                None,
+            );
+        }
+        if requires_element_action_admission
+            && !client.supports(RunnerFeature::BrowserElementActionAdmission)
+        {
+            return browser_error(
+                "capability_unavailable",
+                &format!(
+                    "target Runner does not advertise {}",
+                    RunnerFeature::BrowserElementActionAdmission.as_wire_name()
+                ),
+                "not_started",
+                false,
+                None,
+            );
+        }
+        if kind == "browser_snapshot"
+            && payload.get("query").is_some()
+            && !client.supports(RunnerFeature::BrowserSemanticQuery)
+        {
+            return browser_error(
+                "capability_unavailable",
+                "target Runner does not advertise browser_semantic_query",
+                "not_started",
+                false,
+                None,
+            );
+        }
+        if RunnerBrowserOperationKind::from_wire(kind)
+            .is_some_and(|operation| operation.requires_complex_controls(&payload))
+            && !client.supports(RunnerFeature::BrowserComplexControls)
+        {
+            return browser_error(
+                "capability_unavailable",
+                "target Runner does not advertise browser_complex_controls",
+                "not_started",
+                false,
+                None,
+            );
+        }
+        if kind == "browser_batch" && !client.supports(RunnerFeature::BrowserBatch) {
+            return browser_error(
+                "capability_unavailable",
+                "target Runner does not advertise browser_batch",
+                "not_started",
+                false,
+                None,
+            );
+        }
+        // One operation is bounded by backend request deadlines. Leave room for
+        // its completion after the batch's 20-second dispatch budget expires.
+        let wait_secs = if kind == "browser_batch" {
+            120
+        } else {
+            BROWSER_WAIT_SECS
+        };
+        let payload = match serde_json::to_string(&payload) {
+            Ok(payload) => payload,
+            Err(_) => {
+                return browser_error(
+                    "invalid_request",
+                    "could not encode Browser request",
+                    "not_started",
+                    false,
+                    None,
+                )
+            }
+        };
+        let requested_by = crate::runner_http::requested_by_from_auth(auth);
+        let (request_id, receiver) = match self
+            .runner_registry
+            .enqueue_browser(
+                client_id.to_string(),
+                kind,
+                payload,
+                requested_by,
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                wait_secs,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return browser_error(
+                    "dispatch_denied",
+                    &format!("Browser request was not dispatched: {error}"),
+                    "not_started",
+                    false,
+                    None,
+                )
+            }
+        };
+        let response =
+            match tokio::time::timeout(Duration::from_secs(wait_secs + 2), receiver).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) if effect => {
+                    let dispatched = self
+                        .runner_registry
+                        .cancel_request_dispatch_state(&request_id)
+                        .await;
+                    return browser_delivery_failure(
+                        "Runner response channel closed before a terminal Browser effect result",
+                        dispatched,
+                        recovery,
+                    );
+                }
+                Err(_) if effect => {
+                    let dispatched = self
+                        .runner_registry
+                        .cancel_request_dispatch_state(&request_id)
+                        .await;
+                    return browser_delivery_failure(
+                        "Runner did not return a terminal Browser effect result in time",
+                        dispatched,
+                        recovery,
+                    );
+                }
+                Ok(Err(_)) => {
+                    return browser_error(
+                        "runner_disconnected",
+                        "Runner response channel closed",
+                        "not_started",
+                        false,
+                        None,
+                    )
+                }
+                Err(_) => {
+                    return browser_error(
+                        "runner_timeout",
+                        "Runner did not return Browser observation in time",
+                        "not_started",
+                        false,
+                        None,
+                    )
+                }
+            };
+        if let Some(error) = response.error.as_deref() {
+            if effect {
+                return browser_delivery_failure(error, response.request_dispatched, recovery);
+            }
+            return browser_error("runner_error", error, "not_started", false, None);
+        }
+        if response.exit_code != Some(0) {
+            if effect {
+                return browser_delivery_failure(
+                    "Runner Browser effect ended without a structured terminal result",
+                    response.request_dispatched,
+                    recovery,
+                );
+            }
+            return browser_error(
+                "runner_error",
+                "Runner Browser observation failed",
+                "not_started",
+                false,
+                None,
+            );
+        }
+        let envelope: Value = match response
+            .stdout
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+        {
+            Ok(Some(value)) => value,
+            _ if effect => {
+                return browser_delivery_failure(
+                    "Runner returned invalid Browser JSON after possible effect dispatch",
+                    response.request_dispatched,
+                    recovery,
+                )
+            }
+            _ => {
+                return browser_error(
+                    "invalid_runner_response",
+                    "Runner returned invalid Browser JSON",
+                    "not_started",
+                    false,
+                    None,
+                )
+            }
+        };
+        if envelope.get("ok").and_then(Value::as_bool) == Some(true) {
+            let Some(mut result) = envelope.get("result").cloned() else {
+                return if effect {
+                    browser_delivery_failure(
+                        "Runner omitted Browser effect result after dispatch",
+                        response.request_dispatched,
+                        recovery,
+                    )
+                } else {
+                    browser_error(
+                        "invalid_runner_response",
+                        "Runner omitted Browser observation result",
+                        "not_started",
+                        false,
+                        None,
+                    )
+                };
+            };
+            let Some(object) = result.as_object_mut() else {
+                return browser_error(
+                    "invalid_runner_response",
+                    "Runner Browser result must be an object or array-bearing object",
+                    if effect {
+                        "outcome_unknown"
+                    } else {
+                        "not_started"
+                    },
+                    false,
+                    effect.then(|| {
+                        recovery.to_recovery("reconcile Browser state before any further effect")
+                    }),
+                );
+            };
+            object.insert(
+                "execution_state".to_string(),
+                Value::String("completed".to_string()),
+            );
+            let changed = if kind == "browser_begin_user_handoff" {
+                object
+                    .get("state_changed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(effect)
+            } else {
+                effect
+            };
+            object.insert("state_changed".to_string(), Value::Bool(changed));
+            return ToolResult::ok(result);
+        }
+        let is_batch = kind == "browser_batch";
+        let error = envelope.get("error").cloned().unwrap_or_else(|| json!({}));
+        let kind = error
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("browser_error");
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Browser operation failed");
+        let execution_state = envelope
+            .get("execution_state")
+            .or_else(|| error.get("execution_state"))
+            .and_then(Value::as_str)
+            .unwrap_or(if effect {
+                "outcome_unknown"
+            } else {
+                "not_started"
+            });
+        let action = error.get("recovery_action").and_then(Value::as_str);
+        let recovery_value = if execution_state == "outcome_unknown"
+            || kind.starts_with("stale_")
+            || action.is_some()
+        {
+            let reason = if execution_state == "outcome_unknown" {
+                "effect outcome is uncertain; observe current Browser state and do not blindly retry"
+            } else if kind == "stale_element" {
+                "Element identity is stale; take a fresh snapshot before acting"
+            } else if kind == "stale_attachment" {
+                "Attachment consent is stale; Share the exact tab in the extension, then discover and attach"
+            } else if kind.starts_with("stale_") {
+                "Browser identity is stale; observe current state before acting"
+            } else if execution_state == "completed" {
+                "Browser effect completed but its model-facing state could not be reconciled; observe current state before any further effect"
+            } else {
+                "observe current Browser state before acting"
+            };
+            Some(recovery.for_action(action).to_recovery(reason))
+        } else {
+            None
+        };
+        let mut result = browser_error(
+            kind,
+            message,
+            execution_state,
+            execution_state == "completed" && effect,
+            recovery_value,
+        );
+        if is_batch {
+            if let (Some(output), Some(receipt)) = (
+                result.output.as_object_mut(),
+                envelope.get("result").and_then(Value::as_object),
+            ) {
+                if receipt
+                    .get("completed_count")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+                {
+                    output.insert("state_changed".into(), Value::Bool(true));
+                }
+                for field in [
+                    "requested_count",
+                    "completed_count",
+                    "stopped_at_index",
+                    "remaining_count",
+                    "needs_snapshot",
+                    "stability",
+                    "stopped_execution_state",
+                ] {
+                    if let Some(value) = receipt.get(field) {
+                        output.insert(field.into(), value.clone());
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+#[derive(Clone)]
+struct BrowserRecoveryContext {
+    client_id: String,
+    browser_id: Option<String>,
+    page_id: Option<String>,
+    preferred: &'static str,
+}
+
+impl BrowserRecoveryContext {
+    fn browsers(client_id: &str) -> Self {
+        Self {
+            client_id: client_id.to_string(),
+            browser_id: None,
+            page_id: None,
+            preferred: "browsers",
+        }
+    }
+
+    fn pages(client_id: &str, browser_id: &str) -> Self {
+        Self {
+            client_id: client_id.to_string(),
+            browser_id: Some(browser_id.to_string()),
+            page_id: None,
+            preferred: "pages",
+        }
+    }
+
+    fn snapshot(client_id: &str, browser_id: &str, page_id: &str) -> Self {
+        Self {
+            client_id: client_id.to_string(),
+            browser_id: Some(browser_id.to_string()),
+            page_id: Some(page_id.to_string()),
+            preferred: "snapshot",
+        }
+    }
+
+    fn for_action(mut self, action: Option<&str>) -> Self {
+        self.preferred = match action {
+            Some("browsers") => "browsers",
+            Some("pages") => "pages",
+            Some("snapshot") => "snapshot",
+            _ => self.preferred,
+        };
+        self
+    }
+
+    fn suggested_call(&self) -> SuggestedToolCall {
+        let arguments = match self.preferred {
+            "browsers" => json!({
+                "action": "browsers",
+                "client_id": self.client_id,
+            }),
+            "pages" if self.browser_id.is_some() => json!({
+                "action": "pages",
+                "client_id": self.client_id,
+                "browser_id": self.browser_id,
+            }),
+            "snapshot" if self.browser_id.is_some() && self.page_id.is_some() => json!({
+                "action": "snapshot",
+                "client_id": self.client_id,
+                "browser_id": self.browser_id,
+                "page_id": self.page_id,
+            }),
+            _ if self.browser_id.is_some() => json!({
+                "action": "pages",
+                "client_id": self.client_id,
+                "browser_id": self.browser_id,
+            }),
+            _ => json!({
+                "action": "browsers",
+                "client_id": self.client_id,
+            }),
+        };
+        SuggestedToolCall::fallback_recovery("observe_browser", arguments)
+    }
+
+    fn to_recovery(&self, reason: &str) -> Value {
+        json!({
+            "reason": reason,
+            "suggested_call": self.suggested_call().to_value(),
+        })
+    }
+}
+
+fn browser_delivery_failure(
+    message: &str,
+    request_dispatched: Option<bool>,
+    recovery: BrowserRecoveryContext,
+) -> ToolResult {
+    if request_dispatched == Some(false) {
+        browser_error("not_started", message, "not_started", false, None)
+    } else {
+        browser_error(
+            "outcome_unknown",
+            message,
+            "outcome_unknown",
+            false,
+            Some(recovery.to_recovery(
+                "effect may have reached the Browser; reconcile with observe_browser and never blindly retry",
+            )),
+        )
+    }
+}
+
+fn browser_error(
+    kind: &str,
+    message: &str,
+    execution_state: &str,
+    state_changed: bool,
+    recovery: Option<Value>,
+) -> ToolResult {
+    let mut output = json!({
+        "execution_state": execution_state,
+        "state_changed": state_changed,
+        "error_kind": kind,
+        "message": message,
+    });
+    if let Some(recovery) = recovery {
+        output["recovery"] = recovery;
+    }
+    ToolResult::err_with_output(message, output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enhanced_browser_payloads_preserve_legacy_default_wire_shape() {
+        let snapshot = browser_snapshot_payload(
+            "browser_abcdefghijklmnop",
+            "page_abcdefghijklmnop",
+            "auto",
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(snapshot["browser_id"], "browser_abcdefghijklmnop");
+        assert_eq!(snapshot["page_id"], "page_abcdefghijklmnop");
+        assert!(snapshot.get("mode").is_none());
+        assert!(snapshot.get("max_nodes").is_none());
+        assert!(snapshot.get("max_depth").is_none());
+        assert!(snapshot.get("node_offset").is_none());
+
+        let enhanced = browser_snapshot_payload(
+            "browser_abcdefghijklmnop",
+            "page_abcdefghijklmnop",
+            "interactive",
+            Some(48),
+            Some(10),
+            Some(256),
+            None,
+        );
+        assert_eq!(enhanced["mode"], "interactive");
+        assert_eq!(enhanced["max_nodes"], 48);
+        assert_eq!(enhanced["max_depth"], 10);
+        assert_eq!(enhanced["node_offset"], 256);
+        let query = webcodex_core::browser_query::BrowserSnapshotQuery {
+            fields_only: true,
+            text: Some("School".into()),
+            ..Default::default()
+        };
+        let queried = browser_snapshot_payload(
+            "browser_fixture",
+            "page_fixture",
+            "auto",
+            None,
+            None,
+            None,
+            Some(&query),
+        );
+        assert_eq!(queried["query"]["fields_only"], true);
+        assert_eq!(queried["query"]["text"], "School");
+
+        let diagnostics = browser_diagnostics_payload(
+            "browser_abcdefghijklmnop",
+            "page_abcdefghijklmnop",
+            false,
+            false,
+            None,
+        );
+        assert!(diagnostics.get("since_cursor").is_none());
+        let delta = browser_diagnostics_payload(
+            "browser_abcdefghijklmnop",
+            "page_abcdefghijklmnop",
+            false,
+            false,
+            Some(42),
+        );
+        assert_eq!(delta["since_cursor"], 42);
+    }
+
+    #[test]
+    fn browser_policy_matrix_is_action_sensitive_and_never_shell_like() {
+        use crate::tool_runtime::specialized::{
+            SpecializedAuthorityRequirement, SpecializedEffect,
+        };
+        let observe = browser_observe_policy(&BrowserObserveToolCall::Targets);
+        assert_eq!(observe.source, SpecializedSource::Browser);
+        assert_eq!(observe.effect, SpecializedEffect::Read);
+        assert_eq!(
+            observe.authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_BROWSER_READ)
+        );
+        assert_eq!(
+            observe.authority.first_missing(None),
+            Some(SCOPE_BROWSER_READ)
+        );
+        assert!(!observe.write_like);
+        assert!(!observe.shell_like);
+
+        let surface = browser_observe_policy(&BrowserObserveToolCall::Surface {
+            client_id: "mini".into(),
+            browser_id: "browser_fixture".into(),
+        });
+        assert_eq!(
+            surface.authority,
+            SpecializedAuthorityRequirement::All(&[SCOPE_BROWSER_READ, SCOPE_COMPUTER_READ])
+        );
+        assert_eq!(surface.effect, SpecializedEffect::Read);
+        let attach = browser_act_policy(&BrowserActToolCall::Attach {
+            client_id: "mini".into(),
+            attachment_id: "attachment_fixture".into(),
+        });
+        assert_eq!(
+            attach.authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_BROWSER_CONTROL)
+        );
+        assert!(attach.write_like);
+
+        let launch = browser_act_policy(&BrowserActToolCall::Launch {
+            client_id: "msi".to_string(),
+            mode: None,
+            profile: None,
+        });
+        assert_eq!(
+            launch.authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_BROWSER_LAUNCH)
+        );
+        assert_eq!(
+            launch.authority.first_missing(None),
+            Some(SCOPE_BROWSER_LAUNCH)
+        );
+        assert_eq!(launch.effect, SpecializedEffect::Management);
+        assert!(launch.write_like);
+        assert!(!launch.shell_like);
+        assert_eq!(launch.risk, "browser_control");
+
+        let navigate = browser_act_policy(&BrowserActToolCall::Navigate {
+            client_id: "msi".to_string(),
+            browser_id: "browser_abcdefghijklmnop".to_string(),
+            page_id: "page_abcdefghijklmnop".to_string(),
+            url: "https://example.test/".to_string(),
+        });
+        assert_eq!(
+            navigate.authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_BROWSER_CONTROL)
+        );
+        assert_eq!(
+            navigate.authority.first_missing(None),
+            Some(SCOPE_BROWSER_CONTROL)
+        );
+        assert_eq!(navigate.effect, SpecializedEffect::Management);
+        assert!(navigate.write_like);
+        assert!(!navigate.shell_like);
+
+        let upload = browser_act_policy(&BrowserActToolCall::UploadFile {
+            client_id: "msi".to_string(),
+            browser_id: "browser_abcdefghijklmnop".to_string(),
+            page_id: "page_abcdefghijklmnop".to_string(),
+            element_id: "element_abcdefghijklmnop".to_string(),
+            project: "agent:msi:resume".to_string(),
+            path: "resume.pdf".to_string(),
+        });
+        assert_eq!(
+            upload.authority,
+            SpecializedAuthorityRequirement::All(&[SCOPE_BROWSER_CONTROL, SCOPE_PROJECT_READ])
+        );
+        assert_eq!(upload.risk, "browser_file_upload");
+        assert!(upload.write_like);
+        assert!(!upload.shell_like);
+
+        let batch = browser_act_policy(&BrowserActToolCall::Batch {
+            client_id: "mini".into(),
+            browser_id: "browser_fixture".into(),
+            page_id: "page_fixture".into(),
+            operations: vec![BrowserBatchOperation::UploadFile {
+                element_id: "element_fixture".into(),
+                project: "agent:mini:resume".into(),
+                path: "resume.pdf".into(),
+            }],
+        });
+        assert_eq!(batch.authority, upload.authority);
+        assert_eq!(batch.risk, upload.risk);
+    }
+
+    #[test]
+    fn uncertain_effect_never_suggests_browser_act_retry() {
+        let result = browser_delivery_failure(
+            "timeout",
+            Some(true),
+            BrowserRecoveryContext::snapshot("runner", "browser_x", "page_x"),
+        );
+        assert_eq!(result.output["execution_state"], "outcome_unknown");
+        assert_eq!(
+            result.output["recovery"]["suggested_call"]["tool"],
+            "observe_browser"
+        );
+        assert_eq!(
+            result.output["recovery"]["suggested_call"]["arguments"]["action"],
+            "snapshot"
+        );
+    }
+
+    #[test]
+    fn known_undispatched_effect_is_not_started_without_retry_hint() {
+        let result = browser_delivery_failure(
+            "cancelled before dispatch",
+            Some(false),
+            BrowserRecoveryContext::browsers("runner"),
+        );
+        assert_eq!(result.output["execution_state"], "not_started");
+        assert!(result.output.get("recovery").is_none());
+    }
+}

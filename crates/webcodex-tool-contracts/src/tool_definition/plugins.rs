@@ -1,13 +1,12 @@
 use super::ToolVisibility::ModelVisible;
 use super::{
     adaptive_runtime_direct, def, model_spec, require_any_scopes, ToolDefinition,
-    TOOL_CATEGORY_RUNTIME,
+    TOOL_CATEGORY_PLUGIN,
 };
 use crate::metadata::{
     ToolPathHint::None as NoPath, ToolRisk::RunControl, PLUGIN_INSPECT, PLUGIN_INVOKE,
     PLUGIN_MANAGE, TOOL_PROVIDER_CONTROL,
 };
-use crate::registry::input_schemas::plugin_tool_input_schema;
 
 const PLUGIN_GATEWAY_SCOPES: &[&str] = &[PLUGIN_INSPECT, PLUGIN_INVOKE, PLUGIN_MANAGE];
 
@@ -18,7 +17,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[adaptive_runtime_direct(
                 "plugin_tool",
                 super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
-                TOOL_CATEGORY_RUNTIME,
+                TOOL_CATEGORY_PLUGIN,
                 None,
                 TOOL_PROVIDER_CONTROL,
                 super::ToolSemanticContract {
@@ -34,10 +33,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[adaptive_runtime_direct(
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Stable gateway for Runner-owned native Tool Plugins. Provider tools are never outer WebCodex MCP tools. Discovery begins at an exact caller-visible Runner; describe observes one exact Runner/provider/tool schema and returns an opaque binding; call accepts only binding + arguments, never retargets, relists, reloads, or blindly retries. Gateway visibility requires any Plugin scope, while each action separately enforces plugin:inspect, plugin:invoke, or plugin:manage before provider dispatch.",
-            plugin_tool_input_schema,
+            "Stable gateway for Runner-owned native Tool Plugins. Provider tools are never outer WebCodex MCP tools. Discovery starts at an exact visible Runner. Startup catalog is selection metadata, not an input schema or binding. Describe the selected tool when missing, then reuse both while retained for the exact Runner/provider/tool and bound Project; another call/task/Session alone needs no describe. projectBound requires project on describe and write authority at call. Never reuse a projectBound binding for another Project. For a different intended Project, describe with that project and use the new binding; do not just drop a call-time project. Re-describe after context loss or explicit stale/replaced/schema-change recovery; this is observation, not permission to replay an effect. Unknown outcomes still require reconciliation, never blind retry. Provider call accepts only binding + arguments and never retargets. Each action enforces plugin:inspect, plugin:invoke, or plugin:manage before dispatch.",
         ),
         PLUGIN_GATEWAY_SCOPES,
     ),
     26,
+    super::ToolDirectReason::CoreWorkflow,
 )];

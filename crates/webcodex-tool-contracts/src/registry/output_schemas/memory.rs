@@ -9,13 +9,13 @@ fn descriptor_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "memory_id": {"type":"string","pattern":"^wc_mem_[0-9a-f]{32}$"},
+            "memory_id": {"type":"string","pattern":"^wc_mem_[A-Za-z0-9_-]{16}$"},
             "memory_key": {"type":"string"},
             "summary": {"type":"string","maxLength":MAX_MEMORY_SUMMARY_CHARS},
             "priority": {"type":"string","enum":["high","normal","low"]},
             "bootstrap": {"type":"boolean"},
             "tags": {"type":"array","maxItems":MAX_MEMORY_TAGS,"items":{"type":"string","maxLength":MAX_MEMORY_TAG_CHARS}},
-            "revision": {"type":"string","pattern":"^wc_memrev_[0-9a-f]{64}$"},
+            "revision": {"type":"string","pattern":"^wc_memrev_[A-Za-z0-9_-]{43}$"},
             "matched_fields": {"type":"array","items":{"type":"string","enum":["memory_key","summary","body","tags"]}}
         },
         "required": ["memory_id","memory_key","summary","priority","bootstrap","tags","revision"],
@@ -40,16 +40,16 @@ fn memory_scope_descriptor_schema() -> Value {
     json!({
         "type":"object",
         "properties": {
-            "memory_scope_id":{"type":"string","pattern":"^wc_memscope_[0-9a-f]{64}$"},
+            "memory_scope_id":{"type":"string","pattern":"^wc_memscope_[A-Za-z0-9_-]{43}$"},
             "identity_state":{"type":"string","enum":["attributed"]},
             "current_status":{"type":"string","enum":["current","not_current","unknown"]},
             "project_runtime_id":{"type":["string","null"]},
             "runner_client_id":{"type":["string","null"]},
-            "root_fingerprint":{"type":["string","null"],"pattern":"^wc_memroot_[0-9a-f]{64}$"},
+            "root_fingerprint":{"type":["string","null"],"pattern":"^wc_memroot_[A-Za-z0-9_-]{43}$"},
             "current_project_runtime_id":{"type":["string","null"]},
             "memory_count":{"type":"integer","minimum":1},
             "bootstrap_count":{"type":"integer","minimum":0},
-            "catalog_revision":{"type":"string","pattern":"^wc_memcat_[0-9a-f]{64}$"},
+            "catalog_revision":{"type":"string","pattern":"^wc_memcat_[A-Za-z0-9_-]{43}$"},
             "oldest_memory_created_at_unix_ms":{"type":"integer"},
             "latest_memory_updated_at_unix_ms":{"type":"integer"},
             "scope_created_at_unix_ms":{"type":"integer"},
@@ -62,7 +62,7 @@ fn memory_scope_descriptor_schema() -> Value {
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
-        "memory_search" => Some(wrapped_output_schema(vec![
+        "search_memory" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             (
                 "catalog_revision",
@@ -111,7 +111,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("boolean", "Always false for search failures."),
             ),
         ])),
-        "memory_read" => Some(wrapped_output_schema(vec![
+        "read_memory" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             (
                 "memory_id",
@@ -176,7 +176,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("boolean", "Always false for read failures."),
             ),
         ])),
-        "memory_set" => Some(wrapped_output_schema(vec![
+        "set_memory" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             (
                 "memory_id",
@@ -217,7 +217,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
-        "memory_delete" => Some(wrapped_output_schema(vec![
+        "delete_memory" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             (
                 "memory_id",
@@ -248,7 +248,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("string", "Current revision on stale delete CAS."),
             ),
         ])),
-        "memory_scope_list" => Some(wrapped_output_schema(vec![
+        "list_memory_scopes" => Some(wrapped_output_schema(vec![
             ("total_count", schema_type("integer", "Total durable Memory scope count.")),
             ("returned_count", schema_type("integer", "Scope descriptors returned in this page.")),
             ("offset", schema_type("integer", "Effective page offset.")),
@@ -258,7 +258,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("error_kind", schema_type("string", "Stable lifecycle/store error code.")),
             ("state_changed", schema_type("boolean", "Always false for list failures.")),
         ])),
-        "memory_scope_purge" => Some(wrapped_output_schema(vec![
+        "purge_memory_scope" => Some(wrapped_output_schema(vec![
             ("memory_scope_id", schema_type("string", "Opaque Memory scope identity.")),
             ("catalog_revision", nullable_schema("string", "Purged catalog revision, or null when already absent.")),
             ("current_catalog_revision", schema_type("string", "Current catalog revision when the CAS fence is stale.")),

@@ -7,6 +7,7 @@ use crate::apply_edits_shared::{
     canonicalize_apply_text_line_endings, detect_apply_text_line_ending,
     restore_apply_text_line_endings,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -97,10 +98,11 @@ impl CodexPatchMatchMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyPatchMatchingMode {
     FirstMatch,
+    #[default]
     Unique,
     ExactUnique,
 }
@@ -112,12 +114,6 @@ impl ApplyPatchMatchingMode {
             Self::Unique => "unique",
             Self::ExactUnique => "exact_unique",
         }
-    }
-}
-
-impl Default for ApplyPatchMatchingMode {
-    fn default() -> Self {
-        Self::Unique
     }
 }
 

@@ -3,9 +3,8 @@
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{
-    RunnerCapabilities, RunnerJobUpdateRequest, RunnerResultPayload, RunnerResultRequest,
-    ShellCommandExecutionState, ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource,
-    ShellJobActivityState,
+    RunnerCapabilities, RunnerJobUpdateRequest, RunnerPolicySummary, ShellCommandExecutionState,
+    ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
 };
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
 use serde_json::json;
@@ -14,6 +13,7 @@ use std::time::{Duration, Instant};
 
 fn process_call(project: String, session_id: Option<String>) -> ToolCall {
     ToolCall::RunProcess {
+        interactive: false,
         project,
         executable: "argv-helper".to_string(),
         args: vec![
@@ -28,6 +28,38 @@ fn process_call(project: String, session_id: Option<String>) -> ToolCall {
         cwd: None,
         purpose: Some(ExecutionPurpose::Diagnostic),
     }
+}
+
+// The shared execution lifecycle is exercised through both public entry points.
+// Reuse the fake Runner fixture so these checks never spawn a real process.
+fn structured_execution_calls(
+    project: &str,
+    timeout_secs: u64,
+    sync_wait_secs: Option<u64>,
+) -> [(&'static str, ToolCall); 2] {
+    let mut process = process_call(project.to_string(), None);
+    if let ToolCall::RunProcess {
+        timeout_secs: timeout,
+        sync_wait_secs: wait,
+        ..
+    } = &mut process
+    {
+        *timeout = Some(timeout_secs);
+        *wait = sync_wait_secs;
+    }
+    let script = ToolCall::RunScript {
+        project: project.to_string(),
+        language: crate::runner_protocol::ShellScriptLanguage::Sh,
+        script: "printf lifecycle".to_string(),
+        args: Vec::new(),
+        stdin: None,
+        session_id: None,
+        timeout_secs: Some(timeout_secs),
+        sync_wait_secs,
+        cwd: None,
+        purpose: Some(ExecutionPurpose::Diagnostic),
+    };
+    [("process", process), ("script", script)]
 }
 
 fn process_sync_call(project: String, session_id: Option<String>) -> ToolCall {
@@ -115,6 +147,34 @@ async fn register_detached_process_job_agent(
     crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
 }
 
+async fn register_detached_process_job_agent_with_policy(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    root: &std::path::Path,
+    policy: RunnerPolicySummary,
+) -> String {
+    let capabilities = RunnerCapabilities {
+        shell: true,
+        async_jobs: true,
+        async_shell_jobs: true,
+        structured_validation_argv: true,
+        structured_process_argv: true,
+        structured_execution_jobs: true,
+        detached_process_jobs: true,
+        ..Default::default()
+    };
+    register_agent_with_projects_and_policy(
+        runtime,
+        client_id,
+        None,
+        capabilities,
+        vec![registered_project("demo", &root.to_string_lossy())],
+        Some(policy),
+    )
+    .await;
+    crate::tool_runtime::runner_project_runtime_id(client_id, "demo")
+}
+
 fn detached_process_call_with(
     project: String,
     idempotency_key: &str,
@@ -174,14 +234,15 @@ async fn update_process_job(
             status: status.to_string(),
             stdout_chunk: stdout.map(str::to_string),
             stderr_chunk: stderr.map(str::to_string),
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code,
             duration_ms: state.map(|_| 25),
             error: error.map(str::to_string),
             command_execution_state: state,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity,
             finished: state.is_some(),
         })
@@ -199,26 +260,10 @@ async fn complete_process_lifecycle(
     stderr: &str,
     error: Option<&str>,
 ) {
-    runtime
-        .runner_registry
-        .complete(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id,
-                exit_code,
-                stdout: Some(stdout.to_string()),
-                stderr: Some(stderr.to_string()),
-                duration_ms: Some(7),
-                error: error.map(str::to_string),
-            },
-            command_execution_state: Some(state),
-            mcp_gateway: None,
-            plugin_gateway: None,
-            coding_agent: None,
-        })
-        .await
-        .unwrap();
+    complete_patch_agent_execution(
+        runtime, client_id, request_id, state, exit_code, stdout, stderr, error, 7,
+    )
+    .await;
 }
 
 async fn dispatch_process_until_request(
@@ -236,6 +281,274 @@ async fn dispatch_process_until_request(
     });
     let request = wait_for_patch_agent_request(runtime, client_id).await;
     (task, request)
+}
+
+async fn dispatch_typed_process_until_request(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    arguments: serde_json::Value,
+    auth: crate::auth::AuthContext,
+) -> (
+    tokio::task::JoinHandle<ToolResult>,
+    crate::runner_protocol::RunnerRequest,
+) {
+    let (call, metadata) =
+        crate::tool_runtime::parse_tool_call_with_recorder_metadata("run_process", arguments)
+            .unwrap();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth_transport_options_and_metadata(
+                    call,
+                    Some(&auth),
+                    crate::tool_runtime::sessions::SessionTransport::Mcp,
+                    metadata,
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(runtime, client_id).await;
+    (task, request)
+}
+
+fn typed_process_arguments(project: &str) -> serde_json::Value {
+    json!({
+        "project": project,
+        "executable": "argv-helper",
+        "args": ["probe"],
+        "timeout_secs": 30,
+        "sync_wait_secs": 30,
+        "purpose": "diagnostic"
+    })
+}
+
+#[tokio::test]
+async fn model_argv_alias_executes_canonical_process_and_returns_success_hint() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project = register_process_agent(&runtime, "process-alias", temp.path(), true).await;
+    let auth = auth_context(None, true);
+    let runtime_copy = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_copy
+            .call_tool_with_context(
+                ToolCallRequest {
+                    tool_name: "run_process".to_string(),
+                    arguments: json!({
+                        "project":project, "executable":"argv-helper", "argv":["status"],
+                        "timeout_secs":30, "sync_wait_secs":30
+                    }),
+                },
+                ToolCallContext {
+                    transport: ToolTransport::Api,
+                    session_id: None,
+                    auth: Some(&auth),
+                    window: None,
+                    record_oauth_scope_denials: true,
+                    host_file_import_trust:
+                        crate::tool_runtime::kernel::HostFileImportTrust::Untrusted,
+                },
+            )
+            .await
+    });
+    let request = wait_for_patch_agent_request(&runtime, "process-alias").await;
+    assert_eq!(request.kind, "run_process");
+    assert_eq!(request.process.as_ref().unwrap().args, ["status"]);
+    let wire = serde_json::to_value(&request).unwrap();
+    assert!(wire.get("argv").is_none());
+    assert!(wire["process"].get("argv").is_none());
+    complete_process_lifecycle(
+        &runtime,
+        "process-alias",
+        request.request_id,
+        ShellCommandExecutionState::Completed,
+        Some(0),
+        "ok",
+        "",
+        None,
+    )
+    .await;
+    let outcome = task.await.unwrap();
+    let completion = outcome.model_ergonomics.as_ref().unwrap();
+    let record = completion
+        .record_for_tool_result(outcome.result.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(
+        record.input_normalization_code,
+        Some(webcodex_tool_contracts::ToolInputNormalizationCode::ArgvToArgs)
+    );
+    let result = outcome.result.unwrap();
+    assert!(result.success, "{result:?}");
+    assert_eq!(
+        result.output["input_normalization"],
+        json!({
+            "code":"argv_to_args", "hint":"normalized argv→args"
+        })
+    );
+}
+
+#[tokio::test]
+async fn run_process_projects_explicit_expectation_truth_without_changing_execution_truth() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client_id = "process-expectation-presentation";
+    let project = register_process_agent(&runtime, client_id, temp.path(), true).await;
+    let auth = auth_context(None, true);
+
+    for (label, expectation, exit_code, expected_success, expected_satisfied) in [
+        (
+            "accepted nonzero",
+            json!({"accepted_exit_codes": [0, 1]}),
+            1,
+            false,
+            true,
+        ),
+        (
+            "accepted mismatch",
+            json!({"accepted_exit_codes": [0, 1]}),
+            2,
+            false,
+            false,
+        ),
+        (
+            "accepted zero",
+            json!({"accepted_exit_codes": [0, 1]}),
+            0,
+            true,
+            true,
+        ),
+        (
+            "observe nonzero",
+            json!({"result_expectation": "observe"}),
+            1,
+            false,
+            true,
+        ),
+    ] {
+        let mut arguments = typed_process_arguments(&project);
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(expectation.as_object().unwrap().clone());
+        let (task, request) =
+            dispatch_typed_process_until_request(&runtime, client_id, arguments, auth.clone())
+                .await;
+        complete_process_lifecycle(
+            &runtime,
+            client_id,
+            request.request_id,
+            ShellCommandExecutionState::Completed,
+            Some(exit_code),
+            "",
+            "",
+            None,
+        )
+        .await;
+        let result = task.await.unwrap();
+        assert_eq!(result.success, expected_success, "{label}");
+        assert!(result.output.get("execution_success").is_none(), "{label}");
+        assert_eq!(
+            result.output["expectation_satisfied"], expected_satisfied,
+            "{label}: {}",
+            result.output
+        );
+        let schema = crate::tool_runtime::registry::output_schema_for_tool("run_process");
+        let instance = json!({
+            "success": result.success,
+            "output": result.output.clone(),
+            "error": result.error.clone(),
+        });
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
+            .unwrap_or_else(|error| panic!("{label} immediate result schema mismatch: {error}"));
+        if exit_code != 0 {
+            assert_eq!(result.output["execution_state"], "completed", "{label}");
+            assert_eq!(result.output["exit_code"], exit_code, "{label}");
+            assert_eq!(result.output["command_ok"], false, "{label}");
+            assert_eq!(
+                result.output["failure_kind"], "command_exit_nonzero",
+                "{label}"
+            );
+        }
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("accepted_exit_codes"), "{label}");
+        assert!(!serialized.contains("result_expectation"), "{label}");
+    }
+
+    let (task, request) = dispatch_typed_process_until_request(
+        &runtime,
+        client_id,
+        typed_process_arguments(&project),
+        auth.clone(),
+    )
+    .await;
+    complete_process_lifecycle(
+        &runtime,
+        client_id,
+        request.request_id,
+        ShellCommandExecutionState::Completed,
+        Some(1),
+        "",
+        "",
+        None,
+    )
+    .await;
+    let ordinary = task.await.unwrap();
+    assert!(!ordinary.success);
+    assert!(ordinary.output.get("execution_success").is_none());
+    assert!(ordinary.output.get("expectation_satisfied").is_none());
+}
+
+#[tokio::test]
+async fn run_process_expectation_projection_fails_closed_for_unknown_and_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client_id = "process-expectation-fail-closed";
+    let project = register_process_agent(&runtime, client_id, temp.path(), true).await;
+    let auth = auth_context(None, true);
+
+    for (label, state, error) in [
+        (
+            "outcome unknown",
+            ShellCommandExecutionState::OutcomeUnknown,
+            "process result lost after spawn",
+        ),
+        (
+            "timeout",
+            ShellCommandExecutionState::TimedOut,
+            "process timed out",
+        ),
+    ] {
+        let mut arguments = typed_process_arguments(&project);
+        arguments["accepted_exit_codes"] = json!([0, 1]);
+        let (task, request) =
+            dispatch_typed_process_until_request(&runtime, client_id, arguments, auth.clone())
+                .await;
+        complete_process_lifecycle(
+            &runtime,
+            client_id,
+            request.request_id,
+            state,
+            None,
+            "",
+            "",
+            Some(error),
+        )
+        .await;
+        let result = task.await.unwrap();
+        assert!(!result.success, "{label}");
+        assert!(result.output.get("execution_success").is_none(), "{label}");
+        assert_eq!(
+            result.output["execution_state"],
+            if label == "timeout" {
+                "timed_out"
+            } else {
+                "outcome_unknown"
+            },
+            "{label}"
+        );
+        assert_eq!(result.output["expectation_satisfied"], false, "{label}");
+    }
 }
 
 #[tokio::test]
@@ -606,6 +919,46 @@ async fn detached_process_idempotency_replays_same_intent_and_rejects_conflict()
     );
     assert_eq!(runtime.runner_registry.list_jobs(Some(10)).await.len(), 1);
 
+    // Same-key replay must not disguise already-terminal Job truth as a new
+    // pending handoff. The original execution is still never redispatched.
+    update_process_job(
+        &runtime,
+        "detached-idempotency",
+        &request,
+        "completed",
+        Some(ShellCommandExecutionState::Completed),
+        Some(0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    let completed_replay = runtime
+        .dispatch_with_auth(
+            detached_process_call_with(
+                project.clone(),
+                key,
+                "argv-helper",
+                vec!["detached".to_string()],
+                None,
+            ),
+            Some(&auth),
+        )
+        .await;
+    assert!(completed_replay.success, "{:?}", completed_replay.error);
+    assert_eq!(completed_replay.output["job_id"], job_id);
+    assert_eq!(completed_replay.output["status"], "completed");
+    assert_eq!(completed_replay.output["execution_state"], "completed");
+    assert_eq!(completed_replay.output["terminal"], true);
+    assert_eq!(completed_replay.output["command_started"], true);
+    assert_eq!(completed_replay.output["command_completed"], true);
+    assert!(
+        probe_patch_agent_request(&runtime, "detached-idempotency")
+            .await
+            .is_none(),
+        "terminal same-key replay must not redispatch"
+    );
+
     let conflict = runtime
         .dispatch_with_auth(
             detached_process_call_with(
@@ -682,6 +1035,7 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
     restarted
         .runner_registry
         .register(crate::runner_protocol::RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -703,6 +1057,9 @@ async fn detached_process_lost_initiation_after_server_restart_recovers_same_job
                     stdout: Default::default(),
                     stderr: Default::default(),
                     validation_progress: None,
+                    test_count_evidence: None,
+                    format_mutation: None,
+                    build_artifacts: None,
                     activity: Some(ShellJobActivity {
                         state: ShellJobActivityState::Working,
                         phase: ShellJobActivityPhase::ProcessRunning,
@@ -805,6 +1162,7 @@ async fn detached_process_uses_existing_job_identity_and_typed_runner_request() 
     assert!(result.success, "{:?}", result.error);
     let job_id = result.output["job_id"].as_str().unwrap().to_string();
     assert_eq!(result.output["execution_source"], "run_detached_process");
+    assert_observe_job_continuation(&result.output);
 
     let request = wait_for_patch_agent_request(&runtime, "detached-product-path").await;
     assert_eq!(request.kind, "start_detached_process_job");
@@ -817,105 +1175,211 @@ async fn detached_process_uses_existing_job_identity_and_typed_runner_request() 
 }
 
 #[tokio::test]
-async fn run_process_fast_terminal_jobs_project_back_without_visible_duplicates() {
+async fn detached_process_reports_runner_policy_timeout_clamp_at_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project = register_detached_process_job_agent_with_policy(
+        &runtime,
+        "detached-policy-clamp",
+        temp.path(),
+        RunnerPolicySummary {
+            max_timeout_secs: 3_600,
+            ..Default::default()
+        },
+    )
+    .await;
+    let auth = auth_context(None, true);
+    let mut call = detached_process_call(project);
+    let ToolCall::RunDetachedProcess { timeout_secs, .. } = &mut call else {
+        unreachable!("detached_process_call must return RunDetachedProcess");
+    };
+    *timeout_secs = Some(18_000);
+
+    let result = runtime.dispatch_with_auth(call, Some(&auth)).await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["requested_timeout_secs"], 18_000);
+    assert_eq!(result.output["effective_timeout_secs"], 3_600);
+    assert_eq!(result.output["runner_policy_max_timeout_secs"], 3_600);
+    assert_eq!(result.output["timeout_clamped"], true);
+
+    let request = wait_for_patch_agent_request(&runtime, "detached-policy-clamp").await;
+    assert_eq!(request.timeout_secs, 18_000);
+}
+
+#[tokio::test]
+async fn structured_execution_fast_terminal_jobs_project_back_without_visible_duplicates() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(250));
     let project = register_process_job_agent(&runtime, "process-fast-job", temp.path()).await;
     let auth = auth_context(None, true);
 
     for (exit_code, status, expected_success) in [(0, "completed", true), (19, "failed", false)] {
-        let (task, request) = dispatch_process_until_request(
-            &runtime,
-            "process-fast-job",
-            process_call(project.clone(), None),
-            auth.clone(),
-        )
-        .await;
-        assert_eq!(request.kind, "start_process_job");
-        assert_eq!(request.command, "");
-        assert!(request.process.is_some());
-        assert!(request.script.is_none());
+        for (entry, call) in structured_execution_calls(&project, 30, None) {
+            let (task, request) =
+                dispatch_process_until_request(&runtime, "process-fast-job", call, auth.clone())
+                    .await;
+            assert_eq!(request.kind, format!("start_{entry}_job"));
+            assert_eq!(request.command, "");
+            assert_eq!(request.process.is_some(), entry == "process");
+            assert_eq!(request.script.is_some(), entry == "script");
+            update_process_job(
+                &runtime,
+                "process-fast-job",
+                &request,
+                "running",
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            update_process_job(
+                &runtime,
+                "process-fast-job",
+                &request,
+                status,
+                Some(ShellCommandExecutionState::Completed),
+                Some(exit_code),
+                Some("terminal stdout\n"),
+                Some("terminal stderr\n"),
+                None,
+            )
+            .await;
+
+            let result = task.await.unwrap();
+            assert_eq!(result.success, expected_success);
+            if expected_success {
+                for omitted in [
+                    "execution_state",
+                    "command_started",
+                    "command_completed",
+                    "command_ok",
+                    "exit_code",
+                    "duration_ms",
+                    "purpose",
+                    "cwd",
+                    "executor",
+                    "promoted_to_job",
+                    "terminal",
+                    "job_id",
+                    "job_status",
+                    "observation_token",
+                    "effective_timeout_secs",
+                    "continuation",
+                    "sync_wait_secs",
+                    "async_handoff_available",
+                    "failure_kind",
+                    "tool_failure",
+                    "stdout_truncated",
+                    "stderr_truncated",
+                ] {
+                    assert!(
+                        result.output.get(omitted).is_none(),
+                        "boring terminal success field {omitted} should be omitted: {}",
+                        result.output
+                    );
+                }
+            } else {
+                assert_eq!(result.output["execution_state"], "completed");
+                assert_eq!(result.output["command_started"], true);
+                assert_eq!(result.output["command_completed"], true);
+                assert_eq!(result.output["exit_code"], exit_code);
+                assert_eq!(result.output["promoted_to_job"], false);
+                assert_eq!(result.output["terminal"], true);
+                assert!(result.output["job_id"].is_null());
+                assert!(result.output["job_status"].is_null());
+                assert_eq!(result.output["async_handoff_available"], true);
+                assert!(result.output.get("continuation").is_none());
+                assert_eq!(result.output["failure_kind"], "command_exit_nonzero");
+                assert_eq!(result.output["tool_failure"], false);
+            }
+            assert!(
+                runtime
+                    .runner_registry
+                    .hidden_job_ids_for_test()
+                    .await
+                    .is_empty(),
+                "a fast terminal execution must not retain its internal Job"
+            );
+            assert!(
+                runtime.runner_registry.list_jobs(Some(10)).await.is_empty(),
+                "a fast terminal execution must not become a public duplicate"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn structured_execution_fast_outcome_unknown_preserves_visible_recovery_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(250));
+    let project = register_process_job_agent(&runtime, "process-fast-unknown", temp.path()).await;
+    let auth = auth_context(None, true);
+    for (entry, call) in structured_execution_calls(&project, 30, None) {
+        let (task, request) =
+            dispatch_process_until_request(&runtime, "process-fast-unknown", call, auth.clone())
+                .await;
+        assert_eq!(request.kind, format!("start_{entry}_job"));
+        let job_id = request.job_id.clone().expect("structured process Job id");
         update_process_job(
             &runtime,
-            "process-fast-job",
+            "process-fast-unknown",
             &request,
-            "running",
+            "lost",
+            Some(ShellCommandExecutionState::OutcomeUnknown),
             None,
+            Some("partial process output\n"),
             None,
-            None,
-            None,
-            None,
-        )
-        .await;
-        update_process_job(
-            &runtime,
-            "process-fast-job",
-            &request,
-            status,
-            Some(ShellCommandExecutionState::Completed),
-            Some(exit_code),
-            Some("terminal stdout\n"),
-            Some("terminal stderr\n"),
-            None,
+            Some("process terminal correlation was lost after spawn"),
         )
         .await;
 
         let result = task.await.unwrap();
-        assert_eq!(result.success, expected_success);
-        if expected_success {
-            for omitted in [
-                "execution_state",
-                "command_started",
-                "command_completed",
-                "command_ok",
-                "exit_code",
-                "duration_ms",
-                "purpose",
-                "cwd",
-                "executor",
-                "promoted_to_job",
-                "terminal",
-                "job_id",
-                "job_status",
-                "observation_token",
-                "effective_timeout_secs",
-                "sync_wait_secs",
-                "async_handoff_available",
-                "failure_kind",
-                "tool_failure",
-                "stdout_truncated",
-                "stderr_truncated",
-            ] {
-                assert!(
-                    result.output.get(omitted).is_none(),
-                    "boring terminal success field {omitted} should be omitted: {}",
-                    result.output
-                );
-            }
-        } else {
-            assert_eq!(result.output["execution_state"], "completed");
-            assert_eq!(result.output["command_started"], true);
-            assert_eq!(result.output["command_completed"], true);
-            assert_eq!(result.output["exit_code"], exit_code);
-            assert_eq!(result.output["promoted_to_job"], false);
-            assert_eq!(result.output["terminal"], true);
-            assert!(result.output["job_id"].is_null());
-            assert!(result.output["job_status"].is_null());
-            assert_eq!(result.output["async_handoff_available"], true);
-            assert_eq!(result.output["failure_kind"], "command_exit_nonzero");
-            assert_eq!(result.output["tool_failure"], false);
-        }
-        assert!(
-            runtime
-                .runner_registry
-                .hidden_job_ids_for_test()
-                .await
-                .is_empty(),
-            "a fast terminal execution must not retain its internal Job"
+        assert!(!result.success);
+        assert_eq!(result.output["execution_state"], "outcome_unknown");
+        assert_eq!(result.output["command_started"], true);
+        assert_eq!(result.output["command_completed"], false);
+        assert_eq!(result.output["promoted_to_job"], true);
+        assert_eq!(result.output["terminal"], false);
+        assert_eq!(result.output["job_id"], job_id);
+        assert_eq!(result.output["job_status"], "lost");
+        assert_eq!(
+            result.output["continuation"]["arguments"]["items"][0]["job_id"],
+            job_id
         );
+        let schema = crate::tool_runtime::registry::output_schema_for_tool(&format!("run_{entry}"));
+        let instance = json!({
+            "success": result.success,
+            "output": result.output.clone(),
+            "error": result.error.clone(),
+        });
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
+            .unwrap_or_else(|error| {
+                panic!("uncertain run_{entry} result schema mismatch: {error}")
+            });
+
+        let visible = runtime
+            .runner_registry
+            .get_job_for_auth(Some(&crate::test_support::runner_access(&auth)), &job_id)
+            .await
+            .unwrap();
+        assert_eq!(visible.status, "lost");
+        assert_eq!(
+            visible.command_execution_state,
+            Some(ShellCommandExecutionState::OutcomeUnknown)
+        );
+        assert!(runtime
+            .runner_registry
+            .hidden_job_ids_for_test()
+            .await
+            .is_empty());
+        assert!(runtime.runner_registry.remove_job_record(&job_id).await);
         assert!(
-            runtime.runner_registry.list_jobs(Some(10)).await.is_empty(),
-            "a fast terminal execution must not become a public duplicate"
+            probe_patch_agent_request(&runtime, "process-fast-unknown")
+                .await
+                .is_none(),
+            "uncertainty must not redispatch the admitted execution"
         );
     }
 }
@@ -929,13 +1393,18 @@ async fn run_process_terminal_success_is_sparse_after_full_session_effect_record
     let session_id = session.session_id.clone();
     let auth = auth_context(None, true);
 
-    let (task, request) = dispatch_process_until_request(
-        &runtime,
-        "process-sparse-ledger",
-        process_call(project.clone(), Some(session_id.clone())),
-        auth.clone(),
-    )
-    .await;
+    let call = process_call(project.clone(), Some(session_id.clone()));
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime.dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
+                call, Some(&auth), sessions::SessionTransport::Api,
+                Default::default(), None, true, Vec::new(), Default::default(),
+                Default::default(), super::super::return_timing::ToolReturnTimingPolicy::unconstrained(),
+            ).await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, "process-sparse-ledger").await;
     update_process_job(
         &runtime,
         "process-sparse-ledger",
@@ -961,7 +1430,27 @@ async fn run_process_terminal_success_is_sparse_after_full_session_effect_record
     )
     .await;
 
-    let result = task.await.unwrap();
+    let (mut result, projection, _) = task.await.unwrap();
+    assert_eq!(result.output["execution_state"], "completed");
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], true);
+    assert_eq!(result.output["command_ok"], true);
+    let audit = super::super::tool_audit::canonical_execution_audit_result_for_tool(
+        "run_process",
+        &result.output,
+    );
+    assert_eq!(audit["command_ok"], true);
+    assert_eq!(audit["execution_state"], "completed");
+    let mut timer =
+        super::super::model_ergonomics_telemetry::ModelErgonomicsTimer::start_with_arguments(
+            "run_process",
+            &json!({}),
+        )
+        .unwrap();
+    timer.capture_canonical_result(&result);
+    projection.project(&mut result);
+    let metrics = timer.finish().record_for_tool_result(&result).unwrap();
+    assert_eq!(metrics.execution_state.as_deref(), Some("completed"));
     assert!(result.success, "{:?}", result.error);
     for omitted in [
         "execution_state",
@@ -1146,7 +1635,7 @@ async fn run_process_fast_prestart_rejection_retains_not_started_through_the_hid
 }
 
 #[tokio::test]
-async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budget() {
+async fn run_process_six_hour_handoff_is_queryable_once_and_keeps_the_original_budget() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(40));
     let project = register_process_job_agent(&runtime, "process-slow-job", temp.path()).await;
@@ -1156,6 +1645,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
         &runtime,
         "process-slow-job",
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: "argv-helper".to_string(),
             args: vec![
@@ -1165,7 +1655,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
             ],
             stdin: Some("input\n".to_string()),
             session_id: None,
-            timeout_secs: Some(121),
+            timeout_secs: Some(21_600),
             sync_wait_secs: Some(45),
             cwd: None,
             purpose: Some(ExecutionPurpose::Diagnostic),
@@ -1177,7 +1667,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
     assert_eq!(request.command, "");
     assert!(request.process.is_some());
     assert!(request.script.is_none());
-    assert_eq!(request.timeout_secs, 121);
+    assert_eq!(request.timeout_secs, 21_600);
     update_process_job(
         &runtime,
         "process-slow-job",
@@ -1194,48 +1684,23 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
     let handoff = task.await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_eq!(handoff.output["terminal"], false);
-    assert_eq!(handoff.output["execution_state"], "running");
-    assert_eq!(handoff.output["command_started"], true);
-    assert_eq!(handoff.output["command_completed"], false);
-    assert_eq!(handoff.output["effective_timeout_secs"], 121);
-    assert_eq!(handoff.output["sync_wait_secs"], 45);
+    let job_id = assert_sparse_pending_job_handoff(&handoff.output).to_string();
+    assert_eq!(request.job_id.as_deref(), Some(job_id.as_str()));
+
+    let status = runtime
+        .job_status_for_auth(job_id.clone(), false, Some(&auth))
+        .await;
+    assert!(status.success, "{:?}", status.error);
+    assert_eq!(status.output["job_id"], job_id);
+    assert_eq!(status.output["status"], "running");
     assert_eq!(
-        handoff.output["stdout_tail"],
-        "progress already available\n"
-    );
-    assert_eq!(handoff.output["stdout_lines"], 1);
-    assert_eq!(handoff.output["stdout_truncated"], false);
-    assert_eq!(handoff.output["detected_summary"]["outcome"], "in_progress");
-    assert_eq!(
-        handoff.output["activity"],
+        status.output["activity"],
         json!({
             "state": "working",
             "phase": "process_running",
             "source": "runner_execution"
         })
     );
-    assert_eq!(
-        handoff.output["detected_summary"]["progress"]["reason_code"],
-        "process_running"
-    );
-    let job_id = handoff.output["job_id"].as_str().unwrap().to_string();
-    assert_eq!(request.job_id.as_deref(), Some(job_id.as_str()));
-
-    let status = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: job_id.clone(),
-                include_command_preview: false,
-            },
-            Some(&auth),
-        )
-        .await;
-    assert!(status.success, "{:?}", status.error);
-    assert_eq!(status.output["job_id"], job_id);
-    assert_eq!(status.output["status"], "running");
-    assert_eq!(status.output["activity"], handoff.output["activity"]);
     assert!(status.output["command_execution_state"].is_null());
     assert_eq!(
         status.output["structured_execution"]["execution_source"],
@@ -1276,13 +1741,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
     )
     .await;
     let terminal = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: job_id.clone(),
-                include_command_preview: false,
-            },
-            Some(&auth),
-        )
+        .job_status_for_auth(job_id.clone(), false, Some(&auth))
         .await;
     assert!(terminal.success, "{:?}", terminal.error);
     assert_eq!(terminal.output["status"], "completed");
@@ -1298,16 +1757,17 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
 }
 
 #[tokio::test]
-async fn run_process_sync_wait_validation_fails_before_execution_start() {
+async fn run_process_zero_sync_wait_fails_before_execution_start() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
     let project =
         register_process_job_agent(&runtime, "process-sync-wait-bounds", temp.path()).await;
 
-    for (timeout_secs, sync_wait_secs) in [(60, 0), (60, 61), (5, 6)] {
+    for (timeout_secs, sync_wait_secs) in [(60, 0)] {
         let result = runtime
             .dispatch_with_auth(
                 ToolCall::RunProcess {
+                    interactive: false,
                     project: project.clone(),
                     executable: "argv-helper".to_string(),
                     args: Vec::new(),
@@ -1347,6 +1807,7 @@ async fn run_process_short_timeout_stays_direct_without_job_headroom() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunProcess {
+                        interactive: false,
                         project,
                         executable: "argv-helper".to_string(),
                         args: Vec::new(),
@@ -1384,73 +1845,77 @@ async fn run_process_short_timeout_stays_direct_without_job_headroom() {
 }
 
 #[tokio::test]
-async fn stop_job_stops_the_promoted_process_without_starting_a_replacement() {
+async fn structured_execution_stop_job_preserves_handoff_identity_without_replacement() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(30));
     let project = register_process_job_agent(&runtime, "process-stop-job", temp.path()).await;
     let auth = auth_context(None, true);
-    let (task, start_request) = dispatch_process_until_request(
-        &runtime,
-        "process-stop-job",
-        process_call(project.clone(), None),
-        auth.clone(),
-    )
-    .await;
-    update_process_job(
-        &runtime,
-        "process-stop-job",
-        &start_request,
-        "running",
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
-    let handoff = task.await.unwrap();
-    let job_id = handoff.output["job_id"].as_str().unwrap().to_string();
-    assert_eq!(handoff.output["promoted_to_job"], true);
-
-    let stopped = runtime
-        .dispatch_with_auth(
-            ToolCall::StopJob {
-                project,
-                job_id: job_id.clone(),
-                session_id: None,
-                confirm: true,
-            },
-            Some(&auth),
+    for (entry, call) in structured_execution_calls(&project, 30, None) {
+        let (task, start_request) =
+            dispatch_process_until_request(&runtime, "process-stop-job", call, auth.clone()).await;
+        update_process_job(
+            &runtime,
+            "process-stop-job",
+            &start_request,
+            "running",
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await;
-    assert!(stopped.success, "{:?}", stopped.error);
-    let stop_request = wait_for_patch_agent_request(&runtime, "process-stop-job").await;
-    assert_eq!(stop_request.kind, "stop_job");
-    assert_eq!(stop_request.job_id.as_deref(), Some(job_id.as_str()));
-    update_process_job(
-        &runtime,
-        "process-stop-job",
-        &start_request,
-        "stopped",
-        Some(ShellCommandExecutionState::Completed),
-        Some(-1),
-        None,
-        Some("job stopped by request\n"),
-        Some("job stopped"),
-    )
-    .await;
-    let terminal = runtime.runner_registry.get_job(&job_id).await.unwrap();
-    assert_eq!(terminal.status, "stopped");
-    assert_eq!(
-        terminal.command_execution_state,
-        Some(ShellCommandExecutionState::Completed)
-    );
-    assert!(
-        probe_patch_agent_request(&runtime, "process-stop-job")
-            .await
-            .is_none(),
-        "stopping the Job must never enqueue a replacement execution"
-    );
+        let handoff = task.await.unwrap();
+        let job_id = assert_sparse_pending_job_handoff(&handoff.output).to_string();
+        assert_eq!(start_request.kind, format!("start_{entry}_job"));
+        assert_eq!(start_request.job_id.as_deref(), Some(job_id.as_str()));
+        assert!(
+            probe_patch_agent_request(&runtime, "process-stop-job")
+                .await
+                .is_none(),
+            "handoff must not dispatch a second execution"
+        );
+
+        let stopped = runtime
+            .dispatch_with_auth(
+                ToolCall::StopJob {
+                    project: project.clone(),
+                    job_id: job_id.clone(),
+                    session_id: None,
+                    confirm: true,
+                },
+                Some(&auth),
+            )
+            .await;
+        assert!(stopped.success, "{:?}", stopped.error);
+        let stop_request = wait_for_patch_agent_request(&runtime, "process-stop-job").await;
+        assert_eq!(stop_request.kind, "stop_job");
+        assert_eq!(stop_request.job_id.as_deref(), Some(job_id.as_str()));
+        update_process_job(
+            &runtime,
+            "process-stop-job",
+            &start_request,
+            "stopped",
+            Some(ShellCommandExecutionState::Completed),
+            Some(-1),
+            None,
+            Some("job stopped by request\n"),
+            Some("job stopped"),
+        )
+        .await;
+        let terminal = runtime.runner_registry.get_job(&job_id).await.unwrap();
+        assert_eq!(terminal.status, "stopped");
+        assert_eq!(
+            terminal.command_execution_state,
+            Some(ShellCommandExecutionState::Completed)
+        );
+        assert!(
+            probe_patch_agent_request(&runtime, "process-stop-job")
+                .await
+                .is_none(),
+            "stopping the Job must never enqueue a replacement execution"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1485,7 +1950,7 @@ async fn promoted_process_inherits_the_initiating_session_without_a_second_tool_
     )
     .await;
     let handoff = task.await.unwrap();
-    let job_id = handoff.output["job_id"].as_str().unwrap();
+    let job_id = assert_sparse_pending_job_handoff(&handoff.output);
     let job = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(job.session_id.as_deref(), Some(session.session_id.as_str()));
     assert_eq!(job.project_id.as_deref(), Some(project.as_str()));
@@ -1533,6 +1998,7 @@ async fn run_process_preserves_large_typed_argv_without_shell_parsing() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunProcess {
+                        interactive: false,
                         project,
                         executable: "argv-helper".to_string(),
                         args: large_args,
@@ -1635,6 +2101,98 @@ async fn authority_denied_run_process_has_prestart_lifecycle() {
 }
 
 #[tokio::test]
+async fn structured_execution_wait_timeout_uses_dispatch_evidence_for_both_entries() {
+    for dispatched in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = test_runtime();
+        let client_id = "structured-wait-timeout";
+        let project = register_process_job_agent(&runtime, client_id, temp.path()).await;
+        for (entry, call) in structured_execution_calls(&project, 1, Some(1)) {
+            let task = tokio::spawn({
+                let runtime = runtime.clone();
+                async move {
+                    runtime
+                        .dispatch_with_auth(call, Some(&auth_context(None, true)))
+                        .await
+                }
+            });
+            if dispatched {
+                let request = wait_for_patch_agent_request(&runtime, client_id).await;
+                assert_eq!(request.kind, format!("run_{entry}"));
+                assert!(request.job_id.is_none());
+            }
+            let result = task.await.unwrap();
+            assert!(!result.success, "{entry}, dispatched={dispatched}");
+            assert_eq!(result.output["command_started"], dispatched);
+            assert_eq!(result.output["command_completed"], false);
+            assert_eq!(result.output["terminal"], !dispatched);
+            assert_eq!(
+                result.output["execution_state"],
+                if dispatched {
+                    "outcome_unknown"
+                } else {
+                    "not_started"
+                }
+            );
+            assert_eq!(
+                result.output["failure_kind"],
+                if dispatched {
+                    "outcome_unknown"
+                } else {
+                    "timeout"
+                }
+            );
+            if dispatched {
+                assert!(result
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Do not automatically retry"));
+            }
+            assert!(
+                probe_patch_agent_request(&runtime, client_id)
+                    .await
+                    .is_none(),
+                "{entry} timeout must remove the original queue entry without replay"
+            );
+            assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn structured_execution_dropped_waiter_without_dispatch_record_stays_unknown() {
+    use crate::tool_runtime::structured_execution::{
+        await_structured_request_result, StructuredRequestKind,
+    };
+    let runtime = test_runtime();
+    for kind in [
+        StructuredRequestKind::Process,
+        StructuredRequestKind::Script,
+    ] {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(sender);
+        let result = await_structured_request_result(
+            &runtime.runner_registry,
+            "missing-original-request",
+            receiver,
+            1,
+            kind,
+        )
+        .await;
+        assert!(!result.success);
+        assert_eq!(result.output["execution_state"], "outcome_unknown");
+        assert_eq!(result.output["command_started"], true);
+        assert_eq!(result.output["command_completed"], false);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Do not automatically retry"));
+    }
+}
+
+#[tokio::test]
 async fn run_process_transport_uncertainty_and_timeout_preserve_phase_a_truth() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime();
@@ -1661,6 +2219,7 @@ async fn run_process_transport_uncertainty_and_timeout_preserve_phase_a_truth() 
     assert_eq!(uncertain.output["execution_state"], "outcome_unknown");
     assert_eq!(uncertain.output["command_started"], true);
     assert_eq!(uncertain.output["command_completed"], false);
+    assert!(uncertain.output.get("continuation").is_none());
     assert!(uncertain
         .error
         .as_deref()
@@ -1813,7 +2372,7 @@ async fn run_process_named_ssh_resource_fails_before_enqueue() {
 
     let result = runtime
         .dispatch_with_auth(
-            process_call(project, Some(session.session_id)),
+            process_call(project, Some(session.session_id.clone())),
             Some(&auth_context(None, true)),
         )
         .await;
@@ -1829,6 +2388,27 @@ async fn run_process_named_ssh_resource_fails_before_enqueue() {
     assert!(probe_patch_agent_request(&runtime, "process-ssh")
         .await
         .is_none());
+
+    let shell_form = ToolCall::RunProcess {
+        interactive: false,
+        project: runner_project_runtime_id("process-ssh", "demo"),
+        executable: "bash".to_string(),
+        args: vec!["-c".to_string(), "printf unsafe".to_string()],
+        stdin: None,
+        session_id: Some(session.session_id),
+        timeout_secs: Some(30),
+        sync_wait_secs: Some(30),
+        cwd: None,
+        purpose: None,
+    };
+    let denied = runtime
+        .dispatch_with_auth(shell_form, Some(&auth_context(None, true)))
+        .await;
+    assert!(!denied.success);
+    assert_eq!(denied.output["execution_state"], "not_started");
+    assert!(probe_patch_agent_request(&runtime, "process-ssh")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -1841,6 +2421,7 @@ async fn run_process_validation_and_inspect_permission_boundaries_fail_closed() 
 
     for invalid in [
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: String::new(),
             args: Vec::new(),
@@ -1852,6 +2433,7 @@ async fn run_process_validation_and_inspect_permission_boundaries_fail_closed() 
             purpose: None,
         },
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: "sh".to_string(),
             args: vec!["-c".to_string(), "touch marker".to_string()],
@@ -1863,6 +2445,7 @@ async fn run_process_validation_and_inspect_permission_boundaries_fail_closed() 
             purpose: None,
         },
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: "argv-helper".to_string(),
             args: vec!["bad\0arg".to_string()],
@@ -1874,6 +2457,7 @@ async fn run_process_validation_and_inspect_permission_boundaries_fail_closed() 
             purpose: None,
         },
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: "argv-helper".to_string(),
             args: vec![String::new(); 257],
@@ -1885,6 +2469,7 @@ async fn run_process_validation_and_inspect_permission_boundaries_fail_closed() 
             purpose: None,
         },
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: "argv-helper".to_string(),
             args: vec!["x".repeat(8_193)],
@@ -1896,6 +2481,7 @@ async fn run_process_validation_and_inspect_permission_boundaries_fail_closed() 
             purpose: None,
         },
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: "argv-helper".to_string(),
             args: Vec::new(),
@@ -1907,6 +2493,7 @@ async fn run_process_validation_and_inspect_permission_boundaries_fail_closed() 
             purpose: None,
         },
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: "argv-helper".to_string(),
             args: Vec::new(),
@@ -1918,6 +2505,7 @@ async fn run_process_validation_and_inspect_permission_boundaries_fail_closed() 
             purpose: None,
         },
         ToolCall::RunProcess {
+            interactive: false,
             project: project.clone(),
             executable: "argv-helper".to_string(),
             args: Vec::new(),
@@ -2052,4 +2640,317 @@ async fn model_facing_session_denials_keep_run_process_prestart_lifecycle() {
             .is_none(),
         "model-facing Session denials must happen before Runner enqueue"
     );
+}
+
+#[tokio::test]
+async fn run_process_shell_command_mode_recovery_is_lossless_parser_ready_and_prestart() {
+    use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client = "shell-recovery";
+    let project = runner_project_runtime_id(client, "demo");
+    let auth = bootstrap_auth_context();
+    for (dialect, available_dialects) in [
+        (
+            Some("powershell"),
+            Some(vec!["sh".to_string(), "bash".to_string()]),
+        ),
+        (Some("custom"), Some(vec!["sh".to_string()])),
+        (Some("bash"), None),
+    ] {
+        let expected_available_dialects = available_dialects.clone();
+        register_agent_with_shell_profiles(
+            &runtime,
+            client,
+            Some(RunnerPolicySummary {
+                shell_profiles: Some(ShellProfilesSummary {
+                    default_profile: None,
+                    configured_count: 0,
+                    prepared_cache_count: 0,
+                    profiles: vec![],
+                    default_dialect: dialect.map(str::to_string),
+                    available_dialects,
+                }),
+                ..Default::default()
+            }),
+            vec![registered_project("demo", &temp.path().to_string_lossy())],
+        )
+        .await;
+        for (shell, args, extra, convertible) in [
+            (
+                "sh",
+                json!(["-c", "printf '%s' '雪 $HOME'\nprintf done"]),
+                json!({}),
+                true,
+            ),
+            (
+                "bash",
+                json!(["-c", "printf '%s' 'a b'"]),
+                json!({"result_expectation":"success"}),
+                true,
+            ),
+            ("bash", json!(["-lc", "echo login"]), json!({}), true),
+            (
+                "bash",
+                json!(["-c", "echo $0", "custom-zero"]),
+                json!({}),
+                false,
+            ),
+            ("bash", json!(["-c", "cat"]), json!({"stdin":""}), false),
+            (
+                "bash",
+                json!(["-c", "echo hello"]),
+                json!({"cwd":"bad\0cwd"}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"accepted_exit_codes":[0,1]}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"result_expectation":"failure"}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"result_expectation":"observe"}),
+                false,
+            ),
+            (
+                "powershell",
+                json!(["-Command", "echo hello"]),
+                json!({}),
+                false,
+            ),
+            ("cmd", json!(["/c", "echo hello"]), json!({}), false),
+            ("/bin/bash", json!(["-c", "echo hello"]), json!({}), false),
+            (
+                "bash",
+                json!([
+                    "-c",
+                    "x".repeat(crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES + 1)
+                ]),
+                json!({}),
+                false,
+            ),
+        ] {
+            let session = runtime.sessions.start_session(Some(project.clone()), None);
+            let mut arguments = json!({"project":project, "executable":shell, "args":args,
+                "session_id":session.session_id, "cwd":".", "timeout_secs":30, "sync_wait_secs":30,
+                "purpose":"test", "assertion_name":"shell recovery"});
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (call, metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
+                "run_process",
+                arguments.clone(),
+            )
+            .unwrap();
+            let recovery_available = convertible
+                && expected_available_dialects
+                    .as_ref()
+                    .is_some_and(|dialects| dialects.iter().any(|dialect| dialect == shell));
+            let runtime_copy = runtime.clone();
+            let auth_copy = auth.clone();
+            let task = tokio::spawn(async move {
+                runtime_copy
+                    .dispatch_with_auth_transport_options_and_metadata(
+                        call,
+                        Some(&auth_copy),
+                        sessions::SessionTransport::Mcp,
+                        metadata,
+                    )
+                    .await
+            });
+            if recovery_available {
+                let request = wait_for_patch_agent_request(&runtime, client).await;
+                assert_eq!(request.kind, "run_shell");
+                assert!(
+                    request.process.is_none(),
+                    "native RunProcess must not start"
+                );
+                assert_eq!(request.shell.unwrap().as_str(), shell);
+                assert_eq!(request.login, args[0] == "-lc");
+                assert_eq!(request.command, args[1]);
+                complete_process_lifecycle(
+                    &runtime,
+                    client,
+                    request.request_id,
+                    ShellCommandExecutionState::Completed,
+                    Some(0),
+                    "ok",
+                    "",
+                    None,
+                )
+                .await;
+            }
+            let result = task.await.unwrap();
+            if recovery_available {
+                assert!(result.success, "{result:?}");
+                assert_eq!(result.output["requested_surface"], "run_process");
+                assert_eq!(result.output["execution_source"], "run_shell");
+                if args[0] == "-lc" {
+                    assert_eq!(result.output["shell"], "bash_login");
+                }
+                let expected_code = if args[0] == "-lc" {
+                    "run_process_bash_lc_to_login_run_shell"
+                } else if shell == "sh" {
+                    "run_process_sh_c_to_run_shell"
+                } else {
+                    "run_process_bash_c_to_run_shell"
+                };
+                assert_eq!(result.output["input_normalization"]["code"], expected_code);
+                assert!(result.output["input_normalization"]["hint"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("normalized run_process"));
+            } else {
+                assert!(!result.success, "{result:?}");
+                assert_eq!(result.output["command_started"], false, "{result:?}");
+                assert_eq!(result.output["execution_state"], "not_started");
+                assert_eq!(result.output["failure_kind"], "invalid_arguments");
+            }
+            assert!(result.output.get("suggested_call").is_none());
+            let schema = crate::tool_runtime::registry::output_schema_for_tool("run_process");
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &json!({
+                "success":result.success, "output":result.output, "error":result.error}),
+                &schema,
+            )
+            .unwrap();
+            assert!(probe_patch_agent_request(&runtime, client).await.is_none());
+            assert!(
+                runtime.runner_registry.list_jobs(None).await.is_empty(),
+                "no Job admitted"
+            );
+            assert_eq!(
+                std::fs::read_dir(temp.path()).unwrap().count(),
+                0,
+                "workspace state unchanged"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn shell_recovery_requires_raw_shell_policy_and_explicit_selection_capability() {
+    use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client = "shell-recovery-gates";
+    let policy = |allow_raw_shell| RunnerPolicySummary {
+        allow_raw_shell,
+        shell_profiles: Some(ShellProfilesSummary {
+            default_profile: None,
+            configured_count: 0,
+            prepared_cache_count: 0,
+            profiles: vec![],
+            default_dialect: Some("bash".to_string()),
+            available_dialects: Some(vec!["bash".to_string()]),
+        }),
+        ..Default::default()
+    };
+    for (allow_raw_shell, explicit_shell_selection) in [(false, true), (true, false)] {
+        runtime
+            .runner_registry
+            .register(crate::runner_protocol::RunnerRegisterRequest {
+                computer_session_availability: None,
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+                client_id: client.to_string(),
+                runner_instance_id: "inst".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                display_name: None,
+                owner: None,
+                hostname: None,
+                host_context: None,
+                capabilities: crate::test_support::current_runner_capabilities(
+                    RunnerCapabilities {
+                        shell: true,
+                        structured_process_argv: true,
+                        explicit_shell_selection,
+                        bash_login_shell: true,
+                        ..Default::default()
+                    },
+                ),
+                policy: Some(policy(allow_raw_shell)),
+            })
+            .await
+            .unwrap();
+        crate::test_support::apply_project_inventory_snapshot(
+            &runtime.runner_registry,
+            client,
+            "inst",
+            vec![registered_project("demo", &temp.path().to_string_lossy())],
+        )
+        .await;
+        let call = ToolCall::RunProcess {
+            interactive: false,
+            project: runner_project_runtime_id(client, "demo"),
+            executable: "bash".to_string(),
+            args: vec!["-c".to_string(), "printf unsafe".to_string()],
+            stdin: None,
+            session_id: None,
+            timeout_secs: Some(30),
+            sync_wait_secs: Some(30),
+            cwd: None,
+            purpose: None,
+        };
+        let result = runtime
+            .dispatch_with_auth(call, Some(&bootstrap_auth_context()))
+            .await;
+        assert!(!result.success, "{result:?}");
+        assert_eq!(result.output["execution_state"], "not_started");
+        assert!(result.output.get("input_normalization").is_none());
+        assert!(probe_patch_agent_request(&runtime, client).await.is_none());
+    }
+}
+
+#[tokio::test]
+async fn typed_execution_admission_projection_preserves_not_started_for_all_runner_names() {
+    let registry = crate::runner_http::RunnerRegistry::default();
+    let mut expected_output = None;
+    for client_id in ["demo", "offline-demo", "permission-denied-demo"] {
+        let error = registry
+            .enqueue_process_typed(
+                client_id.into(),
+                None,
+                crate::runner_protocol::ShellProcessArgv {
+                    executable: "echo".into(),
+                    args: vec!["test".into()],
+                },
+                None,
+                30,
+                30,
+                "test".into(),
+            )
+            .await
+            .err()
+            .expect("unknown Runner must reject before enqueue");
+        let result = crate::tool_runtime::process::execution_admission_failure_result(
+            error,
+            "confirm the Runner identity and connection before retrying.",
+        );
+        assert!(!result.success);
+        assert_eq!(result.output["failure_kind"], "agent_offline");
+        assert_eq!(result.output["execution_state"], "not_started");
+        assert_eq!(result.output["command_started"], false);
+        assert_eq!(result.output["command_completed"], false);
+        assert_eq!(result.output["tool_failure"], true);
+        if let Some(expected) = &expected_output {
+            assert_eq!(&result.output, expected);
+        } else {
+            expected_output = Some(result.output);
+        }
+    }
 }

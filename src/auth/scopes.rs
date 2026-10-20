@@ -19,18 +19,36 @@ pub use webcodex_core::authority::{
     AGENT_SCOPES, COMMUNICATION_MANAGE_SCOPES, COMMUNICATION_READ_SCOPES, KNOWN_SCOPES,
     MEMORY_MANAGE_SCOPES, MEMORY_READ_SCOPES, SCOPE_ACCOUNT_MANAGE, SCOPE_ADMIN,
     SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
-    SCOPE_CODING_AGENT_RUN, SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ,
-    SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE, SCOPE_COMPUTER_CONTROL,
-    SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH, SCOPE_COMPUTER_POINTER_CONTROL,
-    SCOPE_COMPUTER_READ, SCOPE_JOB_DETACH, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL, SCOPE_MEMORY_MANAGE,
-    SCOPE_MEMORY_READ, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE,
-    SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNNER_MANAGE, SCOPE_RUNTIME_READ,
-    SCOPE_SESSION_COLLABORATE, SCOPE_SSH_LOCAL,
+    SCOPE_BROWSER_CONTROL, SCOPE_BROWSER_LAUNCH, SCOPE_BROWSER_READ, SCOPE_CODING_AGENT_RUN,
+    SCOPE_COMMUNICATION_MANAGE, SCOPE_COMMUNICATION_READ, SCOPE_COMPUTER_CLIPBOARD_READ,
+    SCOPE_COMPUTER_CLIPBOARD_WRITE, SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ,
+    SCOPE_COMPUTER_LAUNCH, SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_JOB_DETACH,
+    SCOPE_JOB_RUN, SCOPE_MCP_LOCAL, SCOPE_MEMORY_MANAGE, SCOPE_MEMORY_READ, SCOPE_PLUGIN_INSPECT,
+    SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE,
+    SCOPE_RUNNER_MANAGE, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE, SCOPE_SSH_LOCAL,
 };
 
 /// True when `scope` is one of the Runner transport scopes.
 pub(crate) fn is_agent_scope(scope: &str) -> bool {
     AGENT_SCOPES.contains(&scope)
+}
+
+/// Scopes that require an explicit principal even when legacy unauthenticated
+/// runtime-tool access is otherwise preserved.
+pub(crate) fn scope_requires_explicit_unauthenticated_authority(scope: &str) -> bool {
+    matches!(
+        scope,
+        SCOPE_ADMIN
+            | SCOPE_BROWSER_READ
+            | SCOPE_BROWSER_CONTROL
+            | SCOPE_BROWSER_LAUNCH
+            | SCOPE_MEMORY_READ
+            | SCOPE_MEMORY_MANAGE
+            | SCOPE_PLUGIN_INSPECT
+            | SCOPE_PLUGIN_INVOKE
+            | SCOPE_PLUGIN_MANAGE
+            | SCOPE_SSH_LOCAL
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -117,13 +135,30 @@ pub(crate) fn oauth_scope_policy_for_runtime_tool(tool_name: &str) -> OAuthToolS
         .unwrap_or(OAuthToolScopePolicy::Unknown)
 }
 
+/// Project the existing tool authority policy into OAuth alternatives.
+/// Each security scheme is one sufficient way to authorize the tool: RequireAny
+/// therefore produces separate one-scope alternatives, while RequireAll keeps
+/// every required scope in one scheme. Unknown exposes no authorization hint.
+pub(crate) fn oauth_mcp_security_scheme_scopes(tool_name: &str) -> Option<Vec<Vec<&'static str>>> {
+    match oauth_scope_policy_for_runtime_tool(tool_name) {
+        OAuthToolScopePolicy::Require(scope) => Some(vec![vec![scope]]),
+        OAuthToolScopePolicy::RequireAny(scopes) => {
+            Some(scopes.iter().copied().map(|scope| vec![scope]).collect())
+        }
+        OAuthToolScopePolicy::RequireAll(scopes) => Some(vec![scopes.to_vec()]),
+        OAuthToolScopePolicy::Unknown => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn required_oauth_scope_for_path_method(
     method: &str,
     path: &str,
 ) -> Option<&'static str> {
     match oauth_route_scope_policy_for_path_method(method, path) {
-        OAuthRouteScopePolicy::Require(scope) => Some(scope),
+        OAuthRouteScopePolicy::Require(scope) | OAuthRouteScopePolicy::FirstPartyRequire(scope) => {
+            Some(scope)
+        }
         _ => None,
     }
 }
@@ -133,7 +168,8 @@ pub(crate) fn enforce_route_scope(
     method: &str,
     path: &str,
 ) -> Result<(), (Option<&'static str>, String)> {
-    match oauth_route_scope_policy_for_path_method(method, path) {
+    let policy = oauth_route_scope_policy_for_path_method(method, path);
+    match policy {
         OAuthRouteScopePolicy::Public | OAuthRouteScopePolicy::BodyAware(_) => Ok(()),
         OAuthRouteScopePolicy::Require(scope) => {
             if ctx.has_scope(scope) {
@@ -149,11 +185,16 @@ pub(crate) fn enforce_route_scope(
                 Err((None, "route requires bootstrap authority".to_string()))
             }
         }
-        OAuthRouteScopePolicy::FirstPartyOnly => {
+        OAuthRouteScopePolicy::FirstPartyOnly | OAuthRouteScopePolicy::FirstPartyRequire(_) => {
             if matches!(
                 ctx.kind,
                 super::context::AuthKind::Bootstrap | super::context::AuthKind::ApiToken
             ) {
+                if let OAuthRouteScopePolicy::FirstPartyRequire(scope) = policy {
+                    if !ctx.has_scope(scope) {
+                        return Err((Some(scope), format!("missing required scope: {}", scope)));
+                    }
+                }
                 Ok(())
             } else {
                 Err((
@@ -184,6 +225,28 @@ mod tests {
     use super::*;
     use crate::tool_runtime::metadata::lookup_tool_metadata;
     use crate::tool_runtime::tool_definition::known_tool_names;
+
+    #[test]
+    fn oauth_mcp_security_scheme_scope_options_preserve_any_and_all() {
+        // A control or launch credential can authorize control_browser;
+        // requiring both in a single OAuth scheme misrepresents that choice.
+        assert_eq!(
+            serde_json::json!(oauth_mcp_security_scheme_scopes("control_browser")),
+            serde_json::json!([[SCOPE_BROWSER_CONTROL], [SCOPE_BROWSER_LAUNCH]])
+        );
+        assert_eq!(
+            serde_json::json!(oauth_mcp_security_scheme_scopes("control_computer")),
+            serde_json::json!([[SCOPE_COMPUTER_CONTROL], [SCOPE_COMPUTER_LAUNCH]])
+        );
+        assert_eq!(
+            serde_json::json!(oauth_mcp_security_scheme_scopes("save_computer_snapshot")),
+            serde_json::json!([[SCOPE_PROJECT_WRITE, SCOPE_COMPUTER_READ]])
+        );
+        assert_eq!(
+            serde_json::json!(oauth_mcp_security_scheme_scopes("definitely_not_a_tool")),
+            serde_json::Value::Null
+        );
+    }
 
     #[test]
     fn validate_scopes_rejects_unknown() {
@@ -252,14 +315,19 @@ mod tests {
             "/api/oauth/clients/create",
             "/api/oauth/clients/list",
             "/api/oauth/clients/update_scopes",
+            "/api/oauth/clients/add_redirect_uri",
+            "/api/oauth/clients/remove_redirect_uri",
             "/api/oauth/clients/revoke",
         ] {
             assert_eq!(
                 oauth_route_scope_policy_for_path_method("POST", path),
-                OAuthRouteScopePolicy::FirstPartyOnly,
+                OAuthRouteScopePolicy::FirstPartyRequire(SCOPE_ACCOUNT_MANAGE),
                 "POST {path}"
             );
-            assert_eq!(required_oauth_scope_for_path_method("POST", path), None);
+            assert_eq!(
+                required_oauth_scope_for_path_method("POST", path),
+                Some(SCOPE_ACCOUNT_MANAGE)
+            );
         }
     }
 
@@ -316,15 +384,6 @@ mod tests {
                 SCOPE_SESSION_COLLABORATE,
             ),
             ("POST", "/api/tools/list", SCOPE_RUNTIME_READ),
-            ("POST", "/api/connector/task/start", SCOPE_RUNTIME_READ),
-            ("POST", "/api/connector/files/read", SCOPE_PROJECT_READ),
-            ("POST", "/api/connector/code/navigate", SCOPE_PROJECT_READ),
-            ("POST", "/api/connector/code/impact", SCOPE_PROJECT_READ),
-            ("POST", "/api/connector/edits/apply", SCOPE_PROJECT_WRITE),
-            ("POST", "/api/connector/checks/run", SCOPE_JOB_RUN),
-            ("POST", "/api/connector/task/cancel", SCOPE_JOB_RUN),
-            ("POST", "/api/connector/task/finish", SCOPE_PROJECT_WRITE),
-            ("POST", "/api/projects/read_file", SCOPE_PROJECT_READ),
             ("POST", "/api/runtime-console/projects", SCOPE_PROJECT_READ),
             (
                 "POST",
@@ -336,7 +395,7 @@ mod tests {
                 "/api/runtime-console/workflow-session",
                 SCOPE_PROJECT_READ,
             ),
-            ("POST", "/api/projects/run_job", SCOPE_JOB_RUN),
+            ("POST", "/api/shell/job", SCOPE_JOB_RUN),
             ("POST", "/api/users/me", SCOPE_ACCOUNT_MANAGE),
             ("POST", "/api/tokens/list", SCOPE_ACCOUNT_MANAGE),
             ("POST", "/api/audit/stats", SCOPE_ACCOUNT_MANAGE),
@@ -399,16 +458,6 @@ mod tests {
         }
         for (label, auth) in [("pat", &pat), ("oauth", &oauth)] {
             assert_eq!(
-                enforce_route_scope(auth, "POST", "/api/projects/read_file"),
-                Err((
-                    Some(SCOPE_PROJECT_READ),
-                    "missing required scope: project:read".to_string()
-                )),
-                "{label} must not bypass missing project:read"
-            );
-        }
-        for (label, auth) in [("pat", &pat), ("oauth", &oauth)] {
-            assert_eq!(
                 enforce_route_scope(auth, "POST", "/api/runtime-console/projects"),
                 Err((
                     Some(SCOPE_PROJECT_READ),
@@ -418,17 +467,19 @@ mod tests {
             );
         }
         assert!(
-            enforce_route_scope(&shared, "POST", "/api/projects/read_file").is_ok(),
-            "direct shared key should use its declared project:read scope"
-        );
-        assert!(
             enforce_route_scope(&shared, "POST", "/api/runtime-console/projects").is_ok(),
             "direct shared key should retain its existing project:read Runtime Console access"
         );
-        assert!(
-            enforce_route_scope(&pat, "POST", "/api/oauth/clients/list").is_ok(),
-            "PAT remains an allowed first-party identity"
+        assert_eq!(
+            enforce_route_scope(&pat, "POST", "/api/oauth/clients/list")
+                .unwrap_err()
+                .0,
+            Some(SCOPE_ACCOUNT_MANAGE),
+            "PAT identity alone must not grant client management"
         );
+        let mut account_pat = pat.clone();
+        account_pat.scopes.push(SCOPE_ACCOUNT_MANAGE.to_string());
+        assert!(enforce_route_scope(&account_pat, "POST", "/api/oauth/clients/list").is_ok());
         assert!(
             enforce_route_scope(&oauth, "POST", "/api/oauth/clients/list").is_err(),
             "OAuth delegation cannot become first-party client management"
@@ -564,7 +615,7 @@ mod tests {
                 OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
             ),
             (
-                "session_summary",
+                "read_session_summary",
                 OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
             ),
             (
@@ -600,81 +651,100 @@ mod tests {
                 OAuthToolScopePolicy::Require(SCOPE_SESSION_COLLABORATE),
             ),
             (
-                "session_discussion_summary",
+                "read_session_discussion_summary",
                 OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
             ),
             (
-                "runtime_status",
+                "get_runtime_status",
                 OAuthToolScopePolicy::Require(SCOPE_RUNTIME_READ),
-            ),
-            (
-                "read_file",
-                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
             (
                 "read_files",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
             (
-                "show_changes",
+                "read_workspace_changes",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
             (
-                "document_diagnostics",
-                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
-            ),
-            ("hover", OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ)),
-            (
-                "workspace_symbols",
+                "read_document_diagnostics",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
             (
-                "workspace_checkpoint_create",
+                "read_symbol_hover",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
             ),
             (
-                "workspace_checkpoint_restore",
+                "list_workspace_symbols",
+                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
+            ),
+            #[cfg(feature = "workspace-checkpoints")]
+            (
+                "create_workspace_checkpoint",
+                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
+            ),
+            #[cfg(feature = "workspace-checkpoints")]
+            (
+                "restore_workspace_checkpoint",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
-            ("git_log", OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ)),
+            (
+                "read_git_log",
+                OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ),
+            ),
             (
                 "write_project_file",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
             (
-                "artifact_upload_begin",
+                "begin_artifact_upload",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
             (
-                "artifact_upload_chunk",
+                "upload_artifact_chunk",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
             (
-                "artifact_upload_finish",
+                "finish_artifact_upload",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
             (
-                "artifact_upload_abort",
+                "abort_artifact_upload",
                 OAuthToolScopePolicy::Require(SCOPE_PROJECT_WRITE),
             ),
             (
-                "computer_list_windows",
+                "observe_browser",
+                OAuthToolScopePolicy::Require(SCOPE_BROWSER_READ),
+            ),
+            (
+                "control_browser",
+                OAuthToolScopePolicy::RequireAny(&[SCOPE_BROWSER_CONTROL, SCOPE_BROWSER_LAUNCH]),
+            ),
+            (
+                "observe_computer",
                 OAuthToolScopePolicy::Require(SCOPE_COMPUTER_READ),
             ),
             (
-                "computer_snapshot",
-                OAuthToolScopePolicy::Require(SCOPE_COMPUTER_READ),
+                "control_computer",
+                OAuthToolScopePolicy::RequireAny(&[SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_LAUNCH]),
             ),
             (
-                "computer_save_snapshot",
+                "save_computer_snapshot",
                 OAuthToolScopePolicy::RequireAll(&[SCOPE_PROJECT_WRITE, SCOPE_COMPUTER_READ]),
             ),
             ("run_shell", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             ("stop_job", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             ("cargo_test", OAuthToolScopePolicy::Require(SCOPE_JOB_RUN)),
             (
-                "coding_agent_start",
+                "start_coding_agent",
                 OAuthToolScopePolicy::RequireAll(&[SCOPE_CODING_AGENT_RUN, SCOPE_PROJECT_WRITE]),
+            ),
+            (
+                "start_agent_task_endpoint_continuation",
+                OAuthToolScopePolicy::RequireAll(&[
+                    SCOPE_COMMUNICATION_READ,
+                    SCOPE_COMMUNICATION_MANAGE,
+                ]),
             ),
             (
                 "start_agent_task_coding_run",
@@ -694,11 +764,11 @@ mod tests {
                 ]),
             ),
             (
-                "coding_agent_observe",
+                "observe_coding_agent",
                 OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
             ),
             (
-                "coding_agent_cancel",
+                "cancel_coding_agent",
                 OAuthToolScopePolicy::Require(SCOPE_CODING_AGENT_RUN),
             ),
         ] {
@@ -711,7 +781,7 @@ mod tests {
         for tool in [
             "list_tools",
             "start_session",
-            "session_summary",
+            "read_session_summary",
             "update_session_context",
             "close_session",
             "post_session_message",
@@ -719,26 +789,25 @@ mod tests {
             "observe_session_messages",
             "resolve_session_message",
             "complete_session_message",
-            "session_discussion_summary",
-            "workspace_checkpoint_create",
-            "workspace_checkpoint_restore",
-            "show_changes",
-            "document_diagnostics",
-            "hover",
-            "workspace_symbols",
-            "read_file",
+            "read_session_discussion_summary",
+            #[cfg(feature = "workspace-checkpoints")]
+            "create_workspace_checkpoint",
+            #[cfg(feature = "workspace-checkpoints")]
+            "restore_workspace_checkpoint",
+            "read_workspace_changes",
+            "read_document_diagnostics",
+            "read_symbol_hover",
+            "list_workspace_symbols",
             "read_files",
             "write_project_file",
-            "artifact_upload_begin",
-            "artifact_upload_chunk",
-            "artifact_upload_finish",
-            "artifact_upload_abort",
+            "begin_artifact_upload",
+            "upload_artifact_chunk",
+            "finish_artifact_upload",
+            "abort_artifact_upload",
             "apply_unified_diff",
-            "computer_list_windows",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_activate_window",
-            "computer_snapshot",
+            "observe_computer",
+            "control_computer",
+            "save_computer_snapshot",
             "run_shell",
             "cargo_test",
         ] {
@@ -829,19 +898,19 @@ mod tests {
     #[test]
     fn memory_scope_policy_and_lightweight_credential_classes_are_explicit() {
         assert_eq!(
-            oauth_scope_policy_for_runtime_tool("memory_search"),
+            oauth_scope_policy_for_runtime_tool("search_memory"),
             OAuthToolScopePolicy::RequireAll(MEMORY_READ_SCOPES)
         );
         assert_eq!(
-            oauth_scope_policy_for_runtime_tool("memory_read"),
+            oauth_scope_policy_for_runtime_tool("read_memory"),
             OAuthToolScopePolicy::RequireAll(MEMORY_READ_SCOPES)
         );
         assert_eq!(
-            oauth_scope_policy_for_runtime_tool("memory_set"),
+            oauth_scope_policy_for_runtime_tool("set_memory"),
             OAuthToolScopePolicy::RequireAll(MEMORY_MANAGE_SCOPES)
         );
         assert_eq!(
-            oauth_scope_policy_for_runtime_tool("memory_delete"),
+            oauth_scope_policy_for_runtime_tool("delete_memory"),
             OAuthToolScopePolicy::RequireAll(MEMORY_MANAGE_SCOPES)
         );
         assert!(KNOWN_SCOPES.contains(&SCOPE_MEMORY_READ));

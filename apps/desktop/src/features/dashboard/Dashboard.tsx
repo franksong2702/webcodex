@@ -1,237 +1,43 @@
 import type { DesktopState } from "../../models/topology";
+import { Button } from "@mantine/core";
+import { ArrowRight, Folder, History, MessageSquare, Puzzle } from "lucide-react";
+import { useProduct } from "../../i18n/product";
+import { useConnectionsTools } from "../../i18n/connections-tools";
 import { useLocale } from "../../i18n/locale";
-import {
-  projectReadinessLabel,
-  readinessNextAction,
-  readinessSummary,
-  runnerReadinessLabel,
-  serverReadinessLabel,
-} from "../../i18n/presentation";
+import { useWorkspace } from "../workspace/WorkspaceContext";
+import { WorkspaceStatus, ChatgptObservation } from "../workspace/WorkspaceStatus";
+import { BrowserRuntimeStatus } from "./BrowserRuntimeStatus";
 
 interface DashboardProps {
-  state: DesktopState;
-  refreshing: boolean;
-  onRefresh: () => void;
+  state: DesktopState; refreshing: boolean; onRefresh: () => Promise<void>;
   onResumeRuntime: () => void;
-  onConnectChatGpt: () => void;
   onChangeSetup: () => void;
-  onNavigate: (page: "projects" | "connection" | "activity") => void;
+  onNavigate: (page: "projects" | "connection" | "activity" | "extensions") => void;
   onStopQuickShare: () => void;
-  onStopRuntime: () => void;
 }
-
-export function Dashboard({
-  state,
-  refreshing,
-  onRefresh,
-  onResumeRuntime,
-  onConnectChatGpt,
-  onChangeSetup,
-  onNavigate,
-  onStopQuickShare,
-  onStopRuntime,
-}: DashboardProps) {
-  const { t } = useLocale();
-  const isQuickShare = state.topology?.experience === "quick_share";
-  const operationBusy = Boolean(state.current_operation);
-  const canResumeRuntime = !isQuickShare && Boolean(state.topology) && !state.readiness.runtime_ready;
-  const canConnectChatGpt = !isQuickShare &&
-    state.topology?.server.kind === "local" &&
-    state.readiness.runtime_ready &&
-    state.openai_tunnel_configured &&
-    !state.regular_tunnel;
-  const summary = readinessSummary(state.readiness.summary_kind, state.readiness.summary, t);
-  const nextAction = readinessNextAction(
-    state.readiness.next_action_kind,
-    state.readiness.next_action,
-    t,
-  );
-  return (
-    <section
-      className="page-section dashboard-page"
-      aria-labelledby="home-title"
-      aria-busy={refreshing}
-      data-webcodex-page="home"
-    >
-      <div className="page-heading-row">
-        <div>
-          <div className="eyebrow">{t("home.eyebrow")}</div>
-          <h1 id="home-title">WebCodex</h1>
-          <p className="lede">{summary}</p>
-        </div>
-        <button
-          className="secondary-button"
-          onClick={onRefresh}
-          disabled={refreshing || operationBusy}
-          data-webcodex-action="refresh-runtime"
-        >
-          {refreshing ? t("home.checking") : t("home.refresh")}
-        </button>
-      </div>
-
-      <div
-        className={`readiness-banner ${state.readiness.ready_for_chatgpt ? "ready" : "pending"}`}
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
-      >
-        <div>
-          <span className="section-kicker">{t("home.overall")}</span>
-          <strong>{state.readiness.ready_for_chatgpt ? t("home.readyToUse") : summary}</strong>
-        </div>
-        <div className="readiness-actions">
-          {canResumeRuntime && (
-            <button className="primary-button" onClick={onResumeRuntime} disabled={operationBusy || refreshing} data-webcodex-action="resume-runtime">
-              {t("home.resumeRuntime")}
-            </button>
-          )}
-          {canConnectChatGpt && (
-            <button className="primary-button" onClick={onConnectChatGpt} disabled={operationBusy} data-webcodex-action="connect-chatgpt">
-              {t("home.connectChatGpt")}
-            </button>
-          )}
-          {nextAction && !canResumeRuntime && !canConnectChatGpt && <span>{nextAction}</span>}
-        </div>
-      </div>
-
-      <div className="status-grid" aria-label={t("home.components")}>
-        <StatusCard
-          title={t("home.service")}
-          value={serviceLabel(state, t)}
-          state={state.readiness.server}
-          explanation={serviceExplanation(state, t)}
-        />
-        <StatusCard
-          title={t("home.runner")}
-          value={runnerReadinessLabel(state.readiness.runner, t)}
-          state={state.readiness.runner}
-          explanation={t("home.runnerExplanation")}
-        />
-        <StatusCard
-          title={t("home.projects")}
-          value={state.readiness.project === "ready" ? t("home.projectReady") : projectReadinessLabel(state.readiness.project, t)}
-          state={state.readiness.project}
-          explanation={state.project?.path ?? t("home.noProject")}
-        />
-        <StatusCard
-          title={t("home.connection")}
-          value={connectionLabel(state, t)}
-          state={connectionCardState(state)}
-          explanation={connectionExplanation(state, t)}
-        />
-      </div>
-
-      <section className="dashboard-shortcuts" aria-labelledby="home-shortcuts-title">
-        <div className="section-heading">
-          <h2 id="home-shortcuts-title">{t("home.shortcuts")}</h2>
-        </div>
-        <div className="shortcut-grid">
-          {(["projects", "connection", "activity"] as const).map((page) => (
-            <button className="shortcut-card" key={page} onClick={() => onNavigate(page)}>
-              <span className={`nav-icon nav-${page}`} aria-hidden="true" />
-              <strong>{t(`home.open.${page}`)}</strong>
-              <span>{t(`home.hint.${page}`)}</span>
-              <span className="shortcut-arrow" aria-hidden="true">↗</span>
-            </button>
-          ))}
-        </div>
-      </section>
-
-      {state.quick_share && (
-        <div className="handoff-card">
-          <div>
-            <span className="section-kicker">{t("home.quickShareHandoff")}</span>
-            <strong>{state.quick_share.ready_for_chatgpt ? t("home.handoffReady") : t("home.handoffAction")}</strong>
-            {state.quick_share.mcp_url && <code>{state.quick_share.mcp_url}</code>}
-            <span>{quickShareClipboardLabel(state.quick_share.clipboard_state, state.quick_share.clipboard_contains, t)}</span>
-          </div>
-          <button className="danger-button" onClick={onStopQuickShare} disabled={operationBusy} data-webcodex-action="stop-quick-share">{t("home.stopShare")}</button>
-        </div>
-      )}
-
-      {!isQuickShare && state.topology && (
-        <div className="runtime-actions">
-          <span>{t("home.runtimeOwnership")}</span>
-          <div className="runtime-action-buttons">
-            <button className="secondary-button" onClick={onChangeSetup} disabled={operationBusy} data-webcodex-action="change-runtime-setup">{t("home.changeSetup")}</button>
-            {state.readiness.runtime_ready && (
-              <button className="secondary-button" onClick={onStopRuntime} disabled={operationBusy} data-webcodex-action="stop-runtime">{t("home.stopRuntime")}</button>
-            )}
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-function StatusCard({
-  title,
-  value,
-  state,
-  explanation,
-}: {
-  title: string;
-  value: string;
-  state: string;
-  explanation: string;
-}) {
-  const tone = state === "ready" || state === "remote_ready" ? "ready" : state === "error" ? "error" : state === "unknown" ? "unknown" : "pending";
-  return (
-    <article className="status-card">
-      <span className="section-kicker">{title}</span>
-      <div className="status-value"><i className={`status-dot ${tone}`} aria-hidden="true" />{value}</div>
-      <p>{explanation}</p>
-    </article>
-  );
-}
-
-type Translate = ReturnType<typeof useLocale>["t"];
-
-function serviceLabel(state: DesktopState, t: Translate) {
-  if (state.readiness.server === "ready" && state.topology?.server.kind === "remote") return t("common.connected");
-  return serverReadinessLabel(state.readiness.server, t);
-}
-
-function serviceExplanation(state: DesktopState, t: Translate) {
-  if (state.topology?.server.kind === "remote") return t("home.serviceRemote", { url: state.topology.server.url });
-  return t("home.serviceLocal");
-}
-
-function quickShareClipboardLabel(state: string, contains: string, t: Translate) {
-  if (state !== "copied") return t("clipboard.unavailable");
-  if (contains === "tunnel_id") return t("clipboard.tunnelId");
-  if (contains === "bearer_credential") return t("clipboard.bearer");
-  if (contains === "sensitive_mcp_url") return t("clipboard.sensitiveUrl");
-  return t("clipboard.copied");
-}
-
-function chatgptActivityObserved(state: DesktopState) {
-  return state.readiness.runtime_ready && Boolean(state.chatgpt_activity?.observed);
-}
-
-function connectionCardState(state: DesktopState) {
-  if (state.regular_tunnel?.status === "error") return "error";
-  if (chatgptActivityObserved(state)) return "ready";
-  return state.readiness.exposure;
-}
-
-function connectionLabel(state: DesktopState, t: Translate) {
-  if (chatgptActivityObserved(state) && state.regular_tunnel?.status !== "error") {
-    return t("home.connectionObservedLabel");
-  }
-  const exposure = state.topology?.exposure;
-  if (!exposure || exposure.kind === "none") return t("connection.noDesktopTunnel");
-  if (exposure.kind === "cloudflare") return "Cloudflare";
-  if (exposure.kind === "open_ai_tunnel") return "OpenAI Secure Tunnel";
-  return "Existing HTTPS";
-}
-
-function connectionExplanation(state: DesktopState, t: Translate) {
-  if (state.regular_tunnel?.status !== "error" && chatgptActivityObserved(state)) {
-    return t("home.connectionObserved");
-  }
-  if (state.regular_tunnel?.status === "ready" && state.regular_tunnel.ready_for_chatgpt) return t("home.connectionTunnelReady");
-  if (state.readiness.exposure === "remote_ready") return t("home.connectionRemoteReady");
-  if (state.readiness.exposure === "local_ready") return t("home.connectionLocalReady");
-  return t("home.connectionUnverified");
+export function Dashboard(props: DashboardProps) {
+  const { state, onNavigate } = props;
+  const p = useProduct(); const c = useConnectionsTools(); const { t } = useLocale();
+  const workspace = useWorkspace();
+  const busy = Boolean(state.current_operation);
+  return <section className="page-section workspace-page dashboard-page" aria-labelledby="home-title" data-webcodex-page="home">
+    <header className="page-heading-row">
+      <h1 id="home-title">{p("overview")}</h1>
+      <Button className="secondary-button" variant="default" disabled={busy || props.refreshing} onClick={() => void props.onRefresh()}>{p("refresh")}</Button>
+    </header>
+    <WorkspaceStatus state={state} />
+    <BrowserRuntimeStatus state={state} />
+    {!state.readiness.runtime_ready && <div className="workspace-quick-actions"><Button className="secondary-button" variant="default" onClick={state.readiness.next_action_kind === "restart_quick_share" ? props.onChangeSetup : props.onResumeRuntime} disabled={busy}>{state.readiness.next_action_kind === "restart_quick_share" ? p("restart") + " Quick Share" : p("start") + " WebCodex"}</Button></div>}
+    <div className="dashboard-handoff">
+      <MessageSquare size={24} aria-hidden="true" />
+      <div><h2>{p("continueInChatgpt")}</h2><p>{p("chatgptWorkflow")}</p><ChatgptObservation state={state} /></div>
+      <Button className="secondary-button" variant="default" aria-label={`${p("manage")} ${c("connections")}`} onClick={() => onNavigate("connection")}>{c("connections")}<ArrowRight size={16} aria-hidden="true" /></Button>
+    </div>
+    <div className="dashboard-shortcuts">
+      <button type="button" onClick={() => onNavigate("projects")}><Folder aria-hidden="true" /><strong>{p("projects")}</strong><span>{workspace.projects.length} · {p("projectShortcut")}</span><ArrowRight size={16} aria-hidden="true" /></button>
+      <button type="button" onClick={() => onNavigate("activity")}><History aria-hidden="true" /><strong>{p("activity")}</strong><span>{p("activityShortcut")}</span><ArrowRight size={16} aria-hidden="true" /></button>
+      <button type="button" onClick={() => onNavigate("extensions")}><Puzzle aria-hidden="true" /><strong>{t("extensions.title")}</strong><span>{p("extensionShortcut")}</span><ArrowRight size={16} aria-hidden="true" /></button>
+    </div>
+    {state.topology?.experience === "quick_share" && state.quick_share && <button className="secondary-button" onClick={props.onStopQuickShare} disabled={busy}>{p("stop")} Quick Share</button>}
+  </section>;
 }

@@ -13,7 +13,7 @@ async fn dispatch_records_edit_tool_usage_without_sensitive_args() {
     clear_test_edit_tool_usage();
     let runtime = test_runtime();
 
-    // Canonical path selection.
+    // Structured edit path selection.
     let canonical = runtime
         .dispatch_with_auth(
             ToolCall::ApplyTextEdits {
@@ -29,9 +29,10 @@ async fn dispatch_records_edit_tool_usage_without_sensitive_args() {
                         new_text: Some("b".to_string()),
                         anchor_text: None,
                         occurrence: None,
+                        expected_match_count: None,
                         line_scope: None,
                     }],
-                    expected_sha256: Some("a".repeat(64)),
+                    expected_read_revision: None,
                 }],
                 dry_run: Some(true),
                 session_id: None,
@@ -41,7 +42,7 @@ async fn dispatch_records_edit_tool_usage_without_sensitive_args() {
         .await;
     assert!(!canonical.success);
 
-    // Advanced path selection.
+    // Whole-file path selection.
     let advanced = runtime
         .dispatch_with_auth(
             ToolCall::WriteProjectFile {
@@ -49,7 +50,7 @@ async fn dispatch_records_edit_tool_usage_without_sensitive_args() {
                 path: "src/secret.rs".to_string(),
                 content: "fn main() { /* secret body */ }".to_string(),
                 overwrite: Some(true),
-                expected_sha256: None,
+                expected_read_revision: None,
                 session_id: None,
             },
             None,
@@ -77,13 +78,13 @@ async fn dispatch_records_edit_tool_usage_without_sensitive_args() {
         "only edit tools should emit usage events: {events:?}"
     );
 
-    assert_eq!(events[0].tool_name, "apply_text_edits");
-    assert_eq!(events[0].edit_surface, EditToolSurface::Canonical);
+    assert_eq!(events[0].tool_name, "edit_project_files");
+    assert_eq!(events[0].edit_surface, EditToolSurface::StructuredOrPatch);
     assert_eq!(events[0].category, TELEMETRY_CATEGORY_EDIT);
     assert!(!events[0].success);
 
     assert_eq!(events[1].tool_name, "write_project_file");
-    assert_eq!(events[1].edit_surface, EditToolSurface::Advanced);
+    assert_eq!(events[1].edit_surface, EditToolSurface::WholeFile);
     assert!(!events[1].success);
 
     for event in &events {
@@ -116,12 +117,14 @@ async fn kernel_generic_telemetry_and_edit_enrichment_each_emit_once() {
     let outcome = runtime
         .call_tool_with_context(
             super::super::kernel::ToolCallRequest {
-                tool_name: "write_project_file".to_string(),
+                tool_name: "edit_project_files".to_string(),
                 arguments: json!({
                     "project": "agent:oe:missing",
-                    "path": "src/private.rs",
-                    "content": "PRIVATE edit body",
-                    "overwrite": true
+                    "changes": [{
+                        "kind": "create",
+                        "path": "src/private.rs",
+                        "content": "PRIVATE edit body"
+                    }]
                 }),
             },
             super::super::kernel::ToolCallContext {
@@ -141,7 +144,7 @@ async fn kernel_generic_telemetry_and_edit_enrichment_each_emit_once() {
         .expect("one generic model-visible completion")
         .record_for_tool_result(result)
         .expect("generic record");
-    assert_eq!(generic.tool_name, "write_project_file");
+    assert_eq!(generic.tool_name, "edit_project_files");
     assert_eq!(generic.tool_category, "edit");
     assert_eq!(generic.success, result.success);
 
@@ -151,7 +154,7 @@ async fn kernel_generic_telemetry_and_edit_enrichment_each_emit_once() {
         1,
         "edit-specific enrichment must remain one event"
     );
-    assert_eq!(edit_events[0].tool_name, "write_project_file");
+    assert_eq!(edit_events[0].tool_name, "edit_project_files");
 }
 
 #[tokio::test]
@@ -170,7 +173,7 @@ async fn edit_tool_usage_does_not_change_session_ledger_shape() {
                 path: "src/x.rs".to_string(),
                 content: "a".to_string(),
                 overwrite: None,
-                expected_sha256: None,
+                expected_read_revision: None,
                 session_id: Some(session.session_id.clone()),
             },
             None,
@@ -209,24 +212,24 @@ async fn edit_tool_usage_does_not_change_session_ledger_shape() {
     let usage = take_test_edit_tool_usage();
     assert_eq!(usage.len(), 1);
     assert_eq!(usage[0].tool_name, "write_project_file");
-    assert_eq!(usage[0].edit_surface, EditToolSurface::Advanced);
+    assert_eq!(usage[0].edit_surface, EditToolSurface::WholeFile);
 }
 
 #[test]
-fn edit_surface_table_matches_canonicalization_contract() {
+fn edit_surface_table_matches_mutation_form_contract() {
     // Keep the classification table aligned with the product contract used by
-    // tool descriptions / discovery (canonical vs advanced).
+    // tool descriptions / discovery (mutation form only).
     assert_eq!(
-        edit_tool_surface("apply_text_edits"),
-        Some(EditToolSurface::Canonical)
+        edit_tool_surface("edit_project_files"),
+        Some(EditToolSurface::StructuredOrPatch)
     );
     assert_eq!(
         edit_tool_surface("apply_unified_diff"),
-        Some(EditToolSurface::Canonical)
+        Some(EditToolSurface::StructuredOrPatch)
     );
     assert_eq!(
         edit_tool_surface("write_project_file"),
-        Some(EditToolSurface::Advanced)
+        Some(EditToolSurface::WholeFile)
     );
     // Removed legacy compatibility tools are no longer classified.
     for name in [
@@ -251,11 +254,11 @@ fn edit_surface_table_matches_canonicalization_contract() {
 fn sample_edit_tool_args_are_not_required_by_telemetry_module() {
     // Sanity: telemetry classification is name-only; sample args (paths/content)
     // used elsewhere for schema fixtures must not be needed to classify tools.
-    // `apply_text_edits` is the small exact guarded-edit fallback and can
-    // synthesize args from its spec; telemetry classification is name-only and
+    // `edit_project_files` is the primary structured editor and can synthesize
+    // args from its spec; telemetry classification is name-only and
     // is asserted via `edit_tool_surface` above, so no sample-args construction
     // is required beyond the canonical tools.
-    let _ = sample_tool_args("apply_text_edits");
+    let _ = sample_tool_args("edit_project_files");
     let _ = json!({"path": "ignored-by-telemetry"});
-    assert!(edit_tool_surface("apply_text_edits").is_some());
+    assert!(edit_tool_surface("edit_project_files").is_some());
 }

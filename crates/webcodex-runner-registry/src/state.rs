@@ -1,9 +1,11 @@
+use super::dispatch_fence::PendingDispatchFence;
 use super::{RunnerFeature, RunnerFeatureSet, RunnerTransport};
 use crate::protocol::AcceptedRunnerProtocol;
 use crate::RunnerAccessGroup;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{oneshot, watch, Notify};
 use webcodex_core::coding_agent::{
     CodingAgentProvider, CodingAgentResponse, CodingAgentRunInventory,
@@ -15,8 +17,8 @@ use webcodex_core::runner_operation::RunnerOperation;
 use webcodex_core::runner_protocol::{
     PersistentShellResult, RunnerBuildInfo, RunnerHostContext, RunnerPolicySummary,
     RunnerProjectSummary, RunnerRequest, RunnerView, ShellCommandExecutionState, ShellJobActivity,
-    ShellJobCodexMetadata, ShellJobStructuredExecutionMetadata, ShellJobValidationProgress,
-    ShellProcessArgv, ShellProjectInventoryStatus, ShellRunResponse,
+    ShellJobCodexMetadata, ShellJobStructuredExecutionMetadata, ShellJobTestCountEvidence,
+    ShellJobValidationProgress, ShellProcessArgv, ShellProjectInventoryStatus, ShellRunResponse,
     JOB_INVENTORY_MAX_TERMINAL_JOBS, JOB_TERMINAL_RETENTION_SECS,
 };
 
@@ -52,6 +54,9 @@ pub(super) struct RunnerRecord {
     /// hand-off: once changed, the previous instance can no longer poll or
     /// submit results/job_updates.
     pub(super) runner_instance_id: String,
+    /// Renewed on every accepted registration, including same-instance reconnects.
+    /// This private presentation fence is not Runner execution authority.
+    pub(super) registration_observation_epoch: String,
     pub(super) display_name: Option<String>,
     pub(super) owner: Option<String>,
     pub(super) hostname: Option<String>,
@@ -62,6 +67,9 @@ pub(super) struct RunnerRecord {
     /// registration snapshot. It also owns the public wire projection, so the
     /// record has no second independently stored capability copy.
     pub(super) runner_features: RunnerFeatureSet,
+    /// None preserves legacy direct-session behavior; brokered persistent
+    /// Runners report current helper eligibility separately from support.
+    pub(super) computer_session_availability: Option<bool>,
     pub(super) projects: Vec<RunnerProjectSummary>,
     /// Authoritative project snapshot plus bounded in-progress staging. A
     /// staging failure never changes liveness or partially publishes projects.
@@ -121,12 +129,18 @@ pub(super) struct RunnerRecord {
 #[derive(Debug, Clone)]
 pub struct RunnerSemanticView {
     pub view: RunnerView,
+    /// Captured with the record under the registry lock, not after an awaiting
+    /// caller resumes. This preserves identity-observation order across tasks.
+    pub observed_at: std::time::Instant,
     pub(super) runner_features: RunnerFeatureSet,
 }
 
 impl RunnerSemanticView {
     pub fn supports(&self, feature: RunnerFeature) -> bool {
         self.runner_features.supports(feature)
+            && (!crate::capabilities::is_computer(feature)
+                || self.view.computer_session_availability.is_none()
+                || (self.view.computer_session_availability == Some(true) && self.view.connected))
     }
 
     #[cfg(any(test, feature = "root-test-support"))]
@@ -134,6 +148,7 @@ impl RunnerSemanticView {
         let runner_features = RunnerFeatureSet::from_wire_for_test(&view.capabilities);
         Self {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         }
     }
@@ -149,6 +164,15 @@ pub(super) struct ProjectedStructuredTerminalSuppression {
 }
 
 impl RunnerRecord {
+    pub(super) fn supports(&self, feature: RunnerFeature) -> bool {
+        self.runner_features.supports(feature)
+            && (!crate::capabilities::is_computer(feature)
+                || self.computer_session_availability.is_none()
+                || (self.computer_session_availability == Some(true)
+                    && super::now_ts().saturating_sub(self.last_seen)
+                        <= super::RUNNER_ONLINE_WINDOW_SECS))
+    }
+
     pub(super) fn prune_projected_structured_terminal_suppressions(&mut self, now: i64) {
         self.projected_structured_terminal_suppressions
             .retain(|suppression| suppression.expires_at > now);
@@ -201,12 +225,6 @@ impl RunnerRecord {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct SkillStoreDispatchFence {
-    pub(super) runner_instance_id: String,
-    pub(super) management: bool,
-}
-
 #[derive(Debug)]
 pub(super) struct PendingShellRequest {
     pub(super) request: RunnerRequest,
@@ -216,33 +234,13 @@ pub(super) struct PendingShellRequest {
     pub(super) operation: RunnerOperation,
     pub(super) waiter: Option<oneshot::Sender<ShellRunResponse>>,
     pub(super) job_id: Option<String>,
-    /// Optional Control-side project-placement fence for synchronous requests
-    /// whose filesystem authority must still match the active registration at
-    /// the instant the request is handed to the Runner.
-    pub(super) expected_runner_owner: Option<String>,
-    pub(super) expected_project_id: Option<String>,
-    pub(super) expected_project_cwd: Option<String>,
-    /// Exact Runner process lease captured for an MCP gateway request. This is
-    /// revalidated under the registry lock immediately before dequeue so a
-    /// replacement Runner cannot consume stale bridge work.
-    pub(super) expected_mcp_gateway_runner_instance_id: Option<String>,
-    /// Exact provider lease captured with the Runner lease. Both logical id
-    /// and opaque provider instance must still match registration immediately
-    /// before dequeue.
-    pub(super) expected_mcp_gateway_provider_id: Option<String>,
-    pub(super) expected_mcp_gateway_provider_instance_id: Option<String>,
-    /// Exact Runner process lease captured for Runner-local managed SSH resource
-    /// management. Revalidated at dequeue so a replacement Runner can never
-    /// inherit a host-configuration mutation.
-    pub(super) expected_ssh_resource_runner_instance_id: Option<String>,
-    /// Exact Runner process lease captured for first-class config check/reload.
-    /// Revalidated at dequeue so neither check nor reload can silently retarget
-    /// a replacement process using the same client_id.
-    pub(super) expected_runner_config_runner_instance_id: Option<String>,
-    /// Exact Runner process lease plus read/manage mode captured for a
-    /// Runner-global Skill store request. Revalidated at dequeue so a
-    /// replacement process using the same client_id cannot inherit authority.
-    pub(super) skill_store_fence: Option<SkillStoreDispatchFence>,
+    pub(super) dispatch_fence: PendingDispatchFence,
+    /// Server-process monotonic enqueue instant for queue-wait and request
+    /// round-trip observability. It is never serialized or exposed on the wire.
+    pub(super) enqueued_at: Instant,
+    /// Transport that authoritatively dequeued this request. Captured at
+    /// dispatch so a later same-instance reconnect cannot relabel its result.
+    pub(super) dispatched_transport: Option<RunnerTransport>,
     pub(super) dispatched: bool,
 }
 
@@ -268,7 +266,7 @@ pub enum ShellJobVisibility {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum JobRecoveryPhase {
+pub enum JobRecoveryPhase {
     Recovering,
     Reconciled,
     LostAfterReconcile,
@@ -285,7 +283,7 @@ impl JobRecoveryPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum JobRecoveryReason {
+pub enum JobRecoveryReason {
     RunnerTransportDisconnected,
     RunnerTransportStale,
     RunnerRequestNotDispatched,
@@ -357,11 +355,25 @@ impl JobRecoveryState {
 pub(super) struct JobObservationState {
     pub(super) epoch: Arc<str>,
     pub(super) revision: Arc<AtomicU64>,
+    /// Total observation revision of the most recent change that affected
+    /// public Job meaning beyond a sequence-only liveness update. This keeps
+    /// the opaque token format stable while allowing observers to suppress
+    /// heartbeat-only revision advances.
+    pub(super) last_meaningful_revision: Arc<AtomicU64>,
     pub(super) notify: Arc<Notify>,
     /// First time this Server process observed the Job in a terminal execution
     /// lifecycle. Runner-reported `ended_at` remains the public execution time
     /// and never controls Server registry retention.
     pub(super) terminal_observed_at: Option<i64>,
+    pub(super) receipt_candidates: Option<crate::receipts::ReceiptCandidates>,
+    /// Exact terminal-event candidates consumed by a post-registry-lock sink.
+    /// This owns no Job truth: authoritative terminal state remains on the Job.
+    pub(super) terminal_event_candidates: Option<crate::receipts::TerminalEventCandidates>,
+    /// Fixed historical deadline, also identifies a receipt with no live lease.
+    pub(super) receipt_expires_at: Option<i64>,
+    /// Durability visibility barrier shared with the post-unlock receipt writer.
+    /// This is storage acknowledgement, not a second mutation verdict.
+    pub(super) receipt_persisted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl JobObservationState {
@@ -369,8 +381,13 @@ impl JobObservationState {
         Self {
             epoch,
             revision: Arc::new(AtomicU64::new(0)),
+            last_meaningful_revision: Arc::new(AtomicU64::new(0)),
             notify: Arc::new(Notify::new()),
             terminal_observed_at: None,
+            receipt_candidates: None,
+            terminal_event_candidates: None,
+            receipt_expires_at: None,
+            receipt_persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -401,6 +418,8 @@ pub(super) struct ShellJobRecord {
     /// plaintext key. Keeping this on the Job preserves authorization after
     /// the originating runner registration is removed.
     pub(super) auth_group: Option<RunnerAccessGroup>,
+    /// Immutable historical attribution; registration replacement cannot retarget it.
+    pub(super) owner_at_admission: Option<String>,
     /// Internal lease owner. Never exposed through public job tools.
     pub(super) runner_instance_id: String,
     pub(super) kind: String,
@@ -431,6 +450,9 @@ pub(super) struct ShellJobRecord {
     pub(super) validation_steps: Vec<String>,
     pub(super) validation: Option<webcodex_core::runner_protocol::ShellJobValidationMetadata>,
     pub(super) validation_progress: Option<ShellJobValidationProgress>,
+    pub(super) test_count_evidence: Option<ShellJobTestCountEvidence>,
+    pub(super) format_mutation: Option<webcodex_core::project_format::ProjectFormatMutationReport>,
+    pub(super) build_artifacts: Option<Vec<webcodex_core::project_build::ProjectBuildArtifact>>,
     /// Last Runner-authoritative bounded activity for an active Job. Cleared on
     /// terminal/recovery transitions; never used as execution authority.
     pub(super) activity: Option<ShellJobActivity>,
@@ -481,6 +503,8 @@ impl Default for ShellJobLogState {
 
 #[derive(Debug, Default)]
 pub(super) struct RunnerRegistryInner {
+    pub(super) maintenance: Option<crate::maintenance::MaintenanceLeaseState>,
+    pub(super) runtime_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub(super) runners: HashMap<String, RunnerRecord>,
     pub(super) pending_by_id: HashMap<String, PendingShellRequest>,
     /// Waiters for explicit persistent-shell lifecycle results. Kept separate
@@ -500,7 +524,7 @@ pub(super) struct RunnerRegistryInner {
     pub(super) coding_agent_waiters: HashMap<String, oneshot::Sender<CodingAgentResponse>>,
     pub(super) coding_agent_fences: HashMap<String, CodingAgentDispatchFence>,
     pub(super) queues_by_runner: HashMap<String, VecDeque<String>>,
-    pub(super) jobs_by_id: HashMap<String, ShellJobRecord>,
+    pub(super) jobs_by_id: crate::job_index::JobRecords,
     pub(super) request_to_job: HashMap<String, String>,
     /// Bounded stale-instance tombstones prevent a replaced runner process
     /// from reclaiming the same runner lease after the replacement later

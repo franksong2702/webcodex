@@ -5,6 +5,7 @@
 //! It must stay dependency-light: only `serde` and `std`, which both binaries
 //! have. Do not add main-crate-only imports here.
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -78,10 +79,11 @@ pub fn restore_apply_text_line_endings(text: String, line_ending: ApplyTextLineE
 }
 
 /// Kind of atomic text edit performed by `apply_text_edits`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyTextEditKind {
     ReplaceExact,
+    ReplaceRange,
     InsertAfter,
     InsertBefore,
     DeleteExact,
@@ -91,6 +93,7 @@ impl ApplyTextEditKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReplaceExact => "replace_exact",
+            Self::ReplaceRange => "replace_range",
             Self::InsertAfter => "insert_after",
             Self::InsertBefore => "insert_before",
             Self::DeleteExact => "delete_exact",
@@ -98,12 +101,41 @@ impl ApplyTextEditKind {
     }
 }
 
+/// Byte range of complete 1-based inclusive lines in the canonical original source.
+/// Includes the selected final line's newline if present. EOF adds no synthetic line.
+/// The caller must verify a whole-file read guard before resolving this range.
+pub fn resolve_apply_text_line_range(
+    source: &str,
+    range: ApplyTextLineScope,
+) -> Result<(usize, usize), &'static str> {
+    range.validate()?;
+    let mut offset = 0;
+    let mut start = None;
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        if index + 1 == range.start_line {
+            start = Some(offset);
+        }
+        offset += line.len();
+        if index + 1 == range.end_line {
+            return Ok((start.expect("validated line order"), offset));
+        }
+    }
+    Err("replace_range exceeds the original file's line count")
+}
+
+/// Canonical model-facing advisory for the narrow duplicate-anchor insertion case.
+/// The Runner may report this evidence, but the Server projects only this exact text.
+pub const APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING: &str =
+    "Inserted text already contains the full anchor at the insertion boundary; the original anchor remains.";
+
 /// Optional source-line safety fence for one exact edit. Lines are 1-based and
 /// inclusive against the canonicalized original file content for the batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ApplyTextLineScope {
+    #[schemars(range(min = 1))]
     pub start_line: usize,
+    #[schemars(range(min = 1))]
     pub end_line: usize,
 }
 
@@ -128,30 +160,112 @@ impl ApplyTextLineScope {
 
 /// A single atomic text edit against one file. Only the fields relevant to the
 /// `kind` are required; the runtime validates presence before dispatch.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ApplyTextEditInput {
     pub kind: ApplyTextEditKind,
+    #[schemars(length(min = 1, max = 524288))]
     #[serde(default)]
     pub old_text: Option<String>,
+    /// Insertions preserve this text and the original anchor. On supporting
+    /// Runners, dry-run and successful results include files[].edits[].warning
+    /// when this text ends with the full anchor_text for insert_before or starts
+    /// with it for insert_after, after existing LF/CRLF canonicalization of both.
+    /// An anchor only in the middle does not warn; no other whitespace or fuzzy
+    /// comparison applies. The advisory never changes text, success, or change flags.
+    #[schemars(length(max = 524288))]
     #[serde(default)]
     pub new_text: Option<String>,
+    #[schemars(length(min = 1, max = 524288))]
     #[serde(default)]
     pub anchor_text: Option<String>,
+    #[schemars(range(min = 1))]
     #[serde(default)]
     pub occurrence: Option<usize>,
+    /// Replace every fully contained exact match only when its count is exactly
+    /// this value. Mutually exclusive with occurrence and requires a read guard.
+    #[schemars(range(min = 1, max = 1024))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_match_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_scope: Option<ApplyTextLineScope>,
 }
 
 /// Maximum number of source-order exact-match candidates returned for one
 /// recoverable edit conflict. The full match count remains available.
-pub const MAX_APPLY_TEXT_CONFLICT_CANDIDATES: usize = 8;
+pub const MAX_APPLY_TEXT_CONFLICT_CANDIDATES: usize = 5;
+/// Bound both requested bulk work and model-facing source-range evidence.
+pub const MAX_APPLY_TEXT_EXPECTED_MATCH_COUNT: usize = 1024;
+pub const MAX_APPLY_TEXT_MATCH_RANGES_PER_EDIT: usize = 8;
+pub const MAX_APPLY_TEXT_MATCH_RANGES_TOTAL: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ApplyTextMatchCandidate {
     pub occurrence: usize,
     pub start_line: usize,
     pub end_line: usize,
+}
+
+/// Source-order, non-overlapping exact ranges from one immutable canonical
+/// source. Only eligible matches are retained, up to the explicit request cap.
+pub struct ApplyTextBulkMatches {
+    pub ranges: Vec<(usize, usize)>,
+    pub match_count: usize,
+    pub candidate_ranges: Vec<ApplyTextMatchCandidate>,
+    /// Bounded source-order evidence for successful bulk exact edits. This is
+    /// intentionally wider than conflict recovery so reducing failure payloads
+    /// cannot silently shrink successful review evidence.
+    pub evidence_ranges: Vec<ApplyTextMatchCandidate>,
+    pub candidates_truncated: bool,
+}
+
+pub fn resolve_apply_text_bulk_matches(
+    original: &str,
+    needle: &str,
+    line_scope: Option<&ApplyTextLineScope>,
+) -> ApplyTextBulkMatches {
+    debug_assert!(!needle.is_empty());
+    let mut ranges = Vec::new();
+    let mut candidates = Vec::new();
+    let mut evidence_ranges = Vec::new();
+    let mut global_occurrence = 0usize;
+    let mut match_count = 0usize;
+    let mut line_cursor = 0usize;
+    let mut current_line = 1usize;
+    let newlines = needle.bytes().filter(|byte| *byte == b'\n').count();
+    let ends_with_newline = needle.ends_with('\n');
+    for (start, _) in original.match_indices(needle) {
+        current_line += original.as_bytes()[line_cursor..start]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        line_cursor = start;
+        global_occurrence += 1;
+        let candidate = ApplyTextMatchCandidate {
+            occurrence: global_occurrence,
+            start_line: current_line,
+            end_line: current_line + newlines.saturating_sub(usize::from(ends_with_newline)),
+        };
+        if line_scope.is_none_or(|scope| scope.contains(candidate)) {
+            match_count += 1;
+            if ranges.len() < MAX_APPLY_TEXT_EXPECTED_MATCH_COUNT {
+                ranges.push((start, start + needle.len()));
+            }
+            if candidates.len() < MAX_APPLY_TEXT_CONFLICT_CANDIDATES {
+                candidates.push(candidate);
+            }
+            if evidence_ranges.len() < MAX_APPLY_TEXT_MATCH_RANGES_PER_EDIT {
+                evidence_ranges.push(candidate);
+            }
+        }
+    }
+    ApplyTextBulkMatches {
+        ranges,
+        match_count,
+        candidate_ranges: candidates,
+        evidence_ranges,
+        candidates_truncated: match_count > MAX_APPLY_TEXT_CONFLICT_CANDIDATES,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,7 +425,7 @@ pub fn resolve_apply_text_match(
 
 /// Kind of project-file change performed by one transactional
 /// `apply_text_edits` batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApplyFileChangeKind {
     Edit,
@@ -395,6 +509,27 @@ mod tests {
     }
 
     #[test]
+    fn replace_range_resolves_complete_inclusive_lines_without_synthetic_eof() {
+        let source = "alpha\nβeta\ngamma\n";
+        let (start, end) = resolve_apply_text_line_range(source, scope(2, 3)).unwrap();
+        assert_eq!(&source[start..end], "βeta\ngamma\n");
+
+        let eof_source = "alpha\nβeta";
+        let (start, end) = resolve_apply_text_line_range(eof_source, scope(2, 2)).unwrap();
+        assert_eq!(&eof_source[start..end], "βeta");
+        assert!(resolve_apply_text_line_range("alpha\n", scope(2, 2)).is_err());
+    }
+
+    #[test]
+    fn replace_range_rejects_invalid_or_out_of_bounds_ranges() {
+        let source = "a\nb\nc\n";
+        assert!(resolve_apply_text_line_range(source, scope(0, 1)).is_err());
+        assert!(resolve_apply_text_line_range(source, scope(3, 2)).is_err());
+        assert!(resolve_apply_text_line_range(source, scope(2, 4)).is_err());
+        assert!(resolve_apply_text_line_range("", scope(1, 1)).is_err());
+    }
+
+    #[test]
     fn lowercase_sha256_validation_is_exact() {
         assert!(is_lowercase_hex_sha256(
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -424,10 +559,33 @@ mod tests {
         assert!(conflict.candidates_truncated);
         assert_eq!(conflict.candidate_ranges[0].occurrence, 1);
         assert_eq!(conflict.candidate_ranges[0].start_line, 2);
-        assert_eq!(conflict.candidate_ranges[7].occurrence, 8);
+        assert_eq!(
+            conflict.candidate_ranges[MAX_APPLY_TEXT_CONFLICT_CANDIDATES - 1].occurrence,
+            MAX_APPLY_TEXT_CONFLICT_CANDIDATES
+        );
         let second = resolve_apply_text_match(&source, "needle\n", Some(2), None).unwrap();
         assert_eq!(&source[second.0..second.1], "needle\n");
         assert!(second.0 > source.find("needle\n").unwrap());
+    }
+
+    #[test]
+    fn bulk_exact_keeps_success_evidence_wider_than_failure_candidates() {
+        let source = (1..=10)
+            .map(|index| format!("prefix-{index}\nneedle\n"))
+            .collect::<String>();
+        let matches = resolve_apply_text_bulk_matches(&source, "needle\n", None);
+        assert_eq!(matches.match_count, 10);
+        assert_eq!(
+            matches.candidate_ranges.len(),
+            MAX_APPLY_TEXT_CONFLICT_CANDIDATES
+        );
+        assert_eq!(
+            matches.evidence_ranges.len(),
+            MAX_APPLY_TEXT_MATCH_RANGES_PER_EDIT
+        );
+        assert!(matches.candidates_truncated);
+        assert_eq!(matches.candidate_ranges.last().unwrap().occurrence, 5);
+        assert_eq!(matches.evidence_ranges.last().unwrap().occurrence, 8);
     }
 
     #[test]
@@ -495,6 +653,18 @@ mod tests {
             assert_eq!(conflict.kind, ApplyTextMatchConflictKind::MatchNotFound);
             assert_eq!(conflict.line_scope_match_count, Some(0));
         }
+    }
+
+    #[test]
+    fn bulk_exact_count_uses_only_fully_contained_original_ranges() {
+        let source = "head\na\nb\nmid\na\nb\ntail\n";
+        let scoped = resolve_apply_text_bulk_matches(source, "a\nb\n", Some(&scope(5, 6)));
+        assert_eq!(scoped.match_count, 1);
+        assert_eq!(scoped.candidate_ranges[0].occurrence, 2);
+        assert_eq!(&source[scoped.ranges[0].0..scoped.ranges[0].1], "a\nb\n");
+        let crossing = resolve_apply_text_bulk_matches(source, "a\nb\n", Some(&scope(5, 5)));
+        assert_eq!(crossing.match_count, 0);
+        assert!(crossing.ranges.is_empty());
     }
 
     #[test]

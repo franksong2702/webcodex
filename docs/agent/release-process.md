@@ -3,6 +3,10 @@
 Detailed release readiness lives in
 [`RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md).
 
+The optional Linux Runtime package flavor, explicit release selection, v2
+installer manifest and retained legacy view are described in
+[Linux Runtime packaging](../implementation/linux-runtime-packaging.md).
+
 **Default agent policy** is defined in [`AGENTS.md`](../../AGENTS.md): external
 changes, including deploys, require an explicit task and named destination. A
 reviewed development build deployed only to named dogfood targets is distinct
@@ -34,7 +38,7 @@ For that development deployment:
 3. Preserve the prior working build or another concrete rollback path before
    replacing or restarting the target.
 4. Run focused post-deployment smoke appropriate to the changed Server, Runner,
-   CLI, MCP, or GPT Actions surface.
+   CLI or MCP surface.
 5. Report the exact targets changed, build identity observed, smoke result, and
    rollback path.
 
@@ -85,14 +89,14 @@ version and authorizes the destructive recovery, and all of these facts hold at 
 time of deletion:
 
 - the checkout is clean, its Cargo/npm/Desktop/Tauri versions are the requested version, and its
-  `HEAD` equals current remote `main`;
+  `HEAD` equals the selected remote release source ref (`main` or exactly `release/v<VERSION>`);
 - the remote tag is an annotated commit tag;
 - no GitHub Release exists for the tag and the npm version is absent;
 - every matching authoritative `release-build` run is terminal and none concluded
   successfully.
 
-Use `python3 scripts/release_operator.py reclaim-tag --version <VERSION> --confirm
-v<VERSION> --root <EXACT_MAIN_WORKTREE>` rather than a naked `git push --delete`.
+Use `python3 scripts/release_operator.py reclaim-tag --version <VERSION> --source-ref
+<SOURCE_REF> --confirm v<VERSION> --root <EXACT_SOURCE_WORKTREE>` rather than a naked `git push --delete`.
 The operator fences the repository/source/version, scans bounded release-build
 history, deletes the remote tag, reconciles the remote ref, and removes the matching
 local tag. Its normal GitHub Release check is authenticated so draft releases are
@@ -105,66 +109,87 @@ an existing npm version closes this exception permanently for that version. Fail
 historical workflow runs remain as audit evidence after a reclaim and are not
 deleted or rewritten.
 
+### Failed pre-publication build source-fix recovery
+
+A failed authoritative `release-build` may expose a release-only build, packaging,
+installer, provenance, or workflow-contract defect that pre-tag readiness does not
+exercise. After that happens, the same version may take a bounded recovery path
+without repeating readiness **only** when all of these conditions hold:
+
+- at least one earlier readiness run for this release version/source line completed
+  successfully before the failed authoritative build;
+- the failed build is terminal and the diagnosed fix is confined to release/CI,
+  packaging, installer, provenance, tests, or documentation surfaces rather than a
+  product/runtime behavior change;
+- the repaired exact `release/v<VERSION>` source passes its ordinary exact-source
+  push CI and focused regression validation for the failed build contract;
+- no GitHub Release exists for the tag, the npm version is absent, and no
+  authoritative `release-build` for the version has succeeded;
+- the human requester explicitly authorizes reclaiming and recreating the version
+  tag at the repaired exact source.
+
+In this recovery path, cancel or ignore any automatically started release-source
+readiness evidence run. Use the guarded `reclaim-tag` operation, create a new
+annotated tag only after the explicit tag authorization, then use a fresh durable
+`build-start` / `build-status` state for the repaired tag. Do not resume a high-level
+plan whose readiness/build state is bound to the superseded source, and do not
+reuse artifacts from any earlier build attempt. A product/runtime source change
+falls back to the normal readiness path.
+
 ## 3. Operator checklist pointer
 
 Before tagging or publishing, follow sections in
-[`RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md). The final executable pre-tag gate is
-`.github/workflows/release-readiness.yml`, dispatched through
-`scripts/release_operator.py readiness-start` for one exact merged `main` SHA and
-observed through the same durable state with `readiness-status`. Before dispatch, the operator
-requires and records exactly one successful main-push CI run for that source. The workflow
-revalidates the exact CI run id/attempt with read-only Actions authority, so readiness reuses
-rather than repeats the cross-platform correctness already proven by main CI: complete Linux
-Rust/tooling coverage, frontend contracts, both native macOS Runner suites, Windows x64
-runtime/package/Desktop-installer lanes, and lightweight Linux/Windows arm64 production-target compilation.
-Readiness then runs only release-specific WebSocket/polling E2E plus coding-loop compare eval;
-after both pass, native `linux/amd64` and `linux/arm64` disposable Server-image jobs verify
-build/runtime/health/non-root behavior and digest-pinned bootstrap generation. These jobs do not
-log in to a registry, upload artifacts, push packages, or produce formal release candidates.
-Six-platform native release-profile/ABI/package validation and the formal Windows x64, macOS Intel,
-and macOS Apple-Silicon Desktop artifacts are intentionally left to the single authoritative
-`release-build.yml` run after immutable tagging instead of being built twice.
-Product-documentation consistency and allowed legacy-term matches remain part of the
-release-prep review rather than being guessed by an automated semantic checker.
+[`RELEASE_CHECKLIST.md`](../RELEASE_CHECKLIST.md). For normal releases, cut `release/v<VERSION>` from the reviewed `main` commit chosen for the release before release prep, then target version/release-metadata work at that branch. For a hotfix, the release branch may instead start at the previous immutable release tag and carry only the required fix plus release prep. Once the branch is cut, unrelated PRs may keep merging into `main`; only the selected release source branch must remain stable through readiness and tag creation. Product fixes unique to the release branch are forward-ported to `main` separately, while release-only version metadata need not be merged back.
 
-The normal release topology deliberately separates roles. The release control host first
-runs `release_operator.py preflight`, then GitHub Actions validates the exact pre-tag
-source in the durable readiness workflow. After explicit authorization creates the
-immutable tag, `release_operator.py build-start` / `build-status` bind one durable
-`rb_*` request to the reviewed release-build workflow; GitHub Actions builds and assembles
+The final executable pre-tag gate is
+`.github/workflows/release-readiness.yml`, observed through
+`scripts/release_operator.py readiness-start` / `readiness-status` for one exact source branch/SHA pair. The source ref is either `main` or exactly `release/v<VERSION>`. Ordinary source-branch CI remains the common correctness authority and records complete Linux Rust/tooling coverage plus path-aware Windows x64, macOS Apple-Silicon, Desktop, and amd64 Server-image checks; scarce Linux ARM64, macOS Intel, and Windows ARM64 runners remain absent from ordinary CI.
+
+For `release/v*`, pushing the exact source also starts `release-readiness.yml` in **source-evidence mode**. That run precomputes the same expensive release-specific evidence that used to sit serially behind operator dispatch: `extended-native.yml` supplies Linux ARM64 production coverage plus macOS Intel and Windows ARM64 runtime/Desktop build/install smoke; WebSocket/polling E2E and coding-loop compare eval run in parallel; then native `linux/amd64` and `linux/arm64` disposable Server-image jobs verify build/runtime/health/non-root behavior and digest-pinned bootstrap generation. The source-evidence run has read-only repository/Actions authority, uploads no artifacts, logs in to no registry, publishes nothing, and creates no formal release candidate.
+
+After exact-source CI and source-evidence both succeed, `readiness-start` binds their exact run ids and attempts in durable local state. Its small operator-dispatched run re-fetches both immutable attempts with read-only Actions authority and fails closed unless workflow path, `push` event, source ref/SHA, repository, attempt, and terminal success all match. The expensive jobs are skipped in that dispatch instead of rebuilt. A release sourced directly from `main` has no precomputed source-evidence run; its dispatch retains the previous slow fallback and executes those expensive jobs itself, so ordinary main pushes do not consume scarce runners.
+
+After immutable tagging, authoritative `release-build.yml` now starts with a cheap exact-tag preflight that runs the deterministic release/tooling contract before any scarce native matrix. Only that preflight can unlock the six-platform runtime/Desktop jobs. This is intentionally redundant with ordinary PR CI: it fences the exact tagged workflow source so YAML/shell/static packaging drift is rejected in minutes instead of after platform builds have consumed tens of minutes.
+
+The core Release and distro/unified installers are separate concerns. By default `release-build.yml` produces the six native runtime archives plus the version-appropriate primary Desktop distributions and same-run release metadata. `include_unified_installers=true` is an explicit opt-in extension that additionally builds the Linux DEB/RPM, macOS PKG, Windows unified EXE, source manifests, and installer manifest. A unified-installer failure must not block the ordinary core Release when that option was not requested. The public download-page workflow likewise treats the installer manifest as optional: a core-only Release completes without a download-page artifact, while a present installer manifest is still validated fail-closed.
+
+Starting with `v0.4.3`, the primary build owns macOS Apple-Silicon plus Windows x64/ARM64 Desktop candidates, while macOS Intel Desktop remains a post-publication supplemental workflow so its slow DMG build does not delay the core Release. The `darwin-x64` runtime archive itself remains part of the primary six-platform bundle. Post-publication consumers prefer machine-readable `--build-info-json` over formatting assumptions about `--version`; historical short commit identities may be accepted only when they still identify the exact immutable release source.
+
 For normal human operation, prefer `release_operator.py doctor` before the release window and one durable high-level `release-init` / `release-resume` plan during the release. The plan composes the same low-level readiness/build/collect/stage/verify primitives without weakening their exact-source correlation. It automatically advances only recoverable phases and returns explicit `needs_authorization` states before immutable tag creation, draft creation, and public GitHub/npm publication; it returns `needs_reconciliation` instead of deleting/repeating local outputs whose completion is uncertain. `release-status` is read-only, and every low-level operator command remains available for diagnosis or bounded recovery.
 
-The lower-level release topology deliberately separates roles. The release control host first
-runs `release_operator.py preflight`, then GitHub Actions validates the exact pre-tag
-source in the durable readiness workflow. After explicit authorization creates the
-immutable tag, `release_operator.py build-start` / `build-status` bind one durable
-`rb_*` request to the reviewed release-build workflow; GitHub Actions builds and assembles
-one same-run native candidate bundle containing the six runtime archives and the three Desktop
-distribution artifacts (Windows x64, macOS Intel, and macOS Apple Silicon). Each Mac lane reuses the
-same unsigned runtime build input for its archive and `.app`, then records the bundled post-signing
-digests separately. Verification and formal GitHub Release builds are ad-hoc signed and intentionally
-not notarized, so the release pipeline does not depend on paid Apple Developer Program credentials.
-Native macOS smoke still verifies the code signature and exact bundled runtime evidence. The release control host collects that exact bundle
-with `release_operator.py collect` (locked run id, source SHA, and tag; GitHub artifact
-REST download, no `gh run download`) and stages npm with `stage-npm` using the retained
-CI binaries without Cargo. After draft assets are uploaded, `verify-draft` compares the
-GitHub asset SHA-256 digests and sizes against the retained bytes instead of downloading
-the same ~100 MiB again. The privileged actions themselves—creating the immutable tag,
-making the GitHub Release public, and `npm publish`—remain explicit human-authorized
-steps rather than one opaque command. Publishing the GitHub Release then authorizes the
-reviewed `release-image.yml` adapter to build the server-only `linux/amd64` +
-`linux/arm64` image from that exact immutable tag, publish/reconcile it in GHCR, and
-attach its immutable digest record plus a self-contained, digest-pinned clone-free
-bootstrap asset to the same Release; the bootstrap is generated from the reviewed
-publication-workflow source so guarded backfills do not depend on new tooling existing in
-an older application tag. `release-build.yml` remains a read-only candidate producer with
-no package-write authority. One well-connected Linux host performs the single full public-byte
-verifier for npm, native Release archives, and all three bounded Desktop distribution bytes after publication; it hashes macOS DMGs but does not replace native macOS ad-hoc signing evidence. The image workflow
-independently requires anonymous GHCR availability and verifies the public deployment-asset
-hashes. Do not fan release downloads or rebuilds out to per-platform development
-machines merely to prove that a foreign archive is downloadable. Native
-execution/architecture evidence belongs to the reviewed release-build matrix; the
-public verifier checks the published bytes without executing foreign binaries.
+The lower-level topology deliberately separates roles. The release control host first runs `release_operator.py preflight` against the exact source ref/SHA, then GitHub Actions validates that pre-tag source in the durable readiness workflow. After explicit authorization creates the immutable tag, the tag becomes the release source authority: `release_operator.py build-start` / `build-status` bind one durable `rb_*` request to `release-build.yml` dispatched from that exact tag. `main` and the release branch may advance after tagging without invalidating the build or publication plan. The workflow always builds the six native runtime archives from the exact tag. For `v0.4.3+`, its core same-run bundle contains the macOS Apple-Silicon and Windows x64/ARM64 Desktop distributions; the historical `v0.4.2`-and-earlier contract retains macOS Intel in that bundle. Ordinary CI/readiness stays ad-hoc and credential-free, while formal public macOS Desktop, bundled Runner, and optional unified payloads default to one persistent `self-signed` identity. The certificate/private key and independently pinned SHA-1 must remain stable across releases; Desktop `dev.webcodex.desktop` and Runner `dev.webcodex.runner` use certificate-anchored, non-cdhash designated requirements. Developer ID/notarization remains an optional future migration and is not a release prerequisite.
+
+New high-level release plans use schema 3 and persist
+`require_unified_installers=true` and dispatch
+`include_unified_installers=true`, opting into the workflow's unified extension.
+Low-level `build-start --include-unified-installers` makes the same selection;
+its default remains the ordinary core-only build. False omits the new dispatch
+input for compatibility with older immutable workflows; true sends it explicitly.
+Build state schema 2 records
+that exact selection. Schema 1 build state migrates conservatively to false;
+a strict plan rejects a reused false/unknown selection, including a previously
+recorded successful phase, instead of treating core-only success as unified
+success or redispatching an uncertain request. It is a caller-owned delivery requirement,
+not an inference from whichever assets happen to remain in a bundle. Collection,
+existing-bundle reconciliation, npm staging and draft verification all enforce the
+eight installer targets, six source manifests and checksummed public `manifest.json`.
+The native workflow uses an explicit Cargo target directory before Desktop
+compilation. Metadata and upload verification require the complete unified
+bundle only when the explicit workflow input is true; core-only bundles retain
+normal validation. Public
+verification remains a separate final gate and must use
+`python3 scripts/verify_public_release.py <VERSION> --require-unified-installers`
+for these plans. Existing schema 1/2 plans migrate with the legacy requirement
+set to false; low-level historical verification retains its default compatibility.
+Current low-level `collect`, `stage-npm`, `verify-draft` and metadata commands
+must pass `--require-unified-installers` when used outside a new plan for a
+supported unified delivery. Do not infer this requirement from a version threshold
+or modify already published legacy releases.
+
+The release control host collects the exact primary bundle with `release_operator.py collect` (locked run id, source SHA, and tag; GitHub artifact REST download, no `gh run download`) and stages npm from the retained runtime bytes without Cargo. Draft verification compares GitHub-provided asset digests and sizes against those retained bytes. Creating the immutable tag, making the GitHub Release public, and `npm publish` remain explicit human-authorized steps.
+
+Publishing a `v0.4.3+` GitHub Release independently activates two post-publication adapters. `release-image.yml` publishes/reconciles the server-only multi-arch GHCR image and its digest-pinned bootstrap assets, validating structured build identity rather than a hand-formatted commit string. `release-desktop-darwin-x64.yml` runs on the native Intel runner, downloads and verifies the already-published immutable `darwin-x64` runtime archive against the primary `SHA256SUMS`, validates its machine-readable build identity against the exact tagged source, and attaches the reconciled DMG under the same persistent signing mode plus its dedicated `.sha256` sidecar to the same Release. It never rewrites the primary `SHA256SUMS`. Reruns treat an already-published DMG as immutable authority, verify any existing checksum against those bytes, and may derive only a missing checksum from the existing DMG. An orphan checksum without its DMG or duplicate/conflicting assets fail closed instead of replacing published bytes. The Intel Desktop adapter is intentionally outside the primary Release critical path and can also be manually backfilled from reviewed `main` for the exact public tag.
+One well-connected Linux host performs the full public-byte verifier for npm, the six native Release archives, and the primary Desktop distributions. For `v0.4.3+`, Intel Desktop publication is explicitly outside that core acceptance boundary: no supplemental bytes is valid, a one-file intermediate state is reported as publication in progress without failing the core Release, and a complete DMG/checksum pair is verified independently. Native macOS readiness/smoke owns code-signature evidence; the Linux verifier hashes published DMGs but does not substitute for `codesign` validation. Do not fan release downloads or rebuilds out to per-platform development machines merely to prove that a foreign archive is downloadable.
 
 ---
 

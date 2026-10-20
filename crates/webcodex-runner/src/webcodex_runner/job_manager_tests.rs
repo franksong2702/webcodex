@@ -1,3 +1,6 @@
+use super::super::config::DEFAULT_MAX_CONCURRENT_JOBS;
+use super::super::output_text::OutputTextDecoder;
+use super::super::transport::WS_OUTGOING_CAPACITY;
 use super::*;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::webcodex_runner::detached_job::{
@@ -6,11 +9,24 @@ use crate::webcodex_runner::detached_job::{
 };
 use serde_json::json;
 use std::ffi::OsString;
+#[cfg(feature = "runner-real-process-tests")]
 use std::io::BufReader;
+#[cfg(feature = "runner-real-process-tests")]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use tempfile::TempDir;
+use webcodex_core::runner_protocol::{RunnerEnvelope, VALIDATION_STEP_WAIT_FAILED_CODE};
+
+#[path = "job_manager_tests/heartbeat.rs"]
+mod heartbeat;
+#[path = "job_manager_tests/node_json.rs"]
+mod node_json;
+#[path = "job_manager_tests/project_build.rs"]
+mod project_build;
+#[path = "job_manager_tests/project_validation.rs"]
+mod project_validation;
 
 fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
     let mut snapshot = test_job_snapshot(job_id);
@@ -22,10 +38,644 @@ fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
         client_id: "test-agent".to_string(),
         runner_instance_id: "test-instance".to_string(),
         snapshot,
+        input: None,
         child: None,
         stop_requested: Arc::new(AtomicBool::new(false)),
         slot_reserved: false,
     }
+}
+
+#[test]
+fn rejected_job_timestamps_preserve_server_creation_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = JobManager::new(1);
+    manager.shutting_down.store(true, Ordering::SeqCst);
+    let future = chrono::Utc::now().timestamp() + 3600;
+    let mut request = shell_job_request(temp.path(), "never executed");
+    request.created_at = future;
+    let (sink, _rx) = ws_sink("ws-client");
+    manager.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            RunnerPolicy::default(),
+            ShellConfig::default(),
+            SshConfig::default(),
+            temp.path().join("projects"),
+            request,
+        ),
+    );
+    let inventory = manager.inventory();
+    assert_eq!(inventory.jobs.len(), 1);
+    let snapshot = &inventory.jobs[0];
+    assert_eq!(snapshot.status, "failed");
+    assert_eq!(snapshot.started_at, None);
+    assert_eq!(snapshot.created_at, future);
+    assert_eq!(snapshot.ended_at, Some(future));
+}
+
+#[test]
+fn retained_job_timestamps_preserve_causal_order_across_clocks() {
+    for (job_id, already_started, prestart_failure) in [
+        ("server-clock-ahead", false, false),
+        ("runner-clock-rollback", true, false),
+        ("prestart-server-clock-ahead", false, true),
+    ] {
+        let manager = JobManager::new(1);
+        let future = chrono::Utc::now().timestamp() + 3600;
+        let mut snapshot = test_job_snapshot(job_id);
+        snapshot.created_at = future;
+        snapshot.started_at = already_started.then_some(future + 60);
+        snapshot.status = if already_started {
+            "running"
+        } else {
+            "agent_queued"
+        }
+        .to_string();
+        lock_unpoison(&manager.jobs).insert(
+            job_id.to_string(),
+            RunningJob {
+                client_id: "test-agent".to_string(),
+                runner_instance_id: "test-instance".to_string(),
+                snapshot,
+                input: None,
+                child: None,
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                slot_reserved: true,
+            },
+        );
+        if !prestart_failure {
+            manager
+                .record_update(
+                    job_id,
+                    RunnerJobDelta {
+                        status: "running".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        manager
+            .record_update(
+                job_id,
+                RunnerJobDelta {
+                    status: if prestart_failure {
+                        "failed"
+                    } else {
+                        "completed"
+                    }
+                    .to_string(),
+                    command_execution_state: prestart_failure
+                        .then_some(ShellCommandExecutionState::NotStarted),
+                    exit_code: (!prestart_failure).then_some(0),
+                    duration_ms: Some(17),
+                    finished: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let inventory = manager.inventory();
+        let snapshot = &inventory.jobs[0];
+        assert_eq!(snapshot.created_at, future);
+        if prestart_failure {
+            assert_eq!(snapshot.started_at, None);
+        } else {
+            assert_eq!(
+                snapshot.started_at,
+                Some(future + if already_started { 60 } else { 0 })
+            );
+        }
+        assert_eq!(
+            snapshot.ended_at,
+            Some(snapshot.started_at.unwrap_or(future))
+        );
+        assert_eq!(snapshot.duration_ms, Some(17));
+        // A racing late event cannot revise the first terminal outcome.
+        assert!(manager
+            .record_update(
+                job_id,
+                RunnerJobDelta {
+                    status: "failed".to_string(),
+                    finished: true,
+                    ..Default::default()
+                }
+            )
+            .is_none());
+        assert_eq!(manager.inventory(), inventory);
+    }
+}
+
+#[test]
+fn job_update_delivery_signal_wakes_all_worker_consumers() {
+    let signal = Arc::new(JobUpdateDeliverySignal::default());
+    let mut waiters = Vec::new();
+    for _ in 0..2 {
+        let signal = Arc::clone(&signal);
+        waiters.push(std::thread::spawn(move || {
+            let started = Instant::now();
+            let generation = signal
+                .wait_for_change(0, Duration::from_secs(2))
+                .expect("signal remains open");
+            (generation, started.elapsed())
+        }));
+    }
+
+    std::thread::sleep(Duration::from_millis(50));
+    signal.notify();
+
+    for waiter in waiters {
+        let (generation, elapsed) = waiter.join().expect("signal waiter");
+        assert_eq!(generation, 1);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "all worker consumers must wake promptly from one update notification"
+        );
+    }
+}
+
+#[test]
+fn heartbeat_batch_advances_only_runner_owned_active_lifecycles() {
+    let manager = JobManager::new(1);
+    for (job_id, status) in [
+        ("heartbeat-agent-queued", "agent_queued"),
+        ("heartbeat-running", "running"),
+        ("heartbeat-stop-requested", "stop_requested"),
+        ("heartbeat-server-queued", "queued"),
+        ("heartbeat-legacy-started", "started"),
+        ("heartbeat-terminal", "completed"),
+    ] {
+        let mut snapshot = test_job_snapshot(job_id);
+        snapshot.status = status.to_string();
+        if status == "completed" {
+            snapshot.ended_at = Some(chrono::Utc::now().timestamp());
+            snapshot.exit_code = Some(0);
+            snapshot.duration_ms = Some(1);
+        }
+        lock_unpoison(&manager.jobs).insert(
+            job_id.to_string(),
+            RunningJob {
+                client_id: "test-agent".to_string(),
+                runner_instance_id: "test-instance".to_string(),
+                snapshot,
+                input: None,
+                child: None,
+                stop_requested: Arc::new(AtomicBool::new(status == "stop_requested")),
+                slot_reserved: runner_job_is_active(status),
+            },
+        );
+    }
+
+    let mut detached = test_job_snapshot("heartbeat-detached");
+    detached.status = "running".to_string();
+    detached.context.structured_execution =
+        Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+            execution_source: "run_detached_process".to_string(),
+            language: None,
+            script_bytes: None,
+            arg_count: 0,
+            stdin_present: false,
+            validation_identity: None,
+            validation_tool: None,
+            assertion_name: None,
+        });
+    lock_unpoison(&manager.jobs).insert(
+        "heartbeat-detached".to_string(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            runner_instance_id: "test-instance".to_string(),
+            snapshot: detached,
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        3
+    );
+
+    let jobs = lock_unpoison(&manager.jobs);
+    for job_id in [
+        "heartbeat-agent-queued",
+        "heartbeat-running",
+        "heartbeat-stop-requested",
+    ] {
+        assert_eq!(jobs[job_id].snapshot.update_seq, 2, "{job_id}");
+    }
+    for job_id in [
+        "heartbeat-server-queued",
+        "heartbeat-legacy-started",
+        "heartbeat-terminal",
+        "heartbeat-detached",
+    ] {
+        assert_eq!(jobs[job_id].snapshot.update_seq, 1, "{job_id}");
+    }
+    drop(jobs);
+
+    let pending = lock_unpoison(&manager.pending_job_updates);
+    for job_id in [
+        "heartbeat-agent-queued",
+        "heartbeat-running",
+        "heartbeat-stop-requested",
+    ] {
+        let marker = pending[job_id]
+            .output_only
+            .as_ref()
+            .expect("active Job heartbeat marker");
+        assert_eq!(marker.update_seq, 2);
+        assert!(marker.liveness_only);
+        assert!(!marker.finished);
+    }
+    for job_id in [
+        "heartbeat-server-queued",
+        "heartbeat-legacy-started",
+        "heartbeat-terminal",
+        "heartbeat-detached",
+    ] {
+        assert!(!pending.contains_key(job_id), "{job_id}");
+    }
+}
+
+#[test]
+fn heartbeat_delivery_is_minimal_liveness_only_payload() {
+    let manager = JobManager::new(1);
+    let job_id = "heartbeat-minimal";
+    let mut snapshot = test_job_snapshot(job_id);
+    snapshot.stdout.tail = "retained stdout\n".to_string();
+    snapshot.stderr.tail = "retained stderr\n".to_string();
+    snapshot.command_execution_state = Some(ShellCommandExecutionState::OutcomeUnknown);
+    snapshot.context.validation_steps = vec!["check".to_string(), "test".to_string()];
+    snapshot.validation_progress = Some(ShellJobValidationProgress {
+        completed: 1,
+        current_step: Some("test".to_string()),
+        failed_step: None,
+    });
+    snapshot.activity = Some(ShellJobActivity {
+        state: ShellJobActivityState::Working,
+        phase: ShellJobActivityPhase::ValidationTest,
+        source: ShellJobActivitySource::ValidationPlan,
+    });
+    lock_unpoison(&manager.jobs).insert(
+        job_id.to_string(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            runner_instance_id: "test-instance".to_string(),
+            snapshot,
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        1
+    );
+    let marker = lock_unpoison(&manager.pending_job_updates)[job_id]
+        .output_only
+        .clone()
+        .expect("heartbeat marker");
+    let jobs = lock_unpoison(&manager.jobs);
+    let update = job_update_from_delivery(&jobs[job_id], &marker);
+    assert_eq!(update.update_seq, Some(2));
+    assert_eq!(update.status, "running");
+    assert!(update.stdout_chunk.is_none());
+    assert!(update.stderr_chunk.is_none());
+    assert!(update.log_snapshot.is_none());
+    assert!(update.exit_code.is_none());
+    assert!(update.duration_ms.is_none());
+    assert!(update.error.is_none());
+    assert!(update.command_execution_state.is_none());
+    assert_eq!(
+        update.validation_progress,
+        Some(ShellJobValidationProgress {
+            completed: 1,
+            current_step: Some("test".to_string()),
+            failed_step: None,
+        })
+    );
+    assert!(update.test_count_evidence.is_none());
+    assert!(update.activity.is_none());
+    assert!(!update.finished);
+}
+
+#[test]
+fn heartbeat_delivery_stays_behind_meaningful_updates_and_stops_at_terminal() {
+    let manager = JobManager::new(1);
+    let job_id = "heartbeat-order";
+    lock_unpoison(&manager.jobs).insert(
+        job_id.to_string(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            runner_instance_id: "test-instance".to_string(),
+            snapshot: test_job_snapshot(job_id),
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        1
+    );
+    manager.update_and_send(
+        job_id,
+        RunnerJobDelta {
+            status: "stop_requested".to_string(),
+            error: Some("stop requested".to_string()),
+            ..Default::default()
+        },
+    );
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = &pending[job_id];
+        assert_eq!(queue.required.len(), 1);
+        assert_eq!(queue.required.front().unwrap().update_seq, 3);
+        assert!(queue.output_only.is_none());
+    }
+
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        1
+    );
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = &pending[job_id];
+        assert_eq!(queue.next().unwrap().update_seq, 3);
+        let heartbeat = queue.output_only.as_ref().expect("post-stop heartbeat");
+        assert_eq!(heartbeat.update_seq, 4);
+        assert!(heartbeat.liveness_only);
+    }
+
+    manager.update_and_send(
+        job_id,
+        RunnerJobDelta {
+            status: "stopped".to_string(),
+            error: Some("stopped".to_string()),
+            finished: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        0
+    );
+    let pending = lock_unpoison(&manager.pending_job_updates);
+    let queue = &pending[job_id];
+    assert!(queue.output_only.is_none());
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|update| update.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 5]
+    );
+}
+
+#[test]
+fn delivery_queue_orders_semantic_truth_and_drops_stale_output_only_updates() {
+    let mut queue = JobUpdateDeliveryQueue::default();
+    let base = RunnerJobUpdateRequest {
+        client_id: "test-agent".into(),
+        runner_instance_id: "test-instance".into(),
+        job_id: "ordered-delivery".into(),
+        request_id: Some("request-ordered-delivery".into()),
+        update_seq: Some(0),
+        status: "running".into(),
+        stdout_chunk: None,
+        stderr_chunk: None,
+        log_snapshot: None,
+        exit_code: None,
+        duration_ms: None,
+        error: None,
+        command_execution_state: None,
+        validation_progress: None,
+        test_count_evidence: None,
+        format_mutation: None,
+        build_artifacts: None,
+        activity: None,
+        finished: false,
+    };
+    let mut semantic = base.clone();
+    semantic.update_seq = Some(3);
+    semantic.status = "stop_requested".into();
+    semantic.error = Some("stop requested".into());
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), true));
+
+    // A: a stale output-only (seq2) that arrives behind newer semantic truth
+    // (seq3) is dropped rather than retained to regress the drained state.
+    let mut stale_heartbeat = semantic.clone();
+    stale_heartbeat.update_seq = Some(2);
+    stale_heartbeat.status = "running".into();
+    stale_heartbeat.error = None;
+    assert!(queue.enqueue(
+        PendingJobUpdateDelivery::from_update(&stale_heartbeat),
+        false
+    ));
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+    assert!(queue.output_only.is_none());
+
+    // B: out-of-order semantic seq5 then seq4 both land, kept ascending.
+    semantic.update_seq = Some(5);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), true));
+    semantic.update_seq = Some(4);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), true));
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+
+    // C: a duplicate semantic seq4 replaces the existing seq4 in place. The
+    // distinct status/error sentinel proves replacement, not a new item.
+    let mut duplicate = semantic.clone();
+    duplicate.status = "stopped_replaced".into();
+    duplicate.error = Some("replaced sentinel".into());
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&duplicate), true));
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    let replaced = queue
+        .required
+        .iter()
+        .find(|pending| pending.update_seq == 4)
+        .unwrap();
+    assert_eq!(replaced.status, "stopped_replaced");
+    assert_eq!(replaced.error.as_deref(), Some("replaced sentinel"));
+
+    // D: a genuinely newer output-only (seq6) is coalesced and retained.
+    semantic.update_seq = Some(6);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), false));
+    assert_eq!(queue.output_only.as_ref().unwrap().update_seq, 6);
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+
+    // E: newer semantic truth (seq7) clears the older output-only (seq6).
+    semantic.update_seq = Some(7);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), true));
+    assert!(queue.output_only.is_none());
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5, 7]
+    );
+
+    // F: once required holds seq7, an output-only seq7 or seq6 must not
+    // resurrect an older/equal heartbeat behind the semantic truth.
+    let mut backdoor = semantic.clone();
+    backdoor.update_seq = Some(7);
+    backdoor.status = "running".into();
+    backdoor.error = None;
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&backdoor), false));
+    assert!(queue.output_only.is_none());
+    backdoor.update_seq = Some(6);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&backdoor), false));
+    assert!(queue.output_only.is_none());
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5, 7]
+    );
+}
+
+#[test]
+fn delivery_worker_waits_for_sequence_barrier_before_selecting_candidate() {
+    let manager = JobManager::new(1);
+    let job_id = "delivery-sequence-barrier";
+    let mut snapshot = test_job_snapshot(job_id);
+    snapshot.update_seq = 5;
+    lock_unpoison(&manager.jobs).insert(
+        job_id.to_string(),
+        RunningJob {
+            client_id: "test-agent".into(),
+            runner_instance_id: "test-instance".into(),
+            snapshot,
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    // Model the exact producer gap this queue exists to tolerate: seq5 is
+    // already pending while an older generated seq4 still owns the sequencing
+    // barrier and has not reached the queue yet. The delivery worker must not
+    // let seq5 escape during that window.
+    let delivery_order = lock_unpoison(&manager.job_update_delivery_order);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    manager.install_sink(RunnerSink::WebSocket {
+        tx,
+        client_id: "test-agent".into(),
+        runner_instance_id: "test-instance".into(),
+    });
+
+    let pending = |update_seq, status: &str| PendingJobUpdateDelivery {
+        update_seq,
+        status: status.to_string(),
+        exit_code: None,
+        duration_ms: None,
+        error: None,
+        command_execution_state: None,
+        validation_progress: None,
+        test_count_evidence: None,
+        format_mutation: None,
+        build_artifacts: None,
+        activity: None,
+        finished: false,
+        liveness_only: false,
+    };
+    {
+        let mut pending_map = lock_unpoison(&manager.pending_job_updates);
+        assert!(pending_map
+            .entry(job_id.to_string())
+            .or_default()
+            .enqueue(pending(5, "stop_requested"), true));
+    }
+    manager.delivery_signal.notify();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    {
+        let mut pending_map = lock_unpoison(&manager.pending_job_updates);
+        assert!(pending_map
+            .get_mut(job_id)
+            .unwrap()
+            .enqueue(pending(4, "running"), true));
+    }
+    drop(delivery_order);
+    manager.delivery_signal.notify();
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(5));
+    assert_eq!(
+        updates
+            .iter()
+            .map(|update| update.update_seq)
+            .collect::<Vec<_>>(),
+        vec![Some(4), Some(5)]
+    );
+    assert_eq!(updates[0].status, "running");
+    assert_eq!(updates[1].status, "stop_requested");
 }
 
 #[test]
@@ -41,6 +691,7 @@ fn job_reconciliation_inventory_prioritizes_active_and_bounds_terminal_history()
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot: active,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -90,6 +741,66 @@ fn job_reconciliation_inventory_prioritizes_active_and_bounds_terminal_history()
 }
 
 #[test]
+fn runner_structured_timeout_admission_matches_execution_form_ceilings() {
+    assert!(validate_runner_structured_common(
+        None,
+        None,
+        21_600,
+        runner_protocol::PROCESS_TIMEOUT_MAX_SECS,
+    )
+    .is_ok());
+    assert!(validate_runner_structured_common(
+        None,
+        None,
+        runner_protocol::PROCESS_TIMEOUT_MAX_SECS + 1,
+        runner_protocol::PROCESS_TIMEOUT_MAX_SECS,
+    )
+    .is_err());
+
+    assert!(validate_runner_structured_common(
+        None,
+        None,
+        runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+        runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    )
+    .is_ok());
+    assert!(validate_runner_structured_common(
+        None,
+        None,
+        runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS + 1,
+        runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    )
+    .is_err());
+}
+
+#[test]
+fn terminal_inventory_retains_past_old_fifteen_minutes_and_prunes_at_24h_boundary() {
+    let manager = JobManager::new(1);
+    let now = chrono::Utc::now().timestamp();
+    let old_fifteen_minute_id = "terminal-past-old-fifteen-minute-window";
+    let expired_id = "terminal-at-24h-boundary";
+    lock_unpoison(&manager.jobs).insert(
+        old_fifteen_minute_id.to_string(),
+        retained_terminal_job(old_fifteen_minute_id, now - 15 * 60 - 1),
+    );
+    lock_unpoison(&manager.jobs).insert(
+        expired_id.to_string(),
+        retained_terminal_job(expired_id, now - JOB_TERMINAL_RETENTION_SECS),
+    );
+
+    assert_eq!(JOB_TERMINAL_RETENTION_SECS, 86_400);
+    let inventory = manager.inventory();
+    assert!(inventory
+        .jobs
+        .iter()
+        .any(|snapshot| snapshot.job_id == old_fifteen_minute_id));
+    assert!(!inventory
+        .jobs
+        .iter()
+        .any(|snapshot| snapshot.job_id == expired_id));
+}
+
+#[test]
 fn job_reconciliation_inventory_drops_terminal_payload_before_active_jobs() {
     let manager = JobManager::new(1);
     let now = chrono::Utc::now().timestamp();
@@ -101,6 +812,7 @@ fn job_reconciliation_inventory_drops_terminal_payload_before_active_jobs() {
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot: active,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -144,6 +856,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -170,7 +883,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
             ..Default::default()
         },
     );
-    let first = recv_job_update(&mut rx, Duration::from_secs(2), "incremental update");
+    let first = recv_job_update(&mut rx, Duration::from_secs(5), "incremental update");
     assert_eq!(first.update_seq, Some(2));
     assert!(first.stdout_chunk.is_none());
     let first_logs = first
@@ -249,7 +962,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
         runner_instance_id: "test-instance".to_string(),
     });
     manager.replay_snapshots_since(&registered_inventory);
-    assert!(wait_until(Duration::from_secs(2), || {
+    assert!(wait_until(Duration::from_secs(5), || {
         !lock_unpoison(&manager.pending_job_updates).contains_key("offline-terminal-job")
     }));
     while reconnected_rx.try_recv().is_ok() {}
@@ -274,7 +987,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     manager.replay_snapshots_since(&registered_inventory);
     let replay = recv_job_update(
         &mut fresh_rx,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         "post-register replay",
     );
     assert_eq!(replay.job_id, "offline-terminal-job");
@@ -284,10 +997,23 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     assert_eq!(logs.stdout.tail, "one\ntwo\n");
     assert_eq!(logs.stdout.next_line, 3);
 
+    // Receiving the replay proves it entered the transport queue, but the
+    // delivery worker may not yet have acknowledged the same update_seq in its
+    // local pending queue. Wait for that first delivery to retire before
+    // simulating a later server stop; otherwise the resend can legitimately
+    // coalesce with the still-pending identical sequence and the test races its
+    // own delivery bookkeeping.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !lock_unpoison(&manager.pending_job_updates).contains_key("offline-terminal-job")
+        }),
+        "first terminal replay must retire before simulating the later stop"
+    );
+
     manager.stop("offline-terminal-job").unwrap();
     let stopped_race = recv_job_update(
         &mut fresh_rx,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         "stop racing a lost terminal update replays the terminal snapshot",
     );
     assert_eq!(stopped_race.status, "completed");
@@ -380,7 +1106,7 @@ fn detached_job_request(
             validation_steps: Vec::new(),
             validation: None,
             structured_execution: Some(runner_protocol::ShellJobStructuredExecutionMetadata {
-                execution_source: "run_process".to_string(),
+                execution_source: "run_detached_process".to_string(),
                 language: None,
                 script_bytes: None,
                 arg_count: 3,
@@ -398,7 +1124,7 @@ fn detached_job_request(
                     .into_owned(),
                 args: vec![
                     "--exact".to_string(),
-                    "job_manager_tests::detached_job_payload_subprocess_entrypoint".to_string(),
+                    "webcodex_runner::job_manager::job_manager_tests::detached_job_payload_subprocess_entrypoint".to_string(),
                     "--nocapture".to_string(),
                 ],
             },
@@ -487,6 +1213,27 @@ fn detached_recovery_uses_same_inventory_and_observes_terminal_output() {
     assert_eq!(local.runner_instance_id, "new-runner-instance");
     assert!(local.child.is_none());
     assert!(lock_unpoison(&manager.detached_jobs).contains_key(&request.job_id));
+
+    // Generic liveness heartbeats must never advance the public sequence for a
+    // detached Job. Its durable supervisor/store is the sequence authority, and
+    // the later terminal record must remain admissible to this observer.
+    let durable_seq = recovered.update_seq;
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        0
+    );
+    let after_heartbeat = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == request.job_id)
+        .unwrap();
+    assert_eq!(after_heartbeat.update_seq, durable_seq);
 
     assert!(wait_until(Duration::from_secs(10), || manager
         .inventory()
@@ -759,6 +1506,7 @@ fn job_manager_stop_terminates_the_process_group() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("process-group-job"),
+            input: None,
             child: Some(child.clone()),
             stop_requested: stop_requested.clone(),
             slot_reserved: true,
@@ -806,6 +1554,7 @@ fn job_shutdown_reaps_a_sigterm_responsive_child() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-responsive"),
+            input: None,
             child: Some(Arc::clone(&child)),
             stop_requested: Arc::clone(&stop_requested),
             slot_reserved: true,
@@ -854,6 +1603,7 @@ fn job_shutdown_escalates_ignored_sigterm_for_parent_and_descendant() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-ignoring"),
+            input: None,
             child: Some(Arc::clone(&child)),
             stop_requested: Arc::clone(&stop_requested),
             slot_reserved: true,
@@ -975,7 +1725,7 @@ fn structured_process_helper() -> Arc<StructuredProcessHelper> {
         .get_or_init(|| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/fixtures/process_argv_helper.rs");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::tests::executable_tempdir();
             let output = temp.path().join(format!(
                 "structured-process-helper{}",
                 std::env::consts::EXE_SUFFIX
@@ -1023,6 +1773,7 @@ fn structured_process_context(
     context
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn detached_process_context(cwd: &Path, arg_count: usize, stdin_present: bool) -> ShellJobContext {
     let mut context = structured_process_context(cwd, arg_count, stdin_present);
     context.command_preview = format!("detached process ({arg_count} args)");
@@ -1149,6 +1900,7 @@ fn enqueue_structured_process_job_with_policy(
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn enqueue_detached_process_job(
     manager: &JobManager,
     sink: RunnerSink,
@@ -1741,6 +2493,7 @@ fn phase_e2_prestart_structured_failure_releases_slot_for_queued_job() {
             client_id: "structured-agent".to_string(),
             runner_instance_id: "structured-instance".to_string(),
             snapshot: failed_snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -2095,6 +2848,7 @@ fn output_only_delivery_coalescing_preserves_authoritative_snapshot_invariants()
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -2401,7 +3155,7 @@ fn structured_process_job_drains_large_output_without_log_observation_and_runs_o
             "{name}: {:?}",
             stream.tail
         );
-        assert!(stream.tail.as_bytes().iter().any(|byte| *byte == tail_byte));
+        assert!(stream.tail.as_bytes().contains(&tail_byte));
         assert!(std::str::from_utf8(stream.tail.as_bytes()).is_ok());
     }
     let starts = std::fs::read_to_string(marker).unwrap();
@@ -2950,6 +3704,14 @@ fn structured_script_job_keeps_its_temporary_file_until_terminal_then_removes_it
         "the Runner-owned script file was removed while its one execution was still running"
     );
     assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            manager.inventory().jobs.iter().any(|snapshot| {
+                snapshot.job_id == "structured-script" && snapshot.status == "running"
+            })
+        }),
+        "structured script never published its running lifecycle after the child started"
+    );
     let active = manager
         .inventory()
         .jobs
@@ -3065,7 +3827,7 @@ fn structured_script_job_drains_large_output_without_log_observation_and_runs_on
             "{name}: {:?}",
             stream.tail
         );
-        assert!(stream.tail.as_bytes().iter().any(|byte| *byte == tail_byte));
+        assert!(stream.tail.as_bytes().contains(&tail_byte));
         assert!(std::str::from_utf8(stream.tail.as_bytes()).is_ok());
     }
     assert_eq!(
@@ -3097,6 +3859,7 @@ fn structured_job_snapshot_preserves_post_spawn_outcome_unknown() {
             client_id: "structured-agent".to_string(),
             runner_instance_id: "structured-instance".to_string(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -3234,6 +3997,111 @@ fn run_fail_fast_validation_job(attempt: usize) -> FailFastAttempt {
 
 #[cfg(unix)]
 #[test]
+fn cargo_test_terminal_count_evidence_survives_runner_stream_retention() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(
+        &cargo,
+        "#!/bin/sh\ni=0\nwhile [ $i -lt 7000 ]; do printf 'noise-%04d\\n' \"$i\"; i=$((i + 1)); done\nprintf 'running 120 tests\\n'\nprintf 'test result: ok. 100 passed; 0 failed; 0 ignored\\n'\nprintf 'test result: ok. 20 passed; 0 failed; 0 ignored\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let step = ShellJobValidationStep {
+        name: "test".into(),
+        program: "cargo".into(),
+        args: vec!["test".into()],
+        env: Vec::new(),
+    };
+    let mut context = test_job_context(temp.path(), vec!["test".to_string()]);
+    context.purpose = Some("test".to_string());
+    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
+        project_validation: None,
+        source_fence: None,
+        tool: "cargo_test".to_string(),
+        kind: "test".to_string(),
+        steps: vec![step.clone()],
+        effective_timeout_secs: 60,
+        sync_wait_secs: 10,
+        adapter: "cargo_test".to_string(),
+        validation_target_id: None,
+        minimum_tests: Some(100),
+        require_tests: Some(true),
+        no_run: None,
+    });
+
+    let (sink, mut rx) = structured_test_sink("validation-agent", "validation-instance");
+    let mut shell = ShellConfig::default();
+    shell.path_prepend.push(bin);
+    let manager = JobManager::new(1);
+    manager.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            RunnerPolicy {
+                allow_cwd_anywhere: true,
+                ..RunnerPolicy::default()
+            },
+            shell,
+            SshConfig::default(),
+            temp.path().join("project-registry"),
+            serde_json::from_value(json!({
+                "request_id": "cargo-count-retention-request",
+                "client_id": "validation-agent",
+                "kind": "start_validation_job",
+                "job_id": "cargo-count-retention-job",
+                "cwd": temp.path(),
+                "command": serde_json::to_string(&[step]).unwrap(),
+                "timeout_secs": 60,
+                "requested_by": "test",
+                "created_at": 1,
+                "job_context": context,
+            }))
+            .unwrap(),
+        ),
+    );
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(30));
+    let terminal = updates
+        .iter()
+        .rev()
+        .find(|update| update.finished)
+        .expect("cargo test terminal update");
+    assert_eq!(terminal.status, "completed", "{terminal:?}");
+    assert_eq!(terminal.exit_code, Some(0));
+    let logs = terminal
+        .log_snapshot
+        .as_ref()
+        .expect("terminal bounded logs");
+    assert!(logs.stdout.truncated);
+    assert!(logs.stdout.tail.len() <= JOB_SNAPSHOT_STREAM_MAX_BYTES);
+    let evidence = terminal
+        .test_count_evidence
+        .as_ref()
+        .expect("authoritative terminal test-count evidence");
+    assert!(evidence.tests_detected);
+    assert_eq!(evidence.tests_run_count, Some(120));
+    assert_eq!(
+        evidence.status,
+        webcodex_core::validation_evidence::CargoTestCountEvidenceStatus::CompleteSummary
+    );
+
+    let snapshot = manager
+        .inventory()
+        .jobs
+        .into_iter()
+        .find(|snapshot| snapshot.job_id == "cargo-count-retention-job")
+        .expect("terminal snapshot in Runner inventory");
+    assert!(snapshot.stdout.truncated);
+    assert_eq!(snapshot.test_count_evidence, terminal.test_count_evidence);
+}
+
+#[cfg(unix)]
+#[test]
 fn validation_job_exposes_activity_during_silent_step_and_clears_terminal() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -3345,6 +4213,7 @@ fn arbitrary_process_output_cannot_forge_cargo_activity() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -3416,6 +4285,7 @@ fn cargo_activity_returns_to_validation_plan_after_fine_phase_ends() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -3520,6 +4390,7 @@ fn activity_only_delivery_coalesces_without_consuming_required_semantic_queue() 
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -4028,7 +4899,7 @@ fn python_module_probe_reports_tool_unavailable_without_running_recipe() {
 /// Platform-native liveness probe for job descendants, so the tree tests never
 /// shell out to `tasklist`/`ps`/PowerShell.
 #[cfg(windows)]
-pub(super) fn process_running(pid: u32) -> bool {
+pub(in crate::webcodex_runner) fn process_running(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -4048,7 +4919,7 @@ pub(super) fn process_running(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn process_running(pid: u32) -> bool {
+pub(in crate::webcodex_runner) fn process_running(pid: u32) -> bool {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
     let bytes = unsafe {
@@ -4068,14 +4939,14 @@ pub(super) fn process_running(pid: u32) -> bool {
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(super) fn process_running(pid: u32) -> bool {
+pub(in crate::webcodex_runner) fn process_running(pid: u32) -> bool {
     // SAFETY: signal 0 is an existence probe; the pid comes from our own
     // helper subprocess.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn process_running(pid: u32) -> bool {
+pub(in crate::webcodex_runner) fn process_running(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
@@ -4100,6 +4971,7 @@ fn wait_until(timeout: Duration, condition: impl Fn() -> bool) -> bool {
     condition()
 }
 
+#[cfg(unix)]
 fn wait_for_pid_marker(path: &Path, deadline: Instant, tag: &str) -> u32 {
     loop {
         let observed = std::fs::read_to_string(path)
@@ -4130,6 +5002,7 @@ fn wait_for_pid_marker(path: &Path, deadline: Instant, tag: &str) -> u32 {
 }
 
 /// Poll `process_running(pid)` until the process is gone or `timeout` elapses.
+#[cfg(feature = "runner-real-process-tests")]
 fn wait_for_process_exit(pid: u32, timeout: Duration, tag: &str) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -4157,19 +5030,22 @@ fn wait_for_process_exit(pid: u32, timeout: Duration, tag: &str) -> bool {
 
 /// Compiled copy of the `process_tree_helper` fixture, kept alive for the whole
 /// test process so its binary path never disappears under a running grandchild.
+#[cfg(feature = "runner-real-process-tests")]
 struct JobTreeHelper {
     _temp: TempDir,
     path: PathBuf,
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 static JOB_TREE_HELPER: OnceLock<Arc<JobTreeHelper>> = OnceLock::new();
 
+#[cfg(feature = "runner-real-process-tests")]
 fn job_tree_helper() -> Arc<JobTreeHelper> {
     JOB_TREE_HELPER
         .get_or_init(|| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../webcodex-process/src/bin/process_tree_helper.rs");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::tests::executable_tempdir();
             let output = temp.path().join(format!(
                 "process-tree-helper{}",
                 std::env::consts::EXE_SUFFIX
@@ -4199,6 +5075,7 @@ fn job_tree_helper() -> Arc<JobTreeHelper> {
 /// A background line reader over a job's captured stdout. Each complete line is
 /// delivered as `Line`, and a final `Eof` marks the pipe closing (which a
 /// descendant holding the write end would otherwise delay indefinitely).
+#[cfg(feature = "runner-real-process-tests")]
 enum JobTreeOut {
     Line(Vec<u8>),
     Eof,
@@ -4207,6 +5084,7 @@ enum JobTreeOut {
 /// Spawn the helper in `mode`, capturing its stdout and piping it through a
 /// background line reader. The helper's descendants inherit the stdout write
 /// end, so `Eof` only arrives once the whole tree is gone.
+#[cfg(feature = "runner-real-process-tests")]
 fn spawn_helper_raw(mode: &str, args: &[&str]) -> (ManagedChild, mpsc::Receiver<JobTreeOut>) {
     let helper = job_tree_helper();
     let mut cmd = Command::new(&helper.path);
@@ -4249,6 +5127,7 @@ fn spawn_helper_raw(mode: &str, args: &[&str]) -> (ManagedChild, mpsc::Receiver<
     (managed, rx)
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn read_grandchild_pid(rx: &mpsc::Receiver<JobTreeOut>) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -4272,6 +5151,7 @@ fn read_grandchild_pid(rx: &mpsc::Receiver<JobTreeOut>) -> u32 {
     }
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn wait_for_stdout_eof(rx: &mpsc::Receiver<JobTreeOut>, timeout: Duration, tag: &str) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -4289,6 +5169,7 @@ fn wait_for_stdout_eof(rx: &mpsc::Receiver<JobTreeOut>, timeout: Duration, tag: 
     }
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn extract_grandchild_pid(text: &str) -> Option<u32> {
     text.lines().find_map(|line| {
         line.trim()
@@ -4299,6 +5180,7 @@ fn extract_grandchild_pid(text: &str) -> Option<u32> {
     })
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn insert_running_job(
     manager: &JobManager,
     job_id: &str,
@@ -4311,6 +5193,7 @@ fn insert_running_job(
             client_id: "tree-agent".to_string(),
             runner_instance_id: "tree-instance".to_string(),
             snapshot: test_job_snapshot(job_id),
+            input: None,
             child,
             stop_requested: Arc::clone(&stop_requested),
             slot_reserved: true,
@@ -4319,12 +5202,14 @@ fn insert_running_job(
     stop_requested
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 struct RunningJobTreeFixture {
     parent_pid: u32,
     grandchild_pid: u32,
     output: mpsc::Receiver<JobTreeOut>,
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 impl RunningJobTreeFixture {
     fn assert_terminated(&self, timeout: Duration, tag: &str) {
         assert!(
@@ -4342,6 +5227,7 @@ impl RunningJobTreeFixture {
     }
 }
 
+#[cfg(feature = "runner-real-process-tests")]
 fn seed_running_job_tree(
     manager: &JobManager,
     job_id: &str,
@@ -4368,6 +5254,7 @@ fn seed_running_job_tree(
 /// An explicit stop terminates the whole job process tree, including a
 /// descendant that inherited the stdout pipe, and the stdout reader reaches
 /// EOF instead of blocking forever.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_terminates_whole_tree_including_descendant() {
@@ -4396,6 +5283,7 @@ fn runner_real_process_job_stop_terminates_whole_tree_including_descendant() {
 /// The job worker's cleanup sequence (bounded tree wait, force terminate, then
 /// reader join) must kill an orphaned descendant that keeps the stdout pipe
 /// open, and the output reader must reach EOF instead of being detached.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_cleanup_after_parent_exit_terminates_descendant_and_reaches_eof() {
@@ -4461,7 +5349,14 @@ fn runner_real_process_job_cleanup_after_parent_exit_terminates_descendant_and_r
     // This is exactly what the job worker runs after the direct child's status
     // is decided.
     cleanup_managed_tree(&child);
-    let detached = join_reader_threads_until(readers, Instant::now() + Duration::from_secs(1));
+    let mut stderr = String::new();
+    let detached = drain_and_join_reader_threads_until(
+        readers,
+        &rx,
+        &mut accumulated,
+        &mut stderr,
+        Instant::now() + Duration::from_secs(1),
+    );
     assert_eq!(
         detached, 0,
         "stdout reader must finish on EOF instead of being detached"
@@ -4478,6 +5373,7 @@ fn runner_real_process_job_cleanup_after_parent_exit_terminates_descendant_and_r
 
 /// A shutdown drain terminates every running job's whole tree, leaves a
 /// completed job untouched, and is bounded.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_all_terminates_all_trees_and_preserves_completed_jobs() {
@@ -4492,6 +5388,7 @@ fn runner_real_process_job_stop_all_terminates_all_trees_and_preserves_completed
                 client_id: "tree-agent".to_string(),
                 runner_instance_id: "tree-instance".to_string(),
                 snapshot,
+                input: None,
                 child: None,
                 stop_requested: Arc::clone(&completed_stop),
                 slot_reserved: false,
@@ -4522,6 +5419,7 @@ fn runner_real_process_job_stop_all_terminates_all_trees_and_preserves_completed
 
 /// Repeated stops are idempotent: the second stop must not panic and must not
 /// leave the tree running.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_twice_is_idempotent() {
@@ -4540,6 +5438,7 @@ fn runner_real_process_job_stop_twice_is_idempotent() {
 
 /// Stopping a job whose tree already exited naturally must not panic and must
 /// report success.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_after_natural_exit_does_not_panic() {
@@ -4565,6 +5464,7 @@ fn runner_real_process_job_stop_after_natural_exit_does_not_panic() {
 
 /// Dropping the last real JobManager owner must terminate an active tree even
 /// while a worker clone still holds the jobs map and ManagedChild Arc.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_last_job_manager_owner_drop_terminates_running_tree_with_worker_clone_alive()
@@ -4588,6 +5488,7 @@ fn runner_real_process_last_job_manager_owner_drop_terminates_running_tree_with_
 }
 
 /// Cleanup on an already-exited tree must be a no-op that never panics.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_cleanup_managed_tree_on_exited_tree_does_not_panic() {
@@ -4608,6 +5509,7 @@ fn runner_real_process_cleanup_managed_tree_on_exited_tree_does_not_panic() {
 
 /// A user stop racing Runner shutdown must not deadlock or panic, and both
 /// paths must converge on a fully-terminated tree.
+#[cfg(feature = "runner-real-process-tests")]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_stop_racing_shutdown_does_not_panic() {
@@ -4632,7 +5534,7 @@ fn runner_real_process_job_stop_racing_shutdown_does_not_panic() {
 /// A job timeout must terminate the whole tree (parent shell, helper, and the
 /// helper's descendant) and publish exactly one `timeout` completion. Requires
 /// a real `sh` for the full worker path, so it runs on Linux.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "runner real-process lane: spawns the JobManager process-tree fixture"]
 fn runner_real_process_job_timeout_terminates_the_whole_tree() {
@@ -4715,4 +5617,725 @@ fn runner_real_process_job_timeout_terminates_the_whole_tree() {
         !marker.exists(),
         "delayed grandchild marker must never appear after timeout"
     );
+}
+
+pub(crate) fn shell_job_request(cwd: &Path, command: &str) -> RunnerRequest {
+    RunnerRequest {
+        login: false,
+        shell: None,
+        request_id: "req-job".to_string(),
+        client_id: "ws-client".to_string(),
+        kind: "start_job".to_string(),
+        job_id: Some("job-profile".to_string()),
+        cwd: Some(cwd.to_string_lossy().to_string()),
+        path: None,
+        content: None,
+        max_bytes: None,
+        expected_sha256: None,
+        expected_prefix: None,
+        start_line: None,
+        end_line: None,
+        create_dirs: false,
+        command: command.to_string(),
+        process: None,
+        script: None,
+        stdin: None,
+        timeout_secs: 10,
+        requested_by: "tester".to_string(),
+        created_at: 0,
+        validation: None,
+        lsp: None,
+        job_context: Some(test_job_context(cwd, Vec::new())),
+        mcp_gateway: None,
+        plugin_gateway: None,
+        coding_agent: None,
+        persistent_shell: None,
+    }
+}
+
+#[test]
+fn runner_recovery_context_rejects_cross_product_go_test_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_validation_job".to_string();
+    let cargo_step = ShellJobValidationStep {
+        name: "test".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["test".to_string(), "tool_runtime".to_string()],
+        env: Vec::new(),
+    };
+    request.command = serde_json::to_string(&vec![cargo_step.clone()]).unwrap();
+    let context = request.job_context.as_mut().unwrap();
+    context.purpose = Some("validation".to_string());
+    context.validation_steps = vec!["test".to_string()];
+    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
+        project_validation: None,
+        source_fence: None,
+        tool: "go_test".to_string(),
+        kind: "test".to_string(),
+        steps: vec![cargo_step],
+        effective_timeout_secs: 1800,
+        sync_wait_secs: 10,
+        adapter: "go_test".to_string(),
+        validation_target_id: None,
+        minimum_tests: None,
+        require_tests: None,
+        no_run: None,
+    });
+    let context = context.clone();
+
+    let error = validate_runner_job_context(&context, &request, "ws-client").unwrap_err();
+    assert!(error.contains("validation metadata is invalid"), "{error}");
+}
+
+#[test]
+fn runner_recovery_context_accepts_server_validation_identity_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_process_job".to_string();
+    request.process = Some(runner_protocol::ShellProcessArgv {
+        executable: "cargo".to_string(),
+        args: vec!["test".to_string(), "focused".to_string()],
+    });
+    let context = request.job_context.as_mut().unwrap();
+    context.purpose = Some("test".to_string());
+    context.shell = Some("direct_argv".to_string());
+    context.command_preview = "cargo test focused".to_string();
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_process".to_string(),
+        language: None,
+        script_bytes: None,
+        arg_count: 2,
+        stdin_present: false,
+        validation_identity: Some("assertion:0123456789abcdef01234567".to_string()),
+        validation_tool: Some("cargo_test".to_string()),
+        assertion_name: Some("runner restart assertion".to_string()),
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+
+    let mut invalid = context.clone();
+    invalid
+        .structured_execution
+        .as_mut()
+        .unwrap()
+        .validation_identity = Some("target:not-valid".to_string());
+    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+    assert!(
+        error.contains("structured execution metadata is invalid"),
+        "{error}"
+    );
+
+    let mut detached_assertion = context.clone();
+    let structured = detached_assertion.structured_execution.as_mut().unwrap();
+    structured.execution_source = "run_detached_process".to_string();
+    structured.validation_tool = None;
+    structured.assertion_name = None;
+    assert!(
+        !structured.is_valid(),
+        "assertion identities must remain closed to model-facing process/script Jobs"
+    );
+}
+
+#[test]
+fn runner_recovery_context_accepts_compact_session_base64url_alphabet() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "printf ok");
+    let context = request.job_context.as_mut().unwrap();
+    context.runtime_project_id = Some("agent:ws-client:demo".to_string());
+    context.workflow_session_id = Some("wc_sess_AAAAAAAA-AAAAAA_".to_string());
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+}
+
+#[test]
+fn runner_recovery_context_accepts_bash_login_shell() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "printf ok");
+    request.login = true;
+    request.shell = Some(webcodex_core::workflow_session_contract::ExecutionShell::Bash);
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("bash_login".to_string());
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+}
+
+#[test]
+fn runner_recovery_context_accepts_javascript_script_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Javascript,
+        script: "console.log('recovered');\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("javascript".to_string());
+    context.command_preview = format!(
+        "javascript script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Javascript),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+
+    let mut invalid = context;
+    invalid.shell = Some("node".to_string());
+    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+    assert!(error.contains("shell is invalid"), "{error}");
+}
+
+#[test]
+fn runner_recovery_context_accepts_python_script_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Python,
+        script: "print('recovered')\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("python".to_string());
+    context.command_preview = format!(
+        "python script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Python),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+    assert_eq!(context.shell.as_deref(), Some("python"));
+    assert_eq!(
+        context.structured_execution.as_ref().unwrap().language,
+        Some(runner_protocol::ShellScriptLanguage::Python)
+    );
+    assert_eq!(
+        context
+            .structured_execution
+            .as_ref()
+            .unwrap()
+            .execution_source,
+        "run_script"
+    );
+
+    for concrete_runtime in ["python3", "python.exe"] {
+        let mut invalid = context.clone();
+        invalid.shell = Some(concrete_runtime.to_string());
+        let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+        assert!(error.contains("shell is invalid"), "{error}");
+    }
+}
+
+#[test]
+fn runner_recovery_context_accepts_typescript_semantic_identity_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Typescript,
+        script: "const recovered: string = 'ok';\nvoid recovered;\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("typescript".to_string());
+    context.command_preview = format!(
+        "typescript script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Typescript),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+    for concrete_runtime in ["node", "tsx"] {
+        let mut invalid = context.clone();
+        invalid.shell = Some(concrete_runtime.to_string());
+        let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+        assert!(error.contains("shell is invalid"), "{error}");
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn wait_for_job_envelope(
+    rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
+    message: &str,
+) -> RunnerEnvelope {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match rx.try_recv() {
+            Ok(envelope) => return envelope,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => panic!("{message}"),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("{message}: channel disconnected")
+            }
+        }
+    }
+}
+
+pub(crate) fn ws_sink(
+    client_id: &str,
+) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
+    (
+        RunnerSink::WebSocket {
+            tx,
+            client_id: client_id.to_string(),
+            runner_instance_id: "ws-inst".to_string(),
+        },
+        rx,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_registry_dir = tmp.path().join("config/project-registry");
+    let policy = RunnerPolicy {
+        allow_cwd_anywhere: true,
+        ..RunnerPolicy::default()
+    };
+    let shell = ShellConfig::default();
+    let ssh = SshConfig::default();
+    let jobs = JobManager::new(1);
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let mut running_command =
+        configured_shell_job_command(&ShellConfig::default(), "sleep 60").unwrap();
+    running_command
+        .current_dir(tmp.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let running_child = Arc::new(Mutex::new(
+        ManagedChild::spawn(&mut running_command).unwrap(),
+    ));
+    let running_pid = lock_unpoison(&running_child).id();
+    jobs.jobs.lock().unwrap().insert(
+        "running-job".to_string(),
+        RunningJob {
+            client_id: "ws-client".to_string(),
+            runner_instance_id: "ws-instance".to_string(),
+            snapshot: test_job_snapshot("running-job"),
+            input: None,
+            child: Some(Arc::clone(&running_child)),
+            stop_requested: stop_requested.clone(),
+            slot_reserved: true,
+        },
+    );
+    let (sink, mut rx) = ws_sink("ws-client");
+    let request = RunnerRequest {
+        login: false,
+        shell: None,
+        request_id: "req-queued".to_string(),
+        client_id: "ws-client".to_string(),
+        kind: "start_job".to_string(),
+        job_id: Some("queued-job".to_string()),
+        cwd: Some(tmp.path().to_string_lossy().to_string()),
+        path: None,
+        content: None,
+        max_bytes: None,
+        expected_sha256: None,
+        expected_prefix: None,
+        start_line: None,
+        end_line: None,
+        create_dirs: false,
+        command: ": > queued-started".to_string(),
+        process: None,
+        script: None,
+        stdin: None,
+        timeout_secs: 60,
+        requested_by: "tester".to_string(),
+        created_at: 0,
+        validation: None,
+        lsp: None,
+        job_context: Some(test_job_context(tmp.path(), Vec::new())),
+        mcp_gateway: None,
+        plugin_gateway: None,
+        coding_agent: None,
+        persistent_shell: None,
+    };
+    let mut rejected_request = request.clone();
+    rejected_request.request_id = "req-after-shutdown".to_string();
+    rejected_request.job_id = Some("job-after-shutdown".to_string());
+
+    jobs.enqueue(
+        sink,
+        PendingJobStart::from_wire(
+            1,
+            policy.clone(),
+            shell.clone(),
+            ssh.clone(),
+            project_registry_dir.clone(),
+            request,
+        ),
+    );
+    match wait_for_job_envelope(&mut rx, "queued status was sent") {
+        RunnerEnvelope::JobUpdate { payload } => {
+            assert_eq!(payload.job_id, "queued-job");
+            assert_eq!(payload.status, "agent_queued");
+        }
+        other => panic!("expected job_update, got {:?}", other.kind()),
+    }
+    assert_eq!(jobs.queued.lock().unwrap().len(), 1);
+
+    jobs.stop_all();
+
+    assert!(stop_requested.load(Ordering::SeqCst));
+    assert!(jobs.queued.lock().unwrap().is_empty());
+    assert!(lock_unpoison(&running_child).try_wait().unwrap().is_some());
+    assert!(!process_running(running_pid));
+    assert!(
+        !tmp.path().join("queued-started").exists(),
+        "queued job started during shutdown"
+    );
+
+    let (rejected_sink, mut rejected_rx) = ws_sink("ws-client");
+    jobs.enqueue(
+        rejected_sink,
+        PendingJobStart::from_wire(
+            1,
+            policy.clone(),
+            shell.clone(),
+            ssh.clone(),
+            project_registry_dir.clone(),
+            rejected_request,
+        ),
+    );
+    assert!(jobs.queued.lock().unwrap().is_empty());
+    let rejected = (0..2)
+        .find_map(
+            |_| match wait_for_job_envelope(&mut rejected_rx, "shutdown update was sent") {
+                RunnerEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
+                RunnerEnvelope::JobUpdate { .. } => None,
+                other => panic!("expected job_update, got {:?}", other.kind()),
+            },
+        )
+        .expect("shutdown rejection terminal update was sent");
+    assert_eq!(rejected.job_id, "job-after-shutdown");
+    assert_eq!(rejected.status, "failed");
+    assert!(rejected.finished);
+    assert_eq!(rejected.error.as_deref(), Some("runner is shutting down"));
+}
+
+fn decoded_job_operation(request: RunnerRequest) -> RunnerJobOperation {
+    match request.decode_operation().expect("valid typed Job fixture") {
+        RunnerOperation::Job(operation) => operation,
+        _ => panic!("expected Job operation"),
+    }
+}
+
+#[test]
+fn raw_shell_job_lifecycle_distinguishes_terminal_truth_without_error_text_matching() {
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("completed", Some(0)),
+        ShellCommandExecutionState::Completed
+    );
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("failed", Some(7)),
+        ShellCommandExecutionState::Completed
+    );
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("stopped", Some(-1)),
+        ShellCommandExecutionState::Completed
+    );
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("timeout", Some(-1)),
+        ShellCommandExecutionState::TimedOut
+    );
+    assert_eq!(
+        raw_shell_job_terminal_lifecycle("failed", None),
+        ShellCommandExecutionState::OutcomeUnknown
+    );
+}
+
+#[test]
+fn raw_shell_job_prestart_rejection_is_explicitly_not_started() {
+    let temp = tempfile::tempdir().unwrap();
+    let operation = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
+    assert_eq!(
+        job_prestart_lifecycle(&operation),
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+}
+
+#[test]
+fn raw_shell_job_post_spawn_interruption_never_reuses_not_started_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    let shell = decoded_job_operation(shell_job_request(temp.path(), "printf ok"));
+    assert_eq!(
+        post_spawn_interruption_lifecycle(&shell),
+        Some(ShellCommandExecutionState::OutcomeUnknown)
+    );
+
+    let step = ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "cargo".to_string(),
+        args: vec!["check".to_string(), "--all-targets".to_string()],
+        env: Vec::new(),
+    };
+    let mut validation = shell_job_request(temp.path(), "");
+    validation.kind = "start_validation_job".to_string();
+    validation.command = serde_json::to_string(&[step]).unwrap();
+    validation.job_context.as_mut().unwrap().validation_steps = vec!["check".to_string()];
+    let validation = decoded_job_operation(validation);
+    assert_eq!(post_spawn_interruption_lifecycle(&validation), None);
+}
+
+// Native SSH fixtures stay with SSH; private Job delta assertions stay here.
+#[cfg(windows)]
+pub(in crate::webcodex_runner) fn post_spawn_interruption_reason_for_test(
+    shutting_down: bool,
+    stop_requested: bool,
+    job_record_present: bool,
+) -> Option<&'static str> {
+    post_spawn_interruption_reason(shutting_down, stop_requested, job_record_present)
+}
+
+#[cfg(windows)]
+pub(in crate::webcodex_runner) fn assert_post_spawn_interruption_delta(
+    operation: &RunnerJobOperation,
+    duration_ms: u64,
+    error: &str,
+) {
+    let delta = post_spawn_interruption_delta(operation, duration_ms, error);
+    assert_eq!(delta.status, "failed");
+    assert_eq!(delta.exit_code, None);
+    assert_eq!(delta.duration_ms, Some(duration_ms));
+    assert_eq!(
+        delta.command_execution_state,
+        Some(ShellCommandExecutionState::OutcomeUnknown)
+    );
+    assert!(delta.finished);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "real-process stdin isolation: runs an isolated JobManager with parent-only input"]
+fn runner_real_process_shell_job_stdin_isolated() {
+    assert_local_job_stdin_isolated("runner_real_process_shell_job_stdin_isolated", false);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "real-process stdin isolation: covers every step of a validation Job"]
+fn runner_real_process_validation_job_stdin_isolated() {
+    assert_local_job_stdin_isolated("runner_real_process_validation_job_stdin_isolated", true);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+fn assert_local_job_stdin_isolated(test_name: &str, validation: bool) {
+    const FIXTURE_ENV: &str = "WEBCODEX_TEST_JOB_STDIN_FIXTURE";
+    const PARENT_INPUT: &str = "parent-liveness-input-must-not-reach-jobs\n";
+    if std::env::var(FIXTURE_ENV).as_deref() == Ok(test_name) {
+        let root = if validation {
+            crate::tests::executable_tempdir()
+        } else {
+            tempfile::tempdir().unwrap()
+        };
+        let mut shell = ShellConfig::default();
+        #[cfg(windows)]
+        let probe =
+            "if ([Console]::In.ReadToEnd().Length -ne 0) { exit 9 }; Write-Output 'JOB_STDIN_EOF'";
+        #[cfg(unix)]
+        let probe = "if IFS= read -r line; then exit 9; fi; printf 'JOB_STDIN_EOF\\n'";
+        let mut request = shell_job_request(root.path(), probe);
+        request.timeout_secs = 5;
+        if validation {
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            std::fs::copy(
+                &structured_process_helper().path,
+                bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)),
+            )
+            .unwrap();
+            shell.path_prepend.push(bin);
+            let steps = vec![
+                ShellJobValidationStep {
+                    name: "format".into(),
+                    program: "cargo".into(),
+                    args: vec!["fmt".into(), "--".into(), "--check".into()],
+                    env: Vec::new(),
+                },
+                ShellJobValidationStep {
+                    name: "check".into(),
+                    program: "cargo".into(),
+                    args: vec!["check".into(), "--all-targets".into()],
+                    env: Vec::new(),
+                },
+            ];
+            request.kind = "start_validation_job".to_string();
+            request.command = serde_json::to_string(&steps).unwrap();
+            request.job_context = Some(test_job_context(
+                root.path(),
+                vec!["format".into(), "check".into()],
+            ));
+        }
+        let (sink, mut rx) = ws_sink("ws-client");
+        let manager = JobManager::new(1);
+        manager.enqueue(
+            sink,
+            PendingJobStart::from_wire(
+                1,
+                RunnerPolicy {
+                    allow_raw_shell: true,
+                    allow_cwd_anywhere: true,
+                    ..RunnerPolicy::default()
+                },
+                shell,
+                SshConfig::default(),
+                root.path().join("project-registry"),
+                request,
+            ),
+        );
+        let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+        let terminal = updates.last().expect("Job must emit an update");
+        assert!(
+            terminal.finished,
+            "Job did not reach terminal: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.status, "completed",
+            "Job inherited parent stdin: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.exit_code,
+            Some(0),
+            "Job must receive EOF: {terminal:?}"
+        );
+        if validation {
+            assert_eq!(terminal.validation_progress.as_ref().unwrap().completed, 2);
+        }
+        let stdout = terminal.log_snapshot.as_ref().unwrap().stdout.tail.as_str();
+        assert_eq!(
+            stdout.matches("JOB_STDIN_EOF").count(),
+            if validation { 2 } else { 1 }
+        );
+        let mut remaining = String::new();
+        std::io::stdin().read_to_string(&mut remaining).unwrap();
+        assert_eq!(
+            remaining, PARENT_INPUT,
+            "Jobs must not consume Runner input"
+        );
+        return;
+    }
+
+    // Isolate the inherited input in a subprocess; never replace process-global
+    // stdin in the test runner or depend on an interactive terminal / installed Git.
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("parent-input");
+    std::fs::write(&input, PARENT_INPUT).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            &format!(
+                "{}::{test_name}",
+                module_path!().split_once("::").unwrap().1
+            ),
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(FIXTURE_ENV, test_name)
+        .stdin(std::fs::File::open(input).unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ManagedChild::spawn(&mut command).unwrap();
+    let mut stdout = child.child_mut().stdout.take().unwrap();
+    let mut stderr = child.child_mut().stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.terminate_tree().unwrap();
+            break child.wait().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Reclaim descendants even after a failed fixture before joining pipe readers.
+    child.terminate_tree().unwrap();
+    let stdout = out.join().unwrap();
+    let stderr = err.join().unwrap();
+    assert!(
+        status.success(),
+        "isolated {test_name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(String::from_utf8_lossy(&stdout).contains("1 passed"));
+}
+
+#[test]
+fn project_all_packages_cargo_activity_retains_native_progress() {
+    let mut step = ShellJobValidationStep {
+        name: "check".into(),
+        program: "cargo".into(),
+        args: vec!["check".into(), "--all-targets".into(), "--workspace".into()],
+        env: Vec::new(),
+    };
+    assert_eq!(
+        cargo_activity_from_stderr(&step, "Checking member v0.1.0\n"),
+        Some(ShellJobActivity {
+            state: ShellJobActivityState::Working,
+            phase: ShellJobActivityPhase::CargoChecking,
+            source: ShellJobActivitySource::CargoOutput,
+        })
+    );
+    step.args.extend(["-p".into(), "member".into()]);
+    assert!(cargo_activity_from_stderr(&step, "Checking member v0.1.0\n").is_none());
 }

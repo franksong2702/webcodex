@@ -216,7 +216,7 @@ fn prepared_profile_run_shell_and_run_job_see_same_env() {
         &unrestricted_test_policy(),
         &shell,
         &project_registry_dir,
-        &jobs.prepared_profiles,
+        jobs.prepared_profiles(),
         &project_dir,
         &shell_env_var("WEBCODEX_TEST_PROFILE"),
     );
@@ -478,31 +478,34 @@ fn prepared_profile_errors_do_not_leak_init_script_body() {
 
 #[test]
 fn prepared_profile_filters_webcodex_token_env() {
-    let _guard = test_env_lock();
-    let tmp = tempfile::tempdir().unwrap();
-    let shell = shell_with_profiles(Some("test"), vec![("test", ShellProfileConfig::default())]);
-    // Windows environment names are case-insensitive, so mixed-case spellings
-    // must be filtered too; Unix is case-sensitive and only the exact name
-    // can be inherited or configured.
-    #[cfg(windows)]
-    let spellings = ["WEBCODEX_TOKEN", "WebCodex_Token", "authorization"];
-    #[cfg(not(windows))]
-    let spellings = ["WEBCODEX_TOKEN"];
-    for spelling in spellings {
-        let _env = EnvGuard::new().set(spelling, "secret-token");
-        let result = run_profile_shell(
-            &unrestricted_test_policy(),
-            &shell,
-            tmp.path(),
-            &PreparedShellProfileCache::default(),
-            tmp.path(),
-            &shell_if_else_env_present(spelling),
-        );
-        assert_eq!(result.exit_code, Some(0), "{result:?}");
-        assert_eq!(result.stdout.as_deref(), Some("absent"), "{result:?}");
-    }
+    IsolatedEnv::new()
+        .set("WEBCODEX_TOKEN", "secret-token")
+        .set("authorization", "secret-token")
+        .run("inherited", || {
+            let tmp = tempfile::tempdir().unwrap();
+            let shell =
+                shell_with_profiles(Some("test"), vec![("test", ShellProfileConfig::default())]);
+            // Windows environment names are case-insensitive, so mixed-case spellings
+            // must be filtered too; Unix is case-sensitive and only the exact name
+            // can be inherited or configured.
+            #[cfg(windows)]
+            let spellings = ["WEBCODEX_TOKEN", "WebCodex_Token", "authorization"];
+            #[cfg(not(windows))]
+            let spellings = ["WEBCODEX_TOKEN"];
+            for spelling in spellings {
+                let result = run_profile_shell(
+                    &unrestricted_test_policy(),
+                    &shell,
+                    tmp.path(),
+                    &PreparedShellProfileCache::default(),
+                    tmp.path(),
+                    &shell_if_else_env_present(spelling),
+                );
+                assert_eq!(result.exit_code, Some(0), "{result:?}");
+                assert_eq!(result.stdout.as_deref(), Some("absent"), "{result:?}");
+            }
+        });
 }
-
 #[test]
 fn prepared_profile_missing_marker_is_reported_without_script_body() {
     let tmp = tempfile::tempdir().unwrap();
@@ -542,7 +545,7 @@ fn prepared_profile_missing_marker_is_reported_without_script_body() {
 fn prepared_profile_env_payload_parse_failure_is_reported() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::tests::executable_tempdir();
     let bin = tmp.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let fake_env = bin.join("env");

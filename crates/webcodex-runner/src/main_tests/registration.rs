@@ -46,6 +46,26 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
         RUNNER_PROTOCOL_GENERATION_V2
     );
 
+    let browser_available = webcodex_browser::discover_chromium_executable().is_some();
+    assert_eq!(body.capabilities.browser_batch, browser_available);
+    assert_eq!(body.capabilities.browser_semantic_query, browser_available);
+    assert_eq!(
+        body.capabilities.browser_complex_controls,
+        browser_available
+    );
+    assert!(!RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+        .contains(&"browser_complex_controls"));
+    assert!(!RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.contains(&"browser_batch"));
+    assert_eq!(
+        body.capabilities.browser_element_action_admission,
+        browser_available,
+        "current Runner must advertise exact Browser element-action admission iff its Browser backend is available"
+    );
+    assert!(
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+            .contains(&"browser_element_action_admission"),
+        "Browser element-action admission is additive and must remain rolling-upgrade fenced"
+    );
     let capabilities = serde_json::to_value(&body.capabilities).unwrap();
     assert_eq!(
         RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.len(),
@@ -55,6 +75,29 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
         !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
             .contains(&"apply_text_edit_line_scope"),
         "line scope is additive and must not become a generation-2 registration baseline"
+    );
+    assert!(
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.contains(&"apply_text_edit_range"),
+        "range edits are additive and must not become a generation-2 registration baseline"
+    );
+    assert_eq!(
+        capabilities
+            .get("apply_text_edit_range")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "current Runner must explicitly advertise deterministic range edits"
+    );
+    assert!(
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+            .contains(&"apply_text_edit_local_guard_without_sha"),
+        "SHA-less local exact edit proof is additive and must not become a generation-2 registration baseline"
+    );
+    assert_eq!(
+        capabilities
+            .get("apply_text_edit_local_guard_without_sha")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "current Runner must explicitly advertise SHA-less local exact edit proof"
     );
     assert!(
         !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.contains(&"apply_patch"),
@@ -70,11 +113,6 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
             .contains(&"apply_patch_matching_mode"),
         "matching_mode is additive and must not become a generation-2 registration baseline"
     );
-    assert!(
-        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
-            .contains(&"apply_patch_strict_matching"),
-        "strict patch matching is additive and must not become a generation-2 registration baseline"
-    );
     assert_eq!(
         capabilities
             .get("apply_patch_match_metadata")
@@ -88,13 +126,6 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
             .and_then(serde_json::Value::as_bool),
         Some(true),
         "current Runner must explicitly advertise enum-based apply_patch matching"
-    );
-    assert_eq!(
-        capabilities
-            .get("apply_patch_strict_matching")
-            .and_then(serde_json::Value::as_bool),
-        Some(true),
-        "current Runner must explicitly advertise strict patch matching"
     );
     for capability in RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
         assert_eq!(
@@ -146,6 +177,7 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
     assert!(caps.structured_file_delete);
     assert!(caps.apply_text_edit_occurrence);
     assert!(caps.apply_text_edit_line_scope);
+    assert!(caps.apply_text_edit_local_guard_without_sha);
     assert!(caps.apply_patch);
     assert!(caps.async_jobs);
     assert!(caps.async_shell_jobs);
@@ -167,17 +199,27 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
     assert!(caps.structured_validation_argv);
     assert!(caps.structured_cargo_test_count_assertion);
     assert!(caps.structured_cargo_test_execution_policy);
+    assert!(caps.structured_cargo_test_lib);
+    assert!(caps.structured_cargo_check_packages);
+    assert!(caps.supports(RunnerCapabilityId::ProjectValidation));
     assert!(caps.structured_go_test_json);
     assert!(caps.structured_go_test_tool);
     assert!(caps.structured_go_test_packages);
     assert!(caps.structured_process_argv);
     assert!(caps.structured_script_payload);
+    assert!(caps.structured_script_javascript);
+    assert!(caps.structured_script_typescript);
     assert!(caps.internal_posix_script);
     assert!(caps.structured_execution_jobs);
     assert!(caps.lsp_read_only_navigation);
     assert!(caps.lsp_call_hierarchy);
     assert!(caps.project_lifecycle);
     assert!(caps.project_path_registration);
+    assert_eq!(
+        caps.project_format_v1,
+        cfg!(any(target_os = "linux", target_os = "macos", windows)),
+        "project formatting capability is advertised on supported native platforms"
+    );
     assert_eq!(
         caps.computer_observe,
         cfg!(any(target_os = "macos", windows)),
@@ -308,4 +350,76 @@ fn register_request_carries_sanitized_shell_profiles_summary() {
     let rendered = serde_json::to_string(summary).unwrap();
     assert!(!rendered.contains(secret_env), "{rendered}");
     assert!(!rendered.contains(secret_script), "{rendered}");
+}
+
+#[test]
+fn capability_catalog_does_not_enable_configured_off_implementations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
+    cfg.capabilities = Some(RunnerCapabilities {
+        shell: false,
+        git: false,
+        ..Default::default()
+    });
+    let capabilities = runner_register_capabilities(&cfg);
+    assert!(!capabilities.supports(RunnerCapabilityId::Shell));
+    assert!(!capabilities.supports(RunnerCapabilityId::Git));
+    assert!(capabilities.supports(RunnerCapabilityId::ProjectValidation));
+    assert!(capabilities.supports(RunnerCapabilityId::StructuredProcessArgv));
+    assert_eq!(
+        capabilities.supports(RunnerCapabilityId::BrowserObserve),
+        webcodex_browser::discover_chromium_executable().is_some()
+    );
+    assert_eq!(
+        capabilities.supports(RunnerCapabilityId::ComputerControl),
+        cfg!(any(target_os = "macos", windows))
+    );
+    assert_eq!(
+        capabilities.supports(RunnerCapabilityId::ProjectFormat),
+        cfg!(any(target_os = "linux", target_os = "macos", windows))
+    );
+}
+
+#[test]
+fn project_format_register_request_announces_platform_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
+    cfg.capabilities = Some(RunnerCapabilities {
+        project_format_v1: false,
+        ..Default::default()
+    });
+    let body = build_register_request(&cfg, "inst-format", 0);
+    assert_eq!(
+        body.capabilities.project_format_v1,
+        cfg!(any(target_os = "linux", target_os = "macos", windows)),
+        "project formatting capability replaces static config with real platform support"
+    );
+    assert_eq!(
+        body.capabilities.project_format_go_v1,
+        body.capabilities.project_format_v1
+    );
+    assert_eq!(
+        body.capabilities
+            .supports(RunnerCapabilityId::ProjectFormat),
+        cfg!(any(target_os = "linux", target_os = "macos", windows))
+    );
+}
+
+#[test]
+fn configured_capabilities_cannot_grant_provider_support() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(tmp.path().join("config/project-registry"));
+    let mut configured = RunnerCapabilities::default();
+    for id in RunnerCapabilityId::all() {
+        configured.set(*id, true);
+    }
+    cfg.capabilities = Some(configured);
+    let capabilities = runner_register_capabilities(&cfg);
+    assert!(capabilities.supports(RunnerCapabilityId::Shell));
+    assert!(capabilities.supports(RunnerCapabilityId::Git));
+    assert!(!capabilities.supports(RunnerCapabilityId::CodingAgentRuns));
+    let body = build_register_request(&cfg, "no-provider-instance", 0);
+    assert!(!body
+        .capabilities
+        .supports(RunnerCapabilityId::CodingAgentRuns));
 }

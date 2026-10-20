@@ -2,7 +2,7 @@
 
 [English](QUICK_START.md) | [简体中文](QUICK_START.zh-CN.md)
 
-这个页面只做一件事：用 `webcodex share` 临时分享一个本地仓库，让你几分钟内判断 WebCodex 是否适合自己。这个模式是一条命令的**临时、单项目、受限体验**；关闭命令后连接会结束。
+这个页面只做一件事：用 `webcodex share` 临时分享一个本地仓库，让你几分钟内判断 WebCodex 是否适合自己。这个模式是一条命令的**临时、单项目、Project-scoped 普通 WebCodex runtime**；关闭命令后连接会结束。
 
 如果你准备日常使用 WebCodex，并希望获得普通 Server + Runner 的完整 coding 能力，请直接使用[完整使用指南](PERSONAL_SETUP.zh-CN.md)，不要把 `share` 当作长期默认部署。
 
@@ -12,7 +12,7 @@
 - Git，以及一个可以让 AI 安全查看的代码仓库。
 - Linux、macOS 或 Windows x64 可直接使用完整 managed Cloudflare 本机 `share` 流程。
 
-Windows 已支持显式本机 `webcodex share`。固定版本 Cloudflare 没有官方 Windows ARM64 binary，因此 Windows ARM64 使用 `--tunnel cloudflare` 时需要通过 `WEBCODEX_CLOUDFLARED_BIN`/`PATH` 提供受信任 binary；managed OpenAI `tunnel-client` 与 `--tunnel none` 仍可用。
+Windows 已支持显式本机 `webcodex share`。固定版本 Cloudflare 没有官方 Windows ARM64 binary，因此 Windows ARM64 使用 `--tunnel cloudflare` 时需要通过 `WEBCODEX_CLOUDFLARED_BIN`/`PATH` 提供受信任 binary；内置原生 OpenAI Tunnel 与 `--tunnel none` 在 Windows x64/arm64 均可用。
 
 ## 1. 运行 WebCodex
 
@@ -38,6 +38,8 @@ npx --yes @yyjeqhc/webcodex share
 5. 点击 **Scan Tools**。
 
 不同账号或工作区看到的 ChatGPT 文案可能略有区别。Developer Mode、自定义 MCP App 和写入/修改操作是否可用也取决于 ChatGPT 套餐、workspace 与管理员策略；WebCodex 无法启用客户端未授予的权限。具体 URL 和认证值以 WebCodex 终端输出为准。
+
+ChatGPT Dot 目前是 best-effort，不同账号的表现可以不一致。如果 Dot 能发现插件但没有调用 WebCodex，见 [ChatGPT Dot](MCP.zh-CN.md#chatgpt-dot)。
 
 ### 如果找不到 Bearer/访问令牌选项
 

@@ -1,0 +1,2792 @@
+#!/usr/bin/env python3
+"""Offline Agent Loop profiler for existing WebCodex observability evidence.
+
+The profiler consumes payload-safe metadata only. ActionAudit is the preferred
+source for canonical outer-call, Window, and ModelErgonomics facts. Per-trace
+``events.jsonl`` is an optional supplement for observed Runner request metadata;
+payload blobs are never opened.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import re
+import sqlite3
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any, Iterable
+
+SCHEMA_VERSION = 1
+# Bound container nesting before decoding, independent of CPython's recursion
+# checks (which do not impose the same JSON limit across Python versions).
+# Manifests and receipts have shallow schemas; 128 leaves ample metadata room
+# while keeping decoding safely below the usual Python recursion budget.
+MAX_JSON_DEPTH = 128
+DEFAULT_CASE_MANIFEST = Path(__file__).with_name("agent_loop_cases.json")
+CODE_MODE_TOOLS = frozenset(("execute_code_mode", "execute_effectful_code_mode", "execute_mutating_code_mode"))
+CANONICAL_CODE_MODE_SURFACES = ("read_only", "validation", "guarded_edit")
+CODE_MODE_SURFACES = frozenset(CANONICAL_CODE_MODE_SURFACES)
+LEGACY_CODE_MODE_SURFACE_ALIASES = {
+    "e1": "read_only",
+    "e2a": "validation",
+    "e2b": "guarded_edit",
+}
+CODE_MODE_SURFACE_CHOICES = (*CANONICAL_CODE_MODE_SURFACES, *LEGACY_CODE_MODE_SURFACE_ALIASES)
+HOST_CODE_MODE_SURFACE = "host_code_mode"
+TOOL_SELECTION_VARIANT = "tool_selection"
+BENCHMARK_VARIANTS = ("direct", "host_code_mode", "code_mode", TOOL_SELECTION_VARIANT)
+RUN_ANNOTATION_SCHEMA_VERSION = 1
+REPAIR_REASONS = frozenset((
+    "invalid_arguments",
+    "unknown_callable",
+    "wrong_result_shape",
+    "javascript_runtime",
+    "tool_selection_repair",
+    "other_contract_repair",
+))
+CORRECTNESS_VERDICTS = frozenset(("pass", "fail", "unavailable"))
+VALIDATION_VERDICTS = frozenset(("pass", "fail", "not_required", "unavailable"))
+CODE_MODE_COMPOSITION_NUMERIC_FIELDS = (
+    "nested_calls",
+    "nested_successes",
+    "nested_failures",
+    "max_in_flight",
+    "duration_ms",
+    "slot_wait_ms",
+    "returned_bytes",
+    "nested_raw_result_bytes_total",
+    "consequential_calls",
+    "known_results",
+    "job_handoffs",
+    "outcome_unknown",
+)
+# Additive fields may be absent from historical ActionAudit rows. They get their
+# own availability/missing accounting and never invalidate the core composition.
+CODE_MODE_COMPOSITION_OPTIONAL_NUMERIC_FIELDS = (
+    "input_bytes",
+    "mutation_state_changed",
+    "mutation_no_change",
+)
+
+# Closed v13 persisted wire vocabulary for this offline consumer, not alias rules.
+# Runtime/schema spellings are owned by ToolInputNormalizationCode in tool-contracts.
+INPUT_NORMALIZATION_CODES = frozenset((
+    "argv_to_args",
+    "run_process_sh_c_to_run_shell",
+    "run_process_bash_c_to_run_shell",
+    "run_process_bash_lc_to_login_run_shell",
+))
+INPUT_NORMALIZATION_SCHEMA_VERSION = 13
+EDIT_OUTCOME_SCHEMA_VERSION = 13
+EDIT_OUTCOMES = frozenset((
+    "applied",
+    "dry_run_would_change",
+    "dry_run_no_change",
+    "no_change",
+    "conflict",
+    "uncertain",
+    "rejected",
+))
+
+
+class ReportError(ValueError):
+    """Deterministic user-facing report input error."""
+
+
+def _stable_json(value: Any, *, pretty: bool = False) -> str:
+    if pretty:
+        return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _write_json(value: Any, output: Path | None) -> None:
+    text = _stable_json(value, pretty=True)
+    if output is None:
+        sys.stdout.write(text)
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8")
+
+
+def _require_nonempty_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ReportError(f"{field} must be a non-empty string")
+    return value
+
+
+def _canonical_code_mode_surface(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if value in CODE_MODE_SURFACES:
+        return value
+    return LEGACY_CODE_MODE_SURFACE_ALIASES.get(value)
+
+
+def validate_case_manifest(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ReportError("case manifest must be a JSON object")
+    if value.get("schema_version") != 1:
+        raise ReportError("unsupported case manifest schema_version")
+    cases = value.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise ReportError("case manifest cases must be a non-empty array")
+    seen: set[str] = set()
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            raise ReportError(f"cases[{index}] must be an object")
+        case_id = _require_nonempty_string(case.get("id"), f"cases[{index}].id")
+        if case_id in seen:
+            raise ReportError(f"duplicate case id: {case_id}")
+        seen.add(case_id)
+        for field in ("title", "target", "prompt"):
+            _require_nonempty_string(case.get(field), f"cases[{index}].{field}")
+        for field in ("correctness", "validation"):
+            if not isinstance(case.get(field), dict) or not case[field]:
+                raise ReportError(f"cases[{index}].{field} must be a non-empty object")
+        if not isinstance(case["validation"].get("required"), bool):
+            raise ReportError(f"cases[{index}].validation.required must be a boolean")
+        surface = case.get("code_mode_surface")
+        experiment = case.get("experiment", "forced_lanes")
+        if experiment not in ("forced_lanes", "tool_selection"):
+            raise ReportError(f"cases[{index}].experiment is unsupported")
+        if experiment == "tool_selection" and surface is not None:
+            raise ReportError("tool_selection cases must not prescribe code_mode_surface")
+        if surface is not None and _canonical_code_mode_surface(surface) is None:
+            raise ReportError(
+                f"cases[{index}].code_mode_surface must be one of read_only, validation, or guarded_edit"
+            )
+        focus = case.get("dogfood_focus")
+        if focus is not None:
+            if (
+                not isinstance(focus, list)
+                or not focus
+                or len(focus) > 8
+                or any(not isinstance(item, str) or not item.strip() for item in focus)
+                or len(set(focus)) != len(focus)
+            ):
+                raise ReportError(
+                    f"cases[{index}].dogfood_focus must be 1..8 unique non-empty strings"
+                )
+    return value
+
+
+def load_bounded_json(text: str) -> Any:
+    """Decode JSON after bounding container nesting, ignoring string contents."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError("JSON container nesting exceeds limit")
+        elif char in "]}":
+            depth -= 1
+    # Syntax validation remains the standard decoder's responsibility.
+    return json.loads(text)
+
+
+def load_case_manifest(path: Path) -> dict[str, Any]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReportError(f"could not read case manifest: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise ReportError(f"case manifest must be UTF-8: {path}") from exc
+    try:
+        value = load_bounded_json(text)
+    except json.JSONDecodeError as exc:
+        raise ReportError(f"case manifest is not valid JSON: {path}:{exc.lineno}") from exc
+    except (RecursionError, ValueError) as exc:
+        raise ReportError(f"case manifest is not valid bounded JSON: {path}") from exc
+    return validate_case_manifest(value)
+
+
+def _case_by_id(manifest: dict[str, Any], case_id: str) -> dict[str, Any]:
+    for case in manifest["cases"]:
+        if case["id"] == case_id:
+            return case
+    raise ReportError(f"unknown case id: {case_id}")
+
+
+def _require_nonnegative_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ReportError(f"{field} must be a non-negative integer")
+    return value
+
+
+def _reject_unknown_fields(value: dict[str, Any], allowed: set[str], field: str) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ReportError(f"{field} contains unsupported fields: {', '.join(unknown)}")
+
+
+def validate_run_annotation(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ReportError("run annotation must be a JSON object")
+    _reject_unknown_fields(
+        value,
+        {
+            "schema_version",
+            "case_id",
+            "variant",
+            "surface",
+            "base_revision",
+            "case_fingerprint",
+            "repair_turns",
+            "task_timing",
+            "correctness",
+        },
+        "run annotation",
+    )
+    if value.get("schema_version") != RUN_ANNOTATION_SCHEMA_VERSION:
+        raise ReportError("unsupported run annotation schema_version")
+    _require_nonempty_string(value.get("case_id"), "run annotation case_id")
+    variant = value.get("variant")
+    if variant not in BENCHMARK_VARIANTS:
+        raise ReportError("run annotation variant must be direct, host_code_mode, code_mode, or tool_selection")
+    surface = value.get("surface")
+    if variant == "direct":
+        if surface != "direct":
+            raise ReportError("direct run annotation requires surface=direct")
+    elif variant == "host_code_mode":
+        if surface != HOST_CODE_MODE_SURFACE:
+            raise ReportError("host_code_mode run annotation requires surface=host_code_mode")
+    elif variant == TOOL_SELECTION_VARIANT:
+        if surface != TOOL_SELECTION_VARIANT:
+            raise ReportError("tool_selection run annotation requires surface=tool_selection")
+    elif _canonical_code_mode_surface(surface) is None:
+        raise ReportError("code_mode run annotation requires surface=read_only, validation, or guarded_edit")
+    if not _is_exact_git_revision(value.get("base_revision")):
+        raise ReportError("run annotation base_revision must be an exact 40-hex Git commit")
+    if not _is_exact_sha256(value.get("case_fingerprint")):
+        raise ReportError("run annotation case_fingerprint must be an exact 64-hex SHA-256")
+
+    repair_turns = value.get("repair_turns")
+    if repair_turns is not None:
+        if not isinstance(repair_turns, dict):
+            raise ReportError("run annotation repair_turns must be an object")
+        _reject_unknown_fields(repair_turns, {"total", "by_reason"}, "run annotation repair_turns")
+        total = _require_nonnegative_int(
+            repair_turns.get("total"), "run annotation repair_turns.total"
+        )
+        by_reason = repair_turns.get("by_reason")
+        if not isinstance(by_reason, dict):
+            raise ReportError("run annotation repair_turns.by_reason must be an object")
+        normalized_total = 0
+        for reason, count in by_reason.items():
+            if reason not in REPAIR_REASONS:
+                raise ReportError(f"unsupported repair reason: {reason}")
+            normalized_total += _require_nonnegative_int(
+                count, f"run annotation repair_turns.by_reason.{reason}"
+            )
+        if normalized_total != total:
+            raise ReportError("run annotation repair_turns.total must equal by_reason sum")
+
+    task_timing = value.get("task_timing")
+    if task_timing is not None:
+        if not isinstance(task_timing, dict):
+            raise ReportError("run annotation task_timing must be an object")
+        _reject_unknown_fields(
+            task_timing,
+            {"started_at_ms", "ended_at_ms"},
+            "run annotation task_timing",
+        )
+        started = _require_nonnegative_int(
+            task_timing.get("started_at_ms"), "run annotation task_timing.started_at_ms"
+        )
+        ended = _require_nonnegative_int(
+            task_timing.get("ended_at_ms"), "run annotation task_timing.ended_at_ms"
+        )
+        if ended < started:
+            raise ReportError("run annotation task_timing ended_at_ms precedes started_at_ms")
+
+    correctness = value.get("correctness")
+    if correctness is not None:
+        if not isinstance(correctness, dict):
+            raise ReportError("run annotation correctness must be an object")
+        _reject_unknown_fields(
+            correctness, {"task_verdict", "validation_verdict"}, "run annotation correctness"
+        )
+        if correctness.get("task_verdict") not in CORRECTNESS_VERDICTS:
+            raise ReportError(
+                "run annotation correctness.task_verdict must be pass, fail, or unavailable"
+            )
+        if correctness.get("validation_verdict") not in VALIDATION_VERDICTS:
+            raise ReportError(
+                "run annotation correctness.validation_verdict must be pass, fail, not_required, or unavailable"
+            )
+    return value
+
+
+def load_run_annotation(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ReportError(f"could not read run annotation: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ReportError(f"run annotation is not valid JSON: {path}:{exc.lineno}") from exc
+    return validate_run_annotation(value)
+
+
+def load_trace_events(trace_root: Path) -> tuple[set[str], list[dict[str, Any]], int]:
+    if not trace_root.is_dir():
+        raise ReportError(f"trace root is not a directory: {trace_root}")
+    paths = sorted(trace_root.rglob("events.jsonl"))
+    trace_ids: set[str] = set()
+    events: list[dict[str, Any]] = []
+    for path in paths:
+        seen: set[str] = set()
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ReportError(f"could not read trace metadata: {path}") from exc
+        for line_number, raw in enumerate(lines, start=1):
+            if not raw.strip():
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ReportError(f"malformed JSONL in {path}:{line_number}: {exc.msg}") from exc
+            if not isinstance(event, dict):
+                raise ReportError(f"trace event must be an object: {path}:{line_number}")
+            fingerprint = _stable_json(event)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            trace_id = event.get("server_trace_id")
+            if isinstance(trace_id, str) and trace_id:
+                trace_ids.add(trace_id)
+            events.append(event)
+    return trace_ids, events, len(paths)
+
+
+_AUDIT_COLUMNS = """
+e.event_id, e.operation, e.action_name, e.project, e.status,
+e.ids_json, e.summary_json, e.client_window_key, e.server_trace_id,
+e.principal_correlation_kind, e.principal_correlation_id,
+e.window_started_at_ms, e.request_observed_at_ms, e.response_handed_at_ms,
+e.window_transition_kind, e.response_streaming,
+e.window_continuity_eligible, e.window_meaningful, e.started_at
+""".strip()
+
+_CONTINUITY_COLUMNS = """
+e.event_id, e.operation, e.action_name, e.client_window_key,
+e.principal_correlation_kind, e.principal_correlation_id,
+e.window_started_at_ms, e.request_observed_at_ms, e.response_handed_at_ms,
+e.window_transition_kind, e.window_continuity_eligible,
+e.window_meaningful, e.started_at, e.server_trace_id, e.response_streaming,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.model_ergonomics.schema_version') END AS model_ergonomics_version,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.model_ergonomics.tool_name') END AS model_ergonomics_tool,
+CASE WHEN json_valid(e.summary_json) THEN json_type(e.summary_json, '$.model_ergonomics.success') END AS model_ergonomics_success_type,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.model_ergonomics.job_convergence') END AS job_convergence_json,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.model_ergonomics.readiness') END AS readiness_json,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.previous_meaningful_call') END AS previous_meaningful_call
+""".strip()
+
+
+def _open_sqlite_readonly(path: Path) -> sqlite3.Connection:
+    if not path.is_file():
+        raise ReportError(f"audit DB is not a file: {path}")
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise ReportError(f"could not open audit DB read-only: {path}") from exc
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _parse_json_object(raw: Any, field: str, event_id: str) -> dict[str, Any]:
+    if not isinstance(raw, str):
+        raise ReportError(f"{field} is not text for action event {event_id}")
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ReportError(f"{field} is invalid JSON for action event {event_id}") from exc
+    if not isinstance(value, dict):
+        raise ReportError(f"{field} is not an object for action event {event_id}")
+    return value
+
+
+def _row_to_audit_event(row: sqlite3.Row) -> dict[str, Any]:
+    event_id = str(row["event_id"])
+    return {
+        "event_id": event_id,
+        "operation": row["operation"],
+        "action_name": row["action_name"],
+        "project": row["project"],
+        "status": row["status"],
+        "ids": _parse_json_object(row["ids_json"], "ids_json", event_id),
+        "summary": _parse_json_object(row["summary_json"], "summary_json", event_id),
+        "client_window_key": row["client_window_key"],
+        "server_trace_id": row["server_trace_id"],
+        "principal_correlation_kind": row["principal_correlation_kind"],
+        "principal_correlation_id": row["principal_correlation_id"],
+        "window_started_at_ms": row["window_started_at_ms"],
+        "request_observed_at_ms": row["request_observed_at_ms"],
+        "response_handed_at_ms": row["response_handed_at_ms"],
+        "window_transition_kind": row["window_transition_kind"],
+        "response_streaming": None if row["response_streaming"] is None else bool(row["response_streaming"]),
+        "window_continuity_eligible": None if row["window_continuity_eligible"] is None else bool(row["window_continuity_eligible"]),
+        "window_meaningful": bool(row["window_meaningful"]),
+        "started_at": row["started_at"],
+    }
+
+
+def _row_to_continuity_event(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "server_trace_id": row["server_trace_id"],
+        "response_streaming": None if row["response_streaming"] is None else bool(row["response_streaming"]),
+        "summary": {
+            "previous_meaningful_call": row["previous_meaningful_call"],
+            "model_ergonomics": {
+                "schema_version": row["model_ergonomics_version"],
+                "tool_name": row["model_ergonomics_tool"],
+                "success": (row["model_ergonomics_success_type"] == "true"
+                            if row["model_ergonomics_success_type"] in ("true", "false") else None),
+                "job_convergence": _parse_json_object(row["job_convergence_json"] or "{}", "job_convergence", str(row["event_id"])),
+                "readiness": _parse_json_object(row["readiness_json"] or "{}", "readiness", str(row["event_id"])),
+            },
+        },
+        "event_id": str(row["event_id"]),
+        "operation": row["operation"],
+        "action_name": row["action_name"],
+        "client_window_key": row["client_window_key"],
+        "principal_correlation_kind": row["principal_correlation_kind"],
+        "principal_correlation_id": row["principal_correlation_id"],
+        "window_started_at_ms": row["window_started_at_ms"],
+        "request_observed_at_ms": row["request_observed_at_ms"],
+        "response_handed_at_ms": row["response_handed_at_ms"],
+        "window_transition_kind": row["window_transition_kind"],
+        "window_continuity_eligible": None if row["window_continuity_eligible"] is None else bool(row["window_continuity_eligible"]),
+        "window_meaningful": bool(row["window_meaningful"]),
+        "started_at": row["started_at"],
+    }
+
+
+def load_audit_events(audit_db: Path, *, workflow_session_id: str | None, trace_ids: set[str]) -> list[dict[str, Any]]:
+    connection = _open_sqlite_readonly(audit_db)
+    try:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "action_events" not in tables:
+            raise ReportError("audit DB does not contain action_events")
+        if workflow_session_id is not None:
+            if "action_event_workflow_links" not in tables:
+                raise ReportError("audit DB does not contain action_event_workflow_links")
+            sql = f"""
+                SELECT DISTINCT {_AUDIT_COLUMNS}
+                FROM action_events e
+                JOIN action_event_workflow_links l ON l.event_id = e.event_id
+                WHERE l.workflow_session_id = ?
+                ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms, e.started_at * 1000), e.event_id
+            """
+            rows = connection.execute(sql, (workflow_session_id,)).fetchall()
+        elif trace_ids:
+            rows = []
+            ordered_ids = sorted(trace_ids)
+            for start in range(0, len(ordered_ids), 400):
+                chunk = ordered_ids[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                sql = f"""
+                    SELECT {_AUDIT_COLUMNS}
+                    FROM action_events e
+                    WHERE e.server_trace_id IN ({placeholders})
+                    ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms, e.started_at * 1000), e.event_id
+                """
+                rows.extend(connection.execute(sql, chunk).fetchall())
+            rows.sort(key=lambda row: (
+                row["request_observed_at_ms"] if row["request_observed_at_ms"] is not None
+                else row["window_started_at_ms"] if row["window_started_at_ms"] is not None
+                else int(row["started_at"]) * 1000,
+                row["event_id"],
+            ))
+        else:
+            raise ReportError("audit DB selection requires --workflow-session-id or trace ids from --trace-root")
+        return [_row_to_audit_event(row) for row in rows]
+    except sqlite3.Error as exc:
+        raise ReportError(f"could not query audit DB: {exc}") from exc
+    finally:
+        connection.close()
+
+
+def load_audit_continuity_events(
+    audit_db: Path, selected_events: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    selected_meaningful = [
+        event
+        for event in selected_events
+        if event.get("action_name") == "toolsCall" and event.get("window_meaningful")
+    ]
+    keyed = [
+        event
+        for event in selected_meaningful
+        if all(
+            isinstance(event.get(field), str) and event.get(field)
+            for field in (
+                "client_window_key",
+                "principal_correlation_kind",
+                "principal_correlation_id",
+            )
+        )
+        and isinstance(event.get("request_observed_at_ms"), int)
+    ]
+    if not keyed:
+        return selected_meaningful
+
+    keys = {
+        (
+            event["client_window_key"],
+            event["principal_correlation_kind"],
+            event["principal_correlation_id"],
+        )
+        for event in keyed
+    }
+    windows = sorted({key[0] for key in keys})
+    first_started = min(event["request_observed_at_ms"] for event in keyed)
+    last_started = max(event["request_observed_at_ms"] for event in keyed)
+    connection = _open_sqlite_readonly(audit_db)
+    rows: list[sqlite3.Row] = []
+    by_id = {event["event_id"]: event for event in selected_meaningful}
+    try:
+        for start in range(0, len(windows), 400):
+            chunk = windows[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"""
+                SELECT {_CONTINUITY_COLUMNS}
+                FROM action_events e
+                WHERE e.action_name = 'toolsCall'
+                  AND e.window_meaningful = 1
+                  AND e.request_observed_at_ms BETWEEN ? AND ?
+                  AND e.client_window_key IN ({placeholders})
+                ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms, e.started_at * 1000), e.event_id
+            """
+            rows.extend(
+                connection.execute(sql, [first_started, last_started, *chunk]).fetchall()
+            )
+        for row in rows:
+            event = _row_to_continuity_event(row)
+            key = (
+                event.get("client_window_key"),
+                event.get("principal_correlation_kind"),
+                event.get("principal_correlation_id"),
+            )
+            if key in keys:
+                by_id[event["event_id"]] = event
+
+        # The first selected call for a Window may serially continue an exact
+        # meaningful predecessor outside the benchmark Session. Resolve that
+        # one persisted predecessor hop by trace id so the summarizer can treat
+        # it as an explicit run boundary instead of missing continuity. Never
+        # widen backwards by time range.
+        first_selected_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for event in keyed:
+            key = (
+                event["client_window_key"],
+                event["principal_correlation_kind"],
+                event["principal_correlation_id"],
+            )
+            current = first_selected_by_key.get(key)
+            if current is None or event["request_observed_at_ms"] < current["request_observed_at_ms"]:
+                first_selected_by_key[key] = event
+        incoming_predecessors = {
+            previous
+            for event in first_selected_by_key.values()
+            if event.get("window_transition_kind") == "serial"
+            and isinstance(event.get("summary"), dict)
+            and isinstance(
+                previous := event.get("summary", {}).get("previous_meaningful_call"), str
+            )
+            and previous
+        }
+        seen_traces = {
+            event.get("server_trace_id")
+            for event in by_id.values()
+            if isinstance(event.get("server_trace_id"), str)
+            and event.get("server_trace_id")
+        }
+        incoming_predecessors.difference_update(seen_traces)
+        ordered_incoming_predecessors = sorted(incoming_predecessors)
+        for start in range(0, len(ordered_incoming_predecessors), 400):
+            chunk = ordered_incoming_predecessors[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"""
+                SELECT {_CONTINUITY_COLUMNS}
+                FROM action_events e
+                WHERE e.action_name = 'toolsCall'
+                  AND e.window_meaningful = 1
+                  AND e.server_trace_id IN ({placeholders})
+                ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms, e.started_at * 1000), e.event_id
+            """
+            for row in connection.execute(sql, chunk).fetchall():
+                event = _row_to_continuity_event(row)
+                key = (
+                    event.get("client_window_key"),
+                    event.get("principal_correlation_kind"),
+                    event.get("principal_correlation_id"),
+                )
+                trace = event.get("server_trace_id")
+                if key in keys and isinstance(trace, str) and trace:
+                    by_id[event["event_id"]] = event
+
+
+        # Workflow-session links describe business provenance, not every follow-up
+        # observation. An exact observe may therefore be the next meaningful call
+        # after the final linked row. Follow only the persisted exact predecessor
+        # relation from each selected tail; never widen by an arbitrary time window.
+        tails: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for event in keyed:
+            key = (
+                event["client_window_key"],
+                event["principal_correlation_kind"],
+                event["principal_correlation_id"],
+            )
+            if key not in tails or event["request_observed_at_ms"] > tails[key]["request_observed_at_ms"]:
+                tails[key] = event
+        frontier = {
+            event["server_trace_id"]
+            for event in tails.values()
+            if isinstance(event.get("server_trace_id"), str) and event["server_trace_id"]
+        }
+        seen_traces = {
+            event.get("server_trace_id")
+            for event in by_id.values()
+            if isinstance(event.get("server_trace_id"), str) and event.get("server_trace_id")
+        }
+        # The summarizer bounds len(selected)+len(context), even though exact
+        # selected traces are deduplicated again by trace id. Stay within that
+        # public report bound here rather than filling the context to 100k alone.
+        remaining = max(0, 100_000 - len(selected_events) - len(by_id))
+        while frontier and remaining:
+            next_frontier: set[str] = set()
+            ordered = sorted(frontier)
+            frontier.clear()
+            for start in range(0, len(ordered), 400):
+                chunk = ordered[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                sql = f"""
+                    SELECT {_CONTINUITY_COLUMNS}
+                    FROM action_events e
+                    WHERE e.action_name = 'toolsCall'
+                      AND e.window_meaningful = 1
+                      AND json_valid(e.summary_json)
+                      AND json_extract(e.summary_json, '$.previous_meaningful_call') IN ({placeholders})
+                    ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms, e.started_at * 1000), e.event_id
+                """
+                for row in connection.execute(sql, chunk).fetchall():
+                    event = _row_to_continuity_event(row)
+                    key = (
+                        event.get("client_window_key"),
+                        event.get("principal_correlation_kind"),
+                        event.get("principal_correlation_id"),
+                    )
+                    trace = event.get("server_trace_id")
+                    if key not in keys or not isinstance(trace, str) or not trace or trace in seen_traces:
+                        continue
+                    by_id[event["event_id"]] = event
+                    seen_traces.add(trace)
+                    next_frontier.add(trace)
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+                if remaining == 0:
+                    break
+            frontier = next_frontier
+    except sqlite3.Error as exc:
+        raise ReportError(f"could not query audit continuity context: {exc}") from exc
+    finally:
+        connection.close()
+
+    return sorted(by_id.values(), key=_audit_sort_key)
+
+
+def _telemetry(event: dict[str, Any]) -> dict[str, Any] | None:
+    value = event.get("summary", {}).get("model_ergonomics")
+    return value if isinstance(value, dict) else None
+
+
+def _input_ergonomics_record(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Require canonical identity/outcome evidence; never read raw arguments/errors."""
+    value = _telemetry(event)
+    if value is None or event.get("action_name") != "toolsCall":
+        return None
+    version, tool = value.get("schema_version"), value.get("tool_name")
+    if (type(version) is not int or version < 1 or type(value.get("success")) is not bool
+            or not isinstance(tool, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,127}", tool) is None
+            or tool != event.get("operation")):
+        return None
+    return value
+
+
+def _immediate_input_repair_proxy(
+    candidates: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    context: list[dict[str, Any]],
+    *, evidence_available: bool,
+) -> dict[str, Any]:
+    """Exact immediate meaningful-call adjacency, never a model-turn/causal claim."""
+    def key(event: dict[str, Any]) -> tuple[str, str, str] | None:
+        values = tuple(event.get(field) for field in (
+            "client_window_key", "principal_correlation_kind", "principal_correlation_id"))
+        return values if all(isinstance(value, str) and value for value in values) else None
+
+    def eligible(event: dict[str, Any]) -> bool:
+        started, handed = event.get("request_observed_at_ms"), event.get("response_handed_at_ms")
+        return (key(event) is not None and event.get("window_continuity_eligible") is True
+                and event.get("response_streaming") is False
+                and isinstance(event.get("server_trace_id"), str) and bool(event["server_trace_id"])
+                and type(started) is int and type(handed) is int and 0 <= started <= handed)
+
+    reasons: Counter[str] = Counter()
+    observed: Counter[str] = Counter()
+    evaluated = 0
+    if len(selected) + len(context) > 100_000:
+        reasons["continuity_context_limit"] = len(candidates) or 1
+    else:
+        # Selected full rows win over their bounded continuity projections.
+        by_id = {str(event["event_id"]): event for event in [*context, *selected]}
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for event in sorted(by_id.values(), key=_audit_sort_key):
+            if event.get("action_name") == "toolsCall" and event.get("window_meaningful"):
+                scope = key(event)
+                if scope is not None:
+                    groups.setdefault(scope, []).append(event)
+        next_by_id: dict[str, dict[str, Any]] = {}
+        trace_counts: Counter[tuple[Any, Any]] = Counter()
+        successor_counts: Counter[tuple[Any, Any]] = Counter()
+        for scope, calls in groups.items():
+            next_by_id.update((str(before["event_id"]), after) for before, after in zip(calls, calls[1:]))
+            for event in calls:
+                trace = event.get("server_trace_id")
+                previous = event.get("summary", {}).get("previous_meaningful_call")
+                if isinstance(trace, str):
+                    trace_counts[(scope, trace)] += 1
+                if isinstance(previous, str):
+                    successor_counts[(scope, previous)] += 1
+        for failed in candidates:
+            if not eligible(failed):
+                reasons["rejection_continuity_unavailable"] += 1
+                continue
+            successor = next_by_id.get(str(failed["event_id"]))
+            if successor is None:
+                reasons["no_observed_successor"] += 1
+                continue
+            scope, trace = key(failed), failed["server_trace_id"]
+            if (trace_counts[(scope, trace)] != 1
+                    or successor_counts[(scope, trace)] > 1):
+                reasons["ambiguous_serial_identity"] += 1
+                continue
+            # Never skip an intervening meaningful call, even one missing telemetry.
+            next_record = _input_ergonomics_record(successor)
+            if (not eligible(successor) or next_record is None
+                    or successor.get("window_transition_kind") != "serial"
+                    or successor.get("summary", {}).get("previous_meaningful_call") != trace
+                    or successor["request_observed_at_ms"] < failed["response_handed_at_ms"]
+                    or trace_counts[(scope, successor.get("server_trace_id"))] != 1):
+                reasons["successor_continuity_unavailable"] += 1
+                continue
+            evaluated += 1
+            failed_record = _input_ergonomics_record(failed)
+            if next_record["success"] is True and next_record["tool_name"] == failed_record["tool_name"]:
+                observed[next_record["tool_name"]] += 1
+    available = evidence_available and not reasons
+    return {
+        "available": available,
+        "reason": (None if available else "canonical meaningful-call evidence is unavailable"
+                   if not evidence_available else "one or more rejections lack exact immediate successor continuity"),
+        "count": sum(observed.values()) if available else None,
+        "by_tool": dict(sorted(observed.items())) if available else None,
+        "observed_count": sum(observed.values()),
+        "observed_by_tool": dict(sorted(observed.items())),
+        "candidate_rejections": len(candidates),
+        "evaluated_rejections": evaluated,
+        "unavailable_rejections": len(candidates) - evaluated,
+        "unavailable_by_reason": dict(sorted(reasons.items())),
+        "interpretation": "WebCodex-observed immediate same-tool corrective-call proxy; does not prove model turn identity, causality, or a field-spelling failure",
+    }
+
+
+def _summarize_input_ergonomics(
+    audit_events: list[dict[str, Any]],
+    context: list[dict[str, Any]],
+    *, action_audit_available: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    outer = [event for event in audit_events if event.get("action_name") == "toolsCall"]
+    records = [(event, value) for event in outer if (value := _input_ergonomics_record(event)) is not None]
+    eligible = [(event, value) for event, value in records
+                if value["schema_version"] >= INPUT_NORMALIZATION_SCHEMA_VERSION]
+    successful = [(event, value) for event, value in eligible if value["success"] is True]
+    by_code: Counter[str] = Counter()
+    by_tool: Counter[str] = Counter()
+    unknown_codes = 0
+    for _, value in successful:
+        code = value.get("input_normalization_code")
+        if code is None:
+            continue
+        if not isinstance(code, str) or code not in INPUT_NORMALIZATION_CODES:
+            unknown_codes += 1
+            continue
+        by_code[code] += 1
+        by_tool[value["tool_name"]] += 1
+    rejected = [(event, value) for event, value in records
+                if value["success"] is False and value.get("error_kind") == "invalid_arguments"]
+    rejection_tools = Counter(value["tool_name"] for _, value in rejected)
+    normalization_available = action_audit_available and bool(successful) and unknown_codes == 0
+    reason = (None if normalization_available else "unknown or malformed normalization codes"
+              if unknown_codes else "no successful canonical ModelErgonomics v13+ records")
+    return {
+        "measured_canonical_calls": len(records),
+        "eligible_events": len(eligible),
+        "eligible_successful_events": len(successful),
+        "legacy_schema_events": len(records) - len(eligible),
+        "missing_or_invalid_record_events": len(outer) - len(records),
+        "unrecognized_normalization_events": unknown_codes,
+        "normalization_events": sum(by_code.values()),
+        "normalization_by_code": dict(sorted(by_code.items())),
+        "normalization_by_tool": dict(sorted(by_tool.items())),
+        "normalization_rate": sum(by_code.values()) / len(successful) if normalization_available else None,
+        "normalization_rate_denominator": "eligible_successful_events: successful canonical ModelErgonomics v13+ records in the selected audit set",
+        "invalid_argument_rejections": len(rejected),
+        "invalid_arguments_by_tool": dict(sorted(rejection_tools.items())),
+        "immediate_same_tool_repair_proxy": _immediate_input_repair_proxy(
+            [event for event, _ in rejected if event.get("window_meaningful")], outer, context,
+            evidence_available=action_audit_available and any(event.get("window_meaningful") for event, _ in records),
+        ),
+    }, {"available": normalization_available, "reason": reason}
+
+
+def _summarize_job_convergence(selected: list[dict[str, Any]], context: list[dict[str, Any]]) -> dict[str, Any]:
+    """Exact audit joins; no identities or content are returned in the aggregate.
+
+    Missing links, overlap, non-MCP timing and correlation gaps remain unknown.
+    Work is bounded to 100k rows and one million predecessor links per report.
+    """
+    if len(selected) + len(context) > 100_000:
+        raise ReportError("Job convergence analysis exceeds 100000 audit rows")
+    rows = {row.get("server_trace_id"): row for row in context + selected if row.get("server_trace_id")}
+    counts = Counter({name: 0 for name in (
+        "pending_handoff_count", "pending_followed_immediately_by_observe_count", "pending_followup_known_count",
+        "passive_terminal_delivery_count", "passive_failure_delivery_count",
+        "passive_terminal_before_explicit_observe_count", "terminal_failure_followed_by_observe_count",
+        "wait_for_job_terminal_count", "uncorrelated_calls", "unknown_relations",
+        "passive_validation_failure_delivery_count", "terminal_validation_failure_followed_by_observe_count",
+    )})
+    timings: list[int] = []
+    timing_missing = 0
+    links_remaining = 1_000_000
+    failure_observed: set[str] = set()
+    timed: set[str] = set()
+    pending_observed: set[str] = set()
+    pending_origin_by_relation: dict[str, str | None] = {}
+    pending_by_origin_tool: Counter[str] = Counter()
+    followup_by_origin_tool: Counter[str] = Counter()
+    timings_by_origin_tool: dict[str, list[int]] = {}
+    timing_missing_by_origin_tool: Counter[str] = Counter()
+    selected_terminal_by_origin_tool: Counter[str] = Counter()
+    selected_terminal_relations: set[str] = set()
+
+    def facts(row: dict[str, Any]) -> dict[str, Any]:
+        value = (_telemetry(row) or {}).get("job_convergence")
+        return value if isinstance(value, dict) else {}
+
+    def events(row: dict[str, Any]) -> list[dict[str, Any]]:
+        raw = facts(row).get("events", [])
+        if not isinstance(raw, list) or len(raw) > 9:
+            return []
+        return [event for event in raw if isinstance(event, dict)
+                and _is_exact_sha256(event.get("relation"))
+                and event.get("kind") in ("pending_handoff", "explicit_observe", "passive_terminal")]
+
+    def origin_tool(row: dict[str, Any]) -> str | None:
+        telemetry = _telemetry(row)
+        if not isinstance(telemetry, dict):
+            return None
+        tool = telemetry.get("tool_name")
+        if (
+            isinstance(tool, str)
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,127}", tool) is not None
+            and tool == row.get("operation")
+        ):
+            return tool
+        return None
+
+    def predecessor(row: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal links_remaining
+        if links_remaining <= 0:
+            return None
+        links_remaining -= 1
+        previous = rows.get(row.get("summary", {}).get("previous_meaningful_call"))
+        if not previous or row.get("window_transition_kind") != "serial":
+            return None
+        for field in ("client_window_key", "principal_correlation_kind", "principal_correlation_id"):
+            if not row.get(field) or row.get(field) != previous.get(field):
+                return None
+        if any(call.get("window_continuity_eligible") is not True or call.get("response_streaming") is not False
+               for call in (row, previous)):
+            return None
+        start, end = row.get("request_observed_at_ms"), previous.get("response_handed_at_ms")
+        if not isinstance(start, int) or not isinstance(end, int) or start < end:
+            return None
+        return previous
+
+    def history(row: dict[str, Any]):
+        seen: set[str] = set()
+        while (row := predecessor(row)) is not None:
+            trace = row["server_trace_id"]
+            version = (_telemetry(row) or {}).get("schema_version")
+            if (trace in seen or facts(row).get("correlation_complete") is False
+                    or not isinstance(version, int) or version < 10):
+                return
+            seen.add(trace)
+            yield row
+
+    selected_relations = {event["relation"] for row in selected for event in events(row)}
+    selected_traces = {row.get("server_trace_id") for row in selected}
+    for row in selected:
+        telemetry = _telemetry(row) or {}
+        version = telemetry.get("schema_version")
+        if (
+            facts(row).get("correlation_complete") is not True
+            or not isinstance(version, int)
+            or isinstance(version, bool)
+            or version < 10
+        ):
+            continue
+        tool = origin_tool(row)
+        for event in events(row):
+            if event["kind"] != "pending_handoff":
+                continue
+            relation_id = event["relation"]
+            if relation_id not in pending_origin_by_relation:
+                pending_origin_by_relation[relation_id] = tool
+            elif pending_origin_by_relation[relation_id] != tool:
+                pending_origin_by_relation[relation_id] = None
+    for tool in pending_origin_by_relation.values():
+        if tool is not None:
+            pending_by_origin_tool[tool] += 1
+    measured_rows = [row for row in rows.values() if row.get("server_trace_id") in selected_traces
+                     or any(event["relation"] in selected_relations for event in events(row))]
+    # Missing trace/timing still contributes observed invocation counts, but
+    # cannot participate in a relation chain.
+    measured_rows.extend(row for row in selected if not row.get("server_trace_id"))
+    known_followups: set[str] = set()
+    for row in rows.values():
+        version = (_telemetry(row) or {}).get("schema_version")
+        if facts(row).get("correlation_complete") is False or not isinstance(version, int) or version < 10:
+            continue
+        previous = predecessor(row)
+        if previous:
+            for event in events(previous):
+                if event["kind"] == "pending_handoff" and event["relation"] in selected_relations:
+                    known_followups.add(event["relation"])
+    counts["pending_followup_known_count"] = len(known_followups)
+    for relation_id in known_followups:
+        tool = pending_origin_by_relation.get(relation_id)
+        if tool is not None:
+            followup_by_origin_tool[tool] += 1
+    for row in measured_rows:
+        data = facts(row)
+        for name, maximum in (
+            ("pending_handoff_count", 32),
+            ("passive_terminal_delivery_count", 9),
+            ("passive_failure_delivery_count", 9),
+            ("wait_for_job_terminal_count", 1),
+        ):
+            value = data.get(name, 0)
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 <= value <= maximum
+            ):
+                counts[name] += value
+        if data.get("correlation_complete") is False:
+            counts["uncorrelated_calls"] += 1
+        for event in events(row):
+            relation_id = event["relation"]
+            pending = None
+            if event["kind"] == "explicit_observe":
+                previous = predecessor(row)
+                if previous and any(old["kind"] == "pending_handoff" and old["relation"] == relation_id for old in events(previous)):
+                    if relation_id not in pending_observed:
+                        counts["pending_followed_immediately_by_observe_count"] += 1
+                        pending_observed.add(relation_id)
+                if relation_id not in failure_observed:
+                    for previous in history(row):
+                        matching = [old for old in events(previous) if old["relation"] == relation_id]
+                        if any(old["kind"] == "passive_terminal" and old.get("failure") is True for old in matching):
+                            counts["terminal_failure_followed_by_observe_count"] += 1
+                            failure_observed.add(relation_id)
+                            if any(old.get("validation_failure") is True for old in matching if old["kind"] == "passive_terminal"):
+                                counts["terminal_validation_failure_followed_by_observe_count"] += 1
+                            break
+                        if any(old["kind"] == "pending_handoff" for old in matching):
+                            break
+            elif event["kind"] == "passive_terminal":
+                counts["passive_validation_failure_delivery_count"] += int(event.get("validation_failure") is True)
+                observed = False
+                pending = None
+                for previous in history(row):
+                    matching = [old for old in events(previous) if old["relation"] == relation_id]
+                    observed |= any(old["kind"] == "explicit_observe" for old in matching)
+                    if any(old["kind"] == "pending_handoff" for old in matching):
+                        pending = previous
+                        break
+                if pending is None:
+                    counts["unknown_relations"] += 1
+                elif not observed:
+                    counts["passive_terminal_before_explicit_observe_count"] += 1
+            if event["kind"] == "explicit_observe" and event.get("terminal_observed_at_ms") is not None:
+                for previous in history(row):
+                    if any(old["kind"] == "pending_handoff" and old["relation"] == relation_id for old in events(previous)):
+                        pending = previous
+                        break
+            if event["kind"] == "passive_terminal" or event.get("terminal_observed_at_ms") is not None:
+                origin = pending_origin_by_relation.get(relation_id)
+                trace_id = row.get("server_trace_id")
+                if (
+                    pending is not None
+                    and origin is not None
+                    and isinstance(trace_id, str)
+                    and trace_id in selected_traces
+                    and relation_id not in selected_terminal_relations
+                ):
+                    selected_terminal_relations.add(relation_id)
+                    selected_terminal_by_origin_tool[origin] += 1
+                if relation_id not in timed:
+                    timed.add(relation_id)
+                    handed = pending.get("response_handed_at_ms") if pending else None
+                    terminal = event.get("terminal_observed_at_ms")
+                    if isinstance(handed, int) and isinstance(terminal, int) and terminal >= handed:
+                        elapsed = terminal - handed
+                        timings.append(elapsed)
+                        if origin is not None:
+                            timings_by_origin_tool.setdefault(origin, []).append(elapsed)
+                    else:
+                        timing_missing += 1
+                        if origin is not None:
+                            timing_missing_by_origin_tool[origin] += 1
+    origin_tools = sorted(
+        set(pending_by_origin_tool)
+        | set(followup_by_origin_tool)
+        | set(timings_by_origin_tool)
+        | set(timing_missing_by_origin_tool)
+    )
+    return {
+        **counts,
+        "pending_handoff_by_origin_tool": dict(sorted(pending_by_origin_tool.items())),
+        "pending_followup_known_by_origin_tool": dict(sorted(followup_by_origin_tool.items())),
+        "selected_terminal_by_origin_tool": dict(
+            sorted(selected_terminal_by_origin_tool.items())
+        ),
+        "pending_to_terminal_ms": _metric_distribution(timings, missing=timing_missing),
+        "pending_to_terminal_ms_by_origin_tool": {
+            tool: _metric_distribution(
+                timings_by_origin_tool.get(tool, []),
+                missing=timing_missing_by_origin_tool.get(tool, 0),
+            )
+            for tool in origin_tools
+        },
+    }
+
+
+
+JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS = 120_000
+
+
+_JOB_SCHEDULING_INDEPENDENT_TOOLS = frozenset(
+    {
+        "read_files",
+        "search_project_texts",
+        "search_file_context",
+        "review_changes",
+        "read_workspace_changes",
+        "read_git_log",
+        "get_git_status",
+        "read_git_diff_hunks",
+        "read_git_review_summary",
+        "inspect_project_artifact",
+    }
+)
+
+
+def _readiness_facts(event: dict[str, Any]) -> dict[str, Any] | None:
+    value = (_telemetry(event) or {}).get("readiness")
+    if not isinstance(value, dict):
+        return None
+    mode = value.get("mode")
+    wait_state = value.get("wait_state")
+    numeric = {
+        field: value.get(field)
+        for field in ("requested_jobs", "unique_jobs", "waited_ms", "ready_count", "pending_count")
+    }
+    if mode not in ("any", "all") or wait_state not in ("ready", "deadline"):
+        return None
+    if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in numeric.values()):
+        return None
+    return {
+        "mode": mode,
+        "wait_state": wait_state,
+        **numeric,
+    }
+
+
+def _job_scheduling_pending_relations(event: dict[str, Any]) -> set[str]:
+    telemetry = _telemetry(event) or {}
+    version = telemetry.get("schema_version")
+    facts = telemetry.get("job_convergence")
+    if not isinstance(version, int) or version < 10 or not isinstance(facts, dict):
+        return set()
+    if facts.get("correlation_complete") is False:
+        return set()
+    raw = facts.get("events")
+    if not isinstance(raw, list) or len(raw) > 9:
+        return set()
+    return {
+        relation
+        for item in raw
+        if isinstance(item, dict)
+        and item.get("kind") == "pending_handoff"
+        and _is_exact_sha256(relation := item.get("relation"))
+    }
+
+def _summarize_job_scheduling(
+    selected: list[dict[str, Any]],
+    context: list[dict[str, Any]],
+    job_convergence: dict[str, Any] | None = None,
+    *,
+    action_audit_available: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Summarize pending/readiness scheduling without claiming Host-turn identity.
+
+    Serial adjacency is exact ClientWindow continuity only. Readiness telemetry is
+    identity-free, so deadline->rewait cannot prove that the blocked Job set is
+    unchanged; that limitation is explicit in the result.
+    """
+    if not action_audit_available:
+        unavailable = {
+            "pending_handoffs": None,
+            "pending_followup_known": None,
+            "pending_then_independent_work": None,
+            "pending_then_immediate_readiness": None,
+            "pending_then_immediate_observe": None,
+            "readiness_calls": None,
+            "readiness_measured_calls": None,
+            "readiness_ready": None,
+            "readiness_deadline": None,
+            "readiness_any": None,
+            "readiness_all": None,
+            "deadline_then_nearby_rewait": None,
+            "nearby_rewait_max_gap_ms": JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS,
+            "readiness_waited_ms": _metric_distribution([]),
+            "same_model_turn_proven": False,
+            "same_blocked_set_proven": False,
+        }
+        return unavailable, {
+            "available": False,
+            "reason": "job scheduling analysis requires ActionAudit ModelErgonomics and serial ClientWindow continuity",
+        }
+
+    selected_outer = [row for row in selected if row.get("action_name") == "toolsCall"]
+    if len(selected_outer) + len(context) > 100_000:
+        raise ReportError("Job scheduling analysis exceeds 100000 audit rows")
+    if job_convergence is None:
+        job_convergence = _summarize_job_convergence(selected, context)
+
+    readiness_rows = [
+        row for row in selected_outer if row.get("operation") == "wait_for_job_readiness"
+    ]
+    readiness = [(row, _readiness_facts(row)) for row in readiness_rows]
+    measured = [(row, facts) for row, facts in readiness if facts is not None]
+    readiness_complete = len(measured) == len(readiness_rows)
+    waits = [facts["waited_ms"] for _, facts in measured]
+    ready_observed = sum(facts["wait_state"] == "ready" for _, facts in measured)
+    deadline_observed = sum(facts["wait_state"] == "deadline" for _, facts in measured)
+    any_observed = sum(facts["mode"] == "any" for _, facts in measured)
+    all_observed = sum(facts["mode"] == "all" for _, facts in measured)
+
+    rows: dict[str, dict[str, Any]] = {}
+    for row in context + selected:
+        trace = row.get("server_trace_id")
+        if isinstance(trace, str) and trace:
+            rows[trace] = row
+    selected_traces = {
+        row["server_trace_id"]
+        for row in selected_outer
+        if isinstance(row.get("server_trace_id"), str) and row["server_trace_id"]
+    }
+
+    def predecessor(row: dict[str, Any]) -> dict[str, Any] | None:
+        if row.get("window_transition_kind") != "serial":
+            return None
+        previous_trace = row.get("summary", {}).get("previous_meaningful_call")
+        previous = rows.get(previous_trace)
+        if previous is None:
+            return None
+        for field in ("client_window_key", "principal_correlation_kind", "principal_correlation_id"):
+            if not row.get(field) or row.get(field) != previous.get(field):
+                return None
+        if any(
+            call.get("window_continuity_eligible") is not True
+            or call.get("response_streaming") is not False
+            for call in (row, previous)
+        ):
+            return None
+        started = row.get("request_observed_at_ms")
+        handed = previous.get("response_handed_at_ms")
+        if not isinstance(started, int) or not isinstance(handed, int) or started < handed:
+            return None
+        return previous
+
+    independent_observed = 0
+    immediate_readiness_observed = 0
+    deadline_rewait_observed = 0
+    chain_missing = 0
+    for row in selected_outer:
+        if row.get("window_transition_kind") != "serial":
+            continue
+        operation = row.get("operation")
+        relevant = (
+            operation in _JOB_SCHEDULING_INDEPENDENT_TOOLS
+            or operation == "wait_for_job_readiness"
+        )
+        if not relevant:
+            continue
+        previous = predecessor(row)
+        if previous is None:
+            chain_missing += 1
+            continue
+        if previous.get("server_trace_id") not in selected_traces:
+            continue
+        pending_relations = _job_scheduling_pending_relations(previous)
+        if pending_relations:
+            if operation in _JOB_SCHEDULING_INDEPENDENT_TOOLS:
+                independent_observed += 1
+            elif operation == "wait_for_job_readiness":
+                immediate_readiness_observed += 1
+        if (
+            operation == "wait_for_job_readiness"
+            and (previous_readiness := _readiness_facts(previous)) is not None
+            and previous_readiness["wait_state"] == "deadline"
+        ):
+            started = row.get("request_observed_at_ms")
+            handed = previous.get("response_handed_at_ms")
+            if (
+                isinstance(started, int)
+                and isinstance(handed, int)
+                and 0 <= started - handed <= JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS
+            ):
+                deadline_rewait_observed += 1
+
+    chain_complete = chain_missing == 0
+    pending_handoffs = job_convergence.get("pending_handoff_count")
+    pending_followup_known = job_convergence.get("pending_followup_known_count")
+    pending_immediate_observe = job_convergence.get(
+        "pending_followed_immediately_by_observe_count"
+    )
+
+    summary = {
+        "pending_handoffs": pending_handoffs,
+        "pending_followup_known": pending_followup_known,
+        "pending_then_independent_work": independent_observed if chain_complete else None,
+        "pending_then_immediate_readiness": immediate_readiness_observed if chain_complete else None,
+        "pending_then_immediate_observe": pending_immediate_observe,
+        "readiness_calls": len(readiness_rows),
+        "readiness_measured_calls": len(measured),
+        "readiness_ready": ready_observed if readiness_complete else None,
+        "readiness_deadline": deadline_observed if readiness_complete else None,
+        "readiness_any": any_observed if readiness_complete else None,
+        "readiness_all": all_observed if readiness_complete else None,
+        "deadline_then_nearby_rewait": deadline_rewait_observed if chain_complete else None,
+        "nearby_rewait_max_gap_ms": JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS,
+        "readiness_waited_ms": _metric_distribution(
+            waits, missing=len(readiness_rows) - len(measured)
+        ),
+        "same_model_turn_proven": False,
+        "same_blocked_set_proven": False,
+    }
+    complete = readiness_complete and chain_complete
+    reasons = []
+    if not readiness_complete:
+        reasons.append("one or more readiness calls lack complete ModelErgonomics readiness telemetry")
+    if not chain_complete:
+        reasons.append("one or more relevant serial calls lack exact predecessor continuity evidence")
+    return summary, {
+        "available": complete,
+        "reason": None if complete else "; ".join(reasons),
+    }
+
+
+def _code_mode_composition(event: dict[str, Any]) -> dict[str, Any] | None:
+    value = event.get("summary", {}).get("code_mode_composition")
+    if not isinstance(value, dict):
+        return None
+    normalized: dict[str, Any] = {}
+    for field in CODE_MODE_COMPOSITION_NUMERIC_FIELDS:
+        item = value.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return None
+        normalized[field] = item
+    for field in CODE_MODE_COMPOSITION_OPTIONAL_NUMERIC_FIELDS:
+        item = value.get(field)
+        if item is None:
+            continue
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return None
+        normalized[field] = item
+    counts = value.get("nested_tool_counts")
+    if not isinstance(counts, dict):
+        return None
+    normalized_counts: dict[str, int] = {}
+    for tool, count in counts.items():
+        if (
+            not isinstance(tool, str)
+            or not tool
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+        ):
+            return None
+        normalized_counts[tool] = count
+    if normalized["nested_successes"] + normalized["nested_failures"] != normalized["nested_calls"]:
+        return None
+    if sum(normalized_counts.values()) != normalized["nested_calls"]:
+        return None
+    if normalized["known_results"] + normalized["job_handoffs"] + normalized["outcome_unknown"] != normalized["consequential_calls"]:
+        return None
+    normalized["nested_tool_counts"] = normalized_counts
+    return normalized
+
+
+def _nearest_rank(values: Iterable[int], percentile: float) -> int | None:
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    rank = max(1, math.ceil(percentile * len(ordered)))
+    return ordered[rank - 1]
+
+
+def _metric_distribution(values: list[int], *, missing: int = 0) -> dict[str, Any]:
+    observed_total = sum(values)
+    return {
+        "total": observed_total if missing == 0 else None,
+        "observed_total": observed_total,
+        "p50": _nearest_rank(values, 0.50),
+        "p95": _nearest_rank(values, 0.95),
+        "samples": len(values),
+        "missing": missing,
+    }
+
+
+# Optional additive ModelErgonomics v13 output metrics. The producer persists
+# only numeric counters; raw file text, Job logs, paths and correlation ids stay
+# out of the Audit report. Nested Code Mode calls are not individual outer rows.
+_OUTPUT_TRANSFER_FIELDS = {
+    "read_files": (
+        "items", "text_bytes",
+        "identical_same_path_text_items", "identical_same_path_text_bytes",
+    ),
+    "observe_jobs": (
+        "items", "baseline_items", "delta_items", "reset_items",
+        "unchanged_items", "baseline_log_bytes", "delta_log_bytes",
+        "reset_log_bytes", "unchanged_log_bytes",
+    ),
+}
+_MAX_TRANSFER_FIELD = 8 * 1024 * 1024
+
+
+def _valid_output_transfer(tool: str, telemetry: dict[str, Any] | None) -> dict[str, int] | None:
+    if not isinstance(telemetry, dict):
+        return None
+    version = telemetry.get("schema_version")
+    facts = telemetry.get("output_transfer")
+    if (
+        type(version) is not int
+        or version < 13
+        or telemetry.get("tool_name") != tool
+        or telemetry.get("success") is not True
+        or not isinstance(facts, dict)
+        or facts.get("kind") != tool
+    ):
+        return None
+    fields = _OUTPUT_TRANSFER_FIELDS[tool]
+    values = {name: facts.get(name) for name in fields}
+    if any(type(value) is not int or not 0 <= value <= _MAX_TRANSFER_FIELD for value in values.values()):
+        return None
+    if not 1 <= values["items"] <= 8:
+        return None
+    if tool == "read_files":
+        if (
+            values["identical_same_path_text_items"] > values["items"]
+            or values["identical_same_path_text_bytes"] > values["text_bytes"]
+        ):
+            return None
+    elif (
+        sum(values[name] for name in ("baseline_items", "delta_items", "reset_items", "unchanged_items"))
+        != values["items"]
+    ):
+        return None
+    return values
+
+
+def _summarize_output_transfer(
+    outer: list[dict[str, Any]], *, action_audit_available: bool
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    summary: dict[str, Any] = {}
+    availability: dict[str, Any] = {}
+    for tool, fields in _OUTPUT_TRANSFER_FIELDS.items():
+        relevant = [
+            event for event in outer if event.get("operation") == tool
+        ] if action_audit_available else []
+        observed = []
+        for event in relevant:
+            facts = _valid_output_transfer(tool, _telemetry(event))
+            if facts is not None:
+                observed.append(facts)
+        metrics = {
+            name: _metric_distribution(
+                [facts[name] for facts in observed],
+                missing=len(relevant) - len(observed) if action_audit_available else 1,
+            )
+            for name in fields
+        }
+        if not relevant:
+            # Neither no calls nor trace-only input proves a measured zero.
+            for metric in metrics.values():
+                metric["total"] = None
+        summary[tool] = {
+            "calls": len(relevant) if action_audit_available else None,
+            "measured_calls": len(observed) if action_audit_available else None,
+            "metrics": metrics,
+        }
+        complete = action_audit_available and bool(relevant) and len(observed) == len(relevant)
+        availability[tool] = {
+            "available": complete,
+            "reason": None if complete else (
+                "no ActionAudit tool-call evidence" if not action_audit_available
+                else "no matching outer tool calls" if not relevant
+                else "one or more outer calls lack complete payload-free output transfer counters"
+            ),
+        }
+    return summary, availability
+
+
+def _summarize_code_mode_composition(
+    outer: list[dict[str, Any]],
+    variant: str | None,
+    *,
+    action_audit_available: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not action_audit_available:
+        metrics = {
+            field: _metric_distribution([], missing=1)
+            for field in (
+                *CODE_MODE_COMPOSITION_NUMERIC_FIELDS,
+                *CODE_MODE_COMPOSITION_OPTIONAL_NUMERIC_FIELDS,
+            )
+        }
+        return (
+            {
+                "outer_code_mode_calls": None,
+                "outer_calls_with_summary": None,
+                "nested_tool_counts": {},
+                **metrics,
+            },
+            {
+                "available": False,
+                "reason": "Code Mode composition is persisted in ActionAudit summary metadata, not in trace-only evidence",
+            },
+        )
+
+    code_mode_outer = [event for event in outer if event.get("operation") in CODE_MODE_TOOLS]
+    parsed = [
+        composition
+        for event in code_mode_outer
+        if (composition := _code_mode_composition(event)) is not None
+    ]
+    missing = len(code_mode_outer) - len(parsed)
+    reason = None
+    if variant == "code_mode" and not code_mode_outer:
+        missing = max(missing, 1)
+        reason = (
+            "no Code Mode outer ActionAudit row was selected; benchmark calls must link their outer "
+            "ActionAudit rows with recording_session_id"
+        )
+    elif variant in ("direct", "host_code_mode") and code_mode_outer:
+        missing = max(missing, 1)
+        reason = f"a {variant} report selected one or more Code Mode outer calls"
+    elif missing:
+        reason = "one or more Code Mode outer calls lack a valid code_mode_composition summary"
+
+    metrics = {
+        field: _metric_distribution([int(value[field]) for value in parsed], missing=missing)
+        for field in CODE_MODE_COMPOSITION_NUMERIC_FIELDS
+    }
+    for field in CODE_MODE_COMPOSITION_OPTIONAL_NUMERIC_FIELDS:
+        values = [int(value[field]) for value in parsed if field in value]
+        metrics[field] = _metric_distribution(
+            values,
+            missing=len(code_mode_outer) - len(values),
+        )
+    nested_tool_counts: Counter[str] = Counter()
+    for value in parsed:
+        nested_tool_counts.update(value["nested_tool_counts"])
+    available = missing == 0 and reason is None
+    return (
+        {
+            "outer_code_mode_calls": len(code_mode_outer),
+            "outer_calls_with_summary": len(parsed),
+            "nested_tool_counts": dict(sorted(nested_tool_counts.items())),
+            **metrics,
+        },
+        {"available": available, "reason": reason},
+    )
+
+
+def _audit_sort_key(event: dict[str, Any]) -> tuple[int, str]:
+    for field in ("request_observed_at_ms", "window_started_at_ms"):
+        value = event.get(field)
+        if isinstance(value, int):
+            return value, str(event["event_id"])
+    started_at = event.get("started_at")
+    return (int(started_at) * 1000 if isinstance(started_at, int) else 0, str(event["event_id"]))
+
+
+def _window_timing(
+    outer: list[dict[str, Any]],
+    continuity_events: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], int, int, dict[str, dict[str, Any]]]:
+    selected_ids = {str(event["event_id"]) for event in outer}
+    previous: dict[tuple[str, str, str], dict[str, Any]] = {}
+    gaps: list[int] = []
+    gap_pairs: dict[tuple[str, str], list[int]] = {}
+    missing_serial = 0
+    overlap_count = 0
+    source = continuity_events if continuity_events is not None else outer
+    for event in sorted(source, key=_audit_sort_key):
+        if not event.get("window_meaningful"):
+            continue
+        selected = str(event["event_id"]) in selected_ids
+        window_key = event.get("client_window_key")
+        principal_kind = event.get("principal_correlation_kind")
+        principal_id = event.get("principal_correlation_id")
+        if not all(isinstance(value, str) and value for value in (window_key, principal_kind, principal_id)):
+            if selected and event.get("window_transition_kind") == "serial":
+                missing_serial += 1
+            continue
+        key = (window_key, principal_kind, principal_id)
+        predecessor = previous.pop(key, None)
+        transition = event.get("window_transition_kind")
+        if selected and transition == "overlap":
+            overlap_count += 1
+        if selected and transition == "serial":
+            current_started = event.get("request_observed_at_ms")
+            previous_handed = predecessor.get("response_handed_at_ms") if predecessor else None
+            predecessor_selected = (
+                predecessor is not None
+                and str(predecessor["event_id"]) in selected_ids
+            )
+            if (
+                predecessor_selected
+                and isinstance(current_started, int)
+                and isinstance(previous_handed, int)
+                and current_started >= previous_handed
+            ):
+                gap = current_started - previous_handed
+                gaps.append(gap)
+                earlier_tool = predecessor.get("operation")
+                later_tool = event.get("operation")
+                if (isinstance(earlier_tool, str) and earlier_tool
+                        and isinstance(later_tool, str) and later_tool):
+                    gap_pairs.setdefault((earlier_tool, later_tool), []).append(gap)
+            else:
+                missing_serial += 1
+        if event.get("window_continuity_eligible") is True:
+            previous[key] = event
+    # Only persisted operation names are exposed, never Window/principal identity.
+    # Limit cardinality and keep the heaviest observed gaps first. Incomplete
+    # chains remain incomplete in the overall gap distribution above.
+    ranked_pairs = sorted(
+        gap_pairs.items(), key=lambda item: (-sum(item[1]), item[0])
+    )[:10]
+    by_pair = {
+        f"{earlier} -> {later}": _metric_distribution(values)
+        for (earlier, later), values in ranked_pairs
+    }
+    return _metric_distribution(gaps, missing=missing_serial), overlap_count, missing_serial, by_pair
+
+
+def _summarize_host_short_chains(
+    outer: list[dict[str, Any]],
+    continuity_events: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Summarize exact serial Window chains without inferring Host/model turns."""
+    selected_ids = {str(event["event_id"]) for event in outer}
+    previous: dict[tuple[str, str, str], dict[str, Any]] = {}
+    edges: list[tuple[str, str, str, str]] = []
+    missing_serial = 0
+    source = continuity_events if continuity_events is not None else outer
+    for event in sorted(source, key=_audit_sort_key):
+        if not event.get("window_meaningful"):
+            continue
+        selected = str(event["event_id"]) in selected_ids
+        window_key = event.get("client_window_key")
+        principal_kind = event.get("principal_correlation_kind")
+        principal_id = event.get("principal_correlation_id")
+        transition = event.get("window_transition_kind")
+        if not all(
+            isinstance(value, str) and value
+            for value in (window_key, principal_kind, principal_id)
+        ):
+            if selected and transition == "serial":
+                missing_serial += 1
+            continue
+        key = (window_key, principal_kind, principal_id)
+        predecessor = previous.pop(key, None)
+        if selected and transition == "serial":
+            predecessor_selected = (
+                predecessor is not None
+                and str(predecessor["event_id"]) in selected_ids
+            )
+            previous_tool = predecessor.get("operation") if predecessor else None
+            current_tool = event.get("operation")
+            if predecessor_selected:
+                if (
+                    predecessor.get("response_streaming") is False
+                    and event.get("response_streaming") is False
+                    and event.get("window_continuity_eligible") is True
+                    and isinstance(previous_tool, str)
+                    and previous_tool
+                    and isinstance(current_tool, str)
+                    and current_tool
+                ):
+                    edges.append(
+                        (
+                            str(predecessor["event_id"]),
+                            str(event["event_id"]),
+                            previous_tool,
+                            current_tool,
+                        )
+                    )
+                else:
+                    missing_serial += 1
+            elif predecessor is None:
+                # A serial transition claims a predecessor. If the continuity
+                # loader cannot resolve that exact predecessor, the aggregate
+                # remains unavailable rather than guessing whether the edge was
+                # inside or outside the selected benchmark run.
+                missing_serial += 1
+        if event.get("window_continuity_eligible") is True:
+            previous[key] = event
+
+    successor = {before: after for before, after, _, _ in edges}
+    starts = sorted(set(successor) - set(successor.values()))
+    chain_lengths: list[int] = []
+    for start in starts:
+        seen = {start}
+        current = start
+        length = 1
+        while current in successor:
+            current = successor[current]
+            if current in seen:
+                break
+            seen.add(current)
+            length += 1
+        if length > 1:
+            chain_lengths.append(length)
+    pair_counts = Counter(
+        f"{before_tool}->{after_tool}" for _, _, before_tool, after_tool in edges
+    )
+    complete = missing_serial == 0
+    summary = {
+        "serial_transitions": len(edges) if complete else None,
+        "observed_serial_transitions": len(edges),
+        "missing_serial_transitions": missing_serial,
+        "multi_call_chains": len(chain_lengths) if complete else None,
+        "calls_in_multi_call_chains": sum(chain_lengths) if complete else None,
+        "max_chain_calls": max(chain_lengths, default=0) if complete else None,
+        "observed_by_tool_pair": dict(sorted(pair_counts.items())),
+        "same_model_turn_proven": False,
+    }
+    availability = {
+        "available": complete,
+        "reason": (
+            None
+            if complete
+            else "one or more selected serial Window transitions lack exact predecessor continuity evidence"
+        ),
+    }
+    return summary, availability
+
+
+def _observed_span_ms(outer: list[dict[str, Any]]) -> int | None:
+    starts = [event["request_observed_at_ms"] for event in outer if isinstance(event.get("request_observed_at_ms"), int)]
+    ends = [event["response_handed_at_ms"] for event in outer if event.get("response_streaming") is False and isinstance(event.get("response_handed_at_ms"), int)]
+    if not starts or not ends:
+        return None
+    span = max(ends) - min(starts)
+    return span if span >= 0 else None
+
+
+def _summarize_native_batch(
+    outer: list[dict[str, Any]], *, action_audit_available: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Requested cardinality from admitted outer calls, never completed work.
+
+    Missing canonical identity (including gateway calls) makes coverage unknown.
+    Child calls inside Code Mode are deliberately outside this measurement.
+    """
+    fields = {"read_files": "requested_items", "search_project_texts": "requested_queries"}
+    calls: Counter[str] = Counter()
+    measured: dict[str, list[int]] = {tool: [] for tool in fields}
+    unidentified = 0
+    for event in outer:
+        telemetry = _input_ergonomics_record(event)
+        tool = telemetry.get("tool_name") if isinstance(telemetry, dict) else None
+        if not isinstance(tool, str) or not tool:
+            unidentified += 1
+            continue
+        if tool not in fields:
+            continue
+        calls[tool] += 1
+        facts = telemetry.get("native_batch")
+        field = fields[tool]
+        if (
+            type(telemetry.get("schema_version")) is int
+            and telemetry["schema_version"] >= 13
+            and isinstance(facts, dict)
+            and set(facts) == {"kind", field}
+            and facts.get("kind") == tool
+            and type(facts.get(field)) is int
+            and 1 <= facts[field] <= 8
+        ):
+            measured[tool].append(facts[field])
+    result = {}
+    for tool in fields:
+        values = measured[tool]
+        complete = action_audit_available and unidentified == 0 and len(values) == calls[tool]
+        distribution = _metric_distribution(values, missing=calls[tool] - len(values))
+        if not action_audit_available or not complete or not values:
+            distribution["total"] = None
+        result[tool] = {
+            "outer_calls": calls[tool] if action_audit_available and not unidentified else None,
+            "observed_outer_calls": calls[tool] if action_audit_available else None,
+            "observed_multi_item_calls": sum(value > 1 for value in values) if action_audit_available else None,
+            "multi_item_calls": sum(value > 1 for value in values) if complete else None,
+            "requested_cardinality": distribution,
+        }
+    available = action_audit_available and unidentified == 0 and all(len(measured[t]) == calls[t] for t in fields)
+    return result, {
+        "available": available,
+        "reason": None if available else (
+            "native batch evidence requires ActionAudit" if not action_audit_available
+            else "one or more outer calls lack canonical tool identity" if unidentified
+            else "one or more native calls lack valid admitted requested-cardinality evidence"
+        ),
+    }
+
+
+def _summarize_audit(
+    audit_events: list[dict[str, Any]],
+    variant: str | None,
+    continuity_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    outer = [event for event in audit_events if event.get("action_name") == "toolsCall"]
+    statuses = Counter(str(event.get("status") or "unknown") for event in outer)
+    outer_tools = Counter(event["operation"] for event in outer if isinstance(event.get("operation"), str))
+    meaningful_calls = sum(bool(event.get("window_meaningful")) for event in outer)
+    composition, composition_availability = _summarize_code_mode_composition(outer, variant)
+    failed_child_calls = (
+        composition["nested_failures"]["total"]
+        if composition_availability["available"]
+        else None
+    )
+
+    service_values: list[int] = []
+    for event in outer:
+        started = event.get("request_observed_at_ms")
+        handed = event.get("response_handed_at_ms")
+        if event.get("response_streaming") is False and isinstance(started, int) and isinstance(handed, int) and handed >= started:
+            service_values.append(handed - started)
+    service = _metric_distribution(service_values, missing=len(outer) - len(service_values))
+
+    telemetries = [(event, _telemetry(event)) for event in outer]
+    present_telemetries = [(event, value) for event, value in telemetries if value is not None]
+    runtime_durations = [int(value["duration_ms"]) for _, value in present_telemetries if isinstance(value.get("duration_ms"), int) and value["duration_ms"] >= 0]
+    runtime_duration = _metric_distribution(runtime_durations, missing=len(outer) - len(runtime_durations))
+    result_bytes = [int(value["serialized_result_bytes"]) for _, value in present_telemetries if isinstance(value.get("serialized_result_bytes"), int) and value["serialized_result_bytes"] >= 0]
+    result_byte_metric = _metric_distribution(result_bytes, missing=len(outer) - len(result_bytes))
+    output_transfer, output_transfer_availability = _summarize_output_transfer(
+        outer, action_audit_available=True
+    )
+    native_batch, native_batch_availability = _summarize_native_batch(outer, action_audit_available=True)
+
+    failure_kinds: Counter[str] = Counter()
+    recovery_guidance: Counter[str] = Counter()
+    error_kinds: Counter[str] = Counter()
+    edit_outcomes: Counter[str] = Counter()
+    edit_outcomes_by_tool: dict[str, Counter[str]] = {}
+    unrecognized_edit_outcomes = 0
+    for _, value in present_telemetries:
+        for field, counter in (("failure_kind", failure_kinds), ("recovery_kind", recovery_guidance), ("error_kind", error_kinds)):
+            item = value.get(field)
+            if isinstance(item, str) and item:
+                counter[item] += 1
+        outcome = value.get("edit_outcome")
+        if outcome is None:
+            continue
+        schema_version = value.get("schema_version")
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version < EDIT_OUTCOME_SCHEMA_VERSION
+            or not isinstance(outcome, str)
+            or outcome not in EDIT_OUTCOMES
+        ):
+            unrecognized_edit_outcomes += 1
+            continue
+        edit_outcomes[outcome] += 1
+        tool_name = value.get("tool_name")
+        if isinstance(tool_name, str) and tool_name:
+            edit_outcomes_by_tool.setdefault(tool_name, Counter())[outcome] += 1
+
+    gaps, overlap_count, missing_serial, gap_pairs = _window_timing(outer, continuity_events)
+    host_short_chain, host_short_chain_availability = _summarize_host_short_chains(
+        outer, continuity_events
+    )
+    canonical_records = (
+        [value for event in outer if (value := _input_ergonomics_record(event)) is not None]
+        if variant == TOOL_SELECTION_VARIANT
+        else [value for _, value in present_telemetries]
+    )
+    canonical_observed = len(canonical_records)
+    canonical_by_name = Counter(value["tool_name"] for value in canonical_records if isinstance(value.get("tool_name"), str) and value["tool_name"])
+    if variant in ("direct", "host_code_mode", TOOL_SELECTION_VARIANT):
+        canonical_total = canonical_observed if canonical_observed == len(outer) else None
+        canonical_reason = None if canonical_total is not None else "one or more outer calls lack valid canonical ModelErgonomics evidence"
+    elif variant == "code_mode":
+        canonical_total = None
+        canonical_reason = "canonical_calls.total keeps the outer/direct counting contract; use composition.nested_calls for persisted Code Mode child-call totals"
+    else:
+        canonical_total = None
+        canonical_reason = "declare --variant direct, host_code_mode, or code_mode before interpreting canonical call count"
+
+    return {
+        "observed_span_ms": _observed_span_ms(outer),
+        "model_round_trips": None,
+        "model_round_trip_proxy": meaningful_calls,
+        "outer_calls": {
+            "total": len(outer),
+            "meaningful": meaningful_calls,
+            "successful": statuses.get("success", 0),
+            "failed": statuses.get("failed", 0),
+            "timeout_or_unknown": len(outer) - statuses.get("success", 0) - statuses.get("failed", 0),
+            "by_status": dict(sorted(statuses.items())),
+        },
+        "tools": {"outer_by_name": dict(sorted(outer_tools.items()))},
+        "canonical_calls": {
+            "total": canonical_total,
+            "observed_outer_runtime_records": canonical_observed,
+            "by_name": dict(sorted(canonical_by_name.items())),
+        },
+        "edit_outcomes": {
+            "observed": sum(edit_outcomes.values()),
+            "unrecognized": unrecognized_edit_outcomes,
+            "by_outcome": dict(sorted(edit_outcomes.items())),
+            "by_tool": {
+                tool: dict(sorted(counts.items()))
+                for tool, counts in sorted(edit_outcomes_by_tool.items())
+            },
+        },
+        "composition": composition,
+        "host_short_chain": host_short_chain,
+        "child_calls": {
+            "failed": failed_child_calls,
+            "failure_kind_by_name": None,
+        },
+        "timing": {
+            "webcodex_service_ms": service,
+            "tool_runtime_ms": runtime_duration,
+            "outside_webcodex_gap_ms": gaps,
+            "outside_webcodex_gap_by_tool_pair": gap_pairs,
+            "overlap_count": overlap_count,
+        },
+        "results": {"serialized_tool_result_bytes": result_byte_metric},
+        "output_transfer": output_transfer,
+        "native_batch": native_batch,
+        "failures": {
+            "error_kind_by_name": dict(sorted(error_kinds.items())),
+            "failure_kind_by_name": dict(sorted(failure_kinds.items())),
+            "recovery_guidance_by_kind": dict(sorted(recovery_guidance.items())),
+            "child_failure_kind_by_name": None,
+            "resolved_recoveries": None,
+        },
+        "availability": {
+            "action_audit": {"available": True},
+            "output_transfer": output_transfer_availability,
+            "model_round_trips": {
+                "available": False,
+                "reason": "ActionAudit records meaningful outer tool calls but not the model response/turn identity needed to prove exact model round trips",
+            },
+            "model_round_trip_proxy": {
+                "available": True,
+                "reason": "proxy equals meaningful outer tool calls; parallel outer calls may share one model response",
+            },
+            "failed_child_calls": {
+                "available": failed_child_calls is not None,
+                "reason": (
+                    None
+                    if failed_child_calls is not None
+                    else "Code Mode child failure count requires a complete ActionAudit code_mode_composition summary"
+                ),
+            },
+            "child_failure_kinds": {
+                "available": False,
+                "reason": "ActionAudit composition persists authoritative nested failure counts but not per-child failure-kind distribution",
+            },
+            "webcodex_service_timing": {"available": service["total"] is not None, "reason": None if service["total"] is not None else "one or more outer calls lack non-streaming request-observed/response-handoff timestamps"},
+            "tool_runtime_timing": {"available": runtime_duration["total"] is not None, "reason": None if runtime_duration["total"] is not None else "one or more outer calls lack ModelErgonomics runtime duration evidence"},
+            "window_timing": {"available": missing_serial == 0, "reason": None if missing_serial == 0 else "one or more canonical serial transitions lack the predecessor timestamps needed for a gap"},
+            "canonical_calls": {"available": canonical_total is not None, "reason": canonical_reason},
+            "edit_outcomes": {
+                "available": bool(edit_outcomes) and unrecognized_edit_outcomes == 0,
+                "reason": (
+                    None
+                    if edit_outcomes and unrecognized_edit_outcomes == 0
+                    else "no complete authoritative ModelErgonomics edit outcome evidence"
+                    if not edit_outcomes
+                    else "one or more edit outcome labels are unknown or malformed"
+                ),
+            },
+            "native_batch": native_batch_availability,
+            "code_mode_composition": composition_availability,
+            "host_short_chain": host_short_chain_availability,
+            "host_same_model_turn_identity": {
+                "available": False,
+                "reason": "serial ClientWindow continuity proves call ordering, not that calls came from one Host cell or one model response",
+            },
+            "serialized_tool_result_bytes": {"available": result_byte_metric["total"] is not None, "reason": None if result_byte_metric["total"] is not None else "one or more outer calls lack a serialized ToolResult byte count; missing values are not treated as zero"},
+            "resolved_recoveries": {"available": False, "reason": "recovery_kind is guidance metadata, not proof that a later call resolved the failure"},
+        },
+    }
+
+
+def _trace_handler_events(trace_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for event in trace_events:
+        if event.get("event") != "tool_handler_returned":
+            continue
+        trace_id = event.get("server_trace_id")
+        if isinstance(trace_id, str) and trace_id:
+            grouped.setdefault(trace_id, []).append(event)
+    handlers = []
+    for trace_id in sorted(grouped):
+        candidates = grouped[trace_id]
+        candidates.sort(key=lambda event: (int(event.get("duration_ms") or -1), _stable_json(event)))
+        handlers.append(candidates[-1])
+    return handlers
+
+
+def _summarize_trace_only(trace_events: list[dict[str, Any]], variant: str | None) -> dict[str, Any]:
+    handlers = _trace_handler_events(trace_events)
+    statuses: Counter[str] = Counter()
+    tools: Counter[str] = Counter()
+    for event in handlers:
+        tool_success = event.get("tool_success")
+        protocol_success = event.get("protocol_success")
+        if tool_success is True or (tool_success is None and protocol_success is True):
+            statuses["success"] += 1
+        elif tool_success is False or protocol_success is False:
+            statuses["failed"] += 1
+        else:
+            statuses["unknown"] += 1
+        tool_name = event.get("tool_name")
+        if isinstance(tool_name, str) and tool_name:
+            tools[tool_name] += 1
+    composition, composition_availability = _summarize_code_mode_composition(
+        [], variant, action_audit_available=False
+    )
+    output_transfer, output_transfer_availability = _summarize_output_transfer(
+        [], action_audit_available=False
+    )
+    native_batch, native_batch_availability = _summarize_native_batch([], action_audit_available=False)
+    unavailable = {
+        "native_batch": native_batch_availability,
+        "output_transfer": output_transfer_availability,
+        "webcodex_service_timing": {"available": False, "reason": "tool_handler_returned duration is not the canonical request-observed to response-handoff service interval"},
+        "tool_runtime_timing": {"available": False, "reason": "events.jsonl does not persist canonical ModelErgonomics runtime duration evidence"},
+        "window_timing": {"available": False, "reason": "events.jsonl does not persist canonical meaningful/continuity transition facts"},
+        "host_short_chain": {"available": False, "reason": "events.jsonl does not persist canonical serial ClientWindow continuity"},
+        "host_same_model_turn_identity": {"available": False, "reason": "trace lifecycle metadata has no Host cell or model response identity"},
+        "canonical_calls": {"available": False, "reason": "outer trace lifecycle metadata is not a complete canonical nested-call ledger"},
+        "serialized_tool_result_bytes": {"available": False, "reason": "estimated HTTP response bytes are not ToolResult serialized bytes"},
+        "resolved_recoveries": {"available": False, "reason": "trace lifecycle metadata does not prove recovery completion"},
+    }
+    return {
+        "observed_span_ms": None,
+        "model_round_trips": None,
+        "model_round_trip_proxy": None,
+        "outer_calls": {"total": len(handlers), "meaningful": None, "successful": statuses.get("success", 0), "failed": statuses.get("failed", 0), "timeout_or_unknown": statuses.get("unknown", 0), "by_status": dict(sorted(statuses.items()))},
+        "tools": {"outer_by_name": dict(sorted(tools.items()))},
+        "canonical_calls": {"total": None, "observed_outer_runtime_records": None, "by_name": {}},
+        "edit_outcomes": {
+            "observed": 0,
+            "unrecognized": 0,
+            "by_outcome": {},
+            "by_tool": {},
+        },
+        "composition": composition,
+        "host_short_chain": {
+            "serial_transitions": None,
+            "observed_serial_transitions": None,
+            "missing_serial_transitions": None,
+            "multi_call_chains": None,
+            "calls_in_multi_call_chains": None,
+            "max_chain_calls": None,
+            "observed_by_tool_pair": {},
+            "same_model_turn_proven": False,
+        },
+        "child_calls": {"failed": None, "failure_kind_by_name": None},
+        "timing": {
+            "webcodex_service_ms": _metric_distribution([], missing=len(handlers)),
+            "tool_runtime_ms": _metric_distribution([], missing=len(handlers)),
+            "outside_webcodex_gap_ms": _metric_distribution([]),
+            "outside_webcodex_gap_by_tool_pair": {},
+            "overlap_count": None,
+        },
+        "results": {"serialized_tool_result_bytes": _metric_distribution([], missing=len(handlers))},
+        "output_transfer": output_transfer,
+        "native_batch": native_batch,
+        "failures": {"error_kind_by_name": {}, "failure_kind_by_name": {}, "recovery_guidance_by_kind": {}, "child_failure_kind_by_name": None, "resolved_recoveries": None},
+        "availability": {
+            "action_audit": {"available": False, "reason": "no ActionAudit DB evidence was provided"},
+            "edit_outcomes": {
+                "available": False,
+                "reason": "trace metadata does not persist authoritative edit outcome evidence",
+            },
+            "model_round_trips": {
+                "available": False,
+                "reason": "events.jsonl does not persist model response/turn identity",
+            },
+            "model_round_trip_proxy": {
+                "available": False,
+                "reason": "events.jsonl does not persist canonical meaningful outer-call classification",
+            },
+            "failed_child_calls": {
+                "available": False,
+                "reason": "Code Mode child failure count requires ActionAudit code_mode_composition evidence",
+            },
+            "child_failure_kinds": {
+                "available": False,
+                "reason": "trace metadata does not persist authoritative per-child failure-kind distribution",
+            },
+            "code_mode_composition": composition_availability,
+            **unavailable,
+        },
+    }
+
+
+def _runner_summary(trace_events: list[dict[str, Any]], trace_root_present: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not trace_root_present:
+        return ({"requests_observed": None, "by_kind": {}}, {"available": False, "complete": False, "reason": "no trace-root evidence was provided"})
+    requests: dict[str, dict[str, Any]] = {}
+    anonymous: set[str] = set()
+    for event in trace_events:
+        if event.get("event") != "tool_runner_request_enqueued":
+            continue
+        request_id = event.get("runner_request_id")
+        if isinstance(request_id, str) and request_id:
+            requests.setdefault(request_id, event)
+        else:
+            anonymous.add(_stable_json(event))
+    kinds: Counter[str] = Counter()
+    for event in [*requests.values(), *(json.loads(item) for item in anonymous)]:
+        kind = event.get("runner_request_kind")
+        if isinstance(kind, str) and kind:
+            kinds[kind] += 1
+    return (
+        {"requests_observed": len(requests) + len(anonymous), "by_kind": dict(sorted(kinds.items()))},
+        {"available": True, "complete": False, "reason": "events.jsonl proves observed Runner enqueue events but has no fail-open completeness marker"},
+    )
+
+
+def _job_summary(trace_events: list[dict[str, Any]], trace_root_present: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+    job_ids = {event.get("runner_job_id") for event in trace_events if event.get("event") == "tool_runner_request_enqueued" and isinstance(event.get("runner_job_id"), str) and event.get("runner_job_id")}
+    return (
+        {"runner_job_ids_observed": len(job_ids) if trace_root_present else None, "handoffs": None, "terminal": None},
+        {"available": False, "reason": "runner_job_id may be allocated before synchronous completion and does not prove a same-execution model-visible handoff or terminal observation"},
+    )
+
+
+def _summarize_result_bytes_by_tool(
+    audit_events: list[dict[str, Any]],
+    *,
+    action_audit_available: bool,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Group existing outer ToolResult sizes by the existing ActionAudit tool key.
+
+    The report consumes only canonical numeric telemetry. No tool arguments,
+    result payloads, paths, identities or fingerprints are materialized.
+    """
+    if not action_audit_available:
+        return {}, {
+            "available": False,
+            "reason": "trace-only events do not provide canonical ToolResult byte sizes",
+            "unattributed_calls": None,
+        }
+
+    calls: Counter[str] = Counter()
+    measured: dict[str, list[int]] = {}
+    unattributed_calls = 0
+    selected_calls = 0
+    for event in audit_events:
+        if event.get("action_name") != "toolsCall":
+            continue
+        selected_calls += 1
+        tool = event.get("operation")
+        if not isinstance(tool, str) or not tool:
+            unattributed_calls += 1
+            continue
+        calls[tool] += 1
+        telemetry = _telemetry(event)
+        value = telemetry.get("serialized_result_bytes") if isinstance(telemetry, dict) else None
+        if type(value) is int and 0 <= value <= (1 << 64) - 1:
+            measured.setdefault(tool, []).append(value)
+
+    by_tool = {
+        tool: _metric_distribution(
+            measured.get(tool, []),
+            missing=calls[tool] - len(measured.get(tool, [])),
+        )
+        for tool in sorted(calls)
+    }
+    complete = bool(selected_calls) and unattributed_calls == 0 and all(
+        metric["missing"] == 0 for metric in by_tool.values()
+    )
+    reason = (
+        None if complete
+        else "no selected ActionAudit tool-call records" if not selected_calls
+        else "one or more outer calls lack a tool name" if unattributed_calls
+        else "one or more calls lack a valid unsigned serialized ToolResult byte count"
+    )
+    return by_tool, {
+        "available": complete,
+        "reason": reason,
+        "unattributed_calls": unattributed_calls,
+    }
+
+
+def _is_exact_hex(value: Any, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(char in "0123456789abcdefABCDEF" for char in value)
+    )
+
+
+def _is_exact_git_revision(value: Any) -> bool:
+    return _is_exact_hex(value, 40)
+
+
+def _is_exact_sha256(value: Any) -> bool:
+    return _is_exact_hex(value, 64)
+
+
+def _case_fingerprint(case: dict[str, Any]) -> str:
+    return hashlib.sha256(_stable_json(case).encode("utf-8")).hexdigest()
+
+
+def _benchmark_metadata(*, case_manifest: Path | None, case_id: str | None, variant: str | None, surface: str | None = None, base_revision: str | None = None) -> dict[str, Any] | None:
+    if case_id is None:
+        if case_manifest is not None or base_revision is not None or surface is not None:
+            raise ReportError("--case-manifest/--base-revision/--surface require --case-id")
+        return None
+    if variant is None:
+        raise ReportError("--case-id requires --variant")
+    if variant == "direct":
+        if surface is None:
+            surface = "direct"
+        elif surface != "direct":
+            raise ReportError("--variant direct requires --surface direct")
+    elif variant == "host_code_mode":
+        if surface is None:
+            surface = HOST_CODE_MODE_SURFACE
+        elif surface != HOST_CODE_MODE_SURFACE:
+            raise ReportError("--variant host_code_mode requires --surface host_code_mode")
+    elif variant == "code_mode":
+        if surface is None:
+            raise ReportError("--variant code_mode benchmark runs require --surface read_only, validation, or guarded_edit")
+        if _canonical_code_mode_surface(surface) is None:
+            raise ReportError("--variant code_mode requires --surface read_only, validation, or guarded_edit")
+    elif variant == TOOL_SELECTION_VARIANT:
+        if surface is None:
+            surface = TOOL_SELECTION_VARIANT
+        elif surface != TOOL_SELECTION_VARIANT:
+            raise ReportError("--variant tool_selection requires --surface tool_selection")
+    if not _is_exact_git_revision(base_revision):
+        raise ReportError("--case-id requires --base-revision as an exact 40-hex Git commit")
+    manifest = load_case_manifest(case_manifest or DEFAULT_CASE_MANIFEST)
+    case = _case_by_id(manifest, case_id)
+    experiment = case.get("experiment", "forced_lanes")
+    if (variant == TOOL_SELECTION_VARIANT) != (experiment == "tool_selection"):
+        raise ReportError("tool_selection cases and variants cannot be mixed with forced execution lanes")
+    expected_surface = case.get("code_mode_surface")
+    if (
+        variant == "code_mode"
+        and expected_surface is not None
+        and _canonical_code_mode_surface(surface)
+        != _canonical_code_mode_surface(expected_surface)
+    ):
+        raise ReportError(
+            f"case {case_id} requires Code Mode surface {expected_surface}"
+        )
+    return {
+        "manifest_schema_version": manifest["schema_version"],
+        "case_id": case_id,
+        "case_title": case["title"],
+        "target": case["target"],
+        "experiment": experiment,
+        "variant": variant,
+        "surface": surface,
+        "base_revision": base_revision,
+        "validation_required": case["validation"]["required"],
+        "case_fingerprint": _case_fingerprint(case),
+    }
+
+
+def _annotation_projection(
+    annotation: dict[str, Any] | None,
+    benchmark: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if annotation is None:
+        return {
+            "repair_turns": {"total": None, "by_reason": {}},
+            "task_wall_time_ms": None,
+            "correctness": {
+                "task_verdict": None,
+                "validation_verdict": None,
+            },
+            "availability": {
+                "repair_turns": {
+                    "available": False,
+                    "reason": "no payload-safe run annotation supplied; repair turns are not inferred from text or chain-of-thought",
+                },
+                "task_wall_time": {
+                    "available": False,
+                    "reason": "no independent annotated task start/end evidence was supplied; observed_span_ms is not task wall time",
+                },
+                "correctness": {
+                    "available": False,
+                    "reason": "no bounded correctness annotation was supplied",
+                },
+            },
+        }
+    if benchmark is None:
+        raise ReportError("--run-annotation requires --case-id benchmark metadata")
+    for field in ("case_id", "variant", "surface", "base_revision", "case_fingerprint"):
+        if annotation.get(field) != benchmark.get(field):
+            raise ReportError(f"run annotation {field} does not match benchmark metadata")
+
+    repair = annotation.get("repair_turns")
+    timing = annotation.get("task_timing")
+    correctness = annotation.get("correctness")
+    wall_time = (
+        timing["ended_at_ms"] - timing["started_at_ms"]
+        if isinstance(timing, dict)
+        else None
+    )
+    return {
+        "repair_turns": (
+            {
+                "total": repair["total"],
+                "by_reason": dict(sorted(repair["by_reason"].items())),
+            }
+            if isinstance(repair, dict)
+            else {"total": None, "by_reason": {}}
+        ),
+        "task_wall_time_ms": wall_time,
+        "correctness": (
+            {
+                "task_verdict": correctness["task_verdict"],
+                "validation_verdict": correctness["validation_verdict"],
+            }
+            if isinstance(correctness, dict)
+            else {"task_verdict": None, "validation_verdict": None}
+        ),
+        "availability": {
+            "repair_turns": {
+                "available": isinstance(repair, dict),
+                "reason": (
+                    None
+                    if isinstance(repair, dict)
+                    else "run annotation did not include repair_turns; missing is not zero"
+                ),
+            },
+            "task_wall_time": {
+                "available": wall_time is not None,
+                "reason": (
+                    None
+                    if wall_time is not None
+                    else "run annotation did not include independent task start/end timestamps"
+                ),
+            },
+            "correctness": {
+                "available": isinstance(correctness, dict)
+                and correctness.get("task_verdict") != "unavailable"
+                and correctness.get("validation_verdict") != "unavailable",
+                "reason": (
+                    None
+                    if isinstance(correctness, dict)
+                    and correctness.get("task_verdict") != "unavailable"
+                    and correctness.get("validation_verdict") != "unavailable"
+                    else "run annotation did not provide usable task and validation correctness verdicts"
+                ),
+            },
+        },
+    }
+
+
+def summarize(*, trace_root: Path | None, audit_db: Path | None, workflow_session_id: str | None, case_manifest: Path | None, case_id: str | None, variant: str | None, surface: str | None = None, base_revision: str | None = None, run_annotation: Path | None = None) -> dict[str, Any]:
+    if trace_root is None and audit_db is None:
+        raise ReportError("summarize requires --trace-root and/or --audit-db")
+    if workflow_session_id is not None and audit_db is None:
+        raise ReportError("--workflow-session-id requires --audit-db for authoritative Session selection")
+    if audit_db is not None and workflow_session_id is None and trace_root is None:
+        raise ReportError("--audit-db without --trace-root requires --workflow-session-id")
+    trace_ids: set[str] = set()
+    trace_events: list[dict[str, Any]] = []
+    trace_files = 0
+    if trace_root is not None:
+        trace_ids, trace_events, trace_files = load_trace_events(trace_root)
+    audit_events: list[dict[str, Any]] = []
+    continuity_events: list[dict[str, Any]] | None = None
+    if audit_db is not None:
+        audit_events = load_audit_events(audit_db, workflow_session_id=workflow_session_id, trace_ids=trace_ids)
+        continuity_events = load_audit_continuity_events(audit_db, audit_events)
+    if workflow_session_id is not None and trace_events:
+        selected_trace_ids = {event["server_trace_id"] for event in audit_events if isinstance(event.get("server_trace_id"), str) and event["server_trace_id"]}
+        trace_events = [event for event in trace_events if event.get("server_trace_id") in selected_trace_ids]
+        trace_ids = {trace_id for trace_id in trace_ids if trace_id in selected_trace_ids}
+    core = (
+        _summarize_audit(audit_events, variant, continuity_events)
+        if audit_db is not None
+        else _summarize_trace_only(trace_events, variant)
+    )
+    trace_metadata_present = trace_files > 0
+    runner, runner_availability = _runner_summary(trace_events, trace_metadata_present)
+    jobs, jobs_availability = _job_summary(trace_events, trace_metadata_present)
+    core["runner"] = runner
+    core["jobs"] = jobs
+    job_convergence = _summarize_job_convergence(audit_events, continuity_events or [])
+    core["job_convergence"] = job_convergence
+    job_scheduling, job_scheduling_availability = _summarize_job_scheduling(
+        audit_events,
+        continuity_events or [],
+        job_convergence,
+        action_audit_available=audit_db is not None,
+    )
+    core["job_scheduling"] = job_scheduling
+    core["availability"]["job_scheduling"] = job_scheduling_availability
+    input_ergonomics, input_ergonomics_availability = _summarize_input_ergonomics(
+        audit_events, continuity_events or [], action_audit_available=audit_db is not None,
+    )
+    core["input_ergonomics"] = input_ergonomics
+    core["availability"]["input_ergonomics"] = input_ergonomics_availability
+    core["availability"]["runner_requests"] = runner_availability
+    core["availability"]["job_handoffs"] = jobs_availability
+    benchmark = _benchmark_metadata(case_manifest=case_manifest, case_id=case_id, variant=variant, surface=surface, base_revision=base_revision)
+    annotation = load_run_annotation(run_annotation) if run_annotation is not None else None
+    annotated = _annotation_projection(annotation, benchmark)
+    core["availability"].update(annotated["availability"])
+    by_tool_bytes, by_tool_availability = _summarize_result_bytes_by_tool(
+        audit_events, action_audit_available=audit_db is not None
+    )
+    core["results"]["serialized_tool_result_bytes_by_tool"] = by_tool_bytes
+    core["availability"]["serialized_tool_result_bytes_by_tool"] = by_tool_availability
+    core["availability"]["promise_all_usage"] = {
+        "available": False,
+        "reason": "max_in_flight proves child-call concurrency, not JavaScript Promise.all syntax",
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "agent_loop_summary",
+        "benchmark": benchmark,
+        "observed_span_ms": core.pop("observed_span_ms"),
+        "task_wall_time_ms": annotated["task_wall_time_ms"],
+        "repair_turns": annotated["repair_turns"],
+        "correctness": annotated["correctness"],
+        **core,
+        "evidence": {"trace_files": trace_files, "trace_ids": len(trace_ids), "audit_events": len(audit_events), "workflow_session_selected": workflow_session_id is not None, "run_annotation": annotation is not None},
+        "notes": [
+            "Workflow Session selection counts only linked calls; unlinked discovery/bootstrap calls are not attributed or treated as absent from the conversation",
+            "observed_span_ms is the span between observed WebCodex outer-call timestamps, not task wall time",
+            "outside_webcodex_gap_ms contains only canonical serial meaningful-Window gaps and is not model reasoning time",
+            "input_ergonomics normalization rate excludes legacy/missing telemetry; its immediate same-tool corrective-call proxy proves neither model turns nor why the rejected call failed",
+            "Runner request counts are observed enqueue events, not an asserted complete total",
+            "repair_turns come only from the bounded run annotation sidecar and are never inferred from model text or private reasoning",
+            "task_wall_time_ms is reported only when the sidecar supplies explicit independent task start/end timestamps",
+            "output_transfer counts rendered text/log UTF-8 bytes, not JSON escaping, network overhead, tokens or cross-call duplication; Job reset tails can be required recovery evidence",
+            "output_transfer covers only measured outer read_files/observe_jobs; nested Code Mode child transfers are not individually attributable",
+            "job_scheduling.pending_then_independent_work counts only exact immediate serial follow-up calls from a conservative read/review allowlist; generic process/script work is not inferred to be independent",
+            "job_scheduling.deadline_then_nearby_rewait counts only exact serial readiness adjacency within the reported nearby_rewait_max_gap_ms; it does not prove one Host turn or the same blocked Job set",
+        ],
+    }
+
+
+def _get_path(value: dict[str, Any], path: str) -> Any:
+    current: Any = value
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+_COMPARISON_METRICS = [
+    "observed_span_ms", "task_wall_time_ms", "model_round_trips", "model_round_trip_proxy",
+    "efficiency.job_observe_calls",
+    "outer_calls.total", "outer_calls.meaningful",
+    "outer_calls.successful", "outer_calls.failed", "canonical_calls.total",
+    "native_batch.read_files.outer_calls",
+    "native_batch.read_files.multi_item_calls",
+    "native_batch.read_files.requested_cardinality.total",
+    "native_batch.search_project_texts.outer_calls",
+    "native_batch.search_project_texts.multi_item_calls",
+    "native_batch.search_project_texts.requested_cardinality.total",
+    "repair_turns.total", "child_calls.failed",
+    "runner.requests_observed", "composition.nested_calls.total",
+    "composition.nested_successes.total", "composition.nested_failures.total",
+    "composition.max_in_flight.total",
+    "composition.consequential_calls.total", "composition.known_results.total",
+    "composition.job_handoffs.total",
+    "composition.outcome_unknown.total", "composition.duration_ms.total",
+    "composition.slot_wait_ms.total", "composition.input_bytes.total",
+    "composition.returned_bytes.total",
+    "composition.nested_raw_result_bytes_total.total", "timing.webcodex_service_ms.total",
+    "timing.webcodex_service_ms.p50", "timing.webcodex_service_ms.p95",
+    "timing.tool_runtime_ms.total", "timing.outside_webcodex_gap_ms.total",
+    "timing.outside_webcodex_gap_ms.p50", "timing.outside_webcodex_gap_ms.p95",
+    "timing.overlap_count", "results.serialized_tool_result_bytes.total",
+    "host_short_chain.serial_transitions", "host_short_chain.multi_call_chains",
+    "host_short_chain.calls_in_multi_call_chains", "host_short_chain.max_chain_calls",
+    "jobs.handoffs", "jobs.terminal",
+    "job_convergence.pending_handoff_count",
+    "job_convergence.pending_followed_immediately_by_observe_count",
+    "job_convergence.pending_followup_known_count",
+    "job_convergence.passive_terminal_delivery_count",
+    "job_convergence.passive_failure_delivery_count",
+    "job_convergence.passive_terminal_before_explicit_observe_count",
+    "job_convergence.terminal_failure_followed_by_observe_count",
+    "job_convergence.wait_for_job_terminal_count",
+    "job_convergence.passive_validation_failure_delivery_count",
+    "job_convergence.terminal_validation_failure_followed_by_observe_count",
+    "job_convergence.pending_to_terminal_ms.p50",
+    "job_convergence.pending_to_terminal_ms.p95",
+    "job_scheduling.pending_handoffs",
+    "job_scheduling.pending_followup_known",
+    "job_scheduling.pending_then_independent_work",
+    "job_scheduling.pending_then_immediate_readiness",
+    "job_scheduling.pending_then_immediate_observe",
+    "job_scheduling.readiness_calls",
+    "job_scheduling.readiness_ready",
+    "job_scheduling.readiness_deadline",
+    "job_scheduling.readiness_any",
+    "job_scheduling.readiness_all",
+    "job_scheduling.deadline_then_nearby_rewait",
+    "job_scheduling.readiness_waited_ms.p50",
+    "job_scheduling.readiness_waited_ms.p95",
+]
+
+
+def _case_compatibility(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    left = baseline.get("benchmark")
+    right = candidate.get("benchmark")
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return {"comparable": False, "reason": "both reports must carry benchmark case metadata"}
+    if left.get("case_id") != right.get("case_id"):
+        return {"comparable": False, "reason": "benchmark case ids differ"}
+    if left.get("experiment", "forced_lanes") != right.get("experiment", "forced_lanes"):
+        return {"comparable": False, "reason": "benchmark experiments differ"}
+    left_base, right_base = left.get("base_revision"), right.get("base_revision")
+    if not _is_exact_git_revision(left_base) or not _is_exact_git_revision(right_base):
+        return {"comparable": False, "reason": "both reports must record an exact 40-hex Git base revision"}
+    if left_base != right_base:
+        return {"comparable": False, "reason": "benchmark base revisions differ"}
+    left_case_fingerprint = left.get("case_fingerprint")
+    right_case_fingerprint = right.get("case_fingerprint")
+    if not (
+        _is_exact_sha256(left_case_fingerprint)
+        and _is_exact_sha256(right_case_fingerprint)
+    ):
+        return {
+            "comparable": False,
+            "reason": "both reports must record the exact benchmark case fingerprint",
+        }
+    if left_case_fingerprint != right_case_fingerprint:
+        return {
+            "comparable": False,
+            "reason": "benchmark case definitions differ",
+        }
+    return {"comparable": True, "reason": None}
+
+
+def _pair_compatibility(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    case = _case_compatibility(baseline, candidate)
+    if not case["comparable"]:
+        return case
+    # Efficiency runs pin caller/driver attestations; historical reports have
+    # neither field and retain their existing comparison contract.
+    if "efficiency_identity" in baseline or "efficiency_identity" in candidate:
+        left_identity = baseline.get("efficiency_identity")
+        right_identity = candidate.get("efficiency_identity")
+        if (not isinstance(left_identity, dict) or not isinstance(right_identity, dict)
+            or left_identity.get("attested") is not True or right_identity.get("attested") is not True
+            or not _is_exact_sha256(left_identity.get("model_config_digest"))
+            or left_identity.get("model_config_digest") != right_identity.get("model_config_digest")):
+            return {"comparable": False, "reason": "pinned model/config driver attestations are missing or differ"}
+    left = baseline.get("benchmark") or {}
+    right = candidate.get("benchmark") or {}
+    if "efficiency_host_policy" in baseline or "efficiency_host_policy" in candidate:
+        if (baseline.get("efficiency_host_policy") == "host_single_call"
+            and candidate.get("efficiency_host_policy") == "host_composition_allowed"
+            and all(item.get("variant") == "host_code_mode" and item.get("surface") == HOST_CODE_MODE_SURFACE
+                    for item in (left, right))
+            and isinstance(baseline.get("efficiency_identity"), dict)
+            and isinstance(candidate.get("efficiency_identity"), dict)):
+            return {"comparable": True, "reason": None}
+        return {"comparable": False, "reason": "Host policy comparison requires explicit single-call/composition policies and two Host surfaces"}
+    if left.get("experiment", "forced_lanes") == "tool_selection":
+        if all(item.get("variant") == TOOL_SELECTION_VARIANT and item.get("surface") == TOOL_SELECTION_VARIANT for item in (left, right)):
+            return {"comparable": True, "reason": None}
+        return {"comparable": False, "reason": "tool_selection comparisons require two freely selected tool runs"}
+    if left.get("variant") != "direct" or left.get("surface") != "direct":
+        return {
+            "comparable": False,
+            "reason": "baseline must be the direct variant with surface=direct",
+        }
+    candidate_variant = right.get("variant")
+    candidate_surface = right.get("surface")
+    candidate_ok = (
+        candidate_variant == "host_code_mode" and candidate_surface == HOST_CODE_MODE_SURFACE
+    ) or (
+        candidate_variant == "code_mode"
+        and _canonical_code_mode_surface(candidate_surface) is not None
+    )
+    if not candidate_ok:
+        return {
+            "comparable": False,
+            "reason": "candidate must be host_code_mode with surface=host_code_mode or code_mode with surface=read_only, validation, or guarded_edit",
+        }
+    return {"comparable": True, "reason": None}
+
+
+def _correctness_gate_for_report(
+    value: dict[str, Any], label: str
+) -> tuple[bool, str | None]:
+    benchmark = value.get("benchmark")
+    correctness = value.get("correctness")
+    if not isinstance(benchmark, dict) or not isinstance(correctness, dict):
+        return False, f"{label} correctness evidence is unavailable"
+    validation_required = benchmark.get("validation_required")
+    if not isinstance(validation_required, bool):
+        return False, f"{label} benchmark lacks validation_required metadata"
+    if correctness.get("task_verdict") != "pass":
+        return False, f"{label} task correctness verdict is not pass"
+    validation = correctness.get("validation_verdict")
+    if validation_required:
+        if validation != "pass":
+            return False, f"{label} required validation verdict is not pass"
+    elif validation not in ("pass", "not_required"):
+        return False, f"{label} validation verdict is unavailable or failed"
+    return True, None
+
+
+def _correctness_compatibility(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    case = _case_compatibility(baseline, candidate)
+    if not case["comparable"]:
+        return {
+            "comparable": False,
+            "reason": "case/base compatibility is required before correctness can be paired",
+            "baseline": baseline.get("correctness"),
+            "candidate": candidate.get("correctness"),
+        }
+    for label, value in (("baseline", baseline), ("candidate", candidate)):
+        passed, reason = _correctness_gate_for_report(value, label)
+        if not passed:
+            return {
+                "comparable": False,
+                "reason": reason,
+                "baseline": baseline.get("correctness"),
+                "candidate": candidate.get("correctness"),
+            }
+    return {
+        "comparable": True,
+        "reason": None,
+        "baseline": baseline.get("correctness"),
+        "candidate": candidate.get("correctness"),
+    }
+
+
+def compare_reports(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    for label, report in (("baseline", baseline), ("candidate", candidate)):
+        if report.get("schema_version") != SCHEMA_VERSION or report.get("kind") != "agent_loop_summary":
+            raise ReportError(f"{label} is not an agent_loop_summary schema v{SCHEMA_VERSION}")
+    metrics = []
+    for path in _COMPARISON_METRICS:
+        left, right = _get_path(baseline, path), _get_path(candidate, path)
+        if left is None or right is None:
+            metrics.append({"metric": path, "baseline": left, "candidate": right, "delta": None, "comparable": False, "reason": "metric is unavailable in one or both reports"})
+        elif isinstance(left, bool) or isinstance(right, bool) or not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            metrics.append({"metric": path, "baseline": left, "candidate": right, "delta": None, "comparable": False, "reason": "metric is not numeric"})
+        else:
+            metrics.append({"metric": path, "baseline": left, "candidate": right, "delta": right - left, "comparable": True, "reason": None})
+    case_compatibility = _case_compatibility(baseline, candidate)
+    pair_compatibility = _pair_compatibility(baseline, candidate)
+    correctness_compatibility = _correctness_compatibility(baseline, candidate)
+    throughput_compatibility = {
+        "comparable": pair_compatibility["comparable"]
+        and correctness_compatibility["comparable"],
+        "reason": (
+            None
+            if pair_compatibility["comparable"] and correctness_compatibility["comparable"]
+            else pair_compatibility["reason"]
+            if not pair_compatibility["comparable"]
+            else correctness_compatibility["reason"]
+        ),
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "agent_loop_comparison",
+        "case_compatibility": case_compatibility,
+        "pair_compatibility": pair_compatibility,
+        "correctness_compatibility": correctness_compatibility,
+        "throughput_compatibility": throughput_compatibility,
+        "baseline": baseline.get("benchmark"),
+        "candidate": candidate.get("benchmark"),
+        "metrics": metrics,
+        "tools": {
+            "baseline_outer_by_name": _get_path(baseline, "tools.outer_by_name") or {},
+            "candidate_outer_by_name": _get_path(candidate, "tools.outer_by_name") or {},
+            "baseline_canonical_by_name": _get_path(baseline, "canonical_calls.by_name") or {},
+            "candidate_canonical_by_name": _get_path(candidate, "canonical_calls.by_name") or {},
+            "baseline_nested_by_name": _get_path(baseline, "composition.nested_tool_counts") or {},
+            "candidate_nested_by_name": _get_path(candidate, "composition.nested_tool_counts") or {},
+        },
+        "repair_turns": {
+            "baseline_by_reason": _get_path(baseline, "repair_turns.by_reason") or {},
+            "candidate_by_reason": _get_path(candidate, "repair_turns.by_reason") or {},
+        },
+        "host_short_chain": {
+            "baseline_observed_by_tool_pair": _get_path(baseline, "host_short_chain.observed_by_tool_pair") or {},
+            "candidate_observed_by_tool_pair": _get_path(candidate, "host_short_chain.observed_by_tool_pair") or {},
+            "same_model_turn_proven": False,
+        },
+        "contract_surface_evidence": {
+            "baseline": {
+                "error_kind_by_name": _get_path(baseline, "failures.error_kind_by_name") or {},
+                "failure_kind_by_name": _get_path(baseline, "failures.failure_kind_by_name") or {},
+                "recovery_guidance_by_kind": _get_path(baseline, "failures.recovery_guidance_by_kind") or {},
+                "child_failure_kind_by_name": _get_path(baseline, "failures.child_failure_kind_by_name"),
+            },
+            "candidate": {
+                "error_kind_by_name": _get_path(candidate, "failures.error_kind_by_name") or {},
+                "failure_kind_by_name": _get_path(candidate, "failures.failure_kind_by_name") or {},
+                "recovery_guidance_by_kind": _get_path(candidate, "failures.recovery_guidance_by_kind") or {},
+                "child_failure_kind_by_name": _get_path(candidate, "failures.child_failure_kind_by_name"),
+            },
+        },
+        "evidence_availability": {
+            "baseline": baseline.get("availability") or {},
+            "candidate": candidate.get("availability") or {},
+        },
+        "notes": [
+            "deltas are candidate minus baseline and are descriptive only",
+            "throughput comparisons are decision-relevant only when throughput_compatibility.comparable is true",
+            "no metric ordering, score, or winner is inferred",
+        ],
+    }
+
+
+def _read_report(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ReportError(f"could not read report: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ReportError(f"report is not valid JSON: {path}:{exc.lineno}") from exc
+    if not isinstance(value, dict):
+        raise ReportError(f"report must be a JSON object: {path}")
+    return value
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    summarize_parser = subparsers.add_parser("summarize", help="summarize one observed agent run")
+    summarize_parser.add_argument("--trace-root", type=Path)
+    summarize_parser.add_argument("--audit-db", type=Path)
+    summarize_parser.add_argument("--workflow-session-id")
+    summarize_parser.add_argument("--case-manifest", type=Path)
+    summarize_parser.add_argument("--case-id")
+    summarize_parser.add_argument("--variant", choices=BENCHMARK_VARIANTS)
+    summarize_parser.add_argument("--surface", choices=("direct", HOST_CODE_MODE_SURFACE, TOOL_SELECTION_VARIANT, *CODE_MODE_SURFACE_CHOICES))
+    summarize_parser.add_argument("--base-revision")
+    summarize_parser.add_argument("--run-annotation", type=Path)
+    summarize_parser.add_argument("--output", type=Path)
+    compare_parser = subparsers.add_parser("compare", help="compare two summary JSON reports")
+    compare_parser.add_argument("--baseline", type=Path, required=True)
+    compare_parser.add_argument("--candidate", type=Path, required=True)
+    compare_parser.add_argument("--output", type=Path)
+    discovery_parser = subparsers.add_parser("discovery", help="score captured tool retrievals against the fixed discovery corpus")
+    discovery_parser.add_argument("--corpus", type=Path, default=Path(__file__).with_name("agent_tool_discovery_cases.json"))
+    discovery_parser.add_argument("--results", type=Path, required=True)
+    discovery_parser.add_argument("--output", type=Path)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "discovery":
+            try:
+                from scripts import agent_tool_discovery as discovery
+            except ModuleNotFoundError:
+                import agent_tool_discovery as discovery
+            try:
+                corpus = discovery.load_corpus(args.corpus)
+                captured = discovery.load_results(args.results)
+                result = discovery.evaluate_results(corpus, captured)
+            except (OSError, ValueError) as exc:
+                raise ReportError(f"invalid discovery evidence: {exc}") from exc
+            _write_json(result, args.output)
+            return 0
+        if args.command == "summarize":
+            report = summarize(trace_root=args.trace_root, audit_db=args.audit_db, workflow_session_id=args.workflow_session_id, case_manifest=args.case_manifest, case_id=args.case_id, variant=args.variant, surface=args.surface, base_revision=args.base_revision, run_annotation=args.run_annotation)
+            _write_json(report, args.output)
+            return 0
+        comparison = compare_reports(_read_report(args.baseline), _read_report(args.candidate))
+        _write_json(comparison, args.output)
+        return 0
+    except ReportError as exc:
+        print(f"agent_loop_report: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,15 +12,12 @@ fn retired_delete_files_alias_stays_absent() {
     assert!(!registered_tool_specs()
         .iter()
         .any(|spec| spec.name == "delete_files"));
-    assert!(crate::openapi::build_openapi_spec()["paths"]
-        .get("/api/projects/delete_files")
-        .is_none());
 }
 
 #[test]
 fn git_diff_hunks_rejects_unknown_legacy_fields_compactly() {
     let error = ToolCall::from_tool_name(
-        "git_diff_hunks",
+        "read_git_diff_hunks",
         json!({
             "project": SAMPLE_PROJECT,
             "mode": "worktree",
@@ -28,9 +25,12 @@ fn git_diff_hunks_rejects_unknown_legacy_fields_compactly() {
         }),
     )
     .unwrap_err();
-    assert!(error.contains("unknown field(s)"), "{error}");
-    assert!(error.contains("mode"), "{error}");
-    assert!(error.contains("max_lines_per_hunk"), "{error}");
+    assert!(error.contains("unknown field"), "{error}");
+    assert!(
+        error.contains("mode") || error.contains("max_lines_per_hunk"),
+        "{error}"
+    );
+    assert!(error.contains("max_hunk_lines"), "{error}");
     assert!(
         !error.contains("properties"),
         "must not dump JSON Schema: {error}"
@@ -85,27 +85,51 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
     // they are absent here.
     let expected_hidden: BTreeSet<&str> = [
         "start_session",
-        "job_tail",
+        "read_job_tail",
+        "sync_goal_plan",
+        "get_work_result_state",
+        "read_work_result_activity_detail",
+        "send_work_result_message",
+        "apply_patch",
+        "apply_unified_diff",
+        "write_project_file",
+        "read_changed_file_diff",
+        "read_app_artifact_chunk",
+        "record_external_observation",
+        "get_session_handoff_state",
+        "bind_agent_continuation",
+        "recover_agent_continuation_endpoint",
+        "get_agent_continuation_state",
+        "acquire_agent_continuation_wake",
+        "prepare_agent_continuation_wake",
+        "finish_agent_continuation_wake",
+        "unbind_agent_continuation",
+        "get_agent_wait_state",
+        "bind_job_terminal_continuation",
+        "get_job_terminal_continuation_state",
+        "prepare_job_terminal_continuation",
+        "finish_job_terminal_continuation",
+        "unbind_job_terminal_continuation",
         "read_tool_trace",
-        "skill_list",
-        "skill_read_file",
-        "skill_versions",
-        "skill_install",
-        "skill_activate",
-        "skill_remove_revision",
-        "memory_search",
-        "memory_read",
-        "memory_set",
-        "memory_delete",
-        "memory_scope_list",
-        "memory_scope_purge",
+        "list_skills",
+        "read_skill_file",
+        "list_skill_versions",
+        "install_skill",
+        "activate_skill",
+        "remove_skill_revision",
+        "search_memory",
+        "read_memory",
+        "set_memory",
+        "delete_memory",
+        "list_memory_scopes",
+        "purge_memory_scope",
     ]
     .into_iter()
     .collect();
     assert_eq!(
         model_hidden_tool_names().collect::<BTreeSet<_>>(),
         expected_hidden,
-        "hidden ToolDefinitions must match the documented compatibility batch"
+        "hidden ToolDefinitions must match the documented App-only and compatibility inventory"
     );
 }
 
@@ -116,7 +140,7 @@ fn tool_definitions_match_agent_capability_dispatch_helper() {
     };
 
     for definition in tool_definitions() {
-        // ModelHidden tools are dispatched for back-compat but have no
+        // ModelHidden tools retain explicit protocol/domain paths but have no
         // model-facing ToolSpec, so sample_tool_args (which reads the spec's
         // required fields) cannot build arguments for them. They are still
         // covered by the parser-name-gate test. Here we assert the full

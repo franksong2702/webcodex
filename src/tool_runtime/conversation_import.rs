@@ -4,11 +4,17 @@
 //! and consumes those references immediately on the Control side, then streams
 //! the download through the existing bounded artifact upload mutation path.
 
-use super::files::MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES;
+use super::files::{
+    artifact_upload_failure_is_definite, MAX_PROJECT_ARTIFACT_UPLOAD_BYTES,
+    MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES,
+};
 use super::sessions::SessionTransport;
-use super::tool_call::OpenAiHostFileRef;
+use super::tool_call::{HostFileImportProvenance, OpenAiHostFileRef};
 use super::{ToolCall, ToolResult, ToolRuntime};
-use crate::artifact_policy::ooxml_extension_for_mime;
+use crate::artifact_policy::{
+    canonical_extension_for_mime, canonical_known_mime, mime_is_compatible_with_path,
+    normalize_host_import_presentation_mime, GENERIC_BINARY_MIME,
+};
 use crate::auth::AuthContext;
 use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
@@ -17,20 +23,98 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 pub(crate) const MAX_IMPORT_FILES: usize = 10;
-pub(crate) const MAX_IMPORT_FILE_BYTES: usize = 10 * 1024 * 1024;
-const IMPORT_OCTET_STREAM_EXTENSIONS: &[&str] = &[
-    ".png", ".jpg", ".jpeg", ".webp", ".mp3", ".mp4", ".pdf", ".zip", ".docx", ".pptx", ".xlsx",
-    ".txt", ".csv", ".json",
-];
+pub(crate) const MAX_IMPORT_FILE_BYTES: usize = MAX_PROJECT_ARTIFACT_UPLOAD_BYTES;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConversationImportDownloadPolicy {
-    GptActionOpenAiHost,
+    AuthenticatedMcpOpenAiHostFile,
+    LoopbackTrustedMcpHostFile,
     TrustedMcpHostFile,
 }
 
 const IMPORT_DNS_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
-const IMPORT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const IMPORT_DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const IMPORT_DOWNLOAD_OVERALL_NETWORK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Clone, Copy)]
+enum ImportFailureStage {
+    Dns,
+    DownloadRequest,
+    DownloadBody,
+    UploadBegin,
+    UploadChunk,
+    UploadFinish,
+}
+
+impl ImportFailureStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dns => "dns",
+            Self::DownloadRequest => "download_request",
+            Self::DownloadBody => "download_body",
+            Self::UploadBegin => "upload_begin",
+            Self::UploadChunk => "upload_chunk",
+            Self::UploadFinish => "upload_finish",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImportFailureClass {
+    Timeout,
+    ConnectionFailed,
+    Failed,
+    HttpStatus,
+    SizeLimit,
+    ProtocolMismatch,
+}
+
+impl ImportFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::ConnectionFailed => "connection_failed",
+            Self::Failed => "failed",
+            Self::HttpStatus => "http_status",
+            Self::SizeLimit => "size_limit",
+            Self::ProtocolMismatch => "protocol_mismatch",
+        }
+    }
+}
+
+fn diagnostic_trace_id() -> Option<String> {
+    crate::tool_request_trace::current_active_trace_id()
+        .and_then(|id| uuid::Uuid::parse_str(&id).ok())
+        .map(|id| id.hyphenated().to_string())
+}
+
+fn log_import_failure(
+    stage: ImportFailureStage,
+    failure: ImportFailureClass,
+    http_status: Option<u16>,
+) {
+    let server_trace_id = diagnostic_trace_id();
+    // Only fixed categories, a bounded status and a canonical UUID. Never pass
+    // error text, URLs, file names, paths, upload IDs or caller identities here.
+    tracing::warn!(
+        target: "webcodex::mcp",
+        stage = stage.as_str(),
+        failure_class = failure.as_str(),
+        http_status = http_status.filter(|status| (100..=599).contains(status)),
+        server_trace_id = server_trace_id.as_deref(),
+        "mcp_host_file_import_failed"
+    );
+}
+
+fn download_failure_class(error: &reqwest::Error) -> ImportFailureClass {
+    if error.is_timeout() {
+        ImportFailureClass::Timeout
+    } else if error.is_connect() {
+        ImportFailureClass::ConnectionFailed
+    } else {
+        ImportFailureClass::Failed
+    }
+}
 
 #[derive(Debug)]
 struct TrustedDownloadTarget {
@@ -73,46 +157,49 @@ impl From<OpenAiHostFileRef> for OpenAiFileIdRef {
 }
 
 fn sanitize_import_name(name: &str, fallback: &str) -> String {
-    let mut out = String::new();
-    for ch in name.rsplit('/').next().unwrap_or(name).chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-            out.push(ch);
-        } else {
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let mut out = String::with_capacity(basename.len().min(255));
+    for ch in basename.chars() {
+        if ch == '\0'
+            || ch.is_control()
+            || matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        {
             out.push('_');
+        } else {
+            out.push(ch);
         }
     }
-    let trimmed = out.trim_matches('.').trim_matches('_');
-    if trimmed.is_empty() {
-        fallback.to_string()
-    } else {
-        trimmed.to_string()
+    while out.ends_with([' ', '.']) {
+        out.pop();
     }
-}
-
-fn default_extension_for_import_mime(mime: &str) -> Option<&'static str> {
-    if let Some(extension) = ooxml_extension_for_mime(mime) {
-        return Some(extension);
+    while out.len() > 240 {
+        out.pop();
     }
-    match mime {
-        "image/png" => Some(".png"),
-        "image/jpeg" => Some(".jpg"),
-        "image/webp" => Some(".webp"),
-        "audio/mpeg" => Some(".mp3"),
-        "video/mp4" => Some(".mp4"),
-        "application/pdf" => Some(".pdf"),
-        "application/zip" => Some(".zip"),
-        "text/plain" => Some(".txt"),
-        "text/csv" => Some(".csv"),
-        "application/json" => Some(".json"),
-        _ => None,
+    if out.is_empty() || matches!(out.as_str(), "." | "..") {
+        return fallback.to_string();
     }
+    let stem = out
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+    let windows_reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'));
+    if windows_reserved {
+        out.insert(0, '_');
+    }
+    out
 }
 
 fn default_import_leaf(file_ref: &OpenAiFileIdRef, index: usize, mime: &str) -> String {
     let fallback = format!("artifact-{}", index + 1);
     match file_ref.name.as_deref().or(file_ref.id.as_deref()) {
         Some(source_name) => sanitize_import_name(source_name, &fallback),
-        None => match default_extension_for_import_mime(mime) {
+        None => match canonical_extension_for_mime(mime) {
             Some(extension) => format!("{fallback}{extension}"),
             None => fallback,
         },
@@ -134,26 +221,25 @@ fn join_import_path(output_dir: Option<&str>, leaf: &str) -> Result<String, Stri
 }
 
 fn mime_allowed_for_import(mime: &str, path: &str) -> bool {
-    let lower_path = path.to_ascii_lowercase();
-    if let Some(required_extension) = ooxml_extension_for_mime(mime) {
-        return lower_path.ends_with(required_extension);
+    let mime = canonical_known_mime(mime).unwrap_or(GENERIC_BINARY_MIME);
+    mime_is_compatible_with_path(mime, path)
+}
+
+fn is_openai_download_host(host: &str) -> bool {
+    if host == "files.oaiusercontent.com" || host.ends_with(".oaiusercontent.com") {
+        return true;
     }
-    matches!(
-        mime,
-        "image/png"
-            | "image/jpeg"
-            | "image/webp"
-            | "audio/mpeg"
-            | "video/mp4"
-            | "application/pdf"
-            | "application/zip"
-            | "text/plain"
-            | "text/csv"
-            | "application/json"
-    ) || (mime == "application/octet-stream"
-        && IMPORT_OCTET_STREAM_EXTENSIONS
-            .iter()
-            .any(|suffix| lower_path.ends_with(suffix)))
+
+    let Some(storage_account) = host.strip_suffix(".blob.core.windows.net") else {
+        return false;
+    };
+    let Some(region) = storage_account.strip_prefix("oaisdmntpr") else {
+        return false;
+    };
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
 }
 
 fn validate_openai_download_url(download_link: &str) -> Result<reqwest::Url, String> {
@@ -165,10 +251,15 @@ fn validate_openai_download_url(download_link: &str) -> Result<reqwest::Url, Str
     let Some(host) = url.host_str().map(|h| h.to_ascii_lowercase()) else {
         return Err("download_link must include a host".to_string());
     };
-    if host != "files.oaiusercontent.com" && !host.ends_with(".oaiusercontent.com") {
+    if !is_openai_download_host(&host) {
         return Err("download_link host is not an OpenAI file host".to_string());
     }
     Ok(url)
+}
+
+fn ipv4_is_rfc2544_benchmark(ip: Ipv4Addr) -> bool {
+    let [a, b, _c, _d] = ip.octets();
+    a == 198 && (b == 18 || b == 19)
 }
 
 fn ipv4_is_public(ip: Ipv4Addr) -> bool {
@@ -183,7 +274,7 @@ fn ipv4_is_public(ip: Ipv4Addr) -> bool {
         || (a == 192 && b == 0 && c == 2)
         || (a == 192 && b == 88 && c == 99)
         || (a == 192 && b == 168)
-        || (a == 198 && (b == 18 || b == 19))
+        || ipv4_is_rfc2544_benchmark(ip)
         || (a == 198 && b == 51 && c == 100)
         || (a == 203 && b == 0 && c == 113)
         || a >= 224
@@ -239,6 +330,90 @@ fn ip_is_public(ip: IpAddr) -> bool {
     }
 }
 
+fn ip_is_rfc2544_benchmark(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(ip) if ipv4_is_rfc2544_benchmark(ip))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustedMcpAddressPolicy {
+    PublicOnly,
+    PublicOrOpenAiRfc2544FakeIp,
+}
+
+impl TrustedMcpAddressPolicy {
+    fn allows(self, host: &url::Host<&str>, ip: IpAddr) -> bool {
+        if ip_is_public(ip) {
+            return true;
+        }
+        if self != Self::PublicOrOpenAiRfc2544FakeIp || !ip_is_rfc2544_benchmark(ip) {
+            return false;
+        }
+        matches!(
+            host,
+            url::Host::Domain(domain) if is_openai_download_host(&domain.to_ascii_lowercase())
+        )
+    }
+}
+
+fn dns_diagnostic_host(host: &str) -> Option<&str> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.len() > 253 {
+        return None;
+    }
+    host.split('.')
+        .all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        .then_some(host)
+}
+
+fn dns_diagnostic_address_class(ip: IpAddr) -> &'static str {
+    if ip_is_public(ip) {
+        return "public";
+    }
+    if let IpAddr::V6(v6) = ip {
+        if let Some(v4) = ipv6_embedded_ipv4(v6) {
+            return dns_diagnostic_address_class(IpAddr::V4(v4));
+        }
+    }
+    match ip {
+        IpAddr::V4(v4) if v4.octets()[0] == 198 && matches!(v4.octets()[1], 18 | 19) => {
+            "benchmarking"
+        }
+        ip if ip.is_loopback() => "loopback",
+        IpAddr::V4(v4) if v4.is_link_local() => "link_local",
+        IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80 => "link_local",
+        _ => "non_public",
+    }
+}
+
+fn log_download_dns_rejection(host: Option<&str>, ips: &[IpAddr]) {
+    let Some(host) = host.and_then(dns_diagnostic_host) else {
+        return;
+    };
+    let address_classes: std::collections::BTreeSet<_> = ips
+        .iter()
+        .copied()
+        .map(dns_diagnostic_address_class)
+        .collect();
+    let server_trace_id = diagnostic_trace_id();
+    // Log no URL, path, query, raw address, file identity or caller identity.
+    // Domains are bounded DNS labels; classes and event name are constants.
+    tracing::warn!(
+        target: "webcodex::mcp",
+        download_host = host,
+        address_classes = ?address_classes,
+        server_trace_id = server_trace_id.as_deref(),
+        "mcp_host_file_download_dns_rejected"
+    );
+}
+
 #[cfg(test)]
 static IMPORT_TEST_NETWORK_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
@@ -288,18 +463,32 @@ async fn resolve_download_domain(host: &str) -> Result<Vec<IpAddr>, String> {
             return Ok(ips);
         }
     }
-    let resolved = tokio::time::timeout(
-        IMPORT_DNS_RESOLUTION_TIMEOUT,
-        tokio::net::lookup_host((host, 443)),
-    )
+    bounded_download_dns_resolution(async {
+        tokio::net::lookup_host((host, 443))
+            .await
+            .map(|resolved| resolved.map(|addr| addr.ip()).collect())
+    })
     .await
-    .map_err(|_| "host-provided download URL DNS resolution timed out".to_string())?
-    .map_err(|_| "host-provided download URL DNS resolution failed".to_string())?;
-    Ok(resolved.map(|addr| addr.ip()).collect())
+}
+
+async fn bounded_download_dns_resolution(
+    lookup: impl std::future::Future<Output = std::io::Result<Vec<IpAddr>>>,
+) -> Result<Vec<IpAddr>, String> {
+    tokio::time::timeout(IMPORT_DNS_RESOLUTION_TIMEOUT, lookup)
+        .await
+        .map_err(|_| {
+            log_import_failure(ImportFailureStage::Dns, ImportFailureClass::Timeout, None);
+            "host-provided download URL DNS resolution timed out".to_string()
+        })?
+        .map_err(|_| {
+            log_import_failure(ImportFailureStage::Dns, ImportFailureClass::Failed, None);
+            "host-provided download URL DNS resolution failed".to_string()
+        })
 }
 
 async fn validate_trusted_mcp_download_url(
     download_link: &str,
+    address_policy: TrustedMcpAddressPolicy,
 ) -> Result<TrustedDownloadTarget, String> {
     let url = reqwest::Url::parse(download_link)
         .map_err(|_| "invalid host-provided download URL".to_string())?;
@@ -331,9 +520,15 @@ async fn validate_trusted_mcp_download_url(
         }
     };
     if ips.is_empty() {
+        log_download_dns_rejection(resolver_host.as_deref(), &ips);
         return Err("host-provided download URL resolved to no addresses".to_string());
     }
-    if ips.iter().copied().any(|ip| !ip_is_public(ip)) {
+    if ips
+        .iter()
+        .copied()
+        .any(|ip| !address_policy.allows(&host, ip))
+    {
+        log_download_dns_rejection(resolver_host.as_deref(), &ips);
         return Err("host-provided download URL resolves to a non-public address".to_string());
     }
     let mut pinned_addrs = Vec::with_capacity(ips.len());
@@ -371,13 +566,31 @@ async fn prepare_download_request(
     policy: ConversationImportDownloadPolicy,
 ) -> Result<(reqwest::Client, reqwest::Url), String> {
     match policy {
-        ConversationImportDownloadPolicy::GptActionOpenAiHost => {
-            let url = validate_openai_download_url(download_link)?;
-            let client = build_download_client(None)?;
-            Ok((client, request_url_for_download(url)))
+        ConversationImportDownloadPolicy::AuthenticatedMcpOpenAiHostFile => {
+            validate_openai_download_url(download_link)?;
+            let target = validate_trusted_mcp_download_url(
+                download_link,
+                TrustedMcpAddressPolicy::PublicOnly,
+            )
+            .await?;
+            let client = build_download_client(Some(&target))?;
+            Ok((client, request_url_for_download(target.url)))
+        }
+        ConversationImportDownloadPolicy::LoopbackTrustedMcpHostFile => {
+            let target = validate_trusted_mcp_download_url(
+                download_link,
+                TrustedMcpAddressPolicy::PublicOrOpenAiRfc2544FakeIp,
+            )
+            .await?;
+            let client = build_download_client(Some(&target))?;
+            Ok((client, request_url_for_download(target.url)))
         }
         ConversationImportDownloadPolicy::TrustedMcpHostFile => {
-            let target = validate_trusted_mcp_download_url(download_link).await?;
+            let target = validate_trusted_mcp_download_url(
+                download_link,
+                TrustedMcpAddressPolicy::PublicOnly,
+            )
+            .await?;
             let client = build_download_client(Some(&target))?;
             Ok((client, request_url_for_download(target.url)))
         }
@@ -413,14 +626,6 @@ fn request_url_for_download(validated_url: reqwest::Url) -> reqwest::Url {
         }
     }
     validated_url
-}
-
-fn import_upload_failure_is_definite(result: &ToolResult, upload_id: &str) -> bool {
-    result
-        .output
-        .get("upload_id")
-        .and_then(Value::as_str)
-        .is_some_and(|returned| returned == upload_id)
 }
 
 impl ToolRuntime {
@@ -478,11 +683,16 @@ impl ToolRuntime {
                     session_id: input.session_id.clone(),
                 },
                 auth,
-                transport.clone(),
+                transport,
             )
             .await;
         if !result.success {
-            if import_upload_failure_is_definite(&result, upload_id) {
+            log_import_failure(
+                ImportFailureStage::UploadChunk,
+                ImportFailureClass::Failed,
+                None,
+            );
+            if artifact_upload_failure_is_definite(&result, upload_id) {
                 self.abort_import_upload(
                     &input.project,
                     path,
@@ -496,6 +706,11 @@ impl ToolRuntime {
             return Err(result);
         }
         if result.output.get("next_offset").and_then(Value::as_u64) != Some(next_offset as u64) {
+            log_import_failure(
+                ImportFailureStage::UploadChunk,
+                ImportFailureClass::ProtocolMismatch,
+                None,
+            );
             self.abort_import_upload(
                 &input.project,
                 path,
@@ -510,6 +725,306 @@ impl ToolRuntime {
             ));
         }
         Ok(next_offset)
+    }
+
+    async fn import_one_conversation_file(
+        &self,
+        input: &ImportConversationFilesInput,
+        file_ref: &OpenAiFileIdRef,
+        idx: usize,
+        auth: Option<&AuthContext>,
+        transport: SessionTransport,
+        download_policy: ConversationImportDownloadPolicy,
+    ) -> Result<Value, ToolResult> {
+        let source_name = file_ref
+            .name
+            .as_deref()
+            .or(file_ref.id.as_deref())
+            .unwrap_or("artifact");
+        let reported_mime = file_ref.mime_type.as_deref().unwrap_or(GENERIC_BINARY_MIME);
+        let fallback = format!("artifact-{}", idx + 1);
+        let leaf = input
+            .targets
+            .as_ref()
+            .and_then(|targets| targets.get(idx))
+            .map(|target| sanitize_import_name(target, &fallback))
+            .unwrap_or_else(|| default_import_leaf(file_ref, idx, reported_mime));
+        let path = join_import_path(input.output_dir.as_deref(), &leaf).map_err(ToolResult::err)?;
+        let mime = normalize_host_import_presentation_mime(&path, file_ref.mime_type.as_deref());
+        if !mime_allowed_for_import(&mime, &path) {
+            return Err(ToolResult::err(format!(
+                "MIME type for '{source_name}' is incompatible with destination path: {mime}"
+            )));
+        }
+        let (client, request_url) =
+            prepare_download_request(&file_ref.download_link, download_policy)
+                .await
+                .map_err(ToolResult::err)?;
+
+        // Bound both a single stalled network operation and cumulative network
+        // wait time. Runner upload backpressure is deliberately excluded.
+        let mut network_budget = IMPORT_DOWNLOAD_OVERALL_NETWORK_TIMEOUT;
+        let send_started = Instant::now();
+        let send_result = tokio::time::timeout(
+            IMPORT_DOWNLOAD_IDLE_TIMEOUT.min(network_budget),
+            client.get(request_url).send(),
+        )
+        .await;
+        network_budget = network_budget.saturating_sub(send_started.elapsed());
+        let mut response = match send_result {
+            Ok(Ok(response)) => response,
+            failure => {
+                let class = match failure {
+                    Ok(Err(error)) => download_failure_class(&error),
+                    _ => ImportFailureClass::Timeout,
+                };
+                log_import_failure(ImportFailureStage::DownloadRequest, class, None);
+                return Err(ToolResult::err(format!(
+                    "failed to download '{source_name}'"
+                )));
+            }
+        };
+        if !response.status().is_success() {
+            log_import_failure(
+                ImportFailureStage::DownloadRequest,
+                ImportFailureClass::HttpStatus,
+                Some(response.status().as_u16()),
+            );
+            return Err(ToolResult::err(format!(
+                "download for '{source_name}' returned HTTP {}",
+                response.status()
+            )));
+        }
+        let expected_bytes = match response.content_length() {
+            Some(len) if len > MAX_IMPORT_FILE_BYTES as u64 => {
+                log_import_failure(
+                    ImportFailureStage::DownloadBody,
+                    ImportFailureClass::SizeLimit,
+                    None,
+                );
+                return Err(ToolResult::err(format!(
+                    "download for '{source_name}' exceeds {MAX_IMPORT_FILE_BYTES} bytes"
+                )));
+            }
+            Some(len) => Some(len as usize),
+            None => None,
+        };
+        let begin = self
+            .dispatch_import_artifact_call(
+                ToolCall::ArtifactUploadBegin {
+                    project: input.project.clone(),
+                    path: path.clone(),
+                    session_id: input.session_id.clone(),
+                    expected_bytes,
+                    expected_sha256: None,
+                    mime_type: Some(mime.clone()),
+                    overwrite: input.overwrite,
+                },
+                auth,
+                transport,
+            )
+            .await;
+        if !begin.success {
+            log_import_failure(
+                ImportFailureStage::UploadBegin,
+                ImportFailureClass::Failed,
+                None,
+            );
+            return Err(begin);
+        }
+        let Some(upload_id) = begin
+            .output
+            .get("upload_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            log_import_failure(
+                ImportFailureStage::UploadBegin,
+                ImportFailureClass::ProtocolMismatch,
+                None,
+            );
+            return Err(ToolResult::err(
+                "artifact upload begin returned no upload_id",
+            ));
+        };
+
+        let mut downloaded_bytes = 0usize;
+        let mut uploaded_bytes = 0usize;
+        let mut pending = Vec::with_capacity(MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES);
+        loop {
+            if network_budget.is_zero() {
+                log_import_failure(
+                    ImportFailureStage::DownloadBody,
+                    ImportFailureClass::Timeout,
+                    None,
+                );
+                self.abort_import_upload(
+                    &input.project,
+                    &path,
+                    &upload_id,
+                    input.session_id.as_deref(),
+                    auth,
+                    transport,
+                )
+                .await;
+                return Err(ToolResult::err(format!(
+                    "failed to read download for '{source_name}'"
+                )));
+            }
+            let read_started = Instant::now();
+            let read_result = tokio::time::timeout(
+                IMPORT_DOWNLOAD_IDLE_TIMEOUT.min(network_budget),
+                response.chunk(),
+            )
+            .await;
+            network_budget = network_budget.saturating_sub(read_started.elapsed());
+            let chunk = match read_result {
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => break,
+                failure => {
+                    let class = match failure {
+                        Ok(Err(error)) => download_failure_class(&error),
+                        _ => ImportFailureClass::Timeout,
+                    };
+                    log_import_failure(ImportFailureStage::DownloadBody, class, None);
+                    self.abort_import_upload(
+                        &input.project,
+                        &path,
+                        &upload_id,
+                        input.session_id.as_deref(),
+                        auth,
+                        transport,
+                    )
+                    .await;
+                    return Err(ToolResult::err(format!(
+                        "failed to read download for '{source_name}'"
+                    )));
+                }
+            };
+            let Some(next_downloaded_bytes) = downloaded_bytes.checked_add(chunk.len()) else {
+                log_import_failure(
+                    ImportFailureStage::DownloadBody,
+                    ImportFailureClass::SizeLimit,
+                    None,
+                );
+                self.abort_import_upload(
+                    &input.project,
+                    &path,
+                    &upload_id,
+                    input.session_id.as_deref(),
+                    auth,
+                    transport,
+                )
+                .await;
+                return Err(ToolResult::err(format!(
+                    "download for '{source_name}' exceeds {MAX_IMPORT_FILE_BYTES} bytes"
+                )));
+            };
+            if next_downloaded_bytes > MAX_IMPORT_FILE_BYTES {
+                log_import_failure(
+                    ImportFailureStage::DownloadBody,
+                    ImportFailureClass::SizeLimit,
+                    None,
+                );
+                self.abort_import_upload(
+                    &input.project,
+                    &path,
+                    &upload_id,
+                    input.session_id.as_deref(),
+                    auth,
+                    transport,
+                )
+                .await;
+                return Err(ToolResult::err(format!(
+                    "download for '{source_name}' exceeds {MAX_IMPORT_FILE_BYTES} bytes"
+                )));
+            }
+            downloaded_bytes = next_downloaded_bytes;
+
+            let mut remaining = chunk.as_ref();
+            while !remaining.is_empty() {
+                let available = MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES - pending.len();
+                let take = available.min(remaining.len());
+                pending.extend_from_slice(&remaining[..take]);
+                remaining = &remaining[take..];
+                if pending.len() == MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES {
+                    uploaded_bytes = self
+                        .append_import_upload_chunk(
+                            input,
+                            &path,
+                            &upload_id,
+                            uploaded_bytes,
+                            &pending,
+                            auth,
+                            transport,
+                        )
+                        .await?;
+                    pending.clear();
+                }
+            }
+        }
+        if !pending.is_empty() {
+            self.append_import_upload_chunk(
+                input,
+                &path,
+                &upload_id,
+                uploaded_bytes,
+                &pending,
+                auth,
+                transport,
+            )
+            .await?;
+        }
+
+        let result = self
+            .dispatch_import_artifact_call(
+                ToolCall::ArtifactUploadFinish {
+                    project: input.project.clone(),
+                    path: path.clone(),
+                    upload_id: upload_id.clone(),
+                    session_id: input.session_id.clone(),
+                },
+                auth,
+                transport,
+            )
+            .await;
+        if !result.success {
+            log_import_failure(
+                ImportFailureStage::UploadFinish,
+                ImportFailureClass::Failed,
+                None,
+            );
+            if artifact_upload_failure_is_definite(&result, &upload_id) {
+                self.abort_import_upload(
+                    &input.project,
+                    &path,
+                    &upload_id,
+                    input.session_id.as_deref(),
+                    auth,
+                    transport,
+                )
+                .await;
+            }
+            return Err(result);
+        }
+        let mut obj = Map::new();
+        obj.insert(
+            "source_name".to_string(),
+            Value::String(source_name.to_string()),
+        );
+        obj.insert("project".to_string(), Value::String(input.project.clone()));
+        obj.insert("path".to_string(), Value::String(path));
+        obj.insert("bytes_written".to_string(), result.output["bytes"].clone());
+        obj.insert(
+            "mime_type".to_string(),
+            result
+                .output
+                .get("mime_type")
+                .cloned()
+                .unwrap_or_else(|| Value::String(mime)),
+        );
+        obj.insert("sha256".to_string(), result.output["sha256"].clone());
+        Ok(Value::Object(obj))
     }
 
     pub(crate) async fn import_conversation_files(
@@ -528,245 +1043,55 @@ impl ToolRuntime {
         }
         let mut imported = Vec::new();
         for (idx, file_ref) in input.openai_file_id_refs.iter().enumerate() {
-            let source_name = file_ref
-                .name
-                .as_deref()
-                .or(file_ref.id.as_deref())
-                .unwrap_or("artifact");
-            let mime = file_ref
-                .mime_type
-                .as_deref()
-                .unwrap_or("application/octet-stream");
-            let fallback = format!("artifact-{}", idx + 1);
-            let leaf = input
-                .targets
-                .as_ref()
-                .and_then(|targets| targets.get(idx))
-                .map(|target| sanitize_import_name(target, &fallback))
-                .unwrap_or_else(|| default_import_leaf(file_ref, idx, mime));
-            let path = match join_import_path(input.output_dir.as_deref(), &leaf) {
-                Ok(path) => path,
-                Err(e) => return ToolResult::err(e),
-            };
-            if !mime_allowed_for_import(mime, &path) {
-                return ToolResult::err(format!(
-                    "unsupported MIME type for '{source_name}': {mime}"
-                ));
-            }
-            let (client, request_url) =
-                match prepare_download_request(&file_ref.download_link, download_policy).await {
-                    Ok(prepared) => prepared,
-                    Err(e) => return ToolResult::err(e),
-                };
-            // Preserve the previous 30-second download bound without charging
-            // time spent waiting for Runner upload round-trips against the
-            // network budget. Each actual network wait consumes from the same
-            // cumulative budget; remote-controlled stalls therefore remain
-            // bounded while upload backpressure does not create false timeouts.
-            let mut download_budget = IMPORT_DOWNLOAD_TIMEOUT;
-            let send_started = Instant::now();
-            let send_result =
-                tokio::time::timeout(download_budget, client.get(request_url).send()).await;
-            download_budget = download_budget.saturating_sub(send_started.elapsed());
-            let mut response = match send_result {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) | Err(_) => {
-                    // reqwest error text can include the request URL. Keep the
-                    // temporary host URL out of durable/model-visible errors.
-                    return ToolResult::err(format!("failed to download '{source_name}'"));
-                }
-            };
-            if !response.status().is_success() {
-                return ToolResult::err(format!(
-                    "download for '{source_name}' returned HTTP {}",
-                    response.status()
-                ));
-            }
-            let expected_bytes = match response.content_length() {
-                Some(len) if len > MAX_IMPORT_FILE_BYTES as u64 => {
-                    return ToolResult::err(format!(
-                        "download for '{source_name}' exceeds {MAX_IMPORT_FILE_BYTES} bytes"
-                    ));
-                }
-                Some(len) => Some(len as usize),
-                None => None,
-            };
-            let begin = self
-                .dispatch_import_artifact_call(
-                    ToolCall::ArtifactUploadBegin {
-                        project: input.project.clone(),
-                        path: path.clone(),
-                        session_id: input.session_id.clone(),
-                        expected_bytes,
-                        expected_sha256: None,
-                        mime_type: Some(mime.to_string()),
-                        overwrite: input.overwrite,
-                    },
+            match self
+                .import_one_conversation_file(
+                    &input,
+                    file_ref,
+                    idx,
                     auth,
-                    transport.clone(),
+                    transport,
+                    download_policy,
                 )
-                .await;
-            if !begin.success {
-                return begin;
-            }
-            let Some(upload_id) = begin
-                .output
-                .get("upload_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            else {
-                return ToolResult::err("artifact upload begin returned no upload_id");
-            };
-
-            let mut downloaded_bytes = 0usize;
-            let mut uploaded_bytes = 0usize;
-            let mut pending = Vec::with_capacity(MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES);
-            loop {
-                if download_budget.is_zero() {
-                    self.abort_import_upload(
-                        &input.project,
-                        &path,
-                        &upload_id,
-                        input.session_id.as_deref(),
-                        auth,
-                        transport.clone(),
-                    )
-                    .await;
-                    return ToolResult::err(format!("failed to read download for '{source_name}'"));
-                }
-                let read_started = Instant::now();
-                let read_result = tokio::time::timeout(download_budget, response.chunk()).await;
-                download_budget = download_budget.saturating_sub(read_started.elapsed());
-                let chunk = match read_result {
-                    Ok(Ok(Some(chunk))) => chunk,
-                    Ok(Ok(None)) => break,
-                    Ok(Err(_)) | Err(_) => {
-                        self.abort_import_upload(
-                            &input.project,
-                            &path,
-                            &upload_id,
-                            input.session_id.as_deref(),
-                            auth,
-                            transport.clone(),
-                        )
-                        .await;
-                        return ToolResult::err(format!(
-                            "failed to read download for '{source_name}'"
-                        ));
-                    }
-                };
-                let Some(next_downloaded_bytes) = downloaded_bytes.checked_add(chunk.len()) else {
-                    self.abort_import_upload(
-                        &input.project,
-                        &path,
-                        &upload_id,
-                        input.session_id.as_deref(),
-                        auth,
-                        transport.clone(),
-                    )
-                    .await;
-                    return ToolResult::err(format!(
-                        "download for '{source_name}' exceeds {MAX_IMPORT_FILE_BYTES} bytes"
-                    ));
-                };
-                if next_downloaded_bytes > MAX_IMPORT_FILE_BYTES {
-                    self.abort_import_upload(
-                        &input.project,
-                        &path,
-                        &upload_id,
-                        input.session_id.as_deref(),
-                        auth,
-                        transport.clone(),
-                    )
-                    .await;
-                    return ToolResult::err(format!(
-                        "download for '{source_name}' exceeds {MAX_IMPORT_FILE_BYTES} bytes"
-                    ));
-                }
-                downloaded_bytes = next_downloaded_bytes;
-
-                let mut remaining = chunk.as_ref();
-                while !remaining.is_empty() {
-                    let available = MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES - pending.len();
-                    let take = available.min(remaining.len());
-                    pending.extend_from_slice(&remaining[..take]);
-                    remaining = &remaining[take..];
-                    if pending.len() == MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES {
-                        uploaded_bytes = match self
-                            .append_import_upload_chunk(
-                                &input,
-                                &path,
-                                &upload_id,
-                                uploaded_bytes,
-                                &pending,
-                                auth,
-                                transport.clone(),
-                            )
-                            .await
-                        {
-                            Ok(next_offset) => next_offset,
-                            Err(result) => return result,
-                        };
-                        pending.clear();
-                    }
+                .await
+            {
+                Ok(item) => imported.push(item),
+                Err(failure) => {
+                    let source_name = file_ref
+                        .name
+                        .as_deref()
+                        .or(file_ref.id.as_deref())
+                        .unwrap_or("artifact");
+                    let reason = failure
+                        .error
+                        .unwrap_or_else(|| "conversation file import failed".to_string());
+                    return ToolResult::err_with_output(
+                        reason.clone(),
+                        json!({
+                            "imported": imported,
+                            "succeeded": imported,
+                            "count": imported.len(),
+                            "succeeded_count": imported.len(),
+                            "failed_item": {
+                                "index": idx,
+                                "source_name": source_name,
+                            },
+                            "failure_reason": reason,
+                            "partial_success": !imported.is_empty(),
+                            "atomic": false,
+                            "failure": failure.output,
+                        }),
+                    );
                 }
             }
-            if !pending.is_empty() {
-                if let Err(result) = self
-                    .append_import_upload_chunk(
-                        &input,
-                        &path,
-                        &upload_id,
-                        uploaded_bytes,
-                        &pending,
-                        auth,
-                        transport.clone(),
-                    )
-                    .await
-                {
-                    return result;
-                }
-            }
-
-            let result = self
-                .dispatch_import_artifact_call(
-                    ToolCall::ArtifactUploadFinish {
-                        project: input.project.clone(),
-                        path: path.clone(),
-                        upload_id: upload_id.clone(),
-                        session_id: input.session_id.clone(),
-                    },
-                    auth,
-                    transport.clone(),
-                )
-                .await;
-            if !result.success {
-                if import_upload_failure_is_definite(&result, &upload_id) {
-                    self.abort_import_upload(
-                        &input.project,
-                        &path,
-                        &upload_id,
-                        input.session_id.as_deref(),
-                        auth,
-                        transport.clone(),
-                    )
-                    .await;
-                }
-                return result;
-            }
-            let mut obj = Map::new();
-            obj.insert(
-                "source_name".to_string(),
-                Value::String(source_name.to_string()),
-            );
-            obj.insert("project".to_string(), Value::String(input.project.clone()));
-            obj.insert("path".to_string(), Value::String(path));
-            obj.insert("bytes_written".to_string(), result.output["bytes"].clone());
-            obj.insert("mime_type".to_string(), Value::String(mime.to_string()));
-            obj.insert("sha256".to_string(), result.output["sha256"].clone());
-            imported.push(Value::Object(obj));
         }
-        ToolResult::ok(json!({"imported": imported, "count": imported.len()}))
+        ToolResult::ok(json!({
+            "imported": imported,
+            "succeeded": imported,
+            "count": imported.len(),
+            "succeeded_count": imported.len(),
+            "partial_success": false,
+            "atomic": false,
+        }))
     }
 
     pub(crate) async fn dispatch_conversation_import_tool(
@@ -782,21 +1107,33 @@ impl ToolRuntime {
             targets,
             overwrite,
             session_id,
-            trusted_mcp_host_file_import,
+            host_file_import_provenance,
         } = call
         else {
             unreachable!("dispatch_conversation_import_tool called with non-import tool")
         };
-        if !matches!(transport, SessionTransport::Mcp) {
-            return ToolResult::err(
-                "import_conversation_files_to_project requires the MCP host file-reference mechanism; use the dedicated /api/artifacts/import GPT Action outside MCP",
-            );
-        }
-        if !trusted_mcp_host_file_import {
-            return ToolResult::err(
-                "import_conversation_files_to_project requires an explicitly trusted OAuth MCP client",
-            );
-        }
+        let download_policy = match (transport, host_file_import_provenance) {
+            (SessionTransport::Mcp, HostFileImportProvenance::TrustedMcpHostFile) => {
+                ConversationImportDownloadPolicy::TrustedMcpHostFile
+            }
+            (SessionTransport::Mcp, HostFileImportProvenance::LoopbackTrustedMcpHostFile) => {
+                ConversationImportDownloadPolicy::LoopbackTrustedMcpHostFile
+            }
+            (SessionTransport::Mcp, HostFileImportProvenance::AuthenticatedMcpOpenAiHostFile) => {
+                ConversationImportDownloadPolicy::AuthenticatedMcpOpenAiHostFile
+            }
+
+            (SessionTransport::Mcp, _) => {
+                return ToolResult::err(
+                    "import_host_files requires trusted MCP host-file provenance",
+                );
+            }
+            (SessionTransport::Api, _) => {
+                return ToolResult::err(
+                    "import_host_files is available only through trusted MCP host-file integration",
+                );
+            }
+        };
         self.import_conversation_files(
             ImportConversationFilesInput {
                 openai_file_id_refs: openai_file_id_refs.into_iter().map(Into::into).collect(),
@@ -808,7 +1145,7 @@ impl ToolRuntime {
             },
             auth,
             transport,
-            ConversationImportDownloadPolicy::TrustedMcpHostFile,
+            download_policy,
         )
         .await
     }
@@ -817,6 +1154,198 @@ impl ToolRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn diagnostic_trace_accepts_only_canonical_uuids() {
+        for unsafe_id in [
+            "SECRET",
+            "safe-request-correlation",
+            "https://example/path?token=SECRET",
+            "\nINJECT",
+        ] {
+            crate::tool_request_trace::scope_active_trace(Some(unsafe_id.to_string()), async {
+                assert!(diagnostic_trace_id().is_none());
+            })
+            .await;
+        }
+        crate::tool_request_trace::scope_active_trace(
+            Some("C77C5EC6-32E4-4A54-8590-4DA44D35A8BE".to_string()),
+            async {
+                assert_eq!(
+                    diagnostic_trace_id().as_deref(),
+                    Some("c77c5ec6-32e4-4a54-8590-4da44d35a8be")
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dns_failures_are_bounded_and_never_return_resolver_error_text() {
+        let start = tokio::time::Instant::now();
+        let timeout = bounded_download_dns_resolution(std::future::pending())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            IMPORT_DNS_RESOLUTION_TIMEOUT
+        );
+        assert_eq!(
+            timeout,
+            "host-provided download URL DNS resolution timed out"
+        );
+        let failed = bounded_download_dns_resolution(async {
+            Err(std::io::Error::other(
+                "https://private.example/path?sig=SECRET",
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(failed, "host-provided download URL DNS resolution failed");
+    }
+
+    #[tokio::test]
+    async fn dns_rejection_diagnostic_is_bounded_correlated_and_secret_free() {
+        #[derive(Clone)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture(Default::default());
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("warn")
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let trace = "c77c5ec6-32e4-4a54-8590-4da44d35a8be";
+        crate::tool_request_trace::scope_active_trace(Some(trace.to_string()), async {
+            tracing::subscriber::with_default(subscriber, || {
+                log_download_dns_rejection(
+                    Some("files.oaiusercontent.com"),
+                    &[
+                        "198.18.5.253".parse().unwrap(),
+                        "198.19.0.1".parse().unwrap(),
+                        "8.8.8.8".parse().unwrap(),
+                        "127.0.0.1".parse().unwrap(),
+                        "169.254.1.1".parse().unwrap(),
+                    ],
+                );
+                for unsafe_host in [
+                    "evil.example\nINJECT",
+                    "evil.example?token=SECRET",
+                    "evil.example/SECRET",
+                    "user:SECRET@evil.example",
+                    "-bad.example",
+                ] {
+                    log_download_dns_rejection(
+                        Some(unsafe_host),
+                        &["198.18.5.253".parse().unwrap()],
+                    );
+                }
+                for stage in [
+                    ImportFailureStage::Dns,
+                    ImportFailureStage::DownloadRequest,
+                    ImportFailureStage::DownloadBody,
+                    ImportFailureStage::UploadBegin,
+                    ImportFailureStage::UploadChunk,
+                    ImportFailureStage::UploadFinish,
+                ] {
+                    log_import_failure(stage, ImportFailureClass::Failed, Some(999));
+                }
+            });
+        })
+        .await;
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.lines().count(), 7, "{output}");
+        assert!(!output.contains("999"), "{output}");
+        for line in output.lines() {
+            assert!(line.contains(trace), "{line}");
+        }
+        for expected in [
+            "WARN",
+            "mcp_host_file_download_dns_rejected",
+            "files.oaiusercontent.com",
+            trace,
+            "benchmarking",
+            "public",
+            "loopback",
+            "link_local",
+        ] {
+            assert!(output.contains(expected), "{output}");
+        }
+        for excluded in [
+            "198.18.5.253",
+            "198.19.0.1",
+            "8.8.8.8",
+            "127.0.0.1",
+            "169.254.1.1",
+            "SECRET",
+            "INJECT",
+            "token=",
+            "evil.example",
+            "download_url",
+            "query",
+        ] {
+            assert!(!output.contains(excluded), "{output}");
+        }
+    }
+
+    #[test]
+    fn dns_diagnostic_domains_and_address_classes_preserve_rejection_boundaries() {
+        assert_eq!(
+            dns_diagnostic_host("xn--bcher-kva.example."),
+            Some("xn--bcher-kva.example")
+        );
+        assert!(dns_diagnostic_host(&format!("{}.example", "a".repeat(64))).is_none());
+        assert!(dns_diagnostic_host(&format!("{}.example", "a".repeat(254))).is_none());
+        for ip in [
+            "198.18.0.0",
+            "198.18.5.253",
+            "198.19.255.255",
+            "::ffff:198.18.5.253",
+        ] {
+            let ip = ip.parse().unwrap();
+            assert!(!ip_is_public(ip));
+            assert_eq!(dns_diagnostic_address_class(ip), "benchmarking");
+        }
+        for ip in ["10.0.0.1", "192.168.1.1", "::1", "fe80::1", "fc00::1"] {
+            let ip = ip.parse().unwrap();
+            assert!(!ip_is_public(ip));
+            assert_ne!(dns_diagnostic_address_class(ip), "public");
+        }
+    }
+
+    #[test]
+    fn import_limit_matches_canonical_streaming_artifact_limit() {
+        assert_eq!(MAX_IMPORT_FILE_BYTES, MAX_PROJECT_ARTIFACT_UPLOAD_BYTES);
+        assert_eq!(MAX_IMPORT_FILE_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn import_filename_sanitization_preserves_unicode_basename() {
+        assert_eq!(
+            sanitize_import_name("folder/毕业论文.pdf", "fallback.pdf"),
+            "毕业论文.pdf"
+        );
+        assert_eq!(
+            sanitize_import_name(r"folder\报告.md", "fallback.md"),
+            "报告.md"
+        );
+        assert_eq!(
+            sanitize_import_name("../unsafe/name?.txt", "fallback.txt"),
+            "name_.txt"
+        );
+        assert_eq!(sanitize_import_name("..", "fallback"), "fallback");
+        assert_eq!(sanitize_import_name("NUL.txt", "fallback"), "_NUL.txt");
+    }
 
     #[test]
     fn default_import_leaf_preserves_ooxml_when_host_omits_filename() {
@@ -833,10 +1362,12 @@ mod tests {
     }
 
     #[test]
-    fn default_import_leaf_preserves_common_media_extension_when_host_omits_filename() {
+    fn default_import_leaf_uses_shared_file_type_policy() {
         for (mime, expected) in [
             ("audio/mpeg", "artifact-1.mp3"),
             ("video/mp4", "artifact-1.mp4"),
+            ("text/markdown", "artifact-1.md"),
+            ("application/yaml", "artifact-1.yaml"),
         ] {
             let file_ref = OpenAiFileIdRef {
                 name: None,
@@ -849,7 +1380,11 @@ mod tests {
         }
         assert!(mime_allowed_for_import(
             "application/octet-stream",
-            "artifact-1.mp4"
+            "artifact-1.customblob"
+        ));
+        assert!(mime_allowed_for_import(
+            "application/x-unknown",
+            "artifact-1.customblob"
         ));
     }
 
@@ -868,6 +1403,30 @@ mod tests {
     }
 
     #[test]
+    fn openai_download_host_accepts_sediment_blob_accounts_without_broadening_azure() {
+        for host in [
+            "files.oaiusercontent.com",
+            "subdomain.oaiusercontent.com",
+            "oaisdmntprcentralus.blob.core.windows.net",
+            "oaisdmntpreastus2.blob.core.windows.net",
+        ] {
+            assert!(is_openai_download_host(host), "{host} should be accepted");
+        }
+
+        for host in [
+            "oaiusercontent.com",
+            "attacker.blob.core.windows.net",
+            "oaisdmntpr.blob.core.windows.net",
+            "oaisdmntprcentralus.blob.core.windows.net.evil.example",
+        ] {
+            assert!(
+                !is_openai_download_host(host),
+                "{host} must not be accepted as an OpenAI file host"
+            );
+        }
+    }
+
+    #[test]
     fn trusted_mcp_ssrf_policy_rejects_non_public_ip_ranges() {
         for ip in [
             "127.0.0.1",
@@ -876,6 +1435,8 @@ mod tests {
             "192.168.1.1",
             "169.254.1.1",
             "100.64.0.1",
+            "198.18.0.1",
+            "198.19.255.254",
             "0.0.0.0",
             "224.0.0.1",
         ] {
@@ -900,7 +1461,7 @@ mod tests {
             "https://[fc00::1]/file",
             "https://[fe80::1]/file",
         ] {
-            let error = validate_trusted_mcp_download_url(url)
+            let error = validate_trusted_mcp_download_url(url, TrustedMcpAddressPolicy::PublicOnly)
                 .await
                 .expect_err("unsafe target must fail closed");
             assert!(
@@ -908,10 +1469,176 @@ mod tests {
                 "error leaked full temporary URL: {error}"
             );
         }
-        let target = validate_trusted_mcp_download_url("https://8.8.8.8/file")
-            .await
-            .expect("public HTTPS literal should be accepted");
+        let target = validate_trusted_mcp_download_url(
+            "https://8.8.8.8/file",
+            TrustedMcpAddressPolicy::PublicOnly,
+        )
+        .await
+        .expect("public HTTPS literal should be accepted");
         assert_eq!(target.pinned_addrs, vec!["8.8.8.8:443".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn authenticated_mcp_openai_host_policy_stays_host_limited_and_dns_pinned() {
+        let _lock = lock_import_test_network().await;
+
+        set_import_test_resolved_ips(Some(vec!["8.8.8.8".parse().unwrap()]));
+        reset_import_test_dns_resolution_count();
+        let (_client, url) = prepare_download_request(
+            "https://files.oaiusercontent.com/file",
+            ConversationImportDownloadPolicy::AuthenticatedMcpOpenAiHostFile,
+        )
+        .await
+        .expect("authenticated MCP OpenAI file host should be accepted");
+        assert_eq!(url.host_str(), Some("files.oaiusercontent.com"));
+        assert_eq!(import_test_dns_resolution_count(), 1);
+
+        reset_import_test_dns_resolution_count();
+        let (_client, url) = prepare_download_request(
+            "https://oaisdmntprcentralus.blob.core.windows.net/files/file/raw?sig=test",
+            ConversationImportDownloadPolicy::AuthenticatedMcpOpenAiHostFile,
+        )
+        .await
+        .expect("authenticated MCP Sediment blob host should be accepted");
+        assert_eq!(
+            url.host_str(),
+            Some("oaisdmntprcentralus.blob.core.windows.net")
+        );
+        assert_eq!(import_test_dns_resolution_count(), 1);
+
+        set_import_test_resolved_ips(Some(vec!["127.0.0.1".parse().unwrap()]));
+        reset_import_test_dns_resolution_count();
+        let error = prepare_download_request(
+            "https://subdomain.oaiusercontent.com/file",
+            ConversationImportDownloadPolicy::AuthenticatedMcpOpenAiHostFile,
+        )
+        .await
+        .expect_err("OpenAI file host resolving private must fail closed");
+        assert!(error.contains("non-public address"), "{error}");
+        assert_eq!(import_test_dns_resolution_count(), 1);
+
+        set_import_test_resolved_ips(Some(vec!["8.8.8.8".parse().unwrap()]));
+        reset_import_test_dns_resolution_count();
+        let error = prepare_download_request(
+            "https://download.example/file",
+            ConversationImportDownloadPolicy::AuthenticatedMcpOpenAiHostFile,
+        )
+        .await
+        .expect_err("Tier 2 must not expand to arbitrary public HTTPS");
+        assert!(error.contains("OpenAI file host"), "{error}");
+        assert_eq!(
+            import_test_dns_resolution_count(),
+            0,
+            "non-OpenAI Tier 2 URL must be rejected before DNS"
+        );
+
+        set_import_test_resolved_ips(None);
+        reset_import_test_dns_resolution_count();
+    }
+
+    #[test]
+    fn rfc2544_exception_matches_exact_ipv4_benchmark_boundaries() {
+        for ip in ["198.18.0.0", "198.18.0.42", "198.19.255.255"] {
+            assert!(ipv4_is_rfc2544_benchmark(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["198.17.255.255", "198.20.0.0", "198.51.100.42"] {
+            assert!(!ipv4_is_rfc2544_benchmark(ip.parse().unwrap()), "{ip}");
+        }
+        // Mapped IPv6 does not qualify for the IPv4-only fake-IP exception.
+        assert!(!ip_is_rfc2544_benchmark(
+            "::ffff:198.18.0.42".parse().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn loopback_trusted_mcp_policy_allows_rfc2544_only_for_openai_hosts() {
+        let _lock = lock_import_test_network().await;
+        let fake_ip: IpAddr = "198.18.0.42".parse().unwrap();
+
+        set_import_test_resolved_ips(Some(vec![fake_ip]));
+        reset_import_test_dns_resolution_count();
+        let (_client, url) = prepare_download_request(
+            "https://files.oaiusercontent.com/file",
+            ConversationImportDownloadPolicy::LoopbackTrustedMcpHostFile,
+        )
+        .await
+        .expect("loopback trusted OpenAI host may use RFC 2544 fake-IP DNS");
+        assert_eq!(url.host_str(), Some("files.oaiusercontent.com"));
+        assert_eq!(import_test_dns_resolution_count(), 1);
+
+        for private_ip in ["127.0.0.1", "10.0.0.1", "169.254.169.254", "192.168.1.1"] {
+            set_import_test_resolved_ips(Some(vec![private_ip.parse().unwrap()]));
+            let error = prepare_download_request(
+                "https://files.oaiusercontent.com/file",
+                ConversationImportDownloadPolicy::LoopbackTrustedMcpHostFile,
+            )
+            .await
+            .expect_err("real private/sensitive addresses must still fail closed");
+            assert!(error.contains("non-public address"), "{error}");
+        }
+
+        // One forbidden address poisons the entire DNS answer set; no
+        // connection may fall back to the permitted fake IP in this case.
+        set_import_test_resolved_ips(Some(vec![fake_ip, "169.254.169.254".parse().unwrap()]));
+        let error = prepare_download_request(
+            "https://files.oaiusercontent.com/file",
+            ConversationImportDownloadPolicy::LoopbackTrustedMcpHostFile,
+        )
+        .await
+        .expect_err("mixed fake-IP and metadata-service DNS answers must fail closed");
+        assert!(error.contains("non-public address"), "{error}");
+
+        set_import_test_resolved_ips(Some(vec![fake_ip]));
+        for literal in [
+            "https://198.18.0.42/file",
+            "https://[::ffff:198.18.0.42]/file",
+        ] {
+            let error = prepare_download_request(
+                literal,
+                ConversationImportDownloadPolicy::LoopbackTrustedMcpHostFile,
+            )
+            .await
+            .expect_err("literal and mapped IPs must not impersonate an OpenAI hostname");
+            assert!(error.contains("non-public address"), "{error}");
+        }
+
+        set_import_test_resolved_ips(Some(vec![fake_ip]));
+        reset_import_test_dns_resolution_count();
+        let error = prepare_download_request(
+            "https://download.example/file",
+            ConversationImportDownloadPolicy::LoopbackTrustedMcpHostFile,
+        )
+        .await
+        .expect_err("RFC 2544 exception must not broaden arbitrary hosts");
+        assert!(error.contains("non-public address"), "{error}");
+        assert_eq!(import_test_dns_resolution_count(), 1);
+
+        for policy in [
+            ConversationImportDownloadPolicy::AuthenticatedMcpOpenAiHostFile,
+            ConversationImportDownloadPolicy::TrustedMcpHostFile,
+        ] {
+            set_import_test_resolved_ips(Some(vec![fake_ip]));
+            let url = if policy == ConversationImportDownloadPolicy::TrustedMcpHostFile {
+                "https://download.example/file"
+            } else {
+                "https://files.oaiusercontent.com/file"
+            };
+            let error = prepare_download_request(url, policy)
+                .await
+                .expect_err("remote/trusted policies must keep public-only DNS admission");
+            assert!(error.contains("non-public address"), "{error}");
+        }
+
+        set_import_test_resolved_ips(Some(vec!["8.8.8.8".parse().unwrap()]));
+        prepare_download_request(
+            "https://download.example/file",
+            ConversationImportDownloadPolicy::LoopbackTrustedMcpHostFile,
+        )
+        .await
+        .expect("loopback trusted public HTTPS behavior must remain compatible");
+
+        set_import_test_resolved_ips(None);
+        reset_import_test_dns_resolution_count();
     }
 
     #[tokio::test]
@@ -923,12 +1650,17 @@ mod tests {
             vec!["169.254.1.1".parse().unwrap()],
             vec!["::1".parse().unwrap()],
             vec!["fe80::1".parse().unwrap()],
+            vec!["198.18.5.253".parse().unwrap()],
+            vec!["8.8.8.8".parse().unwrap(), "198.18.5.253".parse().unwrap()],
         ] {
             set_import_test_resolved_ips(Some(ips));
             reset_import_test_dns_resolution_count();
-            let error = validate_trusted_mcp_download_url("https://download.example/file")
-                .await
-                .expect_err("unsafe DNS result must fail closed");
+            let error = validate_trusted_mcp_download_url(
+                "https://download.example/file",
+                TrustedMcpAddressPolicy::PublicOnly,
+            )
+            .await
+            .expect_err("unsafe DNS result must fail closed");
             assert!(
                 error.contains("resolved to no addresses")
                     || error.contains("resolves to a non-public address"),
@@ -936,6 +1668,17 @@ mod tests {
             );
             assert_eq!(import_test_dns_resolution_count(), 1);
         }
+        // A resolver-specific Fake-IP exception may restore real public answers;
+        // admission still uses the same all-public predicate and pinned addresses.
+        set_import_test_resolved_ips(Some(vec!["8.8.8.8".parse().unwrap()]));
+        let target = validate_trusted_mcp_download_url(
+            "https://download.example/file",
+            TrustedMcpAddressPolicy::PublicOnly,
+        )
+        .await
+        .expect("public DNS answer may pass the unchanged SSRF policy");
+        assert_eq!(target.pinned_addrs, vec!["8.8.8.8:443".parse().unwrap()]);
+        assert_eq!(target.resolver_host.as_deref(), Some("download.example"));
         set_import_test_resolved_ips(None);
         reset_import_test_dns_resolution_count();
     }

@@ -1,4 +1,4 @@
-use crate::{project_entry, task_cli};
+use crate::project_entry;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,14 +6,26 @@ pub struct RegularServerTunnelOptions {
     pub local_server_url: String,
     pub bootstrap_token: String,
     pub runtime_parent: PathBuf,
+    pub stop_on_stdin_eof: bool,
 }
 
 pub async fn run_regular_server_tunnel(options: RegularServerTunnelOptions) -> Result<(), String> {
-    project_entry::run_regular_server_tunnel(&project_entry::RegularServerTunnelOptions {
-        local_server_url: options.local_server_url,
-        bootstrap_token: options.bootstrap_token,
-        runtime_parent: options.runtime_parent,
-    })
+    run_regular_server_tunnel_with_stop(options, std::future::pending()).await
+}
+
+pub async fn run_regular_server_tunnel_with_stop(
+    options: RegularServerTunnelOptions,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    project_entry::run_regular_server_tunnel_with_stop(
+        &project_entry::RegularServerTunnelOptions {
+            local_server_url: options.local_server_url,
+            bootstrap_token: options.bootstrap_token,
+            runtime_parent: options.runtime_parent,
+            stop_on_stdin_eof: options.stop_on_stdin_eof,
+        },
+        stop,
+    )
     .await
     .map_err(|error| project_entry::render_error(&error, true))
 }
@@ -25,7 +37,6 @@ pub(crate) enum ProjectCliAction {
     Status(project_entry::ProjectCommandOptions),
     Run(project_entry::ProjectCommandOptions),
     Share(project_entry::ShareCommandOptions),
-    Task(task_cli::TaskCliCommand),
     Exit {
         code: i32,
         stdout: String,
@@ -61,7 +72,7 @@ impl CliCommandOutput {
 pub fn is_project_command(args: &[String]) -> bool {
     matches!(
         args.first().map(String::as_str),
-        Some("setup" | "doctor" | "status" | "run" | "share" | "task")
+        Some("setup" | "doctor" | "status" | "run" | "share")
     )
 }
 
@@ -107,29 +118,6 @@ where
                 code: 2,
                 stdout: String::new(),
                 stderr: format!("{error}\n\n{}", project_entry::usage()),
-            },
-        };
-    }
-
-    if command == "task" {
-        if args.len() == 2 && matches!(args[1].as_str(), "--help" | "-h") {
-            return ProjectCliAction::Exit {
-                code: 0,
-                stdout: task_cli::usage().to_string(),
-                stderr: String::new(),
-            };
-        }
-        return match task_cli::parse(&args[1..]) {
-            Ok(command) => ProjectCliAction::Task(command),
-            Err(error) if error == "help requested" => ProjectCliAction::Exit {
-                code: 0,
-                stdout: task_cli::usage().to_string(),
-                stderr: String::new(),
-            },
-            Err(error) => ProjectCliAction::Exit {
-                code: 2,
-                stdout: String::new(),
-                stderr: format!("{}\n\n{}", error, task_cli::usage()),
             },
         };
     }
@@ -217,10 +205,6 @@ pub async fn run_project_command(args: Vec<String>) -> CliCommandOutput {
                     project_entry::render_error(&error, options.project.json)
                 ),
             ),
-        },
-        ProjectCliAction::Task(command) => match task_cli::run(command) {
-            Ok(stdout) => CliCommandOutput::success(format!("{stdout}\n")),
-            Err(stderr) => CliCommandOutput::failure(1, format!("{stderr}\n")),
         },
         ProjectCliAction::Exit {
             code,

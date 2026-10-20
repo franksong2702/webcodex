@@ -21,9 +21,41 @@ pub const NO_STABLE_DIAGNOSTICS_REASON: &str = "no stable diagnostics found";
 pub const VALIDATION_OUTPUT_METADATA_ABSENT_REASON: &str =
     "no validation event contains safe bounded output metadata";
 
+// Passive failure detail is a subset of the canonical parser evidence. The
+// serialized diagnostics object has an independent hard byte ceiling.
+pub const PASSIVE_MAX_DIAGNOSTICS: usize = 3;
+pub const PASSIVE_MAX_FAILED_TESTS: usize = 3;
+pub const PASSIVE_MAX_FAILURE_BYTES: usize = 8 * 1024;
 pub const MAX_DIAGNOSTICS: usize = 20;
 pub const MAX_FAILED_TESTS: usize = 20;
 pub const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
+
+/// Completeness of authoritative Cargo test-count extraction. This is shared
+/// by bounded Server parsing and Runner full-stream accumulation so there is
+/// one vocabulary for why an executed-test count is or is not proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CargoTestCountEvidenceStatus {
+    CompleteSummary,
+    PartialHarnessSummary,
+    NoCompleteSummary,
+    IncompleteStream,
+}
+
+impl CargoTestCountEvidenceStatus {
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::CompleteSummary => "complete_summary",
+            Self::PartialHarnessSummary => "partial_harness_summary",
+            Self::NoCompleteSummary => "no_complete_summary",
+            Self::IncompleteStream => "incomplete_stream",
+        }
+    }
+
+    pub const fn count_is_proven(self) -> bool {
+        matches!(self, Self::CompleteSummary)
+    }
+}
 const MAX_CODE_CHARS: usize = 64;
 const MAX_FILE_CHARS: usize = 512;
 const MAX_TEST_NAME_CHARS: usize = 240;
@@ -83,6 +115,262 @@ pub struct CargoTestSummary {
     pub failed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored: Option<u64>,
+}
+
+/// Extract only a complete final pytest terminal summary. Passing process status
+/// alone, progress lines and truncated output cannot prove an executed-test count.
+/// Skips, xfails/xpasses and collection errors never inflate the executed count.
+pub fn parse_pytest_diagnostics(stdout: &str, truncated: bool) -> ValidationDiagnostics {
+    let summary = if truncated {
+        None
+    } else {
+        pytest_final_summary(stdout)
+    };
+    ValidationDiagnostics {
+        available: summary.is_some(),
+        parser: PARSER_KIND,
+        reason: summary.is_none().then_some("no complete pytest summary"),
+        diagnostic_count: Some(0),
+        diagnostics: Vec::new(),
+        returned_diagnostic_count: 0,
+        diagnostics_truncated: false,
+        invalid_diagnostics_omitted: 0,
+        test_summary: summary,
+        failed_test_details: Vec::new(),
+        failed_test_details_truncated: false,
+        truncated: Some(truncated),
+    }
+}
+
+fn pytest_final_summary(stdout: &str) -> Option<CargoTestSummary> {
+    let mut lines = stdout.lines().rev().filter(|line| !line.trim().is_empty());
+    let summary = pytest_summary_line(lines.next()?)?;
+    // Multiple terminal summaries may represent nested runs or contradictory
+    // evidence. A bounded excerpt must not silently select one as authoritative.
+    if lines.any(|line| pytest_summary_line(line).is_some()) {
+        return None;
+    }
+    Some(summary)
+}
+
+fn pytest_summary_line(line: &str) -> Option<CargoTestSummary> {
+    let line = line.trim().trim_matches('=').trim();
+    let (counts, duration) = line.split_once(" in ")?;
+    let mut duration_parts = duration.split_whitespace();
+    let seconds = duration_parts.next()?.strip_suffix('s')?;
+    if let Some(clock) = duration_parts.next() {
+        let clock = clock.strip_prefix('(')?.strip_suffix(')')?;
+        let parts: Vec<_> = clock.split(':').collect();
+        if parts.len() != 3
+            || parts
+                .iter()
+                .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+            || parts[1].len() != 2
+            || parts[2].len() != 2
+            || parts[1].parse::<u8>().ok()? >= 60
+            || parts[2].parse::<u8>().ok()? >= 60
+        {
+            return None;
+        }
+        if duration_parts.next().is_some() {
+            return None;
+        }
+    }
+    if !seconds.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || !seconds
+            .parse::<f64>()
+            .ok()
+            .is_some_and(|value| value.is_finite() && value >= 0.0)
+    {
+        return None;
+    }
+    let mut passed = 0u64;
+    let mut failed = 0u64;
+    let mut ignored = 0u64;
+    let mut kinds = std::collections::HashSet::new();
+    if counts != "no tests ran" {
+        for part in counts.split(", ") {
+            let (count, kind) = part.split_once(' ')?;
+            let count = count.parse::<u64>().ok()?;
+            if !kinds.insert(kind) {
+                return None;
+            }
+            match kind {
+                "passed" => passed = count,
+                "failed" => failed = count,
+                "skipped" | "xfailed" | "xpassed" => ignored = ignored.checked_add(count)?,
+                "deselected" | "warning" | "warnings" => {}
+                "error" | "errors" if count == 0 => {}
+                "error" | "errors" => return None,
+                _ => return None,
+            }
+        }
+    }
+    passed.checked_add(failed)?;
+    Some(CargoTestSummary {
+        passed: Some(passed),
+        failed: Some(failed),
+        ignored: Some(ignored),
+    })
+}
+
+/// Node's own TAP reporter emits a fixed trailing accounting block. Never
+/// infer executed tests from a package-manager script's exit status or an
+/// arbitrary progress line. Incomplete/truncated/conflicting trailers prove
+/// nothing.
+pub fn parse_node_native_test_diagnostics(stdout: &str, truncated: bool) -> ValidationDiagnostics {
+    let summary = (!truncated)
+        .then(|| node_native_test_summary(stdout))
+        .flatten();
+    ValidationDiagnostics {
+        available: summary.is_some(),
+        parser: PARSER_KIND,
+        reason: summary.is_none().then_some("no complete Node TAP summary"),
+        diagnostic_count: Some(0),
+        diagnostics: Vec::new(),
+        returned_diagnostic_count: 0,
+        diagnostics_truncated: false,
+        invalid_diagnostics_omitted: 0,
+        test_summary: summary,
+        failed_test_details: Vec::new(),
+        failed_test_details_truncated: false,
+        truncated: Some(truncated),
+    }
+}
+
+fn node_native_test_summary(stdout: &str) -> Option<CargoTestSummary> {
+    // Preserve indentation: Node emits nested TAP plans and assertions inside
+    // suites, and those cannot authorize a root-level test-count summary.
+    let lines: Vec<_> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.len() < 10 || lines.first().copied() != Some("TAP version 13") {
+        return None;
+    }
+    let (body, tail) = lines.split_at(lines.len().checked_sub(8)?);
+    // Native Node appends the root plan immediately before the fixed trailer.
+    // Its N counts top-level assertions, not all nested tests in # tests.
+    let root_count = body.last()?.strip_prefix("1..")?.parse::<u64>().ok()?;
+    let mut root_assertions = 0u64;
+    let fields = [
+        "# tests ",
+        "# suites ",
+        "# pass ",
+        "# fail ",
+        "# cancelled ",
+        "# skipped ",
+        "# todo ",
+    ];
+    for line in body.iter().skip(1).take(body.len().saturating_sub(2)) {
+        // Reject duplicate root plans and numeric accounting while allowing
+        // ordinary t.diagnostic prose such as "# pass phase complete".
+        let repeated_count = fields.iter().any(|prefix| {
+            line.strip_prefix(prefix)
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some()
+        });
+        let repeated_duration = line
+            .strip_prefix("# duration_ms ")
+            .and_then(|value| value.parse::<f64>().ok())
+            .is_some_and(|value| value.is_finite() && value >= 0.0);
+        if line.starts_with("1..")
+            || line.starts_with("TAP version ")
+            || repeated_count
+            || repeated_duration
+        {
+            return None;
+        }
+        let ordinal = line
+            .strip_prefix("ok ")
+            .or_else(|| line.strip_prefix("not ok "));
+        if let Some(ordinal) = ordinal {
+            root_assertions = root_assertions.checked_add(1)?;
+            if ordinal.split_whitespace().next()?.parse::<u64>().ok()? != root_assertions {
+                return None;
+            }
+        }
+    }
+    if root_assertions != root_count {
+        return None;
+    }
+    // Accounting lines must themselves be top-level (unindented).
+    let duration = tail[7]
+        .strip_prefix("# duration_ms ")?
+        .parse::<f64>()
+        .ok()?;
+    if !duration.is_finite() || duration < 0.0 {
+        return None;
+    }
+    let mut values = [0_u64; 7];
+    for (i, prefix) in fields.iter().enumerate() {
+        values[i] = tail[i].strip_prefix(prefix)?.parse::<u64>().ok()?;
+    }
+    let [total, suites, passed, failed, cancelled, skipped, todo] = values;
+    // With no root assertions, neither nested tests nor suites can exist.
+    // An empty suite remains valid: Node emits one root suite assertion.
+    if (root_count == 0 && (total != 0 || suites != 0))
+        || cancelled != 0
+        || passed
+            .checked_add(failed)?
+            .checked_add(skipped)?
+            .checked_add(todo)?
+            != total
+    {
+        return None;
+    }
+    Some(CargoTestSummary {
+        passed: Some(passed),
+        failed: Some(failed),
+        ignored: skipped.checked_add(todo),
+    })
+}
+
+/// Parse Go vet's stable relative-file:line:column diagnostics. Compiler prose
+/// without a stable location is not invented into structured evidence.
+pub fn parse_go_vet_diagnostics(stderr: &str, truncated: bool) -> ValidationDiagnostics {
+    let mut items = Vec::new();
+    let mut invalid = 0;
+    for raw in stderr.lines() {
+        let line = sanitize_line(raw);
+        let Some((location, message)) = line.split_once(": ") else {
+            continue;
+        };
+        let Some(span) = parse_location(location) else {
+            invalid += 1;
+            continue;
+        };
+        let Some(message) = sanitize_bounded_value(message, MAX_DIAGNOSTIC_MESSAGE_CHARS)
+            .filter(|m| !looks_sensitive(m))
+        else {
+            invalid += 1;
+            continue;
+        };
+        items.push(CargoDiagnostic {
+            severity: "error",
+            code: None,
+            file: Some(span.file),
+            line: Some(span.line),
+            column: Some(span.column),
+            message: crate::validation_bridge::sanitize_bridge_text(&message),
+        });
+    }
+    items.sort_by(compare_diagnostics);
+    items.dedup();
+    let total = items.len();
+    items.truncate(MAX_DIAGNOSTICS);
+    if total == 0 {
+        diagnostics_unavailable(invalid)
+    } else {
+        diagnostics_from_rust(
+            ParsedDiagnostics {
+                items,
+                total,
+                invalid,
+            },
+            truncated,
+        )
+    }
 }
 
 pub fn parse_cargo_check_diagnostics(

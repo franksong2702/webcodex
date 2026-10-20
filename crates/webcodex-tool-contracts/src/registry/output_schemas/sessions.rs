@@ -1,19 +1,220 @@
 use serde_json::{json, Value};
-use webcodex_core::workflow_session_contract::MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS;
+use webcodex_core::workflow_session_contract::{
+    is_validation_like_execution_purpose, EXECUTION_PURPOSE_VALUES,
+    MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS,
+};
 
-use super::super::input_schemas::{
-    session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
-    session_mode_schema,
-};
 use super::common::{
-    array_schema, cargo_test_count_assertion_schema, continuation_feedback_schema,
-    evidence_history_schema, evidence_integrity_schema, handoff_brief_schema,
-    job_lifecycle_summary_schema, nullable_schema, open_object_schema, permission_summary_schema,
-    schema_type, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
+    acceptance_evidence_schema, array_schema, cargo_test_count_assertion_schema,
+    continuation_feedback_schema, evidence_history_schema, evidence_integrity_schema,
+    external_observation_schema, handoff_brief_schema, job_lifecycle_summary_schema,
+    nullable_schema, open_object_schema, permission_summary_schema, schema_type,
+    session_execution_context_schema, session_guards_schema, session_lifecycle_schema,
+    session_mode_schema, task_outcome_schema, validation_delta_schema, wrapped_output_schema,
 };
+
+fn session_handoff_goal_context_schema() -> Value {
+    let nullable = |schema: Value| json!({"anyOf": [schema, {"type": "null"}]});
+    let excerpt = |max_length: usize, description: &str| {
+        json!({
+            "type": "object",
+            "description": description,
+            "additionalProperties": false,
+            "properties": {
+                "excerpt": nullable(json!({"type": "string", "maxLength": max_length})),
+                "truncated": {"type": "boolean"}
+            },
+            "required": ["excerpt", "truncated"]
+        })
+    };
+    let candidate = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "goal_id": {"type": "string", "maxLength": 128},
+            "title": {"type": "string", "maxLength": 256},
+            "title_truncated": {"type": "boolean"},
+            "lifecycle": {"type": "string", "const": "active"},
+            "revision": {"type": "integer", "minimum": 1}
+        },
+        "required": ["goal_id", "title", "title_truncated", "lifecycle", "revision"]
+    });
+    let condition_list = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {
+                "type": "array",
+                "maxItems": 8,
+                "items": {"type": "string", "maxLength": 256}
+            },
+            "total": {"type": "integer", "minimum": 0},
+            "returned": {"type": "integer", "minimum": 0, "maximum": 8},
+            "truncated": {"type": "boolean"},
+            "content_truncated": {"type": "boolean"}
+        },
+        "required": ["items", "total", "returned", "truncated", "content_truncated"]
+    });
+    let step_list = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "items": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "id": {"type": "string", "maxLength": 32},
+                        "title": {"type": "string", "maxLength": 128},
+                        "title_truncated": {"type": "boolean"},
+                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                    },
+                    "required": ["id", "title", "title_truncated", "status"]
+                }
+            },
+            "total": {"type": "integer", "minimum": 0},
+            "returned": {"type": "integer", "minimum": 0, "maximum": 32},
+            "truncated": {"type": "boolean"}
+        },
+        "required": ["items", "total", "returned", "truncated"]
+    });
+    let goal = json!({
+        "type": "object",
+        "description": "One exact caller-owned active Goal already explicitly correlated to the recovered Workflow Session. This is read-only recovery context and grants no authority.",
+        "additionalProperties": false,
+        "properties": {
+            "goal_id": {"type": "string", "maxLength": 128},
+            "title": {"type": "string", "maxLength": 256},
+            "title_truncated": {"type": "boolean"},
+            "lifecycle": {"type": "string", "const": "active"},
+            "revision": {"type": "integer", "minimum": 1},
+            "objective": excerpt(1024, "Bounded redacted Goal objective for recovery only."),
+            "plan": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "completion_conditions": condition_list,
+                    "steps": step_list,
+                    "current_step_id": nullable(json!({"type": "string", "maxLength": 32})),
+                    "checkpoint": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "summary": excerpt(512, "Bounded latest Goal checkpoint/progress summary."),
+                            "at_unix_ms": nullable(json!({"type": "integer"}))
+                        },
+                        "required": ["summary", "at_unix_ms"]
+                    }
+                },
+                "required": ["completion_conditions", "steps", "current_step_id", "checkpoint"]
+            }
+        },
+        "required": [
+            "goal_id", "title", "title_truncated", "lifecycle", "revision",
+            "objective", "plan"
+        ]
+    });
+
+    json!({
+        "type": "object",
+        "description": "Optional read-only durable Goal recovery context selected only through an existing explicit Workflow Session correlation. Zero correlated active Goals omit this field; multiple active Goals remain selection_required and never expose one Goal as selected.",
+        "additionalProperties": false,
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "source": {"type": "string", "const": "explicit_workflow_session_correlation"},
+            "status": {"type": "string", "enum": ["available", "selection_required", "unavailable"]},
+            "reason_code": nullable(json!({
+                "type": "string",
+                "enum": ["multiple_active_goals", "store_unavailable"]
+            })),
+            "truncated": {"type": "boolean"},
+            "goal": nullable(goal),
+            "candidates": {
+                "type": "array",
+                "maxItems": 8,
+                "items": candidate
+            }
+        },
+        "required": ["version", "source", "status", "reason_code", "truncated", "goal", "candidates"],
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"status": {"const": "available"}},
+                    "required": ["status"]
+                },
+                "then": {
+                    "properties": {
+                        "reason_code": {"type": "null"},
+                        "truncated": {"const": false},
+                        "goal": {"not": {"type": "null"}},
+                        "candidates": {"maxItems": 0}
+                    }
+                }
+            },
+            {
+                "if": {
+                    "properties": {"status": {"const": "selection_required"}},
+                    "required": ["status"]
+                },
+                "then": {
+                    "properties": {
+                        "reason_code": {"const": "multiple_active_goals"},
+                        "goal": {"type": "null"},
+                        "candidates": {"minItems": 2}
+                    }
+                }
+            },
+            {
+                "if": {
+                    "properties": {"status": {"const": "unavailable"}},
+                    "required": ["status"]
+                },
+                "then": {
+                    "properties": {
+                        "reason_code": {"const": "store_unavailable"},
+                        "truncated": {"const": false},
+                        "goal": {"type": "null"},
+                        "candidates": {"maxItems": 0}
+                    }
+                }
+            }
+        ]
+    })
+}
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "record_external_observation" => Some(wrapped_output_schema(vec![
+            ("session_id", schema_type("string", "Exact Workflow Session.")),
+            ("project", schema_type("string", "Exact authorized Project.")),
+            ("provenance", schema_type("string", "Always external_report; not native execution evidence.")),
+            ("inserted", schema_type("boolean", "False for an identical retained replay.")),
+            ("observation", external_observation_schema("Bounded external claim; missing exit_code produces unknown.")),
+        ])),
+        "list_external_observations" => Some(wrapped_output_schema(vec![
+            ("session_id", schema_type("string", "Exact Workflow Session.")),
+            ("project", schema_type("string", "Exact authorized Project.")),
+            ("provenance", schema_type("string", "Always external_report; not native execution evidence.")),
+            ("coverage", json!({
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Capture/ordering truth for this external-report projection. The first adapter has no durable source sequence, so completeness cannot be proven.",
+                "properties": {
+                    "complete": {"type": "boolean", "const": false},
+                    "reason": {"type": "string", "enum": ["source_sequence_unavailable"]},
+                    "ordering": {"type": "string", "enum": ["server_recorded_at_then_identity"]}
+                },
+                "required": ["complete", "reason", "ordering"]
+            })),
+            ("observations", json!({
+                "type": "array",
+                "maxItems": 256,
+                "items": external_observation_schema("Untrusted external report."),
+                "description": "At most 256 retained reports. Ordering is server recorded-at plus identity, not proven source execution order."
+            })),
+        ])),
         "start_session" => Some(wrapped_output_schema(vec![
             (
                 "success",
@@ -22,7 +223,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "True after the in-memory Session context/event commit. JSON ledger persistence may still be pending in the background writer.",
                 ),
             ),
-            ("session_id", schema_type("string", "Opaque session id.")),
+            ("session_id", schema_type("string", "Canonical wc_sess_* Workflow Session id.")),
+            ("session_ref", schema_type("string", "Server-issued principal-scoped ~sN selector for this exact Workflow Session. Selector only; use re-runs ordinary authorization and lifecycle checks.")),
             (
                 "project",
                 nullable_schema("string", "Optional project associated with the task."),
@@ -71,8 +273,30 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
-        "session_summary" => Some(wrapped_output_schema(vec![
-            ("session_id", schema_type("string", "Opaque session id.")),
+        "list_sessions" => Some(wrapped_output_schema(vec![
+            ("project", schema_type("string", "Exact authorized Runtime Project.")),
+            ("total", schema_type("integer", "Retained Sessions matching exact Project, caller authority, and optional lifecycle.")),
+            ("offset", schema_type("integer", "Requested inventory offset.")),
+            ("next_offset", nullable_schema("integer", "Next inventory offset; null when this page reaches the retained inventory end. Not a frozen-snapshot cursor.")),
+            ("selection", json!({"type": "string", "const": "caller_must_choose_exact_session"})),
+            ("sessions", json!({
+                "type": "array", "maxItems": 20,
+                "items": {"type": "object", "additionalProperties": false,
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "session_ref": {"type": "string", "pattern": "^~s[1-9][0-9]{0,18}$"},
+                        "title": {"anyOf": [{"type": "string", "maxLength": 240}, {"type": "null"}]},
+                        "title_truncated": {"type": "boolean"},
+                        "lifecycle": {"type": "string", "enum": ["active", "closed"]},
+                        "created_at": {"type": "integer"}, "updated_at": {"type": "integer"}
+                    },
+                    "required": ["session_id", "title", "title_truncated", "lifecycle", "created_at", "updated_at"]
+                }
+            })),
+        ])),
+        "read_session_summary" => Some(wrapped_output_schema(vec![
+            ("session_id", schema_type("string", "Canonical wc_sess_* Workflow Session id.")),
+            ("session_ref", schema_type("string", "Server-issued principal-scoped ~sN selector for this exact Workflow Session. Selector only; use re-runs ordinary authorization and lifecycle checks.")),
             (
                 "project",
                 nullable_schema("string", "Optional project associated with the task."),
@@ -110,6 +334,62 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "events",
                 array_schema(open_object_schema("Bounded session event."), "Recent events."),
+            ),
+            (
+                "events_total",
+                schema_type(
+                    "integer",
+                    "Total events ever observed for this Session, including events already evicted by durable retention.",
+                ),
+            ),
+            (
+                "events_retained",
+                schema_type(
+                    "integer",
+                    "Events currently retained in the durable Session ledger before model-facing tail slicing.",
+                ),
+            ),
+            (
+                "events_evicted",
+                schema_type(
+                    "integer",
+                    "Events already evicted by the durable per-Session retention bound.",
+                ),
+            ),
+            (
+                "retention_truncated",
+                schema_type(
+                    "boolean",
+                    "True only when durable Session history has actually been evicted.",
+                ),
+            ),
+            (
+                "ledger_first_retained_sequence",
+                schema_type(
+                    "integer",
+                    "Zero-based absolute sequence of the first event still retained in the durable ledger.",
+                ),
+            ),
+            (
+                "events_returned",
+                schema_type(
+                    "integer",
+                    "Number of events returned in this bounded summary response.",
+                ),
+            ),
+            (
+                "events_truncated",
+                schema_type(
+                    "boolean",
+                    "True when the Session has observed more events than this response returns, whether from response slicing or durable eviction.",
+                ),
+            ),
+            (
+                "first_retained_sequence",
+                schema_type(
+                    "integer",
+                    "Legacy-named zero-based absolute sequence of the first event returned in this response.",
+                ),
             ),
             (
                 "messages",
@@ -193,7 +473,29 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("integer", "Unix timestamp of the session's last update."),
             ),
         ])),
-        "validation_summary" => Some(validation_summary_tool_output_schema()),
+        "read_validation_summary" => Some(validation_summary_tool_output_schema()),
+        "get_work_result_state" => {
+            let mut schema = wrapped_output_schema(vec![("work_result", open_object_schema("Lightweight card state."))]);
+            let output = &mut schema["properties"]["output"];
+            output["properties"]["work_result_files"] = open_object_schema("Immutable inventory, diff, UTF-8 content or PDF page for an advertised path. Content: view=content, project/session_id/snapshot_id/path, byte_offset, bytes_total, content, next_byte_offset, complete, limited; 32 KiB/page, 256 KiB/file. PDF: view=pdf, same identity/offset/size/continuation, complete; 128 KiB/page, 20 MiB/file. Runtime content_base64 is moved to private MCP App metadata webcodex/pdfChunk, never structured/text content. Unsupported files return unavailable_reason. Identity reauthorized per request.");
+            output.as_object_mut().expect("output object").remove("required");
+            output["properties"]["work_result_collaboration"] = open_object_schema("Authorized current-Window history page; at most 100 chronological messages, next_before cursor and history_scope cache partition. No attention consumption or workspace observation.");
+            output["oneOf"] = json!([{ "required": ["work_result"] }, { "required": ["work_result_files"] }, { "required": ["work_result_collaboration"] }]);
+            Some(schema)
+        },
+        "present_work_result" => Some(wrapped_output_schema(vec![(
+            "work_result",
+            open_object_schema("Bounded persistent card state for one exact Project and current client Window. Presentation and App refreshes expose the same bounded Window ActionAudit activity used by WebUI, including observe/diagnostic actions; Window collaboration is a read-only Operator/peer transcript independent of Sessions; linked Session evidence and sealed final_changes are optional."),
+        )])),        "send_work_result_message" => Some(wrapped_output_schema(vec![
+            ("success", schema_type("boolean", "Always true on success.")),
+            ("message_id", schema_type("string", "Created or replayed wc_msg_* message id.")),
+            ("replayed", schema_type("boolean", "True when the exact delivery key replayed an already retained message.")),
+            ("state_changed", schema_type("boolean", "True only when a new message was created.")),
+        ])),
+        "read_changed_file_diff" => Some(wrapped_output_schema(vec![(
+            "changes_file_diff",
+            open_object_schema("Bounded lazy unified diff for one advertised path in the Work Result sealed final snapshot."),
+        )])),
         "post_session_message" => Some(wrapped_output_schema(vec![
             ("success", schema_type("boolean", "Always true on success.")),
             (
@@ -202,9 +504,20 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "message_id",
-                schema_type("string", "Created wc_msg_* message id."),
+                schema_type("string", "Created or replayed wc_msg_* message id."),
             ),
             ("message", open_object_schema("Created session message.")),
+            ("replayed", schema_type("boolean", "True for an exact delivery_key retry that returned the original message.")),
+            ("state_changed", schema_type("boolean", "True only when this call created the message.")),
+        ])),
+        "post_peer_message" => Some(wrapped_output_schema(vec![
+            ("success", schema_type("boolean", "Always true on success.")),
+            ("message_id", schema_type("string", "Created durable wc_msg_* peer message id.")),
+            ("sender_peer_id", schema_type("string", "Principal-scoped sender window identity.")),
+            ("recipient_peer_id", schema_type("string", "Principal-scoped recipient window identity.")),
+            ("requires_ack", schema_type("boolean", "Whether omission of the request-scoped ACK causes re-projection.")),
+            ("replayed", schema_type("boolean", "True for an exact delivery_key retry that returned the original message.")),
+            ("state_changed", schema_type("boolean", "True only when this call created the message.")),
         ])),
         "list_session_messages" => Some(wrapped_output_schema(vec![
             ("success", schema_type("boolean", "Always true on success.")),
@@ -238,9 +551,9 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "assignment_fence",
                 json!({
                     "type": "string",
-                    "minLength": 48,
-                    "maxLength": 48,
-                    "pattern": "^wsa1_[A-Za-z0-9_-]{43}$",
+                    "minLength": 27,
+                    "maxLength": 27,
+                    "pattern": "^wsa2_[A-Za-z0-9_-]{22}$",
                     "description": "Deterministic Session/todo-bound semantic snapshot fence. Pass unchanged as expected_assignment_fence; it is not an observation cursor, authority token, or completion key."
                 }),
             ),
@@ -284,7 +597,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("todo", open_object_schema("Resolved todo with resolved_by_message_id correlation.")),
             ("answer", open_object_schema("Created answer with reply_to and trusted author_session_id when available.")),
         ])),
-        "session_discussion_summary" => Some(wrapped_output_schema(vec![
+        "read_session_discussion_summary" => Some(wrapped_output_schema(vec![
             ("success", schema_type("boolean", "Always true on success.")),
             (
                 "session_id",
@@ -355,14 +668,18 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
         ])),
-        "session_handoff_summary" => Some(wrapped_output_schema(vec![
+        "read_session_handoff" | "get_session_handoff_state" => Some(wrapped_output_schema(vec![
             (
-                "summary_only",
-                schema_type("boolean", "True only for compact summary_only output."),
+                "diagnostic",
+                schema_type("boolean", "True only when detailed evidence was explicitly requested."),
             ),
             (
                 "session_id",
                 schema_type("string", "Business session id being handed off."),
+            ),
+            (
+                "session_ref",
+                schema_type("string", "Server-issued principal-scoped ~sN selector for the exact handed-off Session. It grants no authority and never retargets."),
             ),
             (
                 "project",
@@ -370,9 +687,9 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "workspace_clean",
-                schema_type(
+                nullable_schema(
                     "boolean",
-                    "Compact summary_only workspace cleanliness verdict.",
+                    "Diagnostic workspace cleanliness verdict; null means Git cleanliness is not applicable or unavailable.",
                 ),
             ),
             (
@@ -381,7 +698,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "hygiene_clean",
-                schema_type("boolean", "Compact summary_only hygiene cleanliness verdict."),
+                schema_type("boolean", "Diagnostic hygiene cleanliness verdict."),
             ),
             (
                 "collaboration",
@@ -543,26 +860,28 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "workspace",
                 open_object_schema("Bounded workspace summary when project is provided: project, git_available, non_git_project, clean, branch, head, changed_files_count, warnings, suggested_next_actions. Never includes hunks or full diffs."),
             ),
+            #[cfg(feature = "workspace-checkpoints")]
             (
                 "checkpoints",
                 open_object_schema("Bounded checkpoint candidates when project is provided: latest_last_known_good and recent list. Never includes validation.commands or diffs."),
             ),
             (
                 "validation",
-                open_object_schema("Ledger-derived validation-like tool-call summary with status/reason: not_run, passed, failed, mixed, inconclusive, expected, or unknown. `expected` means a pre-declared negative/observation result matched without proving validator pass. Parser version 3 provides bounded structured diagnostics from bounded validation metadata using canonical diagnostics and failed_test_details fields only. Full and summary_only closeout preserve the same validation evidence. Does not include stdout/stderr bodies and performs no root-cause inference; parser.available remains false when session ledger events lack those fields. latest_status and historical_failures retain the existing final-state and resolved-history semantics."),
+                open_object_schema("Ledger-derived validation-like tool-call summary available only in diagnostic=true handoff output, with status/reason: not_run, passed, failed, mixed, inconclusive, expected, or unknown. `expected` means a pre-declared negative/observation result matched without proving validator pass. Parser version 3 provides bounded structured diagnostics from bounded validation metadata using canonical diagnostics and failed_test_details fields only. Does not include stdout/stderr bodies and performs no root-cause inference; parser.available remains false when session ledger events lack those fields. latest_status and historical_failures retain the existing final-state and resolved-history semantics."),
             ),
             (
                 "review_evidence",
-                review_evidence_schema("Ledger-derived non-cargo review evidence summary for full and summary_only outputs. Counts successful read/search/diff/workspace/hygiene inspection tools from the session ledger and exposes bounded tools for compact explainability. For docs-only or read-only audit tasks, validation.status may remain not_run while review_evidence.total is greater than zero. Does not include file contents, stdout/stderr, diff hunks, command text, tokens, secrets, or raw input payloads. Does not change validation.status or make the verdict pass."),
+                review_evidence_schema("Ledger-derived non-cargo review evidence summary available only in diagnostic=true handoff output. Counts successful read/search/diff/workspace/hygiene inspection tools from the session ledger and exposes bounded tools for compact explainability. For docs-only or read-only audit tasks, validation.status may remain not_run while review_evidence.total is greater than zero. Does not include file contents, stdout/stderr, diff hunks, command text, tokens, secrets, or raw input payloads. Does not change validation.status or make the verdict pass."),
             ),
             (
                 "verdict",
-                open_object_schema("Legacy aggregate closeout verdict for full and summary_only output: task_outcome fail or evidence_integrity error maps to blocking fail; otherwise task_outcome warn or evidence_integrity warning maps to non-blocking warn; otherwise pass. Resolved evidence history alone does not lower the verdict."),
+                open_object_schema("Legacy aggregate closeout verdict retained only in diagnostic=true handoff output: task_outcome fail or evidence_integrity error maps to blocking fail; otherwise task_outcome warn or evidence_integrity warning maps to non-blocking warn; otherwise pass. Resolved evidence history alone does not lower the verdict."),
             ),
             (
                 "task_outcome",
                 task_outcome_schema("Final task completion outcome with status pass/warn/fail, blocking, and task-only reasons. Resolved validation history and expected-failure audit metadata do not lower this status."),
             ),
+            ("acceptance", acceptance_evidence_schema()),
             (
                 "evidence_history",
                 evidence_history_schema("Validation evidence history status: clean, mixed_resolved, mixed_unresolved, or failed. Does not replace validation.status or validation.latest_status."),
@@ -587,11 +906,15 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "continuation_feedback",
-                continuation_feedback_schema("Deterministic continuation feedback for normal and summary_only handoff. A read-only attempt summary plus validation delta over existing handoff evidence; never an LLM summary, never an Agent loop, never a new verdict, and it never re-runs validation, mutates the ledger, refreshes activity, or consumes guidance."),
+                continuation_feedback_schema("Deterministic continuation feedback retained only in diagnostic=true handoff output. A read-only attempt summary plus validation delta over existing handoff evidence; never an LLM summary, never an Agent loop, never a new verdict, and it never re-runs validation, mutates the ledger, refreshes activity, or consumes guidance."),
+            ),
+            (
+                "goal_context",
+                session_handoff_goal_context_schema(),
             ),
             (
                 "handoff_brief",
-                handoff_brief_schema("Compact deterministic task handoff for a new window, new Agent, or human receiver. It is a read-only projection over already-obtained Session, continuation, workspace, validation, Job, and guidance evidence; it is not Session replay and never restores hidden model context."),
+                handoff_brief_schema("Compact deterministic task handoff for a new window, new Agent, or human receiver. It includes a bounded read-only external_report section with explicit incomplete capture coverage, separate from native Session, validation, and Job evidence; it is not Session replay and never restores hidden model context."),
             ),
         ])),
         _ => None,
@@ -622,10 +945,10 @@ fn validation_evidence_schema() -> Value {
     fn current_validation_evidence_schema() -> Value {
         json!({
             "type": "object",
-            "description": "Current workspace validation evidence for the current attempt after the latest trusted material workspace-content change. Historical ledger failures remain separately visible and are not erased by this projection.",
+            "description": "Current-attempt validation candidates after observed changes. Execution success without current-source proof is unproven, never passed; historical results remain separately visible.",
             "additionalProperties": false,
             "properties": {
-                "status": {"type": "string", "enum": ["passed", "failed", "inconclusive", "expected", "stale", "not_run", "unknown"]},
+                "status": {"type": "string", "enum": ["unproven", "failed", "inconclusive", "expected", "stale", "not_run", "unknown"]},
                 "reason": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                 "latest_status": {"type": "string", "enum": ["passed", "failed", "inconclusive", "expected", "not_run", "unknown"]},
                 "events_total": {"type": "integer", "minimum": 0},
@@ -739,32 +1062,33 @@ fn validation_parser_metadata_schema() -> Value {
 }
 
 fn validation_event_schema() -> Value {
+    let validation_like_purposes = EXECUTION_PURPOSE_VALUES
+        .iter()
+        .copied()
+        .filter(|purpose| is_validation_like_execution_purpose(purpose))
+        .collect::<Vec<_>>();
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
+            "source_state": super::common::validation_source_state_schema(),
             "tool_name": { "type": "string", "enum": ["cargo_fmt", "cargo_check", "cargo_test", "go_test", "run_process", "run_script", "run_shell", "run_job"] },
-            "execution_source": { "type": "string" },
             "identity": { "type": "string", "maxLength": 256 },
             "assertion_name": { "type": "string", "minLength": 1, "maxLength": MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS },
-            "purpose": { "type": "string", "enum": ["validation", "test", "build", "format", "release"] },
+            "purpose": { "type": "string", "enum": validation_like_purposes },
             "validation_kind": { "type": "string", "enum": ["format", "check", "test", "build", "release", "validation"] },
             "success": { "type": "boolean", "description": "Immutable raw ToolResult success recorded by the Workflow Session. A request-scoped evidence assertion can make this false even when validator execution and correctness passed." },
-            "execution_success": { "type": "boolean", "description": "Derived execution result from authoritative completion state and exit code; independent from request-scoped evidence assertions." },
             "validation_passed": { "type": "boolean", "description": "True when the validator/correctness execution itself passed. This can remain true while the invocation's evidence assertion is insufficient." },
             "failure_class": { "type": "string", "enum": ["none", "execution_or_correctness", "outcome_unknown", "evidence_assertion", "evidence_insufficient", "expected_result"] },
             "expectation_satisfied": { "type": "boolean", "description": "Present for public result expectations; true when the pre-declared expectation matched. This is separate from validation success." },
             "failure_kind": { "type": "string", "enum": ["compile_error", "test_failure", "validation_failed", "timeout", "process_exit", "format_diff", "unknown"] },
-            "failure_category": { "type": "string", "enum": ["compile_error", "test_failure", "validation_failed", "timeout", "process_exit", "format_diff", "unknown"] },
             "unresolved_failure": { "type": "boolean" },
             "exit_code": { "type": "integer" },
-            "summary": { "type": "string", "maxLength": 80 },
             "command_summary": { "type": "string", "maxLength": 512 },
             "cwd": { "type": "string", "maxLength": 4096 },
             "shell": { "type": "string", "enum": ["sh", "bash", "configured", "remote", "direct_argv"] },
             "execution_state": { "type": "string", "enum": ["not_started", "started", "outcome_unknown", "completed", "cancelled", "timed_out"] },
             "project": { "type": "string", "maxLength": 512 },
-            "session_id": { "type": "string", "maxLength": 128 },
             "started_at": { "type": "integer" },
             "completed_at": { "type": "integer" },
             "duration_ms": { "type": "integer", "minimum": 0 },
@@ -780,6 +1104,8 @@ fn validation_event_schema() -> Value {
             },
             "tests_detected": { "type": "boolean" },
             "tests_run_count": { "type": "integer", "minimum": 0 },
+            "tests_passed": { "type": "integer", "minimum": 0 },
+            "tests_failed": { "type": "integer", "minimum": 0 },
             "zero_tests_run": { "type": "boolean" },
             "require_tests": { "type": "boolean" },
             "no_run": { "type": "boolean" },
@@ -792,10 +1118,9 @@ fn validation_event_schema() -> Value {
             "stderr_evidence": { "type": "string" }
         },
         "required": [
-            "tool_name", "execution_source", "identity", "purpose",
-            "validation_kind", "success", "validation_passed", "failure_class", "failure_kind", "failure_category",
-            "unresolved_failure", "summary", "cwd", "shell", "execution_state",
-            "session_id", "stdout_truncated", "stderr_truncated"
+            "tool_name", "identity", "purpose", "validation_kind", "success",
+            "validation_passed", "failure_class", "failure_kind", "unresolved_failure",
+            "cwd", "shell", "execution_state", "stdout_truncated", "stderr_truncated"
         ]
     })
 }

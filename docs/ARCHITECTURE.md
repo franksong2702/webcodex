@@ -1,7 +1,8 @@
 # Architecture
 
-WebCodex is a self-hosted tool runtime that lets online AI clients operate
-private code through a Server and a local Runner, while the Server can also retain
+WebCodex is a self-hosted tool runtime that lets online AI clients work with
+registered directories, files, and code through a Server and a local Runner.
+The Server can also retain
 durable Agent/Conversation state independently of a browser window. This page is a
 conceptual overview; the [CLI](CLI.md), [Runner](RUNNER.md), [Deployment](DEPLOYMENT.md),
 and [Authentication](AUTH_MODEL.md) guides cover the operational details.
@@ -13,18 +14,20 @@ For a short definition of the terms, see the terminology sections in
 
 ```mermaid
 flowchart LR
-  C[AI client] -->|MCP or GPT Actions| S[WebCodex Server]
+  C[AI client] -->|MCP| S[WebCodex Server]
   S -->|authenticated Runner connection| R[webcodex-runner]
   R --> P[Registered Project]
   R --> G[Git / Tests / Shell / Jobs]
 ```
 
-The online client calls WebCodex over MCP or GPT Actions. The Server
+The online client calls WebCodex over MCP. The Server
 authenticates the caller, applies policy, and routes runtime tool calls to a
 connected Runner. The Runner owns the local project boundary and performs the
 file, Git, validation, shell, and Job work on the machine that has the code.
 
-The Server never scans your filesystem and never reads project files directly.
+The Server does not discover or read Runner project files through its own filesystem.
+It requests authorized operations from the Runner and returns their results to the
+client; requested file contents and command output can therefore reach the model.
 Projects are registered by Runners; the Server addresses them by runtime
 project id `agent:<client_id>:<project_id>`.
 
@@ -33,12 +36,12 @@ project id `agent:<client_id>:<project_id>`.
 WebCodex exposes the same Server/Runner runtime through several user-facing adapters:
 
 - **MCP** — the recommended model-facing integration for ChatGPT, Claude, and other MCP clients.
-- **GPT Actions** — the OpenAPI integration for Custom GPTs that do not use MCP directly.
 - **REST** — the Server HTTP runtime API.
 - **CLI** — operator/developer setup, lifecycle, and diagnostics.
+- **Desktop** — native setup and management UI over the same Environment and runtime; it is not a second execution backend.
 - **Console** — the Server-hosted operator browser surface.
 
-For daily use, a regular Server + Runner exposes the configured coding tools for registered Projects. `webcodex share` / `webcodex run` instead create a project-first Connector bound to one repository and use a smaller task-oriented workflow. These are product choices, not identities or credentials.
+A regular Server + Runner and the local `webcodex share` / `webcodex run` lifecycle all expose the ordinary WebCodex runtime. `share` and `run` are deployment/auth/reachability conveniences around one locally registered Project; they do not define a second coding runtime or task model. Their project-scoped credentials restrict which Runner/Project is visible without changing ToolRuntime semantics.
 
 Internal type names used to route these adapters are maintainer implementation details; ordinary users should follow the tools and connection instructions returned by the current Server.
 
@@ -58,15 +61,18 @@ is the id registered by that Runner in its `project-registry` registry.
 `$HOME`; an explicit list narrows it).
 
 For the regular coding runtime, `work_on_project` can optionally collapse a
-source-checkout bootstrap into the same authority path. With `mode=worktree` and
-`client_id + path`, the Runner resolves the requested Git base to an exact commit,
-chooses a Runner-owned managed-worktree location under its filesystem policy,
-creates a detached worktree, and registers it in the same Project Registry before
-the Workflow Session starts. The resulting workspace is therefore a normal
-registered runtime Project: subsequent read/edit/Git/validation tools do not gain
-a path-based bypass. The Server neither chooses the host path nor interprets the
-Git ref, and Session finish does not implicitly delete the worktree or its
-registration.
+source-checkout bootstrap into the same authority path. The canonical model form
+is `project + mode=worktree`: the Server reauthorizes that registered source
+Project and passes its exact Runner/root identity as a fence. `client_id + path`
+remains a compatibility/bootstrap form. The Runner resolves the requested Git
+base to an exact commit, chooses a Runner-owned managed-worktree location inside
+its current filesystem policy, creates a detached worktree, and registers it in
+the same Project Registry before the Workflow Session starts. The resulting
+workspace is therefore a normal registered runtime Project: subsequent
+read/edit/Git/validation tools use the same `allowed_roots` boundary and gain no
+path-based bypass. The model never chooses the managed host path, the Server does
+not interpret the Git ref, and Session finish does not implicitly delete the
+worktree or its registration.
 
 ## Durable Agent and asynchronous work
 
@@ -78,20 +84,25 @@ Conversation membership and Durable Agent identity grant only the communication/
 
 Maintainer-level lifecycle and Agent Task/TaskAttempt details live in [Durable Agent runtime and asynchronous work](architecture/durable-agent-runtime.md) and [Durable Agent/Conversation/Wake contract](architecture/durable-agent-conversation.md).
 
-## Task, Job, and Workflow Session continuity
+The Server also owns an independent durable **Goal** domain for high-level intent/control state. A Goal answers what the user ultimately wants and the authoritative high-level lifecycle of that intent. It is not a Workflow Session, Agent Task, Job, Project selector, credential, or execution authority. Goal references to Agent Tasks and Workflow Sessions are explicit correlation only; dereferencing those ids always re-runs the referenced domain's normal authorization.
 
-- **Connector Task** — project-first work created by the task-oriented Connector. It can be explicitly resumed by its task handle.
+Stateless MCP 2026 can optionally present one exact Goal through the sparse Goal Plan App. `present_goal_plan(goal_id)` is the sole model-visible App-bound entry; the View converges through the ModelHidden/app-only `sync_goal_plan(goal_id)` read. Both are bounded observations over the same SQLite Goal truth and carry no Project, Runner, Job, Workflow Session mutation, or Host-continuation authority. Existing coding tools do not require Goal identity and keep their normal/native presentation.
+
+## Goal, Job, and Workflow Session continuity
+
+- **Goal** — high-level durable intent/control state (`wc_goal_*`). It can correlate multiple work/execution records, but it does not run them and is never inferred from the current Project, window, credential, or Workflow Session.
 - **Job** — a long-running command or validation that continues after the initiating call returns. Observe the same Job instead of starting another copy.
-- **Workflow Session** — bounded coding evidence/continuity used by the regular runtime for review, validation, collaboration, and closeout. It is not a credential.
+- **Workflow Session** — bounded coding evidence/continuity used by the runtime for review, validation, collaboration, and closeout. It is not a credential.
 
-These objects have different lifecycles and are never inferred from one another merely because requests share a user, credential, project, or chat window. Their exact continuity protocols are maintainer details.
+These objects have different lifecycles and are never inferred from one another merely because requests share a user, credential, project, or chat window. Coding work does not create a parallel Connector Task/Run/Result lifecycle.
 
 ## Runner execution boundary
 
 The Runner is the trust boundary closest to the repository:
 
-- Projects execute only inside registered project roots and the configured
-  `allowed_roots` policy.
+- Project resolution and structured file operations enforce registered roots and
+  the configured `allowed_roots` policy. Process tools run with the Runner OS
+  account's permissions; project roots are not an operating-system sandbox.
 - Shell and Job tools are bounded execution primitives, not replacements for
   structured tools. Prefer structured read, edit, validation, and native argv
   operations when they fit; use `run_shell` for real shell semantics or short,
@@ -100,12 +111,12 @@ The Runner is the trust boundary closest to the repository:
   `~/.bashrc` / `~/.profile` are not sourced by default.
 - The Runner connects out to the Server over QUIC, WebSocket, or polling, and
   reconnects automatically. A disconnect is a liveness fact, not a lost-work
-  fact: active Jobs enter a bounded `recovering` state and are restored from
-  the Runner's inventory when the same instance reconnects.
+  fact. For a Runner advertising Job reconciliation, active Jobs enter bounded
+  `recovering` state and can reconcile from the same instance's inventory. Without
+  that capability, or when the recovery deadline expires or the instance is
+  replaced, ordinary Jobs become `lost`. Reconnection never authorizes replay.
 
-Runner Job wire lifecycle vocabulary is interpreted once by the canonical typed
-contract in `webcodex-core`; the Runner, Registry, Store, Connector runtime, and
-Workflow Session then project that lifecycle into their own domain states. Server
+Runner Job wire lifecycle vocabulary is interpreted once by the canonical typed contract in `webcodex-core`; the Runner, Registry, Store, and Workflow Session then project that lifecycle into their own domain states. Server
 recovery remains an orthogonal Registry overlay, so `recovering` is an observed
 recovery state rather than a Runner wire lifecycle value.
 
@@ -115,7 +126,7 @@ recovery state rather than a Runner wire lifecycle value.
 flowchart TD
   M[Online model] -->|tool calls only| S[WebCodex Server]
   S -->|policy + auth + session ledger| R[Runner]
-  R -->|allowed project dirs only| P[Private repo]
+  R -->|project policy / OS account permissions| P[Registered directory]
   M -. no direct filesystem access .- P
 ```
 
@@ -125,41 +136,50 @@ The model sees tool results, not arbitrary local files. Access is bounded by:
 - scoped user tokens for the client surfaces,
 - Runner tokens bound to a `client_id` for transport,
 - `allowed_roots` and path policy on the Runner,
-- an authority mode that decides whether consequential tools auto-execute or
-  require human approval,
+- an authority mode that auto-authorizes consequential tools after hard safety
+  checks (`trusted_agent`) or denies them (`restricted`); restricted mode does
+  not create an approval queue,
 - bounded, redacted session evidence.
 
 See [SECURITY.md](../SECURITY.md) and [AUTH_MODEL.md](AUTH_MODEL.md).
 
 ## Persistence and recovery
 
-The Server persists managed accounts, OAuth state, project/task history, and durable Agent/Conversation state. Workflow/task continuity is restored from its own durable identifiers; WebCodex does not invent continuity from a credential or current browser window.
+The Server persists managed accounts, OAuth state, Workflow Session evidence, durable Agent/Conversation/Agent Task state, and durable Goal state. Workflow Session, Agent Task, and Goal continuity is restored from each domain's own durable identifiers; WebCodex does not invent continuity from a credential, current browser window, Project, or neighboring domain identity.
 
 Runner Jobs are reconciled when the same live Runner process reconnects. Ordinary child processes cannot be adopted by an unrelated replacement Runner; specialized detached execution has its own explicit durable ownership path. The stable Runner `client_id` and the current process lease are separate, but the exact lease field is an internal wire detail.
 
-Durable Store aggregates use closed typed Rust lifecycle/state contracts for business authority. SQLite `TEXT` values and `CHECK` constraints remain the persistence encoding, not a second semantic registry. In particular, a Connector Task's persisted lifecycle is distinct from its derived/effective state: cancellation, result decision, and Run interruption are projected from typed durable facts before the existing public strings are serialized. Connector Execution, result/approval, and durable communication lifecycles likewise decode fail-closed from their unchanged SQLite vocabularies.
+Durable Store aggregates use closed typed Rust lifecycle/state contracts for business authority. SQLite `TEXT` values and `CHECK` constraints remain the persistence encoding, not a second semantic registry. Durable Agent/Conversation/Agent Task/Goal state and other current Store domains decode fail-closed from their owned vocabularies; ordinary coding uses Workflow Session and Runner Job state instead of a parallel Task/Run/Result/Approval schema.
 
 ## Module map
 
 ```text
-MCP / OpenAPI / Runtime HTTP --> ToolRuntime --+--> Project resolution --> Runner bridge
+MCP / Runtime HTTP --> ToolRuntime --+--> Project resolution --> Runner bridge
                                                |      |--> File/Edit/Git/Validation/Job tools
                                                |      +--> Workflow Session / Handoff / Hygiene
                                                +--> Durable Agent / Conversation / Delivery / Wake
+                                               +--> Goal (high-level durable intent/control; no execution dispatch)
 Runtime Console -----------------------> canonical Server HTTP/kernel paths above
 ```
 
-- `route_metadata` — canonical HTTP route identity, security/surface metadata,
-  and OpenAPI exposure. Public Action operation policy is bound directly to its
-  route; Connector routes bind canonical capability identities. Handler mounting
-  stays explicit in the HTTP modules.
-- `runtime_http` — REST runtime routes.
-- `mcp` — the MCP adapter and surface selection.
-- `openapi` — the GPT Actions schema.
-- `connector_runtime` — the canonical project-bound coding path.
+- `route_metadata` — canonical HTTP route identity and security/surface metadata;
+  it contains only maintained endpoints, not a parallel model tool registry.
+- `runtime_http` — authenticated operational routes and `/api/tools/call`, entering
+  the same ToolRuntime kernel as MCP.
+- `mcp` — the model-facing adapter: ToolDefinition-ranked Direct descriptors,
+  `call_runtime_tool` for admitted tools, and independently admitted App extensions.
 - `tool_runtime` — protocol-independent tool parsing, dispatch, project
   resolution, registry metadata, sessions, handoff, hygiene, files, Git,
   patches, validation, shell, Jobs, artifacts, and checkpoints.
+  Workspace Git/worktree snapshots (`workspace_checkpoint_*`) are opt-in:
+  build Server and Runner with `--features workspace-checkpoints`. The root
+  feature forwards to tool contracts, runtime contracts, and workspace; Runner
+  forwards separately to workspace. Default builds omit the implementation,
+  tools, schemas, and checkpoint handoff projection. `include_checkpoints`
+  remains accepted and is ignored when disabled; dormant Runner checkpoint
+  wire operations fail closed. Workflow Session explicit handoff recovery,
+  collaboration ACK/message observation, validation evidence, and Jobs remain always active.
+  The shared workspace path policy stays compiled for `read_project_overview`.
 - `auth` / `oauth_http` / `db` — authentication, OAuth endpoints, and
   persistence.
 - `webcodex-runner` crates — the Runner binary: config, transport, project
@@ -183,6 +203,95 @@ Static definitions retain their worst-case discovery policy. Trusted recording
 Session provenance is supported, while generic invocation continuity metadata
 receives no specialized semantics. Adding another heterogeneous gateway extends
 this closed dispatch boundary without adding a concrete Kernel policy branch.
+
+### Typed queries and post-record responses
+
+`tool_runtime::job_query` owns the shared authorized Job inventory selection:
+normalize filters, ask the Registry for visible matching records, then apply
+status/order/limit before any model or Console projection. `JobInventoryPage`
+is internal and deliberately not serializable. `list_jobs` applies the model
+allowlist only to returned records; `runtime_console_http::job_projection`
+projects typed fields directly instead of parsing model-facing JSON. Registry
+lifecycle refresh, endpoint scopes and visibility remain unchanged. Passive
+Work Result/attention snapshots keep their separate non-refreshing reader.
+
+The ordinary Kernel path finishes authorization, dispatch, control sidecars and
+Session/permission recording before entering `kernel::postprocess`. That stage
+captures canonical audit/telemetry evidence, consumes the existing one-shot
+model projection plan, and finally adds bounded response-only collaboration and
+Job attention. Its internal result keeps canonical audit output separate from
+model output. It cannot redispatch the original operation or reinterpret raw
+business arguments. Specialized gateways and early denials retain their existing
+entry/exit paths. No tool schema, direct admission or UI resource changes follow
+from this internal separation.
+
+Window-specific Console query assembly lives in
+`runtime_console_http::window_queries`, behind the same common authorization
+and error helpers; routes and DTOs stay at the adapter boundary. Audit admission
+and exhaustive ToolCall routing remain in `tool_audit`, while private `request`,
+`result` and `execution_identity` modules own their existing projections. Public
+audit import paths remain stable. Related tests are grouped by responsibility,
+not duplicated per adapter; see [module boundaries](implementation/console-audit-module-boundaries.md).
+
+### Runtime ownership and presentation boundaries
+
+`tool_runtime::result_projection` owns request-scoped model result projection;
+`dispatch` retains execution targeting, permission/Session orchestration, and
+pre-record expectation facts. The existing one-shot projection plan is consumed
+after canonical evidence capture. Moving a presentation field must not introduce
+execution or authorization into the projection module.
+
+Git review and Changes snapshot registries are owned by one `ToolRuntime` through
+shared `Arc`s. Runtime clones share snapshots; independent runtimes cannot read,
+refresh, or evict each other's entries. Their existing authority fences, source
+identities and distinct review/live/sealed retention rules remain separate.
+There is no process-global presentation registry or universal cache policy.
+
+Validation's current-evidence computation consumes its own typed
+`ValidationSummary` directly and serializes at the projection boundary. It never
+reads counts back from its serialized representation. Current-source status is
+separate from historical validator success; its closed status type deliberately
+cannot assert `passed` while external source stability remains unproven. Existing
+JSON projection ports to handoff/continuation remain explicit wire/presentation
+boundaries, not a second source of validation truth.
+
+The Frontend shares visible observation scheduling and narrow read-request
+slots. Goal/Session selection cancels only obsolete reads; periodic refresh skips
+occupied slots, while explicit refreshes coalesce behind them. Mutation delivery
+keys, pending sends and Agent Endpoint renewal are independent lifecycles.
+
+Scale/recovery methodology and maintenance rules are recorded in
+[`implementation/runtime-maintenance-boundaries.md`](implementation/runtime-maintenance-boundaries.md).
+
+### Model-facing tool contract ergonomics
+
+Model-facing tools follow one shared design rule: be strict where meaning,
+authority, identity/fences, retry safety, privacy, or effect truth changes, and be
+tolerant where a recognized parameter only controls bounded presentation or
+resource budgets. Server-known harmless normalization should not consume another
+model turn. Unknown or ambiguous semantic input still fails closed.
+
+Successful projections should foreground sparse business truth; failures should
+be structured and decision-complete. Follow-up calls use one parser-ready
+`{tool, arguments}` representation when the producer can prove the next action,
+while continuation, refinement, failure recovery, and collaboration ACK remain
+separate semantic lanes. Duplicate aliases and compatibility projections are not
+kept without a named consumer.
+
+Internal protocol taxonomies do not automatically belong on the model surface.
+Typed continuation kinds/carriers, absolute cursors, lifecycle bookkeeping,
+timestamps, derived counts, and forensic recovery metadata can remain canonical
+inside WebCodex while the normal model projection exposes only the business
+result, correctness-critical identity/fence/completeness, and one unambiguous
+follow-up. Extra diagnostic detail is progressively disclosed when an exceptional
+state actually requires the model to reason about it. A field that cannot change
+the model's interpretation or next safe action is not model-facing merely because
+it is useful to implementation, tests, telemetry, or the operator Console.
+
+The standing detailed guidance is
+[`agent/tool-contract-guidelines.md`](agent/tool-contract-guidelines.md). Tool
+surface pruning and generalized composition are intentionally downstream of this
+contract/friction cleanup so low usage is not confused with poor ergonomics.
 
 ### Tool audit and privacy policy
 
@@ -226,7 +335,7 @@ effect, proven-no-state-change failure classification, and structured validation
 identity kind. Workflow Session consumes those
 semantic declarations but retains the typed, bounded projectors that decode tool
 results, normalize paths, enforce privacy limits, and persist durable evidence.
-Dynamic request conditions such as `show_changes(include_diff=true)` remain in the
+Dynamic request conditions such as `read_workspace_changes(include_diff=true)` remain in the
 projector rather than becoming declaration-time request parsing.
 
 `ToolCall` remains the exhaustive typed authority for business requests and audit
@@ -247,13 +356,13 @@ are separately pinned to declared development dependencies.
 
 The current layers are:
 
-- **leaf** — `webcodex-core`, `webcodex-process`, `webcodex-computer`, and
-  `webcodex-admin`; these do not depend on another workspace package.
+- **leaf** — low-level contracts/primitives in `webcodex-core`,
+  `webcodex-process`, `webcodex-computer`, and `webcodex-admin`; computer primitives
+  consume core contracts, while core/process/admin have no workspace dependencies.
 - **domain** — Runner config/registry, Store, Workspace, Workflow Session,
-  Tool contracts, Validation, and Persistent Shell ownership.
-- **runtime** — `webcodex-runner` and `webcodex-tool-runtime-contracts`.
-- **application** — `webcodex-connector-runtime`, which composes the domain
-  crates needed by the project-bound Connector path.
+  Tool contracts, Validation, Persistent Shell, and native LSP ownership.
+- **runtime** — `webcodex-runner`, `webcodex-tool-runtime-contracts`, environment
+  lifecycle, and the composition-only `webcodex-build-info` provider.
 - **composition** — the root `webcodex` package, which owns Server composition
   and protocol adapters rather than forcing those concerns into lower crates.
 - **entrypoint** — `webcodex-cli`, the user-facing executable over the lower
@@ -263,8 +372,22 @@ CI validates this policy from `cargo metadata`; adding a workspace crate or a
 new direct workspace dependency therefore requires an intentional policy
 update rather than silently changing the architecture.
 
+### Build identity does not own core invalidation
+
+`webcodex-core::build_info` contains only stable metadata types and formatting.
+The small `webcodex-build-info` package owns the Git/dirty build script and its
+compile-time capture. Server, Runner, CLI and the separate Desktop workspace use
+that provider directly; domain crates never depend on it. There is no runtime
+Git lookup, mutable global identity, copied collector, or new external dependency.
+Identity-only changes therefore invalidate composition rather than core's domain
+consumers. Release overrides, linked-worktree handling and dirty-state truth stay
+in the existing collector. See [the experiment and regression contract](implementation/build-identity-isolation.md).
+
 ## Further reading
 
+- [Resource model and architecture quality exploration](architecture/resource-model-and-quality-review.md) — source-grounded review and staged proposals; not a runtime contract
+- [Model-facing tool contract guidelines](agent/tool-contract-guidelines.md) — turn-economy, normalization, truthfulness, recovery, and compatibility policy
+- [Tool composition research and development plan](architecture/tool-composition-research.md) — later-stage round-trip composition research after primitive contract friction is reduced
 - [Durable Agent runtime and asynchronous work](architecture/durable-agent-runtime.md) — persistent Agent identity and planned asynchronous Agent work
 - [Durable Agent/Conversation/Wake contract](architecture/durable-agent-conversation.md) — current communication implementation
 - [CLI](CLI.md) — commands and terminology

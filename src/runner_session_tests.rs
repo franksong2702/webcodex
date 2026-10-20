@@ -22,6 +22,7 @@ fn streaming_registration(client_id: &str, runner_instance_id: &str) -> RunnerRe
     capabilities.async_jobs = true;
     capabilities.async_shell_jobs = true;
     crate::test_support::current_runner_registration(RunnerRegisterRequest {
+        computer_session_availability: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -35,13 +36,14 @@ fn streaming_registration(client_id: &str, runner_instance_id: &str) -> RunnerRe
         owner: None,
         hostname: None,
         host_context: None,
-        capabilities: capabilities,
+        capabilities,
         policy: None,
     })
 }
 
 fn start_job_request(client_id: &str) -> ShellJobOpRequest {
     ShellJobOpRequest {
+        login: false,
         op: "start".to_string(),
         client_id: Some(client_id.to_string()),
         cwd: None,
@@ -106,7 +108,7 @@ async fn writer_failure_terminates_session_and_reconciles_active_job() {
                 connection_id: "conn-a",
                 notify,
                 cancel,
-                transport_label: "websocket",
+                transport: RunnerTransport::WebSocket,
             },
             out_tx,
             PendingReader,
@@ -138,7 +140,7 @@ async fn writer_task_panic_terminates_session() {
                 connection_id: "conn-a",
                 notify,
                 cancel,
-                transport_label: "websocket",
+                transport: RunnerTransport::WebSocket,
             },
             out_tx,
             PendingReader,
@@ -178,7 +180,7 @@ async fn pump_exit_terminates_pending_reader_and_reconciles_exact_connection() {
                     connection_id: "conn-a",
                     notify,
                     cancel,
-                    transport_label: "websocket",
+                    transport: RunnerTransport::WebSocket,
                 },
                 out_tx,
                 PendingReader,
@@ -214,7 +216,7 @@ async fn pump_task_panic_terminates_session() {
                 connection_id: "conn-a",
                 notify,
                 cancel,
-                transport_label: "websocket",
+                transport: RunnerTransport::WebSocket,
             },
             out_tx,
             PendingReader,
@@ -254,7 +256,7 @@ async fn same_instance_replacement_actively_terminates_old_session_without_losin
                 connection_id: "conn-a",
                 notify: notify_a,
                 cancel: cancel_a,
-                transport_label: "websocket",
+                transport: RunnerTransport::WebSocket,
             },
             out_tx,
             PendingReader,
@@ -326,7 +328,7 @@ async fn stale_writer_failure_cannot_reconcile_replacement_connection() {
                 connection_id: "conn-a",
                 notify: notify_a,
                 cancel: cancel_a,
-                transport_label: "quic",
+                transport: RunnerTransport::Quic,
             },
             out_tx,
             PendingReader,

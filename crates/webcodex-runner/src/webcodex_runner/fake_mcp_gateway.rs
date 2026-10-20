@@ -2,7 +2,7 @@
 // directly with rustc so no closed-source or installed MCP server is needed.
 
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::thread;
@@ -48,6 +48,15 @@ fn main() -> io::Result<()> {
                 "path-leaked\n"
             },
         )?;
+        #[cfg(windows)]
+        append(
+            marker,
+            if env::var_os("SYSTEMROOT").is_some() {
+                "systemroot-bootstrap-ok\n"
+            } else {
+                "systemroot-bootstrap-missing\n"
+            },
+        )?;
         let cwd_matches = match (args.get(2), env::current_dir()) {
             (Some(expected), Ok(current)) => {
                 std::fs::canonicalize(current).ok() == std::fs::canonicalize(expected).ok()
@@ -70,11 +79,21 @@ fn main() -> io::Result<()> {
         match method.as_str() {
             "initialize" => {
                 append(marker, "initialize\n")?;
-                if scenario == "init_crash" {
+                if scenario == "init_crash"
+                    || (scenario == "init_crash_once" && marker_count(marker, "initialize") == 1)
+                {
                     return Ok(());
                 }
                 if scenario == "init_timeout" {
-                    thread::sleep(Duration::from_secs(3));
+                    thread::sleep(Duration::from_secs(6));
+                }
+                if scenario == "init_ping" {
+                    send(&mut writer, r#"{"jsonrpc":"2.0","method":"ping","id":"init-ping"}"#)?;
+                    let mut reply = String::new();
+                    reader.read_line(&mut reply)?;
+                    append(marker, if reply.contains(r#""id":"init-ping""#) && reply.contains(r#""result":{}"#) {
+                        "init-ping-ok\n"
+                    } else { "init-ping-bad\n" })?;
                 }
                 let capabilities = if scenario == "init_missing_tools" {
                     r#"{}"#
@@ -92,6 +111,10 @@ fn main() -> io::Result<()> {
             "tools/list" => {
                 lists += 1;
                 append(marker, "list\n")?;
+                if scenario == "slow_second_list" && lists == 2 {
+                    append(marker, "preflight-wait\n")?;
+                    thread::sleep(Duration::from_millis(250));
+                }
                 if scenario == "notifications" {
                     send(
                         &mut writer,
@@ -110,11 +133,15 @@ fn main() -> io::Result<()> {
                     continue;
                 }
                 if scenario == "oversized_message" {
+                    let padding_bytes = args
+                        .get(2)
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(7 * 1024 * 1024);
                     send(
                         &mut writer,
                         &format!(
                             r#"{{"jsonrpc":"2.0","id":{id},"result":{{"padding":"{}","tools":[]}}}}"#,
-                            "x".repeat(1024 * 1024)
+                            "x".repeat(padding_bytes)
                         ),
                     )?;
                     continue;
@@ -139,12 +166,61 @@ fn main() -> io::Result<()> {
                     )?;
                     continue;
                 }
+                if scenario == "catalog_metadata_depth" {
+                    let mut metadata = "{}".to_string();
+                    for _ in 0..17 {
+                        metadata = format!(r#"{{"next":{metadata}}}"#);
+                    }
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[],"_meta":{metadata}}}}}"#
+                        ),
+                    )?;
+                    continue;
+                }
+                if matches!(
+                    scenario,
+                    "wide_catalog" | "tool_node_overflow" | "catalog_byte_overflow"
+                ) {
+                    let (tool_count, enum_items, description_bytes) = match scenario {
+                        "wide_catalog" => (2, 2100, 0),
+                        "tool_node_overflow" => (1, 4096, 0),
+                        _ => (18, 0, 60 * 1024),
+                    };
+                    let choices = (0..enum_items)
+                        .map(|value| value.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let description = "x".repeat(description_bytes);
+                    let mut tools = vec![r#"{"name":"echo","inputSchema":{"type":"object","properties":{"value":{"type":"string"}}}}"#.to_string()];
+                    for index in 0..tool_count {
+                        tools.push(format!(
+                            r#"{{"name":"choice_{index}","description":"{description}","inputSchema":{{"type":"object","properties":{{"choice":{{"enum":[{choices}]}}}}}}}}"#
+                        ));
+                    }
+                    send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{}]}}}}"#,
+                            tools.join(",")
+                        ),
+                    )?;
+                    continue;
+                }
                 let description = if scenario == "bad_tools" {
-                    "x".repeat(5 * 1024)
+                    // One byte past the 256 KiB MCP wire hard limit.
+                    "x".repeat(256 * 1024 + 1)
+                } else if scenario == "larger_description" {
+                    "x".repeat(96 * 1024)
+                } else if scenario == "long_description" {
+                    "x".repeat(20_000)
                 } else {
                     "Persistent fake echo".to_string()
                 };
-                let value_type = if scenario == "schema_change" && lists >= 2 {
+                let value_type = if (scenario == "schema_change" && lists >= 2)
+                    || (scenario == "recover_schema_change" && marker_count(marker, "start") >= 2)
+                {
                     "number"
                 } else {
                     "string"
@@ -155,6 +231,23 @@ fn main() -> io::Result<()> {
                         r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo","description":"{description}","inputSchema":{{"type":"object","properties":{{"value":{{"type":"{value_type}"}}}}}}}}]}}}}"#
                     ),
                 )?;
+                if scenario == "idle_ping" && lists == 1 {
+                    for (request, expected_id) in [
+                        (r#"{"jsonrpc":"2.0","id":14,"method":"ping"}"#, r#""id":14"#),
+                        (r#"{"jsonrpc":"2.0","id":"provider-14","method":"ping"}"#, r#""id":"provider-14""#),
+                        (r#"{"jsonrpc":"2.0","id":15,"method":"ping"}"#, r#""id":15"#),
+                    ] {
+                        send(&mut writer, request)?;
+                        let mut reply = String::new();
+                        reader.read_line(&mut reply)?;
+                        append(marker, if reply.contains(expected_id) && reply.contains(r#""result":{}"#) {
+                            "ping-ok\n"
+                        } else { "ping-bad\n" })?;
+                    }
+                }
+                if scenario == "exit_after_list" {
+                    return Ok(());
+                }
                 if scenario == "notifications" {
                     send(
                         &mut writer,
@@ -193,7 +286,7 @@ fn main() -> io::Result<()> {
                     continue;
                 }
                 match scenario {
-                    "crash" => return Ok(()),
+                    "crash" | "recover_schema_change" => return Ok(()),
                     "notifications" => {
                         send(
                             &mut writer,
@@ -206,15 +299,33 @@ fn main() -> io::Result<()> {
                             ),
                         )?;
                     }
-                    "callback" => send(
-                        &mut writer,
-                        r#"{"jsonrpc":"2.0","id":9000,"method":"sampling/createMessage","params":{}}"#,
-                    )?,
+                    "call_ping" => {
+                        send(&mut writer, r#"{"jsonrpc":"2.0","id":"during-call","method":"ping"}"#)?;
+                        let mut reply = String::new();
+                        reader.read_line(&mut reply)?;
+                        append(marker, if reply.contains(r#""id":"during-call""#) && reply.contains(r#""result":{}"#) {
+                            "call-ping-ok\n"
+                        } else { "call-ping-bad\n" })?;
+                        send(&mut writer, &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"ping-during-call"}}],"isError":false}}}}"#
+                        ))?;
+                    }
+                    "callback" => {
+                        send(&mut writer, r#"{"jsonrpc":"2.0","id":9000,"method":"sampling/createMessage","params":{}}"#)?;
+                        let mut reply = String::new();
+                        reader.read_line(&mut reply)?;
+                        append(marker, if reply.contains(r#""code":-32601"#) && reply.contains(r#""id":9000"#) {
+                            "callback-rejected\n"
+                        } else { "callback-wrong\n" })?;
+                        send(&mut writer, &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"callback-denied"}}],"isError":false}}}}"#
+                        ))?;
+                    },
                     "timeout" => {
-                        thread::sleep(Duration::from_secs(3));
+                        thread::sleep(Duration::from_secs(6));
                     }
                     "slow" => {
-                        thread::sleep(Duration::from_millis(1_250));
+                        thread::sleep(Duration::from_secs(6));
                         send(
                             &mut writer,
                             &format!(
@@ -228,17 +339,128 @@ fn main() -> io::Result<()> {
                             r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32001,"message":"fixture error"}}}}"#
                         ),
                     )?,
+                    "large_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"{}"}}],"structuredContent":{{"payload":"{}"}},"isError":false}}}}"#,
+                            "x".repeat(192 * 1024),
+                            "y".repeat(192 * 1024)
+                        ),
+                    )?,
+                    "image_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}}],"isError":false}}}}"#
+                        ),
+                    )?,
+                    "mixed_content_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"before"}},{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}},{{"type":"resource_link","uri":"blockbench://project/model.bbmodel","name":"model.bbmodel","title":"Model","description":"Current project","mimeType":"application/json","size":1024,"annotations":{{"audience":["user"],"priority":0.5}},"icons":[{{"src":"https://example.com/icon.png","mimeType":"image/png"}}],"_meta":{{"providerExtension":true}}}},{{"type":"text","text":"after"}}],"structuredContent":{{"kind":"mixed"}},"isError":false}}}}"#
+                        ),
+                    )?,
+                    "image_error_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"/9j/","mimeType":"image/jpeg"}}],"structuredContent":{{"code":"IMAGE_ERROR"}},"isError":true}}}}"#
+                        ),
+                    )?,
+                    "max_image_result" => {
+                        let data = format!("iVBORw0KGgoA{}AA==", "AAAA".repeat(1_398_098));
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"{data}","mimeType":"image/png"}}],"isError":false}}}}"#
+                            ),
+                        )?;
+                    }
+                    "oversized_image" => {
+                        let data = "AAAA".repeat(1_398_102);
+                        send(
+                            &mut writer,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"{data}","mimeType":"image/png"}}],"isError":false}}}}"#
+                            ),
+                        )?;
+                    }
+                    "invalid_image_base64" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"%%%","mimeType":"image/png"}}]}}}}"#
+                        ),
+                    )?,
+                    "missing_image_data" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","mimeType":"image/png"}}]}}}}"#
+                        ),
+                    )?,
+                    "missing_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA=="}}]}}}}"#
+                        ),
+                    )?,
+                    "invalid_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA==","mimeType":"text/plain"}}]}}}}"#
+                        ),
+                    )?,
+                    "mismatched_image_mime" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/jpeg"}}]}}}}"#
+                        ),
+                    )?,
                     "bad_result" => send(
                         &mut writer,
                         &format!(
-                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"image","data":"AA==","mimeType":"image/png"}}]}}}}"#
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"audio","data":"AA==","mimeType":"audio/wav"}}]}}}}"#
+                        ),
+                    )?,
+                    "resource_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource","resource":{{"uri":"file:///tmp/x","text":"x"}}}}]}}}}"#
+                        ),
+                    )?,
+                    "resource_link_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource_link","uri":"file:///tmp/x","name":"x"}}]}}}}"#
+                        ),
+                    )?,
+                    "missing_resource_link_uri" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource_link","name":"model.bbmodel"}}]}}}}"#
+                        ),
+                    )?,
+                    "invalid_resource_link_metadata" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource_link","uri":"blockbench://project/model.bbmodel","name":"model.bbmodel","_meta":"invalid"}}]}}}}"#
+                        ),
+                    )?,
+                    "oversized_resource_link" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"resource_link","uri":"blockbench://project/model.bbmodel","name":"model.bbmodel","description":"{}"}}]}}}}"#,
+                            "x".repeat(512 * 1024)
+                        ),
+                    )?,
+                    "unknown_content_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"video","data":"AA==","mimeType":"video/mp4"}}]}}}}"#
                         ),
                     )?,
                     "oversized_result" => send(
                         &mut writer,
                         &format!(
                             r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
-                            "x".repeat(70 * 1024)
+                            "x".repeat(520 * 1024)
                         ),
                     )?,
                     _ => send(
@@ -269,6 +491,12 @@ fn append(path: Option<&Path>, value: &str) -> io::Result<()> {
         .append(true)
         .open(path)?
         .write_all(value.as_bytes())
+}
+
+fn marker_count(path: Option<&Path>, value: &str) -> usize {
+    path.and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| contents.lines().filter(|line| *line == value).count())
+        .unwrap_or(0)
 }
 
 fn string_field(body: &str, field: &str) -> Option<String> {

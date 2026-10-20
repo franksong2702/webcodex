@@ -11,6 +11,207 @@ use crate::runner_protocol::{
 };
 use serde_json::json;
 
+#[test]
+fn node_script_check_does_not_infer_lint_or_test_counts_from_arbitrary_output() {
+    use crate::tool_runtime::jobs::structured_validation_evidence;
+    let fake = "test result: ok. 500 passed; 0 failed;\n\
+                warning: suspicious\nerror[E0308]: fake rustc\n\
+                {\"code\":\"E001\",\"message\":\"fake lint\"}";
+    for truncated in [false, true] {
+        let evidence =
+            structured_validation_evidence("node:script:check", "check", fake, fake, truncated);
+        let diagnostics = evidence.diagnostics.unwrap();
+        assert!(!diagnostics.available);
+        assert!(diagnostics.diagnostic_count.is_none());
+        assert!(diagnostics.diagnostics.is_empty());
+        assert_eq!(diagnostics.truncated, Some(truncated));
+        assert_eq!(evidence.tests_run_count, None);
+        assert_eq!(evidence.tests_detected, None);
+        assert_eq!(evidence.tests_failed, None);
+        assert_eq!(evidence.warnings_count, None);
+        assert_eq!(evidence.errors_count, None);
+    }
+}
+
+#[test]
+fn validation_evidence_unknown_profiles_preserve_only_process_success() {
+    assert_unproven_validation_profiles(
+        &[("unknown_test", "test"), ("unknown_check", "check")],
+        true,
+    );
+}
+
+#[test]
+fn validation_evidence_known_mismatched_profiles_fail_even_without_minimum() {
+    assert_unproven_validation_profiles(
+        &[
+            ("cargo_check", "test"),
+            ("cargo_fmt", "test"),
+            ("cargo_test", "check"),
+            ("go_vet", "test"),
+            ("go_test", "check"),
+            ("python:pytest:test", "check"),
+            ("cargo_test", "format"),
+        ],
+        false,
+    );
+}
+
+fn assert_unproven_validation_profiles(profiles: &[(&str, &str)], generic_success: bool) {
+    use crate::tool_runtime::jobs::{structured_validation_evidence, validation_job_projection};
+
+    let stdout = "test result: ok. 20 passed; 0 failed; 0 ignored\n";
+    let stderr = "warning: unused import\nerror[E0308]: mismatched types\n";
+    for &(tool, kind) in profiles {
+        for truncated in [false, true] {
+            let evidence = structured_validation_evidence(tool, kind, stdout, stderr, truncated);
+            assert!(evidence.diagnostics.is_none(), "{tool}/{kind}");
+            assert!(evidence.tests_detected.is_none());
+            assert!(evidence.tests_run_count.is_none());
+            assert!(evidence.tests_passed.is_none());
+            assert!(evidence.tests_failed.is_none());
+            assert!(evidence.zero_tests_run.is_none());
+            assert!(evidence.warnings_count.is_none());
+            assert!(evidence.errors_count.is_none());
+            for minimum in [None, Some(0), Some(1)] {
+                let value = validation_job_projection(
+                    Some(tool),
+                    Some(kind),
+                    "completed",
+                    Some(0),
+                    stdout,
+                    stderr,
+                    truncated,
+                    minimum,
+                )
+                .unwrap();
+                assert_eq!(
+                    value["passed"],
+                    generic_success && minimum.is_none(),
+                    "{tool}/{kind}: {value}"
+                );
+                if let Some(minimum) = minimum {
+                    assert_eq!(value["test_count_assertion"]["status"], "unproven");
+                    assert_eq!(value["test_count_assertion"]["minimum_tests"], minimum);
+                    assert_eq!(
+                        value["test_count_assertion"]["reason_code"],
+                        "test_count_unproven"
+                    );
+                    assert!(value["test_count_assertion"]["actual_tests_run"].is_null());
+                } else {
+                    assert!(value.get("test_count_assertion").is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn validation_evidence_go_vet_preserves_historic_counters() {
+    use crate::tool_runtime::jobs::structured_validation_evidence;
+    let stderr = "warning: unused import\nerror[E0308]: mismatched types\n";
+    // Preserve known Go check counter compatibility while unknown tools
+    // cannot borrow the old generic Rustc counter fallback.
+    let go = structured_validation_evidence("go_vet", "check", "", stderr, false);
+    assert!(go.diagnostics.is_some());
+    assert_eq!(go.warnings_count, Some(1));
+    assert_eq!(go.errors_count, Some(1));
+}
+
+#[test]
+fn validation_evidence_authoritative_cargo_count_requires_matching_kind_and_tool() {
+    use crate::runner_protocol::ShellJobTestCountEvidence;
+    use webcodex_core::validation_evidence::CargoTestCountEvidenceStatus;
+
+    let count = ShellJobTestCountEvidence {
+        tests_passed: None,
+        tests_failed: None,
+        tests_detected: true,
+        tests_run_count: Some(20),
+        status: CargoTestCountEvidenceStatus::CompleteSummary,
+    };
+    for (tool, kind) in [
+        ("cargo_test", "check"),
+        ("unknown_test", "test"),
+        ("go_test", "test"),
+    ] {
+        let value = crate::tool_runtime::jobs::validation_job_projection_with_policy(
+            Some(tool),
+            Some(kind),
+            "completed",
+            Some(0),
+            "",
+            "",
+            true,
+            Some(&count),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(value["passed"], false, "{value}");
+        assert_eq!(value["test_count_assertion"]["status"], "unproven");
+        assert!(value["test_count_assertion"]["actual_tests_run"].is_null());
+    }
+}
+
+#[test]
+fn validation_evidence_known_profiles_preserve_counts_failures_zero_and_truncation() {
+    use crate::tool_runtime::jobs::validation_job_projection;
+
+    for (tool, stdout, passed, failed, status, exit) in [
+        ("cargo_test", "test result: ok. 2 passed; 0 failed; 0 ignored\n", 2, 0, "completed", 0),
+        ("cargo_test", "test result: FAILED. 1 passed; 1 failed; 0 ignored\n", 1, 1, "failed", 101),
+        ("cargo_test", "test result: ok. 0 passed; 0 failed; 0 ignored\n", 0, 0, "completed", 0),
+        ("go_test", "{\"Action\":\"pass\",\"Package\":\"example\",\"Test\":\"TestOne\"}\n{\"Action\":\"pass\",\"Package\":\"example\"}\n", 1, 0, "completed", 0),
+        ("go_test", "{\"Action\":\"fail\",\"Package\":\"example\",\"Test\":\"TestOne\"}\n{\"Action\":\"fail\",\"Package\":\"example\"}\n", 0, 1, "failed", 1),
+        ("python:pytest:test", "2 passed in 0.01s\n", 2, 0, "completed", 0),
+        ("python:pytest:test", "1 failed, 1 passed in 0.01s\n", 1, 1, "failed", 1),
+        ("python:pytest:test", "no tests ran in 0.01s\n", 0, 0, "failed", 5),
+    ] {
+        for truncated in [false, true] {
+            let value = validation_job_projection(
+                Some(tool), Some("test"), status, Some(exit), stdout, "", truncated, Some(1),
+            ).unwrap();
+            if truncated {
+                assert!(value["tests_run_count"].is_null(), "{value}");
+                assert!(value["tests_passed"].is_null());
+                assert!(value["tests_failed"].is_null());
+                assert!(value["zero_tests_run"].is_null());
+            } else {
+                assert_eq!(value["tests_run_count"], passed + failed, "{value}");
+                assert_eq!(value["tests_passed"], passed, "{value}");
+                assert_eq!(value["tests_failed"], failed, "{value}");
+                assert_eq!(value["zero_tests_run"], passed + failed == 0);
+                assert_eq!(value["diagnostics"]["available"], true);
+            }
+            assert_eq!(value["passed"], exit == 0 && passed > 0 && !truncated, "{value}");
+            if exit != 0 {
+                assert!(value.get("test_count_assertion").is_none());
+            } else {
+                assert_eq!(value["test_count_assertion"]["status"],
+                    if truncated { "unproven" } else if passed > 0 { "passed" } else { "failed" });
+            }
+        }
+    }
+    // Package-only Go output cannot prove zero; preserve that existing contract.
+    let go_no_tests = validation_job_projection(
+        Some("go_test"),
+        Some("test"),
+        "completed",
+        Some(0),
+        "{\"Action\":\"pass\",\"Package\":\"example\"}\n",
+        "",
+        false,
+        Some(1),
+    )
+    .unwrap();
+    assert!(go_no_tests["tests_run_count"].is_null());
+    assert!(go_no_tests["zero_tests_run"].is_null());
+    assert_eq!(go_no_tests["passed"], false);
+    assert_eq!(go_no_tests["test_count_assertion"]["status"], "unproven");
+}
+
 fn run_jobs_test_in_large_stack_thread<F, Fut>(test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -36,6 +237,190 @@ where
     }
 }
 
+pub(super) fn compact_validation_job(
+    project: &str,
+    source_fence: Option<webcodex_core::validation_source::ValidationSourceFence>,
+) -> crate::runner_protocol::ShellJobInfo {
+    serde_json::from_value(json!({
+        "job_id": "wc_job_compact-validation",
+        "client_id": "compact-validation-client",
+        "kind": "shell",
+        "project_id": project,
+        "purpose": "validation",
+        "command_preview": "secret validation command",
+        "status": "completed",
+        "created_at": 1,
+        "structured_execution": {
+            "execution_source": "run_process",
+            "arg_count": 3,
+            "stdin_present": false,
+            "validation_identity": "assertion:0123456789abcdef01234567",
+            "assertion_name": "secret assertion label"
+        },
+        "validation": {
+            "tool": "cargo_check",
+            "kind": "check",
+            "steps": [{
+                "name": "check",
+                "program": "cargo",
+                "args": ["check"],
+                "env": []
+            }],
+            "effective_timeout_secs": 600,
+            "sync_wait_secs": 10,
+            "adapter": "cargo_check",
+            "source_fence": source_fence
+        },
+        "recovered_after_server_restart": false,
+        "stdout_log_truncated": false,
+        "stderr_log_truncated": false
+    }))
+    .unwrap()
+}
+
+#[test]
+fn compact_validation_job_summary_reobserves_missing_crossed_and_restart_fences() {
+    let runtime = ToolRuntime::new_for_tests();
+    let project = "agent:compact-validation:demo";
+    let start = runtime.validation_sources.capture(project).unwrap();
+
+    let same = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(start.clone())));
+    assert_eq!(same["validation"]["source_state"]["freshness"], "unproven");
+    assert_eq!(
+        same["validation"]["source_state"]["observed_mutation_fence"],
+        "uncrossed"
+    );
+
+    let missing = runtime.model_job_summary_value_for_test(&compact_validation_job(project, None));
+    assert_eq!(
+        missing["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        missing["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    runtime
+        .validation_sources
+        .begin(project)
+        .unwrap()
+        .finish(&ToolResult::ok(json!({"state_changed": true})));
+    let crossed = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(start.clone())));
+    assert_eq!(crossed["validation"]["source_state"]["freshness"], "stale");
+    assert_eq!(
+        crossed["validation"]["source_state"]["observed_mutation_fence"],
+        "crossed"
+    );
+
+    let other_epoch = runtime
+        .validation_sources
+        .capture("agent:other:demo")
+        .unwrap();
+    let mismatch = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(other_epoch)));
+    assert_eq!(
+        mismatch["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        mismatch["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    let restarted = ToolRuntime::new_for_tests();
+    let after_restart =
+        restarted.model_job_summary_value_for_test(&compact_validation_job(project, Some(start)));
+    assert_eq!(
+        after_restart["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        after_restart["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    for summary in [&same, &missing, &crossed, &mismatch, &after_restart] {
+        let source_state = &summary["validation"]["source_state"];
+        assert!(source_state.get("start_fence").is_none());
+        assert!(source_state.get("epoch").is_none());
+        assert!(source_state.get("generation").is_none());
+        let encoded = serde_json::to_string(summary).unwrap();
+        assert!(!encoded.contains("secret validation command"));
+        assert!(!encoded.contains("secret assertion label"));
+        assert!(!encoded.contains("0123456789abcdef01234567"));
+    }
+}
+
+#[test]
+fn passive_validation_projection_separates_execution_result_from_source_freshness() {
+    let runtime = ToolRuntime::new_for_tests();
+    let project = "agent:passive-validation:demo";
+    let start = runtime.validation_sources.capture(project).unwrap();
+    let mut job = compact_validation_job(project, Some(start.clone()));
+    job.exit_code = Some(0);
+
+    let passed = runtime
+        .passive_job_validation_projection(&job, None)
+        .expect("structured validation projection");
+    assert_eq!(passed["tool"], "cargo_check");
+    assert_eq!(passed["passed"], true);
+    assert_eq!(passed["source_state"]["freshness"], "unproven");
+    assert_eq!(
+        passed["source_state"]["observed_mutation_fence"],
+        "uncrossed"
+    );
+    assert!(passed.get("diagnostics").is_none());
+
+    runtime
+        .validation_sources
+        .begin(project)
+        .unwrap()
+        .finish(&ToolResult::ok(json!({"state_changed": true})));
+    let stale = runtime
+        .passive_job_validation_projection(&job, None)
+        .expect("stale structured validation projection");
+    assert_eq!(
+        stale["passed"], true,
+        "execution success remains historical fact"
+    );
+    assert_eq!(stale["source_state"]["freshness"], "stale");
+    assert_eq!(stale["source_state"]["observed_mutation_fence"], "crossed");
+
+    job.exit_code = Some(1);
+    let failed = runtime
+        .passive_job_validation_projection(&job, None)
+        .expect("failed structured validation projection");
+    assert_eq!(failed["passed"], false);
+
+    let metadata = job.validation.as_mut().unwrap();
+    metadata.tool = "cargo_test".to_string();
+    metadata.kind = "test".to_string();
+    job.exit_code = Some(0);
+    job.test_count_evidence = None;
+    let mismatched = runtime
+        .passive_job_validation_projection(&job, None)
+        .expect("mismatched validation profile");
+    assert_eq!(mismatched["passed"], false);
+
+    // A consistent Cargo test identity without count evidence remains
+    // inconclusive, independently of source freshness.
+    let metadata = job.validation.as_mut().unwrap();
+    metadata.adapter = "cargo_test".to_string();
+    metadata.steps[0].name = "test".to_string();
+    metadata.steps[0].args = vec!["test".to_string()];
+    let inconclusive = runtime
+        .passive_job_validation_projection(&job, None)
+        .expect("test validation projection");
+    assert!(
+        inconclusive["passed"].is_null(),
+        "successful cargo_test without authoritative executed-test evidence must remain inconclusive"
+    );
+    assert_eq!(inconclusive["source_state"]["freshness"], "stale");
+}
+
 #[tokio::test]
 async fn run_shell_session_events_record_exit_without_stdio_bodies() {
     let runtime = runtime_with_agent_project("telemetry-shell");
@@ -56,10 +441,12 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "printf success-output".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -98,10 +485,12 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "printf failure-output; exit 7".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -213,7 +602,15 @@ async fn run_shell_via_agent(
     let command = command.to_string();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .run_shell(project, command, timeout_secs, None)
+            .run_shell_with_contract(
+                project,
+                command,
+                timeout_secs,
+                Some(timeout_secs.unwrap_or(60)),
+                None,
+                None,
+                None,
+            )
             .await
     });
     let req = wait_for_patch_agent_request(&runtime, client_id).await;
@@ -246,7 +643,15 @@ async fn run_shell_via_agent_lifecycle_error(
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .run_shell(project, "printf lifecycle".to_string(), Some(30), None)
+            .run_shell_with_contract(
+                project,
+                "printf lifecycle".to_string(),
+                Some(30),
+                Some(30),
+                None,
+                None,
+                None,
+            )
             .await
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
@@ -260,6 +665,8 @@ async fn run_shell_via_agent_lifecycle_error(
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: Some(error.to_string()),
             },
@@ -297,14 +704,15 @@ async fn update_agent_shell_job(
             status: status.to_string(),
             stdout_chunk: stdout_chunk.map(str::to_string),
             stderr_chunk: stderr_chunk.map(str::to_string),
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code,
             duration_ms: finished.then_some(25),
             error: error.map(str::to_string),
             command_execution_state,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished,
         })
@@ -346,17 +754,23 @@ fn project_execution_output_schemas_do_not_advertise_server_local_executor() {
         "run_script",
         "run_shell",
         "run_job",
-        "job_log",
-        "cargo_fmt",
-        "cargo_check",
-        "cargo_test",
-        "go_test",
+        "read_job_tail",
     ] {
         let schema = super::super::registry::output_schema_for_tool(name);
         let executor = &schema["properties"]["output"]["properties"]["executor"];
         assert_eq!(
             executor["const"], "agent",
             "{name} must publish the Runner-only Project execution contract"
+        );
+    }
+
+    for name in ["cargo_fmt", "cargo_check", "cargo_test", "go_test"] {
+        let schema = super::super::registry::output_schema_for_tool(name);
+        assert!(
+            schema["properties"]["output"]["properties"]
+                .get("executor")
+                .is_none(),
+            "{name} tool identity already determines the Runner-backed executor"
         );
     }
 }
@@ -383,10 +797,12 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "printf durable-shell; sleep 30".to_string(),
                         session_id: Some(session_id),
-                        timeout_secs: Some(120),
+                        timeout_secs: Some(600),
+                        sync_wait_secs: Some(1),
                         cwd: Some(".".to_string()),
                         purpose: Some(ExecutionPurpose::Diagnostic),
                         shell: Some(ExecutionShell::Bash),
@@ -399,8 +815,9 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
 
     let start = wait_for_patch_agent_request(&runtime, client_id).await;
     assert_eq!(start.kind, "start_job");
-    assert_eq!(start.timeout_secs, 120);
-    assert!(start.command.starts_with("exec bash -c "));
+    assert_eq!(start.timeout_secs, 600);
+    assert_eq!(start.command, "printf durable-shell; sleep 30");
+    assert_eq!(start.shell, Some(ExecutionShell::Bash));
     let job_id = start.job_id.clone().expect("durable Job id");
     update_agent_shell_job(
         &runtime,
@@ -419,20 +836,7 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["promoted_to_job"], true);
-    assert_eq!(result.output["terminal"], false);
-    assert_eq!(result.output["execution_state"], "running");
-    assert_eq!(result.output["command_started"], true);
-    assert_eq!(result.output["command_completed"], false);
-    assert_eq!(result.output["effective_timeout_secs"], 120);
-    assert_eq!(result.output["sync_wait_secs"], 10);
-    assert_eq!(result.output["job_id"], job_id);
-    assert_eq!(result.output["purpose"], "diagnostic");
-    assert_eq!(result.output["shell"], "bash");
-    assert_eq!(result.output["cwd"], ".");
-    assert!(result.output["observation_token"].is_string());
-    assert!(result.output.as_object().unwrap().contains_key("activity"));
-    assert!(result.output["activity"].is_null());
+    assert_eq!(assert_sparse_pending_job_handoff(&result.output), job_id);
     assert_run_shell_result_matches_schema(&result);
     assert!(
         probe_patch_agent_request(&runtime, client_id)
@@ -454,13 +858,7 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
     assert!(finished.failure_kind.is_none());
 
     let status = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: job_id.clone(),
-                include_command_preview: false,
-            },
-            Some(&auth),
-        )
+        .job_status_for_auth(job_id.clone(), false, Some(&auth))
         .await;
     assert!(status.success, "{:?}", status.error);
     assert_eq!(status.output["job_id"], job_id);
@@ -498,9 +896,11 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
             vec![ObserveJobsItem {
                 job_id: job_id.clone(),
                 after_observation_token: None,
+                observation_ref: None,
             }],
             40,
             None,
+            ObserveJobsWakeOn::Change,
             Some(&auth),
         )
         .await;
@@ -563,12 +963,23 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
     )
     .await;
     let project = agent_test_project_id(client_id);
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let session_id = session.session_id.clone();
     let task = tokio::spawn({
         let runtime = runtime.clone();
+        let session_id = session_id.clone();
         async move {
-            runtime
-                .run_shell(project, "printf fast".to_string(), Some(120), None)
-                .await
+            let auth = auth_context(None, true);
+            runtime.dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
+                ToolCall::RunShell {
+                    project, command: "printf fast".to_string(), timeout_secs: Some(600),
+                    sync_wait_secs: None, cwd: None, purpose: None, shell: None,
+                    session_id: Some(session_id), login: false,
+                },
+                Some(&auth), sessions::SessionTransport::Api, Default::default(),
+                None, true, Vec::new(), Default::default(), Default::default(),
+                super::super::return_timing::ToolReturnTimingPolicy::unconstrained(),
+            ).await
         }
     });
     let start = wait_for_patch_agent_request(&runtime, client_id).await;
@@ -583,27 +994,98 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
         Some(ShellCommandExecutionState::Completed),
         Some(0),
         Some("fast\n"),
-        None,
+        Some("warning\n"),
         None,
         true,
     )
     .await;
-    let result = task.await.unwrap();
+    let (mut result, projection, _) = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["execution_state"], "completed");
     assert_eq!(result.output["promoted_to_job"], false);
     assert_eq!(result.output["terminal"], true);
     assert_eq!(result.output["job_id"], serde_json::Value::Null);
-    assert_eq!(result.output["effective_timeout_secs"], 120);
+    assert_eq!(result.output["effective_timeout_secs"], 600);
     assert_eq!(result.output["sync_wait_secs"], 10);
     assert_run_shell_result_matches_schema(&result);
+    let before = serde_json::to_vec(&result).unwrap().len();
+    let audit = super::super::tool_audit::canonical_execution_audit_result_for_tool(
+        "run_shell",
+        &result.output,
+    );
+    for key in [
+        "command_started",
+        "command_completed",
+        "command_ok",
+        "terminal",
+    ] {
+        assert_eq!(audit[key], true);
+    }
+    assert_eq!(audit["execution_state"], "completed");
+    assert!(audit.get("stdout_tail").is_none());
+    assert!(audit.get("stderr_tail").is_none());
+    let mut timer =
+        super::super::model_ergonomics_telemetry::ModelErgonomicsTimer::start_with_arguments(
+            "run_shell",
+            &serde_json::json!({}),
+        )
+        .unwrap();
+    timer.capture_canonical_result(&result);
+    projection.project(&mut result);
+    let after = serde_json::to_vec(&result).unwrap().len();
+    eprintln!("run_shell terminal success: {before} -> {after} bytes");
+    assert!(
+        after + 300 < before,
+        "lifecycle bookkeeping should be compacted"
+    );
+    for key in [
+        "execution_state",
+        "command_started",
+        "command_completed",
+        "command_ok",
+        "exit_code",
+        "promoted_to_job",
+        "terminal",
+        "job_id",
+        "job_status",
+        "duration_ms",
+        "effective_timeout_secs",
+        "sync_wait_secs",
+        "failure_kind",
+        "tool_failure",
+        "executor",
+    ] {
+        assert!(result.output.get(key).is_none(), "{key}");
+    }
+    assert_eq!(result.output["stdout_tail"], "fast\n");
+    assert_eq!(result.output["stderr_tail"], "warning\n");
+    assert_eq!(result.output["command_summary"], "printf fast");
+    assert!(result.output["cwd"].is_string());
+    assert!(result.output["shell"].is_string());
+    assert_run_shell_result_matches_schema(&result);
+    let completion = timer.finish();
+    let metrics = completion.record_for_tool_result(&result).unwrap();
+    assert_eq!(metrics.execution_state.as_deref(), Some("completed"));
+    assert_eq!(metrics.serialized_result_bytes, Some(after as u64));
+    let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
+    let finished = summary
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "run_shell")
+        .unwrap();
+    assert_eq!(finished.exit_code, Some(0));
+    let evidence = finished.effect_evidence.as_ref().unwrap();
+    assert_eq!(evidence.execution_state.as_deref(), Some("completed"));
+    assert_eq!(evidence.command_started, Some(true));
+    assert_eq!(evidence.command_completed, Some(true));
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
-async fn run_shell_default_sixty_stays_synchronous_even_with_async_job_capability() {
-    let client_id = "shell-default-sync";
-    let runtime = runtime_with_agent_project(client_id);
+async fn long_run_shell_fast_outcome_unknown_preserves_visible_recovery_job() {
+    let client_id = "shell-long-fast-unknown";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_structured_execution_sync_wait(std::time::Duration::from_millis(200));
     register_agent(
         &runtime,
         client_id,
@@ -620,18 +1102,110 @@ async fn run_shell_default_sixty_stays_synchronous_even_with_async_job_capabilit
         let runtime = runtime.clone();
         async move {
             runtime
-                .run_shell(project, "printf default".to_string(), None, None)
+                .run_shell(project, "printf uncertain".to_string(), Some(600), None)
+                .await
+        }
+    });
+    let start = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert_eq!(start.kind, "start_job");
+    let job_id = start.job_id.clone().expect("durable shell Job id");
+    update_agent_shell_job(
+        &runtime,
+        client_id,
+        &start.request_id,
+        &job_id,
+        "lost",
+        Some(ShellCommandExecutionState::OutcomeUnknown),
+        None,
+        Some("partial\n"),
+        Some("reader lost terminal correlation\n"),
+        Some("structured shell lifecycle became uncertain"),
+        true,
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["promoted_to_job"], true);
+    assert_eq!(result.output["terminal"], false);
+    assert_eq!(result.output["job_id"], job_id);
+    assert_eq!(result.output["job_status"], "lost");
+    assert_eq!(
+        result.output["continuation"]["arguments"]["items"][0]["job_id"],
+        job_id
+    );
+    assert_run_shell_result_matches_schema(&result);
+
+    let visible = runtime.runner_registry.get_job(&job_id).await.unwrap();
+    assert_eq!(visible.status, "lost");
+    assert_eq!(
+        visible.command_execution_state,
+        Some(ShellCommandExecutionState::OutcomeUnknown)
+    );
+    assert!(runtime
+        .runner_registry
+        .hidden_job_ids_for_test()
+        .await
+        .is_empty());
+    assert!(runtime.runner_registry.remove_job_record(&job_id).await);
+}
+
+#[tokio::test]
+async fn run_shell_default_sixty_uses_ten_second_same_execution_handoff() {
+    let client_id = "shell-default-handoff";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_structured_execution_sync_wait(std::time::Duration::from_millis(20));
+    register_agent(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            shell: true,
+            async_shell_jobs: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let project = agent_test_project_id(client_id);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .run_shell(project, "printf default; sleep 30".to_string(), None, None)
                 .await
         }
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert_eq!(request.kind, "run_shell");
+    assert_eq!(request.kind, "start_job");
     assert_eq!(request.timeout_secs, 60);
-    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, "default", "").await;
+    let job_id = request.job_id.clone().expect("durable shell Job id");
+    update_agent_shell_job(
+        &runtime,
+        client_id,
+        &request.request_id,
+        &job_id,
+        "running",
+        None,
+        None,
+        Some("default\n"),
+        None,
+        None,
+        false,
+    )
+    .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert_eq!(result.output["terminal"], false);
+    assert_eq!(result.output["job_id"], job_id);
+    assert_eq!(result.output["effective_timeout_secs"], 60);
+    assert_eq!(result.output["sync_wait_secs"], 10);
+    assert!(probe_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+    assert!(runtime.runner_registry.remove_job_record(&job_id).await);
 }
 
 #[tokio::test]
@@ -644,6 +1218,7 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: Some(4),
@@ -684,10 +1259,12 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project,
                 command: "printf denied".to_string(),
                 session_id: None,
                 timeout_secs: Some(120),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -754,6 +1331,7 @@ async fn long_run_shell_job_timeout_is_terminal_and_never_becomes_fake_outcome_u
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
     assert_eq!(handoff.output["job_id"], job_id);
+    // This direct Runtime call retains the internal receipt before model projection.
     assert_eq!(handoff.output["promoted_to_job"], true);
 
     update_agent_shell_job(
@@ -832,7 +1410,10 @@ async fn raw_shell_tools_reject_authored_command_above_shared_bound_before_proje
         .error
         .as_deref()
         .unwrap_or_default()
-        .contains("raw shell command exceeds the 16000-byte UTF-8 limit"));
+        .contains(&format!(
+            "raw shell command exceeds the {}-byte UTF-8 limit",
+            crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES
+        )));
     assert_eq!(run_shell.output["execution_state"], "not_started");
     assert_eq!(run_shell.output["failure_kind"], "runtime_error");
 
@@ -852,7 +1433,10 @@ async fn raw_shell_tools_reject_authored_command_above_shared_bound_before_proje
         .error
         .as_deref()
         .unwrap_or_default()
-        .contains("raw shell command exceeds the 16000-byte UTF-8 limit"));
+        .contains(&format!(
+            "raw shell command exceeds the {}-byte UTF-8 limit",
+            crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES
+        )));
 }
 
 #[tokio::test]
@@ -1083,6 +1667,8 @@ async fn run_shell_runner_timeout_preserves_known_timeout_state() {
                 exit_code: Some(-1),
                 stdout: Some("partial output".to_string()),
                 stderr: Some("runner stopped the process at its deadline".to_string()),
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1_000),
                 error: Some("runner timeout".to_string()),
             },
@@ -1104,7 +1690,8 @@ async fn run_shell_runner_timeout_preserves_known_timeout_state() {
     let error = result.error.as_deref().unwrap_or_default();
     assert!(error.contains("Command timed out after 1s"));
     assert!(error.contains("do not blindly retry"));
-    assert!(error.contains("First inspect the actual process, service, and target state"));
+    assert!(error.contains("First inspect the actual Job, process, service, and target state"));
+    assert!(error.contains("use run_detached_process from the start"));
 }
 
 #[tokio::test]
@@ -1161,24 +1748,6 @@ async fn run_job_rejects_server_configured_project_without_local_spawn() {
         .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("unknown_project"));
-}
-
-#[tokio::test]
-async fn stop_job_rejects_unsafe_job_id() {
-    let runtime = test_runtime();
-    let result = runtime.stop_job("../escape".to_string()).await;
-    assert!(!result.success);
-    assert!(result.error.unwrap().contains("invalid job id"));
-}
-
-#[tokio::test]
-async fn stop_job_unknown_job_returns_error() {
-    let runtime = test_runtime();
-    let result = runtime
-        .stop_job("55555555-6666-7777-8888-999999999999".to_string())
-        .await;
-    assert!(!result.success);
-    assert!(result.error.unwrap().contains("unknown job"));
 }
 
 #[tokio::test]
@@ -1368,6 +1937,7 @@ async fn model_facing_stop_job_stops_agent_job_with_same_session() {
         .await;
     assert!(run.success, "{:?}", run.error);
     let job_id = run.output["job_id"].as_str().unwrap().to_string();
+    assert_observe_job_continuation(&run.output);
 
     let result = runtime
         .dispatch_with_auth(
@@ -1388,13 +1958,7 @@ async fn model_facing_stop_job_stops_agent_job_with_same_session() {
     assert_eq!(result.output["permission"]["status"], "auto_approved");
     assert_eq!(result.output["permission"]["risk"], "job");
     let status = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id,
-                include_command_preview: false,
-            },
-            Some(&auth),
-        )
+        .job_status_for_auth(job_id, false, Some(&auth))
         .await;
     assert!(status.success, "{:?}", status.error);
     assert_eq!(status.output["status"], "stopped");
@@ -1455,13 +2019,7 @@ async fn model_facing_stop_job_reports_requested_and_already_stop_requested() {
     assert_eq!(result.output["stop_effect"], "requested");
 
     let status = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: job_id.clone(),
-                include_command_preview: false,
-            },
-            Some(&auth),
-        )
+        .job_status_for_auth(job_id.clone(), false, Some(&auth))
         .await;
     assert!(status.success, "{:?}", status.error);
     assert_eq!(status.output["status"], "stop_requested");
@@ -1551,24 +2109,42 @@ async fn model_facing_stop_job_session_project_mismatch_beats_auto_approve() {
     assert!(event.permission.is_none());
 }
 
-async fn register_job_agent_for_auth(
+pub(super) async fn register_job_agent_for_auth(
     runtime: &ToolRuntime,
     client_id: &str,
     project_id: &str,
     auth: &crate::auth::AuthContext,
 ) {
+    register_job_agent_for_auth_with_reconciliation(runtime, client_id, project_id, auth, false)
+        .await;
+}
+
+pub(super) async fn register_job_agent_for_auth_with_reconciliation(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project_id: &str,
+    auth: &crate::auth::AuthContext,
+    reconciliation: bool,
+) {
     let caps = crate::test_support::current_runner_capabilities(RunnerCapabilities {
         async_shell_jobs: true,
+        explicit_shell_selection: true,
+        bash_login_shell: true,
+        job_state_reconciliation: reconciliation,
         ..Default::default()
     });
     runtime
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: Some(4),
-                job_inventory: None,
+                job_inventory: reconciliation.then(|| crate::runner_protocol::ShellJobInventory {
+                    active_complete: true,
+                    jobs: Vec::new(),
+                }),
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
@@ -1616,6 +2192,7 @@ async fn register_managed_job_agent(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: Some(4),
@@ -1658,7 +2235,7 @@ async fn start_agent_runtime_job(
     start_agent_runtime_job_in_session(runtime, client_id, project_id, None, auth).await
 }
 
-async fn start_agent_runtime_job_in_session(
+pub(super) async fn start_agent_runtime_job_in_session(
     runtime: &ToolRuntime,
     client_id: &str,
     project_id: &str,
@@ -1683,7 +2260,7 @@ async fn start_agent_runtime_job_in_session(
     result.output["job_id"].as_str().unwrap().to_string()
 }
 
-async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id: &str) -> String {
+pub(super) async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id: &str) -> String {
     let request = wait_for_runner_request_for_instance(runtime, client_id, "inst").await;
     let job_id = request.job_id.clone().expect("Job request id");
     runtime
@@ -1693,18 +2270,19 @@ async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id: &str) -> 
             runner_instance_id: "inst".to_string(),
             job_id: job_id.clone(),
             request_id: Some(request.request_id),
-            update_seq: None,
+            update_seq: Some(1),
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: false,
         })
@@ -1728,8 +2306,31 @@ fn assert_unknown_job(result: ToolResult) {
     assert_eq!(result.output["error_kind"], "unknown_job");
     assert_eq!(result.output["failure_kind"], "job_not_found");
     assert_eq!(result.output["state_changed"], false);
-    assert_eq!(result.output["recovery_kind"], "reobserve");
-    assert_eq!(result.output["recovery_tool"], "list_jobs");
+    assert!(result.output.get("recovery_kind").is_none());
+    assert!(result.output.get("recovery_tool").is_none());
+    assert_eq!(
+        result.output["suggested_call"],
+        json!({"follow_up_kind": "fallback_recovery", "tool": "list_jobs", "arguments": {}})
+    );
+    let suggested = &result.output["suggested_call"];
+    webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(suggested)
+        .expect("unknown Job recovery must pass list_jobs registered inputSchema");
+    let parsed = ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .expect("unknown Job recovery must parse");
+    match parsed {
+        ToolCall::ListJobs {
+            project,
+            session_id,
+            ..
+        } => {
+            assert!(project.is_none());
+            assert!(session_id.is_none());
+        }
+        other => panic!("unexpected recovery call: {}", other.tool_name()),
+    }
     assert!(
         result.error.unwrap_or_default().contains("unknown job"),
         "unauthorized job lookup should be hidden as unknown"
@@ -1744,15 +2345,13 @@ async fn agent_job_log_invalid_token_is_fix_input_not_unknown_job() {
     let job_id = start_agent_runtime_job(&runtime, "client-token", "proj-token", &auth).await;
 
     let result = runtime
-        .dispatch_with_auth(
-            ToolCall::JobLog {
-                job_id,
-                offset: None,
-                tail_lines: None,
-                after_observation_token: Some("bad".to_string()),
-                wait_secs: Some(1),
-            },
+        .job_log_for_auth(
+            job_id,
+            None,
+            None,
             Some(&auth),
+            Some("bad".to_string()),
+            Some(1),
         )
         .await;
 
@@ -1762,6 +2361,7 @@ async fn agent_job_log_invalid_token_is_fix_input_not_unknown_job() {
     assert_eq!(result.output["state_changed"], false);
     assert_eq!(result.output["recovery_kind"], "fix_input");
     assert!(result.output.get("recovery_tool").is_none());
+    assert!(result.output.get("suggested_call").is_none());
     assert!(result.error.unwrap_or_default().contains("malformed"));
 }
 
@@ -1794,13 +2394,7 @@ async fn managed_user_job_inventory_and_counts_do_not_cross_owner() {
     assert!(!alice_list.output.to_string().contains(&bob_job));
 
     let hidden_bob_job = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: bob_job.clone(),
-                include_command_preview: false,
-            },
-            Some(&alice),
-        )
+        .job_status_for_auth(bob_job.clone(), false, Some(&alice))
         .await;
     assert_unknown_job(hidden_bob_job);
 
@@ -1815,7 +2409,7 @@ async fn managed_user_job_inventory_and_counts_do_not_cross_owner() {
         )
         .await;
     assert!(alice_status.success, "{:?}", alice_status.error);
-    assert_eq!(alice_status.output["agents"]["count"], 1);
+    assert_eq!(alice_status.output["runners"]["count"], 1);
     assert_eq!(alice_status.output["jobs"]["active_count"], 1);
     assert!(!alice_status.output.to_string().contains("bob-runner"));
     assert!(!alice_status.output.to_string().contains(&bob_job));
@@ -1936,49 +2530,22 @@ async fn shared_key_runtime_job_tools_filter_agent_jobs_by_auth_group_body() {
 
     assert_unknown_job(
         runtime
-            .dispatch_with_auth(
-                ToolCall::JobStatus {
-                    job_id: job_b.clone(),
-                    include_command_preview: false,
-                },
-                Some(&shared_a),
-            )
+            .job_status_for_auth(job_b.clone(), false, Some(&shared_a))
             .await,
     );
     assert_unknown_job(
         runtime
-            .dispatch_with_auth(
-                ToolCall::JobStatus {
-                    job_id: job_a.clone(),
-                    include_command_preview: false,
-                },
-                Some(&bridge_b),
-            )
+            .job_status_for_auth(job_a.clone(), false, Some(&bridge_b))
             .await,
     );
     assert_unknown_job(
         runtime
-            .dispatch_with_auth(
-                ToolCall::JobStatus {
-                    job_id: job_b.clone(),
-                    include_command_preview: false,
-                },
-                Some(&bridge_a),
-            )
+            .job_status_for_auth(job_b.clone(), false, Some(&bridge_a))
             .await,
     );
     assert_unknown_job(
         runtime
-            .dispatch_with_auth(
-                ToolCall::JobLog {
-                    job_id: job_b.clone(),
-                    offset: None,
-                    tail_lines: None,
-                    after_observation_token: None,
-                    wait_secs: None,
-                },
-                Some(&shared_a),
-            )
+            .job_log_for_auth(job_b.clone(), None, None, Some(&shared_a), None, None)
             .await,
     );
     assert_unknown_job(
@@ -1996,26 +2563,14 @@ async fn shared_key_runtime_job_tools_filter_agent_jobs_by_auth_group_body() {
     );
 
     let status_b = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: job_b.clone(),
-                include_command_preview: false,
-            },
-            Some(&shared_b),
-        )
+        .job_status_for_auth(job_b.clone(), false, Some(&shared_b))
         .await;
     assert!(status_b.success, "{:?}", status_b.error);
     assert_eq!(status_b.output["job_id"], job_b);
     assert!(status_b.output.get("command_preview").is_none());
 
     let status_b_debug = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: job_b.clone(),
-                include_command_preview: true,
-            },
-            Some(&shared_b),
-        )
+        .job_status_for_auth(job_b.clone(), true, Some(&shared_b))
         .await;
     assert!(status_b_debug.success, "{:?}", status_b_debug.error);
     assert!(status_b_debug.output["command_preview"]
@@ -2024,16 +2579,7 @@ async fn shared_key_runtime_job_tools_filter_agent_jobs_by_auth_group_body() {
         .contains("echo client-b"));
 
     let log_b = runtime
-        .dispatch_with_auth(
-            ToolCall::JobLog {
-                job_id: job_b.clone(),
-                offset: None,
-                tail_lines: None,
-                after_observation_token: None,
-                wait_secs: None,
-            },
-            Some(&shared_b),
-        )
+        .job_log_for_auth(job_b.clone(), None, None, Some(&shared_b), None, None)
         .await;
     assert!(log_b.success, "{:?}", log_b.error);
     assert_eq!(log_b.output["stdout_tail"], "b-out\n");
@@ -2176,7 +2722,12 @@ async fn list_jobs_filters_visible_jobs_by_project_session_and_status_before_lim
             Some(&auth_a),
         )
         .await;
-    let mut a1_ids = listed_job_ids(&a1);
+    let ordered_a1_ids = listed_job_ids(&a1);
+    let expected_first_a1 = ordered_a1_ids
+        .first()
+        .cloned()
+        .expect("session A1 should have visible jobs");
+    let mut a1_ids = ordered_a1_ids;
     a1_ids.sort();
     let mut expected_a1 = vec![job_a1_running.clone(), job_a1_completed.clone()];
     expected_a1.sort();
@@ -2223,13 +2774,14 @@ async fn list_jobs_filters_visible_jobs_by_project_session_and_status_before_lim
     assert_eq!(limited.output["matched_count"], 2);
     assert_eq!(limited.output["count"], 1);
     assert_eq!(limited.output["truncated"], true);
+    assert_eq!(listed_job_ids(&limited), vec![expected_first_a1]);
 
     let mismatched = runtime
         .dispatch_with_auth(
             ToolCall::ListJobs {
                 limit: None,
                 status: None,
-                project: Some(project_a),
+                project: Some(project_a.clone()),
                 session_id: Some(session_b1.session_id.clone()),
             },
             Some(&auth_a),
@@ -2249,7 +2801,7 @@ async fn list_jobs_filters_visible_jobs_by_project_session_and_status_before_lim
             limit: None,
             status: None,
             project: None,
-            session_id: Some(session_b1.session_id),
+            session_id: Some(session_b1.session_id.clone()),
         },
     ] {
         let hidden = runtime
@@ -2260,14 +2812,48 @@ async fn list_jobs_filters_visible_jobs_by_project_session_and_status_before_lim
         assert_eq!(hidden.output["matched_count"], 0);
     }
 
-    let status = runtime
-        .dispatch_with_auth(
-            ToolCall::JobStatus {
-                job_id: job_a1_running,
-                include_command_preview: false,
-            },
+    let unique = runtime
+        .active_jobs_summary(
+            Some(&project_a),
+            Some(&session_a1.session_id),
             Some(&auth_a),
+            10,
         )
+        .await;
+    assert_eq!(unique["active_job"]["job_id"], job_a1_running);
+    assert_eq!(unique["active_job"]["status"], "running");
+    assert!(unique["active_job"].get("project").is_none());
+
+    let no_exact_session = runtime
+        .active_jobs_summary(
+            Some(&project_a),
+            Some(&session_b1.session_id),
+            Some(&auth_a),
+            10,
+        )
+        .await;
+    assert!(no_exact_session.get("active_job").is_none());
+
+    let _second_a1 = start_agent_runtime_job_in_session(
+        &runtime,
+        "target-a",
+        "proj-a",
+        Some(&session_a1.session_id),
+        &auth_a,
+    )
+    .await;
+    let ambiguous = runtime
+        .active_jobs_summary(
+            Some(&project_a),
+            Some(&session_a1.session_id),
+            Some(&auth_a),
+            10,
+        )
+        .await;
+    assert!(ambiguous.get("active_job").is_none());
+
+    let status = runtime
+        .job_status_for_auth(job_a1_running, false, Some(&auth_a))
         .await;
     assert_eq!(status.output["status"], "running");
 }
@@ -2315,19 +2901,22 @@ async fn runtime_status_and_list_runners_filter_concurrency_counts_by_auth_group
     assert_eq!(status_a.output["jobs"]["running_count"], 1);
     assert_eq!(status_a.output["jobs"]["queued_count"], 1);
     assert_eq!(
-        status_a.output["agents"]["clients"][0]["job_concurrency"],
+        status_a.output["runners"]["clients"][0]["job_concurrency"],
         json!({"limit": 4, "running": 1, "queued": 1})
     );
-    assert!(status_a.output["agents"]["clients"][0]
+    assert!(status_a.output["runners"]["clients"][0]
         .get("available_slots")
         .is_none());
-    assert!(status_a.output["agents"]["clients"][0]
+    assert!(status_a.output["runners"]["clients"][0]
         .get("saturated")
         .is_none());
 
     let agents_a = runtime
         .dispatch_with_auth(
             ToolCall::ListRunners {
+                query: None,
+                status: None,
+                limit: None,
                 client_id: None,
                 client_ids: None,
                 include_projects: None,
@@ -2338,16 +2927,14 @@ async fn runtime_status_and_list_runners_filter_concurrency_counts_by_auth_group
         .await;
     assert!(agents_a.success, "{:?}", agents_a.error);
     assert_eq!(agents_a.output["count"], 1);
-    assert_eq!(agents_a.output["agents"][0]["client_id"], "status-a");
+    assert_eq!(agents_a.output["runners"][0]["client_id"], "status-a");
     assert_eq!(
-        agents_a.output["agents"][0]["job_concurrency"],
+        agents_a.output["runners"][0]["job_concurrency"],
         json!({"limit": 4, "running": 1, "queued": 1})
     );
-    assert_eq!(
-        agents_a.output["clients"][0]["job_concurrency"],
-        json!({"limit": 4, "running": 1, "queued": 1})
-    );
-    let new_observability = agents_a.output["agents"][0]["job_concurrency"]
+    assert!(agents_a.output.get("clients").is_none());
+    assert!(agents_a.output["summary"].get("clients").is_none());
+    let new_observability = agents_a.output["runners"][0]["job_concurrency"]
         .as_object()
         .unwrap();
     assert_eq!(new_observability.len(), 3);
@@ -2395,7 +2982,7 @@ async fn runtime_status_and_list_runners_filter_concurrency_counts_by_auth_group
     assert_eq!(status_bootstrap.output["jobs"]["active_count"], 5);
     assert_eq!(status_bootstrap.output["jobs"]["running_count"], 2);
     assert_eq!(status_bootstrap.output["jobs"]["queued_count"], 3);
-    assert_eq!(status_bootstrap.output["agents"]["count"], 3);
+    assert_eq!(status_bootstrap.output["runners"]["count"], 3);
 
     let compact_a = runtime
         .dispatch_with_auth(
@@ -2409,7 +2996,7 @@ async fn runtime_status_and_list_runners_filter_concurrency_counts_by_auth_group
         .await;
     assert_eq!(
         compact_a.output["jobs"],
-        json!({"active_count": 2, "running_count": 1, "queued_count": 1})
+        json!({"active_count": 2, "running_count": 1, "queued_count": 1, "recovering_count": 0, "lost_after_reconcile_count": 0})
     );
 }
 
@@ -2437,7 +3024,7 @@ async fn runtime_concurrency_counts_cover_all_visible_jobs_beyond_list_paginatio
     assert_eq!(status.output["jobs"]["running_count"], 0);
     assert_eq!(status.output["jobs"]["queued_count"], 21);
     assert_eq!(
-        status.output["agents"]["clients"][0]["job_concurrency"],
+        status.output["runners"]["clients"][0]["job_concurrency"],
         json!({"limit": 4, "running": 0, "queued": 21})
     );
 }
@@ -2516,17 +3103,15 @@ async fn job_tail_reaches_job_logic_without_agent_auth() {
 #[tokio::test]
 async fn job_log_wait_rejects_invalid_wait_secs_before_execution() {
     let runtime = test_runtime();
-    for invalid in [0u64, 61u64] {
+    for invalid in [0u64, 101u64] {
         let result = runtime
-            .dispatch_with_auth(
-                ToolCall::JobLog {
-                    job_id: "11111111-2222-3333-4444-555555555555".to_string(),
-                    offset: None,
-                    tail_lines: None,
-                    after_observation_token: Some("bad".to_string()),
-                    wait_secs: Some(invalid),
-                },
+            .job_log_for_auth(
+                "11111111-2222-3333-4444-555555555555".to_string(),
                 None,
+                None,
+                None,
+                Some("bad".to_string()),
+                Some(invalid),
             )
             .await;
         assert!(!result.success);
@@ -2539,32 +3124,462 @@ async fn job_log_wait_rejects_invalid_wait_secs_before_execution() {
     }
 }
 
+#[tokio::test]
+async fn job_log_wait_accepts_canonical_max_before_job_lookup() {
+    let runtime = test_runtime();
+    let result = runtime
+        .job_log_for_auth(
+            "11111111-2222-3333-4444-555555555555".to_string(),
+            None,
+            None,
+            None,
+            None,
+            Some(webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "unknown_job");
+}
+
 #[test]
-fn job_log_parses_opaque_observation_token_and_rejects_non_string_values() {
+fn retired_job_log_parser_rejects_former_inputs() {
     let token =
-        crate::job_observation::JobObservationToken::new_legacy("abc", "0123456789abcdef", 7)
+        crate::job_observation::JobObservationToken::new_baseline("abc", "0123456789abcdef", 7)
             .unwrap()
             .encode();
-    let parsed = ToolCall::from_tool_name(
-        "job_log",
+    for args in [
         json!({"job_id": "abc", "after_observation_token": token, "wait_secs": 5}),
+        json!({"job_id": "abc", "after_observation_token": 1, "wait_secs": 5}),
+    ] {
+        let error = ToolCall::from_tool_name("job_log", args).unwrap_err();
+        assert!(error.contains("unknown tool"), "{error}");
+    }
+}
+
+#[test]
+fn job_handoff_model_projection_keeps_identity_and_exceptional_receipts() {
+    let receipt = json!({
+        "execution_state": "running", "job_id": "job-one", "job_status": "running", "terminal": false,
+        "promoted_to_job": true, "async_handoff_available": true,
+        "observation_token": "job-token-one",
+        "continuation_semantics": {"kind": "observe", "carrier": "observation_token"},
+        "continuation": super::super::jobs::observe_job_continuation("job-one", Some("job-token-one")),
+        "stdout_truncated": true, "stderr_truncated": false,
+    });
+    let mut model = ToolResult::ok(receipt.clone());
+    super::super::jobs::sparsify_job_handoff_model_result(&mut model);
+    assert_eq!(
+        model
+            .output
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["continuation".to_string(), "execution_state".to_string(),]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(model.output["execution_state"], "pending");
+    assert_observe_job_continuation(&model.output);
+    for key in [
+        "job_id",
+        "job_status",
+        "terminal",
+        "promoted_to_job",
+        "async_handoff_available",
+        "observation_token",
+        "continuation_semantics",
+        "stdout_truncated",
+        "stderr_truncated",
+    ] {
+        assert!(model.output.get(key).is_none(), "{key}");
+        assert!(
+            receipt.get(key).is_some(),
+            "internal receipt stays complete for {key}"
+        );
+    }
+    assert_eq!(
+        serde_json::to_string(&model.output)
+            .unwrap()
+            .matches("job-token-one")
+            .count(),
+        1
+    );
+    for (field, value) in [
+        ("execution_state", json!("outcome_unknown")),
+        ("observation_token", json!("another-snapshot")),
+        ("job_id", json!("another-job")),
+    ] {
+        let mut exceptional = receipt.clone();
+        exceptional[field] = value;
+        let mut model = ToolResult::ok(exceptional.clone());
+        super::super::jobs::sparsify_job_handoff_model_result(&mut model);
+        assert_eq!(model.output, exceptional);
+    }
+}
+
+#[test]
+fn pending_happy_path_serialized_result_bytes_regression() {
+    let continuation =
+        super::super::jobs::observe_job_continuation("job-one", Some("job-token-one"));
+    // Frozen historical fixture for size comparison only. Scheduling guidance
+    // now lives in startup/discovery, never in the dynamic receipt.
+    let strategy = json!({
+        "default":"continue_independent_work", "passive_terminal_attention":"same_scope_may_surface",
+        "observe_continuation":"logs_details_recovery_fallback", "observe_auto_follow":false,
+        "blocked_fallback":"wait_for_job_terminal",
+        "readiness":{"kind":"join_barrier","when":"ready_work_exhausted","mode":"any_unblocks_branch_all_requires_every_dependency","deadline":"recompute_then_yield_if_unchanged"},
+        "execution_replay":"never_retry_or_redispatch"
+    });
+    let before = ToolResult::ok(
+        json!({"execution_state":"pending", "continuation":continuation, "pending_strategy":strategy}),
+    );
+    let mut after = ToolResult::ok(
+        json!({"execution_state":"running", "job_id":"job-one", "observation_token":"job-token-one", "continuation":continuation}),
+    );
+    super::super::jobs::sparsify_job_handoff_model_result(&mut after);
+    assert_sparse_pending_job_handoff(&after.output);
+    assert_eq!(after.output["continuation"], before.output["continuation"]);
+    let before_bytes = crate::json_measurement::serialized_json_len(&before).unwrap();
+    let after_bytes = crate::json_measurement::serialized_json_len(&after).unwrap();
+    eprintln!("pending: {before_bytes} -> {after_bytes} bytes");
+    assert!(
+        after_bytes * 100 < before_bytes * 50,
+        "happy-path receipt unexpectedly grew: {before_bytes} -> {after_bytes}"
+    );
+}
+
+#[test]
+fn run_shell_recovered_terminal_snapshot_stays_rich_after_projection() {
+    let mut job = compact_validation_job("agent:test:project", None);
+    job.command_execution_state = Some(ShellCommandExecutionState::Completed);
+    job.exit_code = Some(0);
+    job.recovery_state = Some("reconciled".to_string());
+    job.recovered_after_server_restart = true;
+    job.reconciled_at = Some(42);
+    let mut result =
+        ToolRuntime::run_shell_terminal_job_result(&job, "witness".into(), String::new(), 60);
+    super::super::process::add_structured_continuation_facts(&mut result, 60, 10, true);
+    result.output["executor"] = json!("agent");
+    result.output["execution_source"] = json!("run_shell");
+    let before = result.output.clone();
+    let call = ToolCall::from_tool_name(
+        "run_shell",
+        json!({"project":"agent:test:project", "command":"true"}),
     )
     .unwrap();
-    match parsed {
-        ToolCall::JobLog {
-            after_observation_token,
-            wait_secs,
-            ..
-        } => {
-            assert_eq!(after_observation_token.as_deref(), Some(token.as_str()));
-            assert_eq!(wait_secs, Some(5));
-        }
-        other => panic!("expected JobLog, got {other:?}"),
-    }
+    super::super::result_projection::ModelFacingProjectionPlan::capture(&call).project(&mut result);
+    assert_eq!(result.output, before);
+    assert_eq!(result.output["recovery_state"], "reconciled");
+    assert_eq!(result.output["reconciled_at"], 42);
+    assert_eq!(result.output["recovered_after_server_restart"], true);
+    assert_run_shell_result_matches_schema(&result);
+}
 
-    let result = ToolCall::from_tool_name(
-        "job_log",
-        json!({"job_id": "abc", "after_observation_token": 1, "wait_secs": 5}),
+#[test]
+fn validation_ruff_profiles_keep_native_outcomes_and_do_not_borrow_counts() {
+    use crate::tool_runtime::jobs::{structured_validation_evidence, validation_job_projection};
+    for (tool, kind) in [
+        ("python:ruff:check", "check"),
+        ("python:ruff:format", "format"),
+    ] {
+        let stdout = "test result: ok. 20 passed; 0 failed; 0 ignored\n2 passed in 0.01s\n";
+        let evidence =
+            structured_validation_evidence(tool, kind, stdout, "error[E0308]: private", false);
+        assert_eq!(
+            evidence.diagnostics.as_ref().unwrap().parser,
+            "ruff_validation_parser_v1"
+        );
+        assert!(evidence.tests_run_count.is_none());
+        assert!(evidence.errors_count.is_none());
+        assert!(evidence.warnings_count.is_none());
+        for (status, exit, passed) in [
+            ("completed", 0, true),
+            ("failed", 1, false),
+            ("failed", 2, false),
+        ] {
+            let value = validation_job_projection(
+                Some(tool),
+                Some(kind),
+                status,
+                Some(exit),
+                stdout,
+                "",
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(value["passed"], passed);
+        }
+        for status in ["timed_out", "cancelled", "lost"] {
+            let value = validation_job_projection(
+                Some(tool),
+                Some(kind),
+                status,
+                None,
+                stdout,
+                "",
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(value["passed"].is_null());
+        }
+    }
+    let contradiction = validation_job_projection(
+        Some("python:ruff:check"),
+        Some("check"),
+        "completed",
+        Some(0),
+        r#"{"code":"F401","location":{"row":1,"column":1},"filename":"private.py"}"#,
+        "",
+        false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(contradiction["passed"], false);
+}
+
+#[test]
+fn node_native_test_evidence_requires_complete_tap_and_agrees_with_process_result() {
+    use crate::tool_runtime::jobs::validation_job_projection_with_policy;
+    let output = "TAP version 13\n# Subtest: works\nok 1 - works\n1..1\n# tests 1\n# suites 0\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 13.3\n";
+    for (truncated, minimum, expected) in [(false, 1, true), (false, 2, false), (true, 1, false)] {
+        let result = validation_job_projection_with_policy(
+            Some("node:tap:test"),
+            Some("test"),
+            "completed",
+            Some(0),
+            output,
+            "",
+            truncated,
+            None,
+            Some(minimum),
+            Some(true),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result["passed"], expected);
+        assert_eq!(
+            result["tests_run_count"],
+            if truncated {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(1)
+            }
+        );
+        assert_eq!(
+            result["test_count_assertion"]["status"],
+            if truncated {
+                "unproven"
+            } else if expected {
+                "passed"
+            } else {
+                "failed"
+            }
+        );
+    }
+    let unproven_without_minimum = validation_job_projection_with_policy(
+        Some("node:tap:test"),
+        Some("test"),
+        "completed",
+        Some(0),
+        "TAP version 13\n",
+        "",
+        false,
+        None,
+        None,
+        Some(false),
+        None,
+    )
+    .unwrap();
+    assert_eq!(unproven_without_minimum["passed"], false);
+    assert!(unproven_without_minimum["tests_run_count"].is_null());
+    let truncated_without_minimum = validation_job_projection_with_policy(
+        Some("node:tap:test"),
+        Some("test"),
+        "completed",
+        Some(0),
+        output,
+        "",
+        true,
+        None,
+        None,
+        Some(false),
+        None,
+    )
+    .unwrap();
+    assert_eq!(truncated_without_minimum["passed"], false);
+    let contradiction = validation_job_projection_with_policy(
+        Some("node:tap:test"),
+        Some("test"),
+        "completed",
+        Some(0),
+        &output
+            .replace("# fail 0", "# fail 1")
+            .replace("# tests 1", "# tests 2"),
+        "",
+        false,
+        None,
+        Some(1),
+        Some(true),
+        None,
+    )
+    .unwrap();
+    assert!(!contradiction["passed"].as_bool().unwrap());
+    assert!(contradiction["tests_run_count"].is_null());
+
+    let with_plain_diagnostics = output.replacen(
+        "\n1..1\n# tests",
+        "\n# pass phase complete\n# skipped optional setup\n1..1\n# tests",
+        1,
     );
-    assert!(result.is_err());
+    let accepted = validation_job_projection_with_policy(
+        Some("node:tap:test"),
+        Some("test"),
+        "completed",
+        Some(0),
+        &with_plain_diagnostics,
+        "",
+        false,
+        None,
+        Some(1),
+        Some(true),
+        None,
+    )
+    .unwrap();
+    assert_eq!(accepted["passed"], true);
+    assert_eq!(accepted["tests_run_count"], 1);
+
+    // A canonical exit cannot make malformed TAP accounting authoritative,
+    // including when the caller does not require a positive test count.
+    for forged in [
+        output.replace("\n1..1\n# tests", "\n    1..1\n# tests"),
+        output.replace("\n1..1\n# tests", "\n# pass 1\n1..1\n# tests"),
+        output.replace("# Subtest: works\nok 1 - works\n1..1", "1..0"),
+    ] {
+        for require_tests in [Some(true), Some(false)] {
+            let unproven = validation_job_projection_with_policy(
+                Some("node:tap:test"),
+                Some("test"),
+                "completed",
+                Some(0),
+                &forged,
+                "",
+                false,
+                None,
+                None,
+                require_tests,
+                None,
+            )
+            .unwrap();
+            assert_eq!(unproven["passed"], false);
+            assert_eq!(unproven["tests_detected"], false);
+            assert!(unproven["tests_run_count"].is_null());
+            assert!(unproven["tests_passed"].is_null());
+        }
+    }
+}
+
+#[test]
+fn node_json_validation_uses_only_owned_report_evidence_and_same_job_policy() {
+    use crate::runner_protocol::ShellJobTestCountEvidence;
+    use crate::tool_runtime::jobs::validation_job_projection_with_policy;
+    use webcodex_core::validation_evidence::CargoTestCountEvidenceStatus;
+    for tool in ["node:vitest:test", "node:jest:test"] {
+        let evidence = ShellJobTestCountEvidence {
+            tests_detected: true,
+            tests_run_count: Some(2),
+            tests_passed: Some(2),
+            tests_failed: Some(0),
+            status: CargoTestCountEvidenceStatus::CompleteSummary,
+        };
+        for (truncated, minimum, passed) in [(false, 1, true), (true, 1, true), (false, 3, false)] {
+            let value = validation_job_projection_with_policy(
+                Some(tool),
+                Some("test"),
+                "completed",
+                Some(0),
+                "arbitrary tests passed 999",
+                "",
+                truncated,
+                Some(&evidence),
+                Some(minimum),
+                Some(true),
+                None,
+            )
+            .unwrap();
+            assert_eq!(value["passed"], passed, "{tool}: {value}");
+            assert_eq!(value["tests_run_count"], 2);
+            assert_eq!(value["tests_passed"], 2);
+            assert_eq!(value["require_tests"], true);
+        }
+        let absent = validation_job_projection_with_policy(
+            Some(tool),
+            Some("test"),
+            "completed",
+            Some(0),
+            r#"{"numPassedTests":999}"#,
+            "",
+            false,
+            None,
+            None,
+            Some(false),
+            None,
+        )
+        .unwrap();
+        assert_eq!(absent["passed"], false);
+        assert!(absent["tests_run_count"].is_null());
+        let zero = ShellJobTestCountEvidence {
+            tests_detected: true,
+            tests_run_count: Some(0),
+            tests_passed: Some(0),
+            tests_failed: Some(0),
+            status: CargoTestCountEvidenceStatus::CompleteSummary,
+        };
+        for (required, minimum, expected) in [
+            (true, Some(1), false),
+            (false, None, true),
+            (false, Some(1), false),
+        ] {
+            let value = validation_job_projection_with_policy(
+                Some(tool),
+                Some("test"),
+                "completed",
+                Some(0),
+                "",
+                "",
+                false,
+                Some(&zero),
+                minimum,
+                Some(required),
+                None,
+            )
+            .unwrap();
+            assert_eq!(value["passed"], expected, "{tool}: {value}");
+            assert_eq!(value["zero_tests_run"], true);
+        }
+        for status in ["timeout", "stopped", "lost", "running"] {
+            let value = validation_job_projection_with_policy(
+                Some(tool),
+                Some("test"),
+                status,
+                Some(0),
+                "",
+                "",
+                false,
+                Some(&evidence),
+                Some(1),
+                Some(true),
+                None,
+            )
+            .unwrap();
+            assert!(
+                value["tests_run_count"].is_null(),
+                "{tool}/{status}: {value}"
+            );
+            assert_ne!(value["passed"], true);
+        }
+    }
 }

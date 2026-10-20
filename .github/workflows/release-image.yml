@@ -26,6 +26,9 @@ env:
 
 jobs:
   resolve:
+    # Preview releases only distribute GitHub binaries; no automatic GHCR image.
+    # An operator can still explicitly dispatch this workflow from main.
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -50,7 +53,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -171,16 +174,16 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
           persist-credentials: false
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -188,7 +191,7 @@ jobs:
 
       - name: Build and push native image by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -217,7 +220,7 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
           EXPECTED_ARCH: ${{ matrix.architecture }}
           VERSION: ${{ needs.resolve.outputs.version }}
-          SOURCE_SHORT: ${{ needs.resolve.outputs.source_short }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           BUILT_AT: ${{ needs.resolve.outputs.built_at }}
         run: |
           set -euo pipefail
@@ -237,11 +240,29 @@ jobs:
             test ! -e /usr/local/bin/webcodex-runner
           '
 
-          expected_server="webcodex-server $VERSION (commit $SOURCE_SHORT, dirty=false, built_at=$BUILT_AT)"
-          expected_cli="webcodex $VERSION (commit $SOURCE_SHORT, dirty=false, built_at=$BUILT_AT)"
-          test "$(docker run --rm "$ref" --version)" = "$expected_server"
-          test "$(docker run --rm --entrypoint /usr/local/bin/webcodex "$ref" --version)" = "$expected_cli"
+          server_info="$RUNNER_TEMP/webcodex-server-build-info.json"
+          cli_info="$RUNNER_TEMP/webcodex-cli-build-info.json"
+          docker run --rm "$ref" --build-info-json > "$server_info"
+          docker run --rm --entrypoint /usr/local/bin/webcodex "$ref" --build-info-json > "$cli_info"
+          python3 - "$server_info" "$cli_info" "$VERSION" "$SOURCE_SHA" "$BUILT_AT" <<'PY'
+          import json
+          import sys
 
+          server_path, cli_path, version, source_sha, built_at = sys.argv[1:]
+          for path, binary in ((server_path, "webcodex-server"), (cli_path, "webcodex")):
+              info = json.load(open(path, encoding="utf-8"))
+              if info.get("schema_version") != 1 or info.get("binary") != binary:
+                  raise SystemExit(f"unexpected image build-info schema: {binary}")
+              commit = info.get("git_commit")
+              if (
+                  info.get("version") != version
+                  or not isinstance(commit, str)
+                  or not source_sha.startswith(commit)
+                  or info.get("git_dirty") is not False
+                  or info.get("built_at") != built_at
+              ):
+                  raise SystemExit(f"image build identity mismatch: {binary}")
+          PY
           name="webcodex-image-smoke-${GITHUB_RUN_ID}-${{ matrix.slug }}"
           cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
           trap cleanup EXIT
@@ -272,7 +293,7 @@ jobs:
           touch "$RUNNER_TEMP/server-image-digests/${DIGEST#sha256:}"
 
       - name: Upload native digest marker
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: server-image-digest-${{ matrix.slug }}
           path: ${{ runner.temp }}/server-image-digests/*
@@ -289,7 +310,7 @@ jobs:
     outputs:
       digest: ${{ steps.publish.outputs.digest }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -298,16 +319,16 @@ jobs:
           # guarded backfill for older Releases whose tags predate this tooling.
           ref: ${{ github.workflow_sha }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: server-image-digest-*
           path: ${{ runner.temp }}/server-image-digests
@@ -595,7 +616,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Require anonymous GHCR availability
         shell: bash

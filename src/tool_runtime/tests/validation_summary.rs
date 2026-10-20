@@ -54,16 +54,16 @@ fn record_correlated_validation_invocation(
 }
 
 #[test]
-fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized() {
+fn validation_summary_registration_schema_and_metadata_are_synchronized() {
     let call = ToolCall::from_tool_name(
-        "validation_summary",
+        "read_validation_summary",
         json!({
             "project": SAMPLE_PROJECT,
             "session_id": "wc_sess_explicit",
             "limit": 7
         }),
     )
-    .expect("validation_summary should parse");
+    .expect("read_validation_summary should parse");
     match call {
         ToolCall::ValidationSummary {
             project,
@@ -74,7 +74,7 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
             assert_eq!(session_id, "wc_sess_explicit");
             assert_eq!(limit, Some(7));
         }
-        other => panic!("expected validation_summary, got {other:?}"),
+        other => panic!("expected read_validation_summary, got {other:?}"),
     }
 
     let specs = registered_tool_specs();
@@ -84,17 +84,22 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
         known_tool_names().count(),
         "visible specs + hidden tools should cover every known runtime tool"
     );
-    let spec = spec_named(&specs, "validation_summary");
+    let spec = spec_named(&specs, "read_validation_summary");
     assert_eq!(spec.input_schema["additionalProperties"], false);
     assert_eq!(
         spec.input_schema["required"],
         json!(["project", "session_id"])
     );
     assert_eq!(spec.input_schema["properties"]["limit"]["minimum"], 1);
-    assert_eq!(spec.input_schema["properties"]["limit"]["maximum"], 100);
+    assert!(spec.input_schema["properties"]["limit"]
+        .get("maximum")
+        .is_none());
+    assert!(spec.input_schema["properties"]["limit"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("clamped to 100")));
     assert!(spec.description.to_lowercase().contains("does not run"));
 
-    let output = output_schema_for_tool("validation_summary");
+    let output = output_schema_for_tool("read_validation_summary");
     let output = &output["properties"]["output"];
     assert_eq!(output["additionalProperties"], false);
     for field in ["project", "session_id", "validation"] {
@@ -105,7 +110,7 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
         false
     );
 
-    let metadata = lookup_tool_metadata("validation_summary").unwrap();
+    let metadata = lookup_tool_metadata("read_validation_summary").unwrap();
     assert_eq!(metadata.risk, ToolRisk::Read);
     assert_eq!(
         metadata.authority,
@@ -119,30 +124,14 @@ fn validation_summary_registration_schema_metadata_and_openapi_are_synchronized(
     assert!(!metadata.destructive);
     assert!(!metadata.shell_like);
     assert_eq!(
-        oauth_scope_policy_for_runtime_tool("validation_summary"),
+        oauth_scope_policy_for_runtime_tool("read_validation_summary"),
         OAuthToolScopePolicy::Require(SCOPE_PROJECT_READ)
     );
 
-    let openapi = crate::openapi::build_openapi_spec();
-    let tool_call = &openapi["components"]["schemas"]["ToolCallRequest"];
-    let description = tool_call["properties"]["tool"]["description"]
-        .as_str()
-        .unwrap();
-    assert!(description.contains("validation_summary"));
-    for field in ["project", "session_id", "limit"] {
-        assert!(
-            tool_call["properties"].get(field).is_some(),
-            "missing {field}"
-        );
-    }
-    assert_eq!(tool_call["additionalProperties"], false);
-    let operation_count: usize = openapi["paths"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|methods| methods.as_object().unwrap().len())
-        .sum();
-    assert_eq!(operation_count, 22);
+    assert_eq!(
+        crate::model_surface::adaptive_runtime_gateway_target_route("read_validation_summary"),
+        crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
+    );
 }
 
 #[tokio::test]
@@ -585,6 +574,8 @@ async fn validation_summary_keeps_zero_tests_from_resolving_cargo_test_failure()
             "stderr_truncated": false,
             "tests_detected": true,
             "tests_run_count": 0,
+            "tests_passed": 0,
+            "tests_failed": 0,
             "zero_tests_run": true
         }),
     );
@@ -611,6 +602,12 @@ async fn validation_summary_keeps_zero_tests_from_resolving_cargo_test_failure()
         result.output["validation"]["historical_failures"]["unresolved"],
         true
     );
+    let schema = output_schema_for_tool("read_validation_summary");
+    let serialized = serde_json::to_value(&result).unwrap();
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&serialized, &schema)
+        .unwrap_or_else(|error| {
+            panic!("read_validation_summary runtime/schema drift: {error}; {serialized}")
+        });
 }
 
 #[tokio::test]
@@ -695,6 +692,8 @@ async fn validation_summary_is_present_in_validation_tool_manifest_without_new_a
     let runtime = test_runtime();
     let manifest = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: Some("validation".to_string()),
             intent: None,
@@ -707,7 +706,7 @@ async fn validation_summary_is_present_in_validation_tool_manifest_without_new_a
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "validation_summary"));
+        .any(|tool| tool["name"] == "read_validation_summary"));
 }
 
 fn record_validation_event(

@@ -1,18 +1,15 @@
 use salvo::prelude::*;
+use webcodex_core::authority::profiles::OPTIONAL_BROWSER;
 
 use crate::auth::{
     generate_oauth_authorization_code, hash_token, shared_key_hash_of, AuthContext,
-    DIRECT_SHARED_KEY_MODEL_SCOPES, SCOPE_CODING_AGENT_RUN, SCOPE_COMMUNICATION_MANAGE,
-    SCOPE_COMMUNICATION_READ, SCOPE_COMPUTER_CLIPBOARD_READ, SCOPE_COMPUTER_CLIPBOARD_WRITE,
-    SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ, SCOPE_COMPUTER_LAUNCH,
-    SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_JOB_RUN, SCOPE_MCP_LOCAL,
-    SCOPE_MEMORY_MANAGE, SCOPE_MEMORY_READ, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE,
-    SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE,
-    SCOPE_SSH_LOCAL,
+    DIRECT_SHARED_KEY_MODEL_SCOPES, SCOPE_CODING_AGENT_RUN, SCOPE_COMPUTER_CLIPBOARD_READ,
+    SCOPE_COMPUTER_CLIPBOARD_WRITE, SCOPE_COMPUTER_CONTROL, SCOPE_COMPUTER_DISPLAY_READ,
+    SCOPE_COMPUTER_LAUNCH, SCOPE_COMPUTER_POINTER_CONTROL, SCOPE_COMPUTER_READ, SCOPE_MCP_LOCAL,
+    SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_SSH_LOCAL,
 };
 use crate::models::OAuthAuthorizationCodeRecord;
 use crate::runner_http::{RunnerFeature, RunnerFeatureSet};
-use webcodex_core::authority::SCOPE_RUNNER_MANAGE;
 
 use super::{
     apply_oauth_no_store_headers, authorize_bridge_html, decoded_authorize_param, form_field,
@@ -25,37 +22,10 @@ use super::{
 pub(crate) const OAUTH_BRIDGE_INVALID_SCOPE_MESSAGE: &str =
     "bridge tokens exceed the ordinary shared-key OAuth scope ceiling";
 
-pub(crate) const SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES: &[&str] = &[
-    SCOPE_COMPUTER_LAUNCH,
-    SCOPE_COMPUTER_DISPLAY_READ,
-    SCOPE_COMPUTER_POINTER_CONTROL,
-    SCOPE_COMPUTER_CLIPBOARD_READ,
-    SCOPE_COMPUTER_CLIPBOARD_WRITE,
-];
-
-/// Canonical ceiling for a fresh Computer-enabled shared-key OAuth client.
-/// Existing clients may retain a narrower non-empty baseline subset and add the
-/// same fixed optional Computer scopes.
-pub(crate) const SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES: &[&str] = &[
-    SCOPE_RUNTIME_READ,
-    SCOPE_RUNNER_MANAGE,
-    SCOPE_SESSION_COLLABORATE,
-    SCOPE_PROJECT_READ,
-    SCOPE_PROJECT_WRITE,
-    SCOPE_MEMORY_READ,
-    SCOPE_MEMORY_MANAGE,
-    SCOPE_COMMUNICATION_READ,
-    SCOPE_COMMUNICATION_MANAGE,
-    SCOPE_JOB_RUN,
-    SCOPE_COMPUTER_READ,
-    SCOPE_COMPUTER_CONTROL,
-    SCOPE_COMPUTER_LAUNCH,
-    SCOPE_COMPUTER_DISPLAY_READ,
-    SCOPE_COMPUTER_POINTER_CONTROL,
-    SCOPE_COMPUTER_CLIPBOARD_READ,
-    SCOPE_COMPUTER_CLIPBOARD_WRITE,
-];
-
+pub(crate) use webcodex_core::authority::profiles::{
+    OPTIONAL_COMPUTER as SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES,
+    SHARED_KEY_COMPUTER as SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES,
+};
 #[derive(Debug, Clone, Copy)]
 struct BridgePermissionSpec {
     id: &'static str,
@@ -126,50 +96,14 @@ fn bridge_scope_list_is_unique(scopes: &[String]) -> bool {
 }
 
 fn bridge_baseline_scope_ceiling_is_valid(scopes: &[String]) -> bool {
-    !scopes.is_empty()
-        && bridge_scope_list_is_unique(scopes)
-        && scopes
-            .iter()
-            .all(|scope| bridge_oauth_scopes().contains(&scope.as_str()))
+    webcodex_core::authority::profiles::is_baseline(scopes)
 }
-
 fn bridge_computer_scope_ceiling_is_valid(scopes: &[String]) -> bool {
-    if scopes.is_empty() || !bridge_scope_list_is_unique(scopes) {
-        return false;
-    }
-
-    let mut has_baseline_scope = false;
-    for scope in scopes {
-        if bridge_oauth_scopes().contains(&scope.as_str()) {
-            has_baseline_scope = true;
-        } else if !SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES.contains(&scope.as_str()) {
-            return false;
-        }
-    }
-
-    has_baseline_scope
-        && SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES
-            .iter()
-            .all(|required| scopes.iter().any(|scope| scope == required))
+    webcodex_core::authority::profiles::is_computer(scopes)
 }
-
 fn bridge_computer_enabled_scope_ceiling(scopes: &[String]) -> Option<Vec<String>> {
-    if bridge_computer_scope_ceiling_is_valid(scopes) {
-        return Some(scopes.to_vec());
-    }
-    if !bridge_baseline_scope_ceiling_is_valid(scopes) {
-        return None;
-    }
-
-    let mut expanded = scopes.to_vec();
-    expanded.extend(
-        SHARED_KEY_OAUTH_OPTIONAL_COMPUTER_SCOPES
-            .iter()
-            .map(|scope| (*scope).to_string()),
-    );
-    Some(expanded)
+    webcodex_core::authority::profiles::with_computer(scopes)
 }
-
 fn bridge_scope_ceiling_without_optional_class_scopes(scopes: &[String]) -> Option<Vec<String>> {
     if !bridge_scope_list_is_unique(scopes) {
         return None;
@@ -178,14 +112,15 @@ fn bridge_scope_ceiling_without_optional_class_scopes(scopes: &[String]) -> Opti
         scopes
             .iter()
             .filter(|scope| {
-                !matches!(
-                    scope.as_str(),
-                    SCOPE_MCP_LOCAL
-                        | SCOPE_PLUGIN_INSPECT
-                        | SCOPE_PLUGIN_INVOKE
-                        | SCOPE_SSH_LOCAL
-                        | SCOPE_CODING_AGENT_RUN
-                )
+                !OPTIONAL_BROWSER.contains(&scope.as_str())
+                    && !matches!(
+                        scope.as_str(),
+                        SCOPE_MCP_LOCAL
+                            | SCOPE_PLUGIN_INSPECT
+                            | SCOPE_PLUGIN_INVOKE
+                            | SCOPE_SSH_LOCAL
+                            | SCOPE_CODING_AGENT_RUN
+                    )
             })
             .cloned()
             .collect(),
@@ -193,6 +128,13 @@ fn bridge_scope_ceiling_without_optional_class_scopes(scopes: &[String]) -> Opti
 }
 
 fn bridge_scope_ceiling_is_valid(scopes: &[String]) -> bool {
+    let browser_count = OPTIONAL_BROWSER
+        .iter()
+        .filter(|s| scopes.iter().any(|scope| scope == **s))
+        .count();
+    if browser_count != 0 && browser_count != OPTIONAL_BROWSER.len() {
+        return false;
+    }
     let Some(base) = bridge_scope_ceiling_without_optional_class_scopes(scopes) else {
         return false;
     };
@@ -201,6 +143,7 @@ fn bridge_scope_ceiling_is_valid(scopes: &[String]) -> bool {
 
 fn bridge_scope_ceiling_with_options(
     scopes: &[String],
+    browser_permissions: bool,
     computer_permissions: bool,
     local_mcp: bool,
     local_plugins: bool,
@@ -215,6 +158,9 @@ fn bridge_scope_ceiling_with_options(
     } else {
         return None;
     };
+    if browser_permissions {
+        desired.extend(OPTIONAL_BROWSER.iter().map(|s| s.to_string()));
+    }
     if local_mcp {
         desired.push(SCOPE_MCP_LOCAL.to_string());
     }
@@ -318,6 +264,7 @@ pub(crate) fn normalize_bridge_oauth_scopes(
             && scope != SCOPE_PLUGIN_INVOKE
             && scope != SCOPE_SSH_LOCAL
             && scope != SCOPE_CODING_AGENT_RUN
+            && !OPTIONAL_BROWSER.contains(&scope)
             && !SHARED_KEY_OAUTH_COMPUTER_ENABLED_SCOPES.contains(&scope)
     }) {
         return Err(OAuthAuthorizeError::InvalidScope(
@@ -342,6 +289,7 @@ impl BridgeAuthorizeValidated {
             .split_whitespace()
             .filter(|scope| {
                 bridge_oauth_scopes().contains(scope)
+                    || OPTIONAL_BROWSER.contains(scope)
                     || matches!(
                         *scope,
                         SCOPE_MCP_LOCAL
@@ -457,6 +405,7 @@ fn selected_bridge_grant_scopes(
         .filter(|scope| {
             *scope == OAUTH_OFFLINE_ACCESS_SCOPE
                 || bridge_oauth_scopes().contains(scope)
+                || OPTIONAL_BROWSER.contains(scope)
                 || *scope == SCOPE_MCP_LOCAL
                 || *scope == SCOPE_PLUGIN_INSPECT
                 || *scope == SCOPE_PLUGIN_INVOKE
@@ -611,6 +560,7 @@ pub(super) fn validate_bridge_authorize_request(
                 && local_plugins_enabled)
             && !(scope == SCOPE_SSH_LOCAL && local_ssh_enabled)
             && !(scope == SCOPE_CODING_AGENT_RUN && coding_agent_enabled)
+            && !(client.is_shared_key_owned() && OPTIONAL_BROWSER.contains(&scope))
             && !client_bridge_ceiling.contains(&scope)
     }) {
         redirect_with_oauth_error(
@@ -686,6 +636,7 @@ fn issue_bridge_authorization_code(
     let plaintext_code = generate_oauth_authorization_code();
     let code_hash = hash_token(&plaintext_code);
     let record = OAuthAuthorizationCodeRecord {
+        admin_authority: false,
         id: uuid::Uuid::new_v4().to_string(),
         code_hash,
         client_id: validated.client.client_id.clone(),
@@ -733,6 +684,8 @@ struct ProvisionSharedKeyOAuthClientRequest {
     client_id: Option<String>,
     #[serde(default)]
     previous_allowed_scopes: Option<Vec<String>>,
+    #[serde(default)]
+    browser_permissions: bool,
     #[serde(default)]
     computer_permissions: bool,
     #[serde(default)]
@@ -851,6 +804,16 @@ pub(crate) async fn oauth_shared_key_client_provision(
                     res.render(Json(serde_json::json!({"error": "persisted OAuth client exceeds the current ordinary shared-key OAuth scope ceiling"})));
                     return;
                 }
+                if !body.browser_permissions
+                    && client
+                        .allowed_scopes_vec()
+                        .iter()
+                        .any(|s| OPTIONAL_BROWSER.contains(&s.as_str()))
+                {
+                    res.status_code(StatusCode::CONFLICT);
+                    res.render(Json(serde_json::json!({"error": "OAuth client is Browser-enabled; reconnect with --oauth-browser-permissions"})));
+                    return;
+                }
                 if !body.computer_permissions && bridge_client_has_optional_computer_scope(&client)
                 {
                     res.status_code(StatusCode::CONFLICT);
@@ -891,6 +854,7 @@ pub(crate) async fn oauth_shared_key_client_provision(
                 let current_scopes = client.allowed_scopes_vec();
                 let Some(desired_scope_vec) = bridge_scope_ceiling_with_options(
                     &current_scopes,
+                    body.browser_permissions,
                     body.computer_permissions,
                     body.local_mcp,
                     body.local_plugins,
@@ -970,6 +934,15 @@ pub(crate) async fn oauth_shared_key_client_provision(
             .map(|scope| (*scope).to_string())
             .collect()
     });
+    if !body.browser_permissions
+        && base_scopes
+            .iter()
+            .any(|s| OPTIONAL_BROWSER.contains(&s.as_str()))
+    {
+        res.status_code(StatusCode::CONFLICT);
+        res.render(Json(serde_json::json!({"error": "persisted OAuth profile is Browser-enabled; reconnect with --oauth-browser-permissions"})));
+        return;
+    }
     if !body.computer_permissions
         && base_scopes
             .iter()
@@ -1019,6 +992,7 @@ pub(crate) async fn oauth_shared_key_client_provision(
     }
     let Some(create_scopes) = bridge_scope_ceiling_with_options(
         &base_scopes,
+        body.browser_permissions,
         body.computer_permissions,
         body.local_mcp,
         body.local_plugins,

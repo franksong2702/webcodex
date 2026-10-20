@@ -1,11 +1,39 @@
-use serde_json::{json, Value};
+use schemars::JsonSchema;
+use serde_json::{json, Map, Value};
 
-use webcodex_core::runtime_contract::{RECOVERY_KIND_VALUES, RECOVERY_TOOL_VALUES};
+use webcodex_core::runtime_contract::{
+    ContinuationCarrier, ContinuationKind, GeneratedFollowUpKind, CONTINUATION_CARRIER_VALUES,
+    CONTINUATION_KIND_VALUES, GENERATED_FOLLOW_UP_KIND_VALUES, RECOVERY_KIND_VALUES,
+};
 use webcodex_core::workflow_session_contract::{
-    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION, SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON,
+    SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION, SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON,
 };
 
+use crate::input_property_schema_for_tool;
+use crate::schema_generation::typed_host_schema;
 use crate::tool_definition::exploration_tool_names;
+
+pub(super) fn validation_source_state_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Never certifies current source, regardless of execution outcome. Uncrossed covers only canonical potential mutation dispatches in one live Control Project epoch, not external/process writes or an immutable snapshot.",
+        "properties": {
+            "freshness": {"type": "string", "enum": ["unproven", "stale"]},
+            "observed_mutation_fence": {"type": "string", "enum": ["uncrossed", "crossed", "unknown"]},
+            "start_fence": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "epoch": {"type": "string", "pattern": "^[0-9a-fA-F]{32}$", "maxLength": 32},
+                    "generation": {"type": "integer", "minimum": 0, "maximum": webcodex_core::validation_source::MAX_SOURCE_GENERATION},
+                    "quiescent": {"type": "boolean"}
+                },
+                "required": ["epoch", "generation", "quiescent"]
+            }
+        },
+        "required": ["freshness", "observed_mutation_fence"]
+    })
+}
 
 pub fn schema_type(kind: &str, description: &str) -> Value {
     json!({
@@ -24,37 +52,176 @@ pub fn nullable_schema(kind: &str, description: &str) -> Value {
     })
 }
 
-pub fn job_activity_schema() -> Value {
+pub(super) fn session_mode_schema(description: &str) -> Value {
+    input_property_schema_for_tool("start_session", "mode", description)
+}
+
+pub(super) fn session_guards_schema(description: &str) -> Value {
     json!({
-        "anyOf": [
-            {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "state": {"type": "string", "enum": ["working", "waiting"]},
-                    "phase": {
-                        "type": "string",
-                        "enum": [
-                            "process_running",
-                            "validation_format",
-                            "validation_check",
-                            "validation_test",
-                            "cargo_waiting_for_build_lock",
-                            "cargo_compiling",
-                            "cargo_checking"
-                        ]
-                    },
-                    "source": {
-                        "type": "string",
-                        "enum": ["runner_execution", "validation_plan", "cargo_output"]
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "deny_write_tools": {"type": "boolean"},
+            "deny_shell_tools": {"type": "boolean"}
+        },
+        "required": ["deny_write_tools", "deny_shell_tools"]
+    })
+}
+
+pub(super) fn session_execution_context_schema(description: &str) -> Value {
+    input_property_schema_for_tool("start_session", "execution_context", description)
+}
+
+pub(super) fn session_lifecycle_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": ["active", "closed"],
+        "description": description,
+    })
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+pub(super) fn checkpoint_validation_schema(description: &str) -> Value {
+    input_property_schema_for_tool("create_workspace_checkpoint", "validation", description)
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+pub(super) fn checkpoint_labels_schema(description: &str) -> Value {
+    input_property_schema_for_tool("create_workspace_checkpoint", "labels", description)
+}
+
+pub fn continuation_semantics_schema(
+    kind: ContinuationKind,
+    carrier: ContinuationCarrier,
+    description: &str,
+) -> Value {
+    debug_assert!(CONTINUATION_KIND_VALUES.contains(&kind.as_str()));
+    debug_assert!(CONTINUATION_CARRIER_VALUES.contains(&carrier.as_str()));
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"type": "string", "const": kind.as_str()},
+            "carrier": {"type": "string", "const": carrier.as_str()}
+        },
+        "required": ["kind", "carrier"]
+    })
+}
+
+/// Schema for an advisory parser-ready next tool call. The shape never grants
+/// authority or executes the tool. follow_up_kind is intentionally first-class
+/// because it changes whether a Host may continue mechanically without a new
+/// model decision. Domain schemas remain responsible for bounded arguments.
+pub fn suggested_tool_call_schema(
+    follow_up_kind: GeneratedFollowUpKind,
+    tool: &'static str,
+    arguments: Value,
+    description: &str,
+) -> Value {
+    debug_assert!(GENERATED_FOLLOW_UP_KIND_VALUES.contains(&follow_up_kind.as_str()));
+    json!({
+        "type": "object",
+        "description": description,
+        "additionalProperties": false,
+        "properties": {
+            "follow_up_kind": {"type": "string", "const": follow_up_kind.as_str()},
+            "tool": {"type": "string", "const": tool},
+            "arguments": arguments
+        },
+        "required": ["follow_up_kind", "tool", "arguments"]
+    })
+}
+
+/// Recognize the canonical schema shape for one parser-ready SuggestedToolCall.
+///
+/// This is intentionally structural rather than a model-visible marker keyword:
+/// adapters use it to project only formally declared action edges and never scan
+/// arbitrary tool output for user/plugin objects that happen to contain tool
+/// and arguments keys.
+pub fn suggested_tool_call_schema_target(schema: &Value) -> Option<&str> {
+    if schema.get("type").and_then(Value::as_str) != Some("object")
+        || schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
+    {
+        return None;
+    }
+    let properties = schema.get("properties")?.as_object()?;
+    if properties.len() != 3
+        || !properties.contains_key("follow_up_kind")
+        || !properties.contains_key("tool")
+        || !properties.contains_key("arguments")
+    {
+        return None;
+    }
+    let required = schema.get("required")?.as_array()?;
+    if required.len() != 3
+        || !required
+            .iter()
+            .any(|field| field.as_str() == Some("follow_up_kind"))
+        || !required.iter().any(|field| field.as_str() == Some("tool"))
+        || !required
+            .iter()
+            .any(|field| field.as_str() == Some("arguments"))
+    {
+        return None;
+    }
+    let follow_up_kind = properties.get("follow_up_kind")?;
+    if follow_up_kind.get("type").and_then(Value::as_str) != Some("string")
+        || !GENERATED_FOLLOW_UP_KIND_VALUES.contains(&follow_up_kind.get("const")?.as_str()?)
+    {
+        return None;
+    }
+    let tool = properties.get("tool")?;
+    if tool.get("type").and_then(Value::as_str) != Some("string") {
+        return None;
+    }
+    tool.get("const").and_then(Value::as_str)
+}
+pub fn job_activity_schema() -> Value {
+    let mut schema =
+        typed_host_schema::<Option<webcodex_core::runner_protocol::ShellJobActivity>>();
+    schema["description"] = json!("Runner-owned bounded current activity for an active Job. Observation only: it never replaces canonical status, proves completion, or grants retry/continuation authority. null means unavailable, terminal, or temporarily untrusted during recovery.");
+    schema
+}
+
+pub fn observe_job_continuation_schema() -> Value {
+    suggested_tool_call_schema(
+        GeneratedFollowUpKind::FallbackRecovery,
+        "observe_jobs",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "job_id": {"type": "string", "minLength": 1},
+                            "after_observation_token": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN
+                            }
+                        },
+                        "required": ["job_id"]
                     }
                 },
-                "required": ["state", "phase", "source"]
+                "wait_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
+                },
+                "wake_on": {"type": "string", "const": "terminal"}
             },
-            {"type": "null"}
-        ],
-        "description": "Runner-owned bounded current activity for an active Job. Observation only: it never replaces canonical status, proves completion, or grants retry/continuation authority. null means unavailable, terminal, or temporarily untrusted during recovery."
-    })
+            "required": ["items", "wait_secs", "wake_on"]
+        }),
+        "Bounded next-call hint for observing the exact already-started Job. Advisory only: it grants no authority, is not a retry token, and never starts background polling.",
+    )
 }
 
 pub fn exploration_tool_name_schema() -> Value {
@@ -104,6 +271,19 @@ pub fn task_outcome_schema(description: &str) -> Value {
     })
 }
 
+pub(super) fn acceptance_evidence_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "description": "Advisory acceptance-evidence readiness, separate from execution terminal state and task_outcome. ready_for_review never means natural-language requirements accepted. Existing suggested_next_actions/handoff_brief supply recovery actions; evidence_refs name existing sections without copying evidence. Source unproven, stale, incomplete or unknown cannot establish readiness.",
+        "properties": {
+            "state": {"type": "string", "enum": ["ready_for_review", "needs_evidence", "failed", "not_applicable"]},
+            "reason_codes": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "enum": ["workspace_unobserved", "review_missing", "validation_failed", "validation_stale", "source_unproven", "validation_not_run", "validation_inconclusive", "validation_unknown", "validation_evidence_incomplete", "zero_tests", "outputs_invalid", "outputs_historical", "outputs_unverified", "history_partial", "snapshot_changed", "closeout_blocked", "integrity_warning", "no_task_session"]}},
+            "evidence_refs": {"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "enum": ["workspace", "validation", "review_evidence", "task_outputs"]}}
+        },
+        "required": ["state", "reason_codes", "evidence_refs"]
+    })
+}
+
 pub fn evidence_history_schema(description: &str) -> Value {
     json!({
         "type": "object",
@@ -149,7 +329,7 @@ pub fn authority_profile_schema(description: &str) -> Value {
             },
             "source": {
                 "type": "string",
-                "description": "Where the resolved mode came from (default, env:WEBCODEX_AUTHORITY_MODE, migrated_env:WEBCODEX_PERMISSION_MODE, rejected_legacy_env:WEBCODEX_PERMISSION_MODE)."
+                "description": "Where the resolved mode came from (default, env:WEBCODEX_AUTHORITY_MODE, rejected_legacy_env:WEBCODEX_PERMISSION_MODE)."
             },
             "project_write": {
                 "type": "boolean",
@@ -282,7 +462,7 @@ pub fn search_match_schema() -> Value {
             "limit": {
                 "type": "integer",
                 "const": 80,
-                "description": "Deterministic bounded line count for read_file/read_files expansion."
+                "description": "Deterministic bounded line count for read_files expansion."
             }
         },
         "required": ["start_line", "limit"],
@@ -320,7 +500,7 @@ pub(super) fn session_hint_schema() -> Value {
         "properties": {
             "has_open_messages": {
                 "type": "boolean",
-                "description": "True when any counted open session-local message exists."
+                "description": "True when any counted open Session message exists or an otherwise uncounted open message requires acknowledgement."
             },
             "open_counts": {
                 "type": "object",
@@ -342,21 +522,21 @@ pub(super) fn session_hint_schema() -> Value {
             "attention_required": {
                 "type": "boolean",
                 "const": true,
-                "description": "Counts-only fallback marker for open high-priority guidance requiring model-context acknowledgement; may be omitted when the same response already fully projects or ACK-suppresses the urgent guidance set."
+                "description": "Counts-only fallback marker for an open Session message requiring model-context acknowledgement; may be omitted when the same response already fully projects or ACK-suppresses the required message set."
             },
             "attention_reason": {
                 "type": "string",
-                "enum": [SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON],
-                "description": "Stable reason for the strong counts-only attention fallback; omitted for ordinary hints and when the same response already fully covers the urgent guidance set."
+                "enum": [SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON],
+                "description": "Stable reason for the strong counts-only attention fallback; omitted for ordinary hints and when the same response already fully covers the ACK-required message set."
             },
             "attention_instruction": {
                 "type": "string",
-                "enum": [SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION],
-                "description": "Short fixed counts-only fallback instruction; never contains Session message body text and may be omitted when session_attention already fully covers the urgent guidance set."
+                "enum": [SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION],
+                "description": "Short fixed counts-only fallback instruction; never contains Session message body text and may be omitted when session_attention already fully covers the ACK-required message set."
             },
             "suggested_next_tool": {
                 "type": "string",
-                "enum": ["session_discussion_summary"],
+                "enum": ["read_session_discussion_summary"],
                 "description": "Tool to call when the model needs the bounded message details."
             }
         },
@@ -378,33 +558,251 @@ pub fn recovery_kind_schema() -> Value {
     })
 }
 
-pub fn recovery_tool_schema() -> Value {
+fn passive_failure_diagnostics_schema() -> Value {
+    use webcodex_core::validation_evidence::{PASSIVE_MAX_DIAGNOSTICS, PASSIVE_MAX_FAILED_TESTS};
+    let mut schema = super::testing::cargo_test_diagnostics_schema(
+        "Safe parser evidence, at most 8 KiB. For missing/truncated evidence use observe_jobs.",
+    );
+    let fields = schema["properties"].as_object_mut().unwrap();
+    for field in [
+        "parser",
+        "reason",
+        "invalid_diagnostics_omitted",
+        "truncated",
+    ] {
+        fields.remove(field);
+    }
+    fields.get_mut("diagnostics").unwrap()["maxItems"] = json!(PASSIVE_MAX_DIAGNOSTICS);
+    fields.get_mut("returned_diagnostic_count").unwrap()["maximum"] =
+        json!(PASSIVE_MAX_DIAGNOSTICS);
+    fields.get_mut("failed_test_details").unwrap()["maxItems"] = json!(PASSIVE_MAX_FAILED_TESTS);
+    // The generic decoration appears on many schemas; retain selection/bounds
+    // in one description instead of repeating full explicit-observation prose.
+    for field in fields.values_mut() {
+        if let Some(object) = field.as_object_mut() {
+            object.remove("description");
+        }
+    }
+    // Count names already express these facts; do not repeat them in each
+    // embedded passive schema alongside the explicit-observation descriptions.
+    if let Some(counts) = fields.get_mut("test_summary").unwrap()["properties"].as_object_mut() {
+        for count in counts.values_mut() {
+            count.as_object_mut().unwrap().remove("description");
+        }
+    }
+    schema["required"] = json!([
+        "available",
+        "diagnostics",
+        "returned_diagnostic_count",
+        "diagnostics_truncated",
+        "failed_test_details",
+        "failed_test_details_truncated"
+    ]);
+    schema
+}
+
+pub(super) fn passive_job_attention_schema() -> Value {
+    let details = suggested_tool_call_schema(
+        GeneratedFollowUpKind::FallbackRecovery,
+        "observe_jobs",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "job_id": {"type": "string", "minLength": 1, "maxLength": 128}
+                        },
+                        "required": ["job_id"]
+                    }
+                }
+            },
+            "required": ["items"]
+        }),
+        "Read bounded details of this Job only if passive evidence is insufficient.",
+    );
+    let validation = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Historical validation proof; source_state independently describes the mutation fence.",
+        "properties": {
+            "tool": {"type": "string", "maxLength": 64},
+            "kind": {"type": "string", "enum": ["format", "check", "test", "validation", "build", "release"]},
+            "state": {"type": "string", "enum": ["pending", "running", "completed", "timed_out", "cancelled", "lost"]},
+            "passed": nullable_schema("boolean", "Authoritative validation verdict; null is unproven."),
+            "tests_detected": nullable_schema("boolean", "Tests detected by authoritative evidence."),
+            "tests_run_count": nullable_schema("integer", "Proven executed-test count, else null."),
+            "zero_tests_run": nullable_schema("boolean", "Whether zero tests ran; null if unproven."),
+            "test_count_assertion": cargo_test_count_assertion_schema(),
+            "require_tests": {"type": "boolean"},
+            "no_run": {"type": "boolean"},
+            "validation_target_id": {"type": "string", "maxLength": 256},
+            "source_state": validation_source_state_schema(),
+            "diagnostics": passive_failure_diagnostics_schema()
+        },
+        "required": ["kind", "source_state"]
+    });
     json!({
-        "type": "string",
-        "enum": RECOVERY_TOOL_VALUES,
-        "description": "Optional bounded public WebCodex tool to use for the declared reobserve or reconcile action. This field never grants authority or triggers execution."
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Changed Jobs in the exact authenticated Window/Project/Workflow Session. Passive only: never starts, retries, waits or polls.",
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "job_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "tool": {"type": "string", "maxLength": 64},
+                        "status": {"type": "string", "maxLength": 64},
+                        "state": {"type": "string", "enum": ["active", "terminal"]},
+                        "recovery_state": {"type": "string", "maxLength": 64},
+                        "recovery_reason_code": {"type": "string", "maxLength": 128},
+                        "outcome": {"type": "string", "enum": ["passed", "failed", "timed_out", "cancelled"], "description": "Terminal execution outcome. Without state/status, any validation also passed; source_state never certifies current source."},
+                        "exit_code": nullable_schema("integer", "Known terminal exit code, else null."),
+                        "command_ok": nullable_schema("boolean", "Process success only; see validation for proof."),
+                        "validation": validation,
+                        "details": details
+                    },
+                    "required": ["job_id", "tool"],
+                    "oneOf": [
+                        {
+                            "required": ["status", "state"],
+                            "properties": {"validation": {"required": ["tool", "state", "passed"]}}
+                        },
+                        {
+                            "required": ["outcome"],
+                            "properties": {
+                                "outcome": {"const": "passed"},
+                                "status": {"enum": []}, "state": {"enum": []},
+                                "exit_code": {"enum": []}, "command_ok": {"enum": []}, "details": {"enum": []},
+                                "recovery_state": {"enum": []}, "recovery_reason_code": {"enum": []},
+                                "validation": {
+                                    "properties": {
+                                        "state": {"enum": []}, "passed": {"enum": []}, "diagnostics": {"enum": []},
+                                        "source_state": {
+                                            "properties": {
+                                                "freshness": {"const": "unproven"},
+                                                "observed_mutation_fence": {"const": "uncrossed"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        "required": ["items"]
     })
 }
 
+fn add_optional_output_property(schema: &mut Value, name: &str, property_schema: &Value) {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties
+            .entry(name.to_string())
+            .or_insert_with(|| property_schema.clone());
+    } else if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+        let mut properties = Map::new();
+        properties.insert(name.to_string(), property_schema.clone());
+        schema["properties"] = Value::Object(properties);
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = schema.get_mut(keyword).and_then(Value::as_array_mut) {
+            for branch in branches {
+                add_optional_output_property(branch, name, property_schema);
+            }
+        }
+    }
+    for keyword in ["then", "else"] {
+        if let Some(branch) = schema.get_mut(keyword) {
+            add_optional_output_property(branch, name, property_schema);
+        }
+    }
+}
+
+pub(super) fn add_passive_job_attention_to_envelope(schema: &mut Value) {
+    let attention = passive_job_attention_schema();
+    add_passive_job_attention_to_envelope_with_schema(schema, &attention);
+}
+
+fn add_passive_job_attention_to_envelope_with_schema(schema: &mut Value, attention: &Value) {
+    if let Some(output) = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("output"))
+    {
+        add_optional_output_property(output, "job_attention", attention);
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = schema.get_mut(keyword).and_then(Value::as_array_mut) {
+            for branch in branches {
+                add_passive_job_attention_to_envelope_with_schema(branch, attention);
+            }
+        }
+    }
+    for keyword in ["then", "else"] {
+        if let Some(branch) = schema.get_mut(keyword) {
+            add_passive_job_attention_to_envelope_with_schema(branch, attention);
+        }
+    }
+}
+
 pub fn wrapped_output_schema(output_properties: Vec<(&str, Value)>) -> Value {
-    let mut output_properties = output_properties;
-    output_properties.extend([
+    let properties = output_properties
+        .into_iter()
+        .map(|(name, schema)| (name.to_string(), schema))
+        .collect::<Map<_, _>>();
+    wrapped_output_schema_from_properties(properties)
+}
+
+/// Build the existing sparse ToolResult envelope from a canonical typed payload.
+///
+/// The DTO owns property names, nested shapes, enums, and structural bounds. Its
+/// `required` list is intentionally not lifted into `ToolResult.output`: runtime
+/// failures/not-started/outcome-unknown projections remain sparse, and generic
+/// runtime decorations remain legal. Overrides are reserved for explicit model
+/// projection boundaries such as intentionally-open nested LSP payloads.
+pub fn wrapped_typed_output_schema<T: JsonSchema>(overrides: Vec<(&str, Value)>) -> Value {
+    let schema = typed_host_schema::<T>();
+    let mut properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .expect("typed output payload JsonSchema must be an object");
+    for (name, replacement) in overrides {
+        assert!(
+            properties.contains_key(name),
+            "typed output payload has no property {name}"
+        );
+        properties.insert(name.to_string(), replacement);
+    }
+    wrapped_output_schema_from_properties(properties)
+}
+
+fn wrapped_output_schema_from_properties(mut properties: Map<String, Value>) -> Value {
+    properties.extend([
         (
-            "trace_ref",
+            "trace_ref".to_string(),
             schema_type(
                 "string",
                 "Opaque operator diagnostic reference emitted only on eligible failed calls while full tracing is enabled. Read with read_tool_trace; on Adaptive Runtime invoke that target through call_runtime_tool. Never a native path.",
             ),
         ),
-        ("session_hint", session_hint_schema()),
-        ("permission", permission_decision_schema()),
-        ("recovery_kind", recovery_kind_schema()),
-        ("recovery_tool", recovery_tool_schema()),
+        ("session_hint".to_string(), session_hint_schema()),
+        ("permission".to_string(), permission_decision_schema()),
+        ("recovery_kind".to_string(), recovery_kind_schema()),
     ]);
-    let properties = output_properties
-        .into_iter()
-        .map(|(name, schema)| (name.to_string(), schema))
-        .collect::<serde_json::Map<_, _>>();
     json!({
         "type": "object",
         "properties": {
@@ -436,29 +834,7 @@ pub fn wrapped_output_schema(output_properties: Vec<(&str, Value)>) -> Value {
                                 "recovery_kind": {
                                     "type": "null",
                                     "const": "__forbidden_on_success__"
-                                },
-                                "recovery_tool": {
-                                    "type": "null",
-                                    "const": "__forbidden_on_success__"
                                 }
-                            }
-                        }
-                    }
-                }
-            },
-            {
-                "if": {
-                    "properties": {
-                        "output": {"required": ["recovery_tool"]}
-                    },
-                    "required": ["output"]
-                },
-                "then": {
-                    "properties": {
-                        "output": {
-                            "required": ["recovery_kind"],
-                            "properties": {
-                                "recovery_kind": {"enum": ["reobserve", "reconcile"]}
                             }
                         }
                     }
@@ -481,14 +857,14 @@ pub fn cargo_test_count_assertion_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": webcodex_core::runner_protocol::CARGO_TEST_MIN_TESTS_MAX,
-                "description": "Effective caller-requested minimum after combining require_tests and min_tests."
+                "description": "Caller minimum combining require_tests and min_tests."
             },
             "actual_tests_run": {
                 "anyOf": [
                     {"type": "integer", "minimum": 0},
                     {"type": "null"}
                 ],
-                "description": "Proven executed test count, or null when complete count evidence was unavailable."
+                "description": "Proven executed count; null if complete count evidence is unavailable."
             },
             "status": {
                 "type": "string",
@@ -500,8 +876,8 @@ pub fn cargo_test_count_assertion_schema() -> Value {
             },
             "evidence_reason_code": {
                 "type": "string",
-                "enum": ["complete_summary", "output_truncated", "partial_harness_summary", "no_complete_summary"],
-                "description": "Why executed-test count evidence was proven or remained unavailable; this refines evidence diagnostics without changing the assertion verdict."
+                "enum": ["complete_summary", "output_truncated", "partial_harness_summary", "no_complete_summary", "incomplete_stream"],
+                "description": "Why count evidence is proven/unavailable; diagnostic only, never changes the verdict."
             }
         },
         "required": ["minimum_tests", "actual_tests_run", "status", "reason_code", "evidence_reason_code"]
@@ -546,8 +922,92 @@ pub fn continuation_feedback_schema(description: &str) -> Value {
     })
 }
 
-/// Strict compact handoff projection shared by `session_handoff_summary` and
+pub(super) fn external_observation_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": description,
+        "properties": {
+            "adapter_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+            "event_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+            "tool": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "maxLength": 64},
+            "exit_code": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            "recorded_at": {"type": "integer"},
+            "status": {"type": "string", "enum": ["unknown", "reported_success", "reported_failure"]}
+        },
+        "required": ["adapter_id", "event_id", "tool", "exit_code", "recorded_at", "status"]
+    })
+}
+
+/// Strict compact handoff projection shared by `read_session_handoff` and
 /// `finish_coding_task`.
+pub fn task_context_message_notes_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Newest retained explicitly recorded Session notes. Reports are context, not execution/completion proof or new authority. A null total means the discussion snapshot was unavailable; truncation is explicit and this is not a full transcript.",
+        "additionalProperties": false,
+        "properties": {
+            "total": json!({"type":["integer","null"],"minimum":0}),
+            "returned": {"type": "integer", "minimum": 0, "maximum": 5},
+            "truncated": {"type": "boolean"},
+            "items": {
+                "type": "array", "maxItems": 5,
+                "items": {
+                    "type": "object", "additionalProperties": false,
+                    "properties": {
+                        "message_id": {"type": "string", "maxLength": 128},
+                        "status": {"type": "string", "enum": ["open", "resolved"]},
+                        "created_at": {"type": "integer"},
+                        "excerpt": {"type": "string", "maxLength": 600},
+                        "truncated": {"type": "boolean"},
+                        "superseded_by_message_id": json!({"type":["string","null"],"maxLength":128})
+                    },
+                    "required": ["message_id", "status", "created_at", "excerpt", "truncated", "superseded_by_message_id"]
+                }
+            }
+        },
+        "required": ["total", "returned", "truncated", "items"]
+    })
+}
+
+/// Source-referenced task recovery pointers, never execution authority or completion proof.
+pub fn task_context_schema() -> Value {
+    let bounded = |item: Value, maximum: usize| {
+        json!({
+            "type":"object", "additionalProperties":false,
+            "properties": {"items":{"type":"array","maxItems":maximum,"items":item},
+                "total":{"type":"integer","minimum":0},"returned":{"type":"integer","minimum":0,"maximum":maximum},
+                "truncated":{"type":"boolean"}}, "required":["items","total","returned","truncated"]
+        })
+    };
+    json!({"type":"object","additionalProperties":false,"properties":{
+        "scope":{"type":"object","additionalProperties":false,"properties":{
+            "session_id":{"type":["string","null"],"maxLength":128},"project":{"type":["string","null"],"maxLength":512},
+            "instruction_event_id":{"type":["string","null"],"maxLength":128},"complete":{"type":"boolean"}},
+            "required":["session_id","project","instruction_event_id","complete"]},
+        "relevant_files":bounded(json!({"type":"object","additionalProperties":false,"properties":{
+            "path":{"type":"string","maxLength":512},"event_id":{"type":"string","maxLength":128},
+            "source":{"enum":["changed_path","observed_path"]}},"required":["path","event_id","source"]}),6),
+        "failure_locations":bounded(json!({"type":"object","additionalProperties":false,"properties":{
+            "name":{"type":"string","maxLength":240},"path":{"type":["string","null"],"maxLength":512},
+            "line":{"type":["integer","null"],"minimum":1},"source_ref":{"type":"string","maxLength":128}},
+            "required":["name","path","line","source_ref"]}),3),
+        "decisions":task_context_message_notes_schema(),"recent_progress":task_context_message_notes_schema(),
+        "stall":{"type":"object","additionalProperties":false,"properties":{
+            "status":{"enum":["not_observed","suspected","unavailable","reconcile_required"]},
+            "reason_code":{"enum":["threshold_not_met","repeated_unexpected_failure_without_new_evidence","operation_identity_or_scope_unproven","execution_outcome_unknown","snapshot_changed"]},
+            "scanned_events":{"type":"integer","minimum":0,"maximum":20},
+            "event_ids":{"type":"array","maxItems":3,"uniqueItems":true,"items":{"type":"string","maxLength":128}},
+            "recommendation":{"type":["string","null"],"maxLength":384},"advisory_only":{"const":true}},
+            "required":["status","reason_code","scanned_events","event_ids","recommendation","advisory_only"]},
+        "next_steps":bounded(json!({"type":"object","additionalProperties":false,"properties":{
+            "action":{"type":"string","maxLength":384},"source_refs":{"type":"array","maxItems":3,"uniqueItems":true,"items":{"type":"string","maxLength":160}}},
+            "required":["action","source_refs"]}),3),
+        "continuation_entry":{"type":"object","additionalProperties":false,"properties":{
+            "tool":{"const":"read_session_handoff"},"session_id":{"type":["string","null"],"maxLength":128}},"required":["tool","session_id"]}
+    },"required":["scope","relevant_files","failure_locations","decisions","recent_progress","stall","continuation_entry","next_steps"]})
+}
+
 pub fn handoff_brief_schema(description: &str) -> Value {
     fn nullable_with(schema: Value) -> Value {
         json!({
@@ -608,7 +1068,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
     }));
     let validation_reason = nullable_with(json!({
         "type": "string",
-        "enum": ["validation_not_requested", "validation_unavailable"]
+        "enum": ["validation_not_requested", "validation_unavailable", "validation_inconclusive"]
     }));
     let nullable_bool = || nullable_with(json!({"type": "boolean"}));
     let nullable_count = || {
@@ -617,6 +1077,39 @@ pub fn handoff_brief_schema(description: &str) -> Value {
             "minimum": 0
         }))
     };
+    let external_observations = json!({
+        "type": "object",
+        "description": "Retained external claims for the exact output project and handoff Session. These reports never become native execution, validation, Goal, or completion evidence. Last five by server timestamp then identity; source order and capture completeness are unproven.",
+        "additionalProperties": false,
+        "properties": {
+            "status": {"type": "string", "enum": ["available", "unavailable"]},
+            "reason_code": nullable_with(json!({
+                "type": "string",
+                "enum": ["session_project_unavailable", "store_unavailable", "projection_unavailable"]
+            })),
+            "provenance": {"type": "string", "const": "external_report"},
+            "coverage": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "complete": {"type": "boolean", "const": false},
+                    "reason": {"type": "string", "enum": ["source_sequence_unavailable", "read_unavailable"]},
+                    "ordering": {"type": "string", "const": "server_recorded_at_then_identity"}
+                },
+                "required": ["complete", "reason", "ordering"]
+            },
+            "total": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 256})),
+            "returned": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 5})),
+            "truncated": nullable_bool(),
+            "unknown_count": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 256})),
+            "observations": nullable_with(json!({
+                "type": "array",
+                "maxItems": 5,
+                "items": external_observation_schema("Untrusted external report with exact adapter and event identity.")
+            }))
+        },
+        "required": ["status", "reason_code", "provenance", "coverage", "total", "returned", "truncated", "unknown_count", "observations"]
+    });
 
     json!({
         "type": "object",
@@ -651,9 +1144,17 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                 "additionalProperties": false,
                 "properties": {
                     "root_instruction": instruction_schema("The Workflow Session root instruction. It remains separate from later accepted task instructions."),
-                    "latest_instruction": instruction_schema("The latest retained task_instruction event. The same excerpt is returned when it equals the root instruction.")
+                    "latest_instruction": instruction_schema("The latest retained task_instruction event. The same excerpt is returned when it equals the root instruction."),
+                    "decisions": task_context_message_notes_schema(),
+                    "recent_progress": task_context_message_notes_schema(),
+                    "scope": task_context_schema()["properties"]["scope"],
+                    "relevant_files": task_context_schema()["properties"]["relevant_files"],
+                    "failure_locations": task_context_schema()["properties"]["failure_locations"],
+                    "stall": task_context_schema()["properties"]["stall"],
+                    "continuation_entry": task_context_schema()["properties"]["continuation_entry"],
+                    "next_steps": task_context_schema()["properties"]["next_steps"]
                 },
-                "required": ["root_instruction", "latest_instruction"]
+                "required": ["root_instruction", "latest_instruction", "decisions", "recent_progress", "scope", "relevant_files", "failure_locations", "stall", "continuation_entry", "next_steps"]
             },
             "workspace": {
                 "type": "object",
@@ -743,12 +1244,14 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                 },
                 "required": ["status", "open_failures", "reason_code"]
             },
+            "external_observations": external_observations,
             "attention": {
                 "type": "object",
                 "description": "Proven workspace, Job, and open guidance counts. Null means the corresponding evidence was unavailable.",
                 "additionalProperties": false,
                 "properties": {
                     "workspace_conflict": nullable_bool(),
+                    "active_jobs": nullable_count(),
                     "blocking_jobs": nullable_count(),
                     "terminal_pending_jobs": nullable_count(),
                     "recovering_jobs": nullable_count(),
@@ -758,7 +1261,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                     "open_todos": nullable_count()
                 },
                 "required": [
-                    "workspace_conflict", "blocking_jobs",
+                    "workspace_conflict", "active_jobs", "blocking_jobs",
                     "terminal_pending_jobs", "recovering_jobs", "open_guidance",
                     "open_risks", "open_questions", "open_todos"
                 ]
@@ -781,15 +1284,18 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                     "complete": schema_type("boolean", "True only when no fixed evidence-gap reason applies."),
                     "reason_codes": {
                         "type": "array",
-                        "maxItems": 8,
+                        "maxItems": 11,
                         "uniqueItems": true,
                         "items": {
                             "type": "string",
                             "enum": [
                                 "attempt_boundary_evicted",
                                 "continuation_unavailable",
+                                "discussion_unavailable",
+                                "external_observations_changed_during_snapshot",
                                 "guidance_unavailable",
                                 "job_summary_unavailable",
+                                "session_changed_during_snapshot",
                                 "validation_not_requested",
                                 "validation_unavailable",
                                 "workspace_not_requested",
@@ -811,7 +1317,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
         },
         "required": [
             "version", "session", "task", "workspace", "progress",
-            "validation", "attention", "next_actions", "basis",
+            "validation", "external_observations", "attention", "next_actions", "basis",
             "deterministic", "llm_summary"
         ]
     })
@@ -824,6 +1330,7 @@ fn attempt_summary_schema() -> Value {
         "description": "Bounded deterministic summary of the current attempt: boundary, instruction, event range, activity, changes, exploration, validation, jobs, guidance, outcome, and suggested next actions. Pointer fields only; never raw search text, file/LSP bodies, commands, stdout/stderr, full guidance text, absolute roots, or secrets.",
         "additionalProperties": false,
         "properties": {
+            "task_context": {"anyOf":[task_context_schema(), {"type":"null"}]},
             "boundary": attempt_boundary_schema(),
             "instruction": attempt_instruction_schema(),
             "event_range": attempt_event_range_schema(),
@@ -836,7 +1343,7 @@ fn attempt_summary_schema() -> Value {
             "outcome": attempt_outcome_schema(),
             "suggested_next_actions": array_schema(schema_type("string", "A bounded, deterministic suggested next action."), "Bounded suggested next actions (<=8).")
         },
-        "required": ["boundary", "instruction", "event_range", "activity", "changes", "exploration", "validation", "jobs", "guidance", "outcome", "suggested_next_actions"]
+        "required": ["task_context", "boundary", "instruction", "event_range", "activity", "changes", "exploration", "validation", "jobs", "guidance", "outcome", "suggested_next_actions"]
     })
 }
 
@@ -945,8 +1452,8 @@ fn attempt_exploration_schema() -> Value {
             },
             "total_observed_paths": schema_type("integer", "Real unique path count before the 100-path projection cap."),
             "truncated": schema_type("boolean", "True when observed_paths was capped."),
-            "read_count": schema_type("integer", "Successful direct read_file calls in the attempt."),
-            "search_count": schema_type("integer", "Successful search_project_text/search_project_texts calls in the attempt."),
+            "read_count": schema_type("integer", "Successful read_files calls in the attempt."),
+            "search_count": schema_type("integer", "Successful search_project_texts calls in the attempt."),
             "navigation_count": schema_type("integer", "Successful LSP navigation calls in the attempt."),
             "latest_tool": exploration_tool_name_schema(),
             "complete": schema_type("boolean", "False when the attempt boundary was evicted and only a retained tail is available.")
@@ -967,12 +1474,12 @@ fn attempt_exploration_schema() -> Value {
 fn attempt_validation_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Current-attempt validation evidence after the latest trusted material workspace-content change. Historical validation remains separate.",
+        "description": "Current-attempt validation evidence. Successful execution with unproven source is unproven, never a current-source pass. Historical execution results remain separate.",
         "additionalProperties": false,
         "properties": {
             "status": {
                 "type": "string",
-                "enum": ["passed", "failed", "inconclusive", "stale", "not_run", "unknown"]
+                "enum": ["unproven", "failed", "inconclusive", "stale", "not_run", "unknown"]
             },
             "latest_status": {
                 "type": "string",
@@ -1049,7 +1556,7 @@ fn attempt_outcome_schema() -> Value {
     })
 }
 
-/// Validation delta projection surfaced by `validation_summary` and inside
+/// Validation delta projection surfaced by `read_validation_summary` and inside
 /// `continuation_feedback`. Strict `additionalProperties: false` on all
 /// sub-objects so field drift fails loudly.
 pub fn validation_delta_schema(description: &str) -> Value {

@@ -103,6 +103,22 @@ async fn apply_unified_diff_non_applicable_is_domain_outcome_without_apply_dispa
     assert_eq!(result.output["recovery_action"], "regenerate_unified_diff");
 }
 
+#[test]
+fn analyze_unified_diff_public_dotenv_template_is_not_sensitive() {
+    let analysis = analyze_unified_diff(&marker_patch(".env.example", "PUBLIC_FAKE_MARKER"))
+        .expect("public dotenv template diff");
+    assert_eq!(analysis.affected_files, vec![".env.example"]);
+    assert!(!analysis.has_sensitive_paths);
+    assert!(analysis.warnings.is_empty());
+
+    let derived = analyze_unified_diff(&marker_patch(
+        ".env.example.local",
+        "FAKE_SECRET_PLACEHOLDER",
+    ))
+    .expect("derived dotenv diff");
+    assert!(derived.has_sensitive_paths);
+}
+
 #[tokio::test]
 async fn apply_unified_diff_sensitive_path_is_blocked_by_default_before_shell_dispatch() {
     let client_id = "unified-sensitive";
@@ -308,10 +324,11 @@ fn apply_unified_diff_schema_matches_flat_runtime_contract_and_old_tools_are_abs
     use crate::tool_runtime::tool_definition::is_known_tool_name;
 
     let specs = registered_tool_specs();
-    let spec = specs
+    let specialist_specs = crate::tool_runtime::registry::exact_manifest_specialist_tool_specs();
+    let spec = specialist_specs
         .iter()
         .find(|spec| spec.name == "apply_unified_diff")
-        .expect("canonical unified diff spec");
+        .expect("exact-manifest unified diff spec");
     let input = spec.input_schema["properties"].as_object().unwrap();
     assert!(input.contains_key("project"));
     assert!(input.contains_key("diff"));
@@ -340,7 +357,6 @@ fn apply_unified_diff_schema_matches_flat_runtime_contract_and_old_tools_are_abs
         "recovery_action",
         "permission",
         "recovery_kind",
-        "recovery_tool",
         "session_hint",
         "trace_ref",
     ]
@@ -349,7 +365,15 @@ fn apply_unified_diff_schema_matches_flat_runtime_contract_and_old_tools_are_abs
     assert_eq!(actual, expected);
 
     assert!(is_known_tool_name("apply_patch"));
-    assert!(specs.iter().any(|spec| spec.name == "apply_patch"));
+    assert!(specialist_specs
+        .iter()
+        .any(|spec| spec.name == "apply_patch"));
+    for hidden in ["apply_patch", "apply_unified_diff", "write_project_file"] {
+        assert!(
+            specs.iter().all(|spec| spec.name != hidden),
+            "{hidden} must stay out of ordinary registered ToolSpecs"
+        );
+    }
 
     for removed in ["apply_patch_checked", "validate_patch"] {
         assert!(!is_known_tool_name(removed), "{removed} must be removed");

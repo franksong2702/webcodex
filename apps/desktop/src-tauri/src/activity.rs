@@ -34,6 +34,7 @@ pub enum ActivityEventKind {
     RegularTunnelStopped,
     RuntimeStopped,
     StateRecovered,
+    ProjectActivated,
     OperationStarted,
     OperationCancelRequested,
     OperationCancelled,
@@ -45,6 +46,8 @@ pub struct ActivityEntry {
     pub sequence: u64,
     pub timestamp_ms: u64,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_profile_id: Option<crate::connection_id::TunnelProfileId>,
     pub level: ActivityLevel,
     pub event_kind: ActivityEventKind,
     pub message: String,
@@ -53,6 +56,7 @@ pub struct ActivityEntry {
 #[derive(Clone, Default)]
 pub struct ActivityLog {
     inner: Arc<Mutex<ActivityInner>>,
+    pub(crate) lifecycle: Option<crate::lifecycle_log::LifecycleLog>,
 }
 
 #[derive(Default)]
@@ -62,8 +66,38 @@ struct ActivityInner {
 }
 
 impl ActivityLog {
+    pub(crate) fn with_lifecycle(data_dir: &std::path::Path) -> Self {
+        match crate::lifecycle_log::LifecycleLog::start(data_dir) {
+            Ok(lifecycle) => Self {
+                lifecycle: Some(lifecycle),
+                ..Default::default()
+            },
+            Err(_) => {
+                eprintln!("WebCodex Desktop lifecycle metadata logging is unavailable");
+                Self::default()
+            }
+        }
+    }
+
+    pub(crate) fn record_lifecycle(&self, event: crate::lifecycle_log::LifecycleEvent) {
+        if let Some(log) = &self.lifecycle {
+            log.record(event);
+        }
+    }
+
     pub fn push(
         &self,
+        event_kind: ActivityEventKind,
+        source: impl Into<String>,
+        level: ActivityLevel,
+        message: impl AsRef<str>,
+    ) {
+        self.push_for_profile(None, event_kind, source, level, message);
+    }
+
+    pub fn push_for_profile(
+        &self,
+        tunnel_profile_id: Option<crate::connection_id::TunnelProfileId>,
         event_kind: ActivityEventKind,
         source: impl Into<String>,
         level: ActivityLevel,
@@ -83,6 +117,7 @@ impl ActivityLog {
                 .try_into()
                 .unwrap_or(u64::MAX),
             source: source.into(),
+            tunnel_profile_id,
             level,
             event_kind,
             message: sanitize_message(message.as_ref()),

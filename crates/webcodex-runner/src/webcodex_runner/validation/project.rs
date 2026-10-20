@@ -1,0 +1,237 @@
+//! Runner-owned planning; admission revalidates the fence before enqueue.
+use super::*;
+use sha2::{Digest, Sha256};
+use webcodex_core::project_validation::*;
+use webcodex_core::validation_identity::{
+    contextualize_structured_validation_target_identity, structured_validation_target_identity,
+    StructuredValidationExecutionContext, ToolValidationIdentityKind,
+};
+use webcodex_validation::{
+    detect_validation_recipe, project_validation_operation, resolve_node_native_project_check,
+    resolve_node_native_project_lint, resolve_node_native_project_test,
+    validate_node_project_markers, RecipeId, SemanticCheck,
+};
+
+pub(crate) fn plan(
+    policy: &RunnerPolicy,
+    registry: &Path,
+    request: &ProjectValidationRequest,
+) -> Result<(ProjectValidationPlan, PathBuf), ProjectValidationPlanningResult> {
+    let unavailable =
+        |code: &str, backend: Option<&str>| ProjectValidationPlanningResult::Unavailable {
+            code: code.into(),
+            detected_backend: backend.map(str::to_string),
+        };
+    request
+        .validate()
+        .map_err(|_| unavailable("invalid_arguments", None))?;
+    let root = resolve_runner_project(registry, &request.project_id)
+        .map_err(|_| unavailable("unknown_project", None))?;
+    let root = validate_project_root(policy, &root)
+        .map_err(|_| unavailable("invalid_project_path", None))?;
+    let hint = match request.adapter {
+        ProjectValidationAdapter::Auto => None,
+        ProjectValidationAdapter::Rust => Some(RecipeId::Rust),
+        ProjectValidationAdapter::Go => Some(RecipeId::Go),
+        ProjectValidationAdapter::Python => Some(RecipeId::Python),
+        ProjectValidationAdapter::Node => Some(RecipeId::Node),
+    };
+    if matches!(
+        request.adapter,
+        ProjectValidationAdapter::Auto | ProjectValidationAdapter::Node
+    ) {
+        validate_node_project_markers(&root, request.cwd.as_deref())
+            .map_err(|e| unavailable(e.code, Some("node")))?;
+    }
+    let backend = detect_validation_recipe(&root, request.cwd.as_deref(), hint)
+        .map_err(|e| unavailable(e.code, None))?;
+    if request.dependency_resolution_policy.is_some() && backend != RecipeId::Rust {
+        return Err(unavailable(
+            "dependency_resolution_policy_unsupported",
+            Some(backend.as_str()),
+        ));
+    }
+    if request.action == ProjectValidationAction::Lint && backend != RecipeId::Node {
+        return Err(unavailable(
+            "validation_action_unsupported",
+            Some(backend.as_str()),
+        ));
+    }
+    let action = match request.action {
+        ProjectValidationAction::FormatCheck => SemanticCheck::Format,
+        ProjectValidationAction::Check | ProjectValidationAction::Lint => SemanticCheck::Check,
+        ProjectValidationAction::Test => SemanticCheck::Test,
+    };
+    let packages = request
+        .scope
+        .as_ref()
+        .and_then(ProjectValidationScope::explicit_packages)
+        .map(<[String]>::to_vec);
+    let all_packages = request
+        .scope
+        .as_ref()
+        .is_some_and(ProjectValidationScope::selects_all_packages);
+    let filter = request
+        .test
+        .as_ref()
+        .and_then(|test| test.filter.as_deref());
+    // The operation supplies semantic identity and normalization only. The
+    // resolved recipe below is the sole authority for the executable step.
+    let operation = project_validation_operation(backend.as_str(), action, packages, all_packages)
+        .and_then(|operation| operation.with_dependency_policy(request.dependency_policy))
+        .and_then(|operation| {
+            operation.with_dependency_resolution_policy(request.dependency_resolution_policy)
+        })
+        .and_then(|operation| operation.with_test_filter(filter))
+        .map_err(|code| unavailable(code, Some(backend.as_str())))?;
+    let profile = operation.compatibility_profile();
+    let resolved = if backend == RecipeId::Node {
+        if request.action == ProjectValidationAction::Lint {
+            resolve_node_native_project_lint(&root, request.cwd.as_deref())
+        } else if action == SemanticCheck::Test {
+            resolve_node_native_project_test(&root, request.cwd.as_deref())
+        } else {
+            resolve_node_native_project_check(&root, request.cwd.as_deref())
+        }
+    } else {
+        webcodex_validation::resolve_project_validation_recipe_with_resolution_policy(
+            &root,
+            request.cwd.as_deref(),
+            hint,
+            &[action],
+            filter,
+            request
+                .scope
+                .as_ref()
+                .and_then(ProjectValidationScope::explicit_packages),
+            all_packages,
+            request.dependency_policy,
+            request.dependency_resolution_policy,
+        )
+    }
+    .map_err(|e| unavailable(e.code, Some(backend.as_str())))?;
+    let node_json = resolved
+        .steps
+        .first()
+        .and_then(|step| step.node_json_framework());
+    let identity = if let Some(framework) = node_json {
+        structured_validation_target_identity(
+            if framework == "vitest" {
+                ToolValidationIdentityKind::NodeVitestTest
+            } else {
+                ToolValidationIdentityKind::NodeJestTest
+            },
+            &serde_json::json!({"cwd": resolved.recipe_root_relative}),
+        )
+    } else if backend == RecipeId::Node && action == SemanticCheck::Check {
+        let script = resolved
+            .steps
+            .first()
+            .filter(|step| step.is_structured_node_check())
+            .and_then(|step| step.args.get(1))
+            .ok_or_else(|| unavailable("validation_manifest_invalid", Some(backend.as_str())))?;
+        structured_validation_target_identity(
+            ToolValidationIdentityKind::NodeScriptCheck,
+            &serde_json::json!({"cwd": resolved.recipe_root_relative, "script": script}),
+        )
+    } else {
+        operation.validation_target_id(Some(&resolved.recipe_root_relative))
+    }
+    .ok_or_else(|| unavailable("validation_scope_invalid", Some(backend.as_str())))?;
+    let identity = if backend == RecipeId::Go {
+        contextualize_structured_validation_target_identity(
+            &identity,
+            StructuredValidationExecutionContext::GoProjectSingleModuleV1,
+        )
+        .ok_or_else(|| unavailable("validation_scope_invalid", Some(backend.as_str())))?
+    } else {
+        identity
+    };
+    let cwd = root.join(&resolved.recipe_root_relative);
+    Ok((
+        ProjectValidationPlan {
+            provenance: ProjectValidationProvenance {
+                request: request.clone(),
+                backend: backend.as_str().into(),
+                recipe_root: resolved.recipe_root_relative,
+                root_digest: format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes())),
+                manifest_digest: resolved.manifest_digest,
+                invocation_digest: resolved.invocation_digest,
+            },
+            adapter: node_json.map_or_else(
+                || profile.tool_identity.into(),
+                |framework| format!("node:{framework}:test"),
+            ),
+            step: resolved
+                .steps
+                .into_iter()
+                .next()
+                .expect("one requested action"),
+            validation_target_id: identity,
+        },
+        cwd,
+    ))
+}
+
+pub(crate) fn handle(
+    policy: &RunnerPolicy,
+    registry: &Path,
+    request: &ProjectValidationRequest,
+) -> CommandResult {
+    let result = match plan(policy, registry, request) {
+        Ok((plan, _)) => ProjectValidationPlanningResult::Ready { plan },
+        Err(error) => error,
+    };
+    CommandResult {
+        exit_code: Some(0),
+        stdout: Some(serde_json::to_string(&result).expect("typed planning response")),
+        stderr: None,
+        duration_ms: Some(0),
+        error: None,
+    }
+}
+
+pub(crate) fn fence(
+    policy: &RunnerPolicy,
+    registry: &Path,
+    operation: &webcodex_core::runner_operation::RunnerJobOperation,
+) -> Result<(), String> {
+    let webcodex_core::runner_operation::RunnerJobOperation::StartValidation(op) = operation else {
+        return Ok(());
+    };
+    let Some(metadata) = &op.context.validation else {
+        return Ok(());
+    };
+    let Some(provenance) = &metadata.project_validation else {
+        return Ok(());
+    };
+    let registered_id = op
+        .context
+        .runtime_project_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("agent:"))
+        .and_then(|id| id.split_once(':'))
+        .map(|(_, id)| id);
+    if registered_id != Some(provenance.request.project_id.as_str()) {
+        return Err("validation project identity mismatch".into());
+    }
+    let (resolved, cwd) = plan(policy, registry, &provenance.request)
+        .map_err(|_| "validation_plan_stale: resolve project validation again".to_string())?;
+    if &resolved.provenance != provenance
+        || resolved.adapter != metadata.adapter
+        || op.steps != [resolved.step]
+        || op
+            .cwd
+            .as_deref()
+            .and_then(|p| Path::new(p).canonicalize().ok())
+            .as_ref()
+            != Some(
+                &cwd.canonicalize()
+                    .map_err(|_| "validation cwd unavailable")?,
+            )
+        || metadata.validation_target_id.as_deref() != Some(&resolved.validation_target_id)
+    {
+        return Err("validation_plan_stale: resolve project validation again".into());
+    }
+    Ok(())
+}

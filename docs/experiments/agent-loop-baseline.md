@@ -1,0 +1,863 @@
+# Agent Loop Baseline Protocol
+
+This experiment provides a repeatable measurement baseline for comparing a real
+coding-agent run that uses Direct Tools with a run of the same task through Code
+Mode. It measures facts already recorded by WebCodex plus an optional bounded
+run-annotation sidecar. It does not infer model reasoning, intent, private
+chain-of-thought, or unrecorded tool arguments.
+
+The deterministic [`scripts/eval_coding_loop.sh`](../../scripts/eval_coding_loop.sh)
+harness remains responsible for runtime mechanics. This protocol extends that
+existing Agent Loop baseline; it does not create a second benchmark or reporting
+framework.
+
+## Typed Surface v1 dogfood goal
+
+The Typed Surface v1 dogfood lane asks whether a typed callable/result surface
+changes actual task throughput without weakening correctness. The paired report
+is designed to expose whether Code Mode uses fewer meaningful model-facing outer
+calls (a round-trip-pressure proxy, not an exact model-turn count), incurs fewer
+avoidable contract repairs, keeps more mechanical work inside one cell, and
+compresses nested raw results into a smaller returned projection.
+
+A lower call count is not a correctness verdict. A Direct/Code Mode comparison is
+decision-relevant only when both runs use the same exact case definition and
+40-hex Git base and both satisfy the case correctness/validation gate. The report
+never emits a winner, score, or overall ranking.
+
+New Code Mode samples identify the actual experimental surface as `read_only`,
+`validation`, or `guarded_edit`. They are not pooled under a generic `code_mode` surface.
+For schema-v1 replay, the reporter still accepts the historical `e1` / `e2a` / `e2b`
+aliases without rewriting the original case object or its fingerprint.
+
+## Evidence contract
+
+The profiler is [`scripts/agent_loop_report.py`](../../scripts/agent_loop_report.py).
+It accepts the following evidence sources:
+
+1. **ActionAudit SQLite** is the preferred source for outer tool calls. Select one
+   run with an exact Workflow Session id. Existing rows provide the hashed
+   `ClientWindow`, canonical meaningful classification, request-observed and
+   response-handoff timestamps, serial/overlap classification, status, tool
+   identity, and `model_ergonomics` metadata including serialized `ToolResult`
+   bytes. Code Mode outer rows also persist the payload-safe
+   `code_mode_composition` summary: nested call/success/failure counts, nested
+   tool distribution, maximum in-flight calls, consequential outcome counters,
+   slot wait/internal duration, and nested/raw versus returned byte counts.
+2. **Per-trace `events.jsonl`** is an optional supplement for observed Runner
+   enqueue events. The profiler reads only JSONL metadata; it never opens captured
+   request/result payload files.
+3. **Run annotation JSON** is optional and independent of ActionAudit. It records
+   only bounded categorical facts needed when runtime metadata cannot prove them:
+   repair-turn counts/reasons, explicit task start/end timestamps, and final
+   correctness/validation verdicts. It stores no prompt completion, chain of
+   thought, command, file content, credential, deployment identity, Project id,
+   Workflow Session id, ClientWindow, tunnel id, or instance id.
+
+Current `WEBCODEX_TOOL_REQUEST_TRACE=true`/metadata capture persists bounded
+per-trace `events.jsonl`, including observed Runner request correlation and MCP
+request-policy selection. Pass that directory with `--trace-root`; full capture
+is not required and the profiler never opens raw payload blobs. Historical
+journal-only metadata captures are not backfilled. A missing trace root makes
+Runner-request metrics unavailable, not zero.
+
+The deterministic coding-loop harness uses `/api/tools/call`; it is not an MCP
+or Codex Apps client benchmark. Its canonical edit name is `edit_project_files`.
+For live Agent comparisons record the connection path (Apps, direct MCP or native),
+Host mode and model configuration separately; a Server manifest cannot prove which
+schemas a Host loaded. See [MCP client contracts](../implementation/mcp-client-contract-alignment.md).
+
+The opt-in [generic runtime verifier](../implementation/chat-task-loop.md)
+requires case-specific actual runtime proof and the independent final-file
+oracle for all six generic cases. It binds a successful path bootstrap to the
+coordinator's exact fixture root, Session and Project. Bootstrap-only audits,
+arbitrary/no-op scripts and driver-declared passes cannot qualify. Schema-2
+proof must match the sample's fixture identity; old results remain readable
+without automatically receiving new strict acceptance. `host_code_mode` is
+an explicit candidate lane; the existing nested Code Mode default is unchanged.
+Missing/unprovable evidence remains partial, including unsupported baseline CSV
+output receipts. See the linked contract for the controlled script/structured
+edit paths and disposable full-capture requirements.
+
+Session-filtered counts cover only calls linked to that exact Session. Discovery
+or rejected bootstrap calls made before a Session is selected can be unlinked.
+An explicit business `session_id` also does not select the outer recorder: a
+successful tool can write business Session events without a canonical ActionAudit
+recording link. For recorder coverage, the Host must supply the authorized
+`_wc.record` on relevant MCP invocations; see the [Session model](../agent/session-model.md).
+Unlinked calls are not retroactively attributed by time, Project or apparent
+intent. Keep their Host observations separately when available. A Session-scoped
+call count does not establish the complete conversation's call count or model turns.
+
+Trace persistence is fail-open observability, so `runner.requests_observed` means
+exactly that: enqueue records observed in the supplied trace tree. The report does
+not claim that the trace tree is a complete Runner-request ledger.
+
+## Privacy-bounded output transfer observations
+
+For newly observed successful outer `read_files` and `observe_jobs` calls, the
+optional additive `model_ergonomics.output_transfer` record holds counts and
+UTF-8 text/log-tail byte totals from the **final model-visible result**. It
+never persists file paths, Job identifiers, text, logs, or content hashes.
+
+- `read_files`: items, rendered text bytes, and the item/byte subset containing
+  identical text from the same path **within one returned batch**. This does
+  not detect duplicates across independent calls, and repeated text can be
+  intentional.
+- `observe_jobs`: number of baseline, delta, reset and unchanged observations,
+  with the returned stdout/stderr tail bytes split by category. A reset tail
+  may be necessary for recovery and is not automatically wasteful duplication.
+
+The offline profiler's `output_transfer` section summarizes only the exact
+outer calls that carry complete numeric evidence. It reports call counts,
+measured counts, sample/missing counts, and nullable totals. Historical
+ActionAudit rows, malformed/failed observations and trace-only evidence do
+not become zero-valued measurements. Code Mode nested child transfers are
+not individually measured by these outer-call counters.
+
+These figures are a diagnostic for deciding whether further compression
+is warranted. They are raw UTF-8 tail/text bytes rather than full serialized
+JSON, HTTP bytes, tokens, model turns or end-to-end latency; compare them
+alongside existing `results.serialized_tool_result_bytes`.
+
+## Repair-turn and annotation semantics
+
+A **repair turn** is a model turn whose primary purpose is to correct a previous
+avoidable tool-contract, callable-surface, argument-shape, or result-field-use
+error. Typical examples are a wrong argument shape, attempting an unavailable
+callable, reading the wrong result projection field, a JavaScript runtime error
+caused by surface misuse, or a follow-up that repairs the preceding tool
+selection.
+
+The following are not repair turns: a normal search-then-read decision, ordinary
+adaptive branching after new business information, fixing business code after a
+real validation failure, or normal Job continuation.
+
+ActionAudit does not prove that semantic distinction. The profiler therefore never
+classifies repair turns from model text, tool payloads, or chain-of-thought.
+Repair counts come only from the optional sidecar using this intentionally small
+vocabulary:
+
+- `invalid_arguments`
+- `unknown_callable`
+- `wrong_result_shape`
+- `javascript_runtime`
+- `tool_selection_repair`
+- `other_contract_repair`
+
+The sidecar schema is version 1 and rejects unknown fields. Example:
+
+```json
+{
+  "schema_version": 1,
+  "case_id": "<case-id>",
+  "variant": "<direct-or-code_mode>",
+  "surface": "<direct-or-read_only-or-validation-or-guarded_edit>",
+  "base_revision": "<40-hex-base>",
+  "case_fingerprint": "<64-hex-case-sha256>",
+  "repair_turns": {
+    "total": 1,
+    "by_reason": {
+      "invalid_arguments": 1
+    }
+  },
+  "task_timing": {
+    "started_at_ms": 1000,
+    "ended_at_ms": 1700
+  },
+  "correctness": {
+    "task_verdict": "pass",
+    "validation_verdict": "not_required"
+  }
+}
+```
+
+`repair_turns`, `task_timing`, and `correctness` are individually optional.
+Missing sections stay unavailable; they are never coerced to zero. The identity
+fields are required so the sidecar cannot be accidentally attached to another
+case definition, variant, surface, or Git base. `case_fingerprint` must match the
+exact deterministic fingerprint emitted by the benchmark metadata.
+A practical flow is to summarize once without `--run-annotation`, copy the emitted
+`benchmark.case_fingerprint` into the sidecar, then rerun the same summary with the
+annotation attached.
+
+`task_wall_time_ms` is reported only when the sidecar contains both explicit
+independent task start and task end timestamps. `observed_span_ms` is never used
+as a substitute.
+
+## Timing semantics
+
+For a non-streaming outer call `i`, WebCodex-owned service time is:
+
+```text
+service_i = response_handed_at_i - request_observed_at_i
+```
+
+For two continuity-eligible, meaningful calls in the same hashed Window and
+principal, a canonical serial transition permits:
+
+```text
+outside_webcodex_gap_i = request_observed_at_(i+1) - response_handed_at_i
+```
+
+The latter may include model inference, host scheduling, network delay, UI delay,
+or user delay. It must not be named `model_think_time` or `reasoning_time`.
+Non-meaningful calls do not consume the meaningful predecessor. When a report is
+scoped to one Workflow Session or trace set, the profiler privately replays
+same-Window/same-principal meaningful ActionAudit rows across the selected span so
+an interleaved call outside the selection cannot be skipped over. Such context
+rows never contribute call/tool/failure counts; if the real canonical predecessor
+is outside the selection, that selected gap remains unavailable. Overlap is counted
+separately and never converted into a negative gap. Streaming handoff does not
+prove response completion. Continuity breaks remain missing evidence.
+
+`observed_span_ms` is only the span covered by observed WebCodex outer-call
+timestamps. It is not end-to-end task wall time.
+
+Percentiles use deterministic nearest-rank semantics. For metrics with partially
+missing samples, `observed_total` and sample counts remain visible, while `total`
+is `null`; missing evidence is never substituted with zero.
+
+### Which tools produce the largest responses?
+
+The offline Agent Loop report now groups the **existing** ActionAudit
+`model_ergonomics.serialized_result_bytes` by its already-exposed outer
+tool name under `results.serialized_tool_result_bytes_by_tool`.
+Each tool receives its observed byte sum, available/missing call counts and
+deterministic nearest-rank p50/p95. Its `total` remains `null` if any
+selected call has missing, invalid or pre-result evidence; a complete tool
+remains usable even if another tool's evidence is incomplete.
+`availability.serialized_tool_result_bytes_by_tool` reports overall
+coverage and the number of outer calls without a tool name.
+
+Use only fully measured groups (`missing=0`) when ranking output-volume
+candidates for follow-up profiling. Missing tool names remain unattributed
+rather than being guessed from raw traces. Trace-only evidence returns
+an unavailable empty breakdown. This measure is the serialized model-facing
+ToolResult projection, excluding HTTP envelopes, model tokens, unrelated
+transport traffic, and nested Code Mode child results. It does not identify
+repeated text across calls or establish any end-to-end latency improvement.
+No runtime telemetry, tool schema or returned content is changed.
+
+## Benchmark cases
+
+[`scripts/agent_loop_cases.json`](../../scripts/agent_loop_cases.json) is the
+authoritative case manifest. Each run starts from a fresh clean target at an exact
+Git base revision. Direct, Host Code Mode, and Code Mode runs must use the same
+case id, exact 40-hex base revision, prompt/correctness definition, and validation
+expectation.
+The profiler includes a deterministic case fingerprint so changed case definitions
+cannot silently compare as the same pair.
+
+The controlled-lane corpus contains seventeen cases: eleven coding/inspection cases
+and six general file/command cases. Six additional `tool_selection` cases use
+task-language prompts without prescribing an execution lane. The controlled
+coding/inspection cases are:
+
+- `readonly_review`: read-only status/read/search/diff inspection.
+- `focused_edit_validation`: one focused edit, diff review, and successful
+  `cargo check`.
+- `guarded_multi_file_edit`: search → selected reads → one guarded two-file edit →
+  post-edit reads/diff, with an independent fixture-side oracle for both changed
+  files and preserved unrelated sentinels.
+- `failed_validation_recovery`: a deliberately failing `cargo test`, diagnostic
+  inspection, fix, and successful rerun.
+- `long_validation_handoff`: real same-execution Job handoff and terminal
+  observation when the validation actually hands off.
+- `independent_observations`: independent status/diff/search/read observations,
+  intended to expose meaningful-outer-call reduction and actual child concurrency.
+- `adaptive_search_read`: search first, then read only the result-dependent
+  target ranges.
+- `native_batching_observations`: several related reads and searches that have a
+  natural native batch shape.
+- `result_shape_pressure`: structured search-match output followed by a targeted
+  read, exercising layered success/output/optional result fields without telling
+  the model that field access is the subject of the test.
+- `known_business_failure`: a safe expected missing-file result followed by the
+  normal README fallback, distinguishing ordinary `success=false` business
+  behavior from host/protocol/JavaScript failure.
+- `compact_projection`: larger child read evidence distilled into exactly three
+  concise final facts.
+
+The general cases are:
+
+- `generic_mixed_files_conflict`: copy mixed files, preserve inputs and a
+  destination conflict, and independently verify bytes/hashes and file counts.
+- `generic_encoded_csv`: reconcile encodings/columns and independently verify
+  the actual CSV rows, statistics and output receipts.
+- `generic_failure_repair`: inspect an intentional nonzero exit and repair it;
+  expected business failures are not contract-repair turns.
+- `generic_pending_independent_join`: do independent work before one readiness
+  join, then observe the original interactive Job without redispatch.
+- `generic_stale_read_revision`: reject a stale edit, reread, and preserve an
+  external writer's exact bytes through successful recovery.
+- `generic_missing_output`: verify that a declared missing output blocks closeout;
+  this expected negative case requires the output-receipt contract.
+
+The coding fixture cases reuse the disposable Rust project recipe already owned
+by `eval_coding_loop.sh`; general cases reuse the fixture recipes in
+`e2e_generic_agent_ws.py`. This protocol does not create a second runtime harness.
+Read-only WebCodex-repository cases must leave the workspace clean.
+The generic manifest entries specify preparation and independent checks. Real
+stale-edit replay requires an operator write after the model's first read; do not
+silently substitute a model-issued write. The scripted driver is deterministic
+runtime acceptance, not a real ChatGPT sample. See
+[General Agent experience](general-agent-experience.md) for the implementation,
+replay protocol and observed acceptance results.
+
+The corpus records an expected `code_mode_surface` for every current case:
+read-only cases use `read_only`, the long validation/Job case uses `validation`,
+and edit-oriented cases use `guarded_edit` with validation outside the mutating
+cell where needed. The parser keeps `code_mode_surface` and `dogfood_focus`
+optional for historical schema-v1 manifest compatibility, but a current case that
+declares a surface rejects a Code Mode run labeled with another surface.
+
+## Paired run protocol
+
+For one case, Direct, Host Code Mode, and Code Mode runs must satisfy all of these constraints:
+
+- same exact case definition and 40-hex Git base revision;
+- fresh clean workspace for each run;
+- same user task prompt and correctness expectations;
+- Direct uses `guidance_profile=direct`;
+- Host Code Mode uses `guidance_profile=host_code_mode` and is reported as `variant=host_code_mode`, `surface=host_code_mode`;
+- Code Mode uses `guidance_profile=code_mode`;
+- new Code Mode captures record `surface=read_only`, `validation`, or `guarded_edit` explicitly; historical schema-v1 `e1` / `e2a` / `e2b` labels remain replay-compatible aliases;
+- the only intended experimental variable is the guidance/surface behavior being
+  evaluated.
+
+Runtime Project, Workflow Session, Window, tunnel, and host-internal identifiers
+may be used transiently to select authoritative evidence. They must not be written
+into the manifest, docs, tests, run annotation, or durable benchmark result.
+
+## Reproducible paired benchmark command
+
+`scripts/agent_loop_benchmark.py` is a thin orchestration layer over this existing
+manifest and `agent_loop_report.py`. It does not contain another agent loop or a
+benchmark-only WebCodex execution path. A caller-supplied Host driver performs the
+real task using the ordinary Direct or Code Mode contracts. The orchestrator owns
+only reproducibility mechanics:
+
+- one fresh detached Git worktree per sample at one exact base revision;
+- the requested base revision must equal the benchmark checkout's current `HEAD`, so the manifest, fixtures, and code under test come from one revision;
+- the same case fingerprint/prompt/correctness definition for both variants;
+- alternating pair order (`direct/code_mode`, then `code_mode/direct`) to expose
+  one-sided process/cache ordering effects;
+- bounded annotation and the existing report/correctness compatibility gates;
+- fixture-side disk/diff oracles where the manifest provides one; changed-path capture is bounded to 64 KiB / 512 paths, and the multi-file case additionally requires persisted evidence for one successful guarded edit plus its search/read phases;
+- explicit `pass`, `fail`, `partial`, and `unsupported` samples. None are
+  silently filtered from the aggregate;
+- non-unsupported `pass` requires non-empty canonical ActionAudit evidence and the audited execution lane must match the requested variant/surface (`direct`, `execute_code_mode`, `execute_effectful_code_mode`, or `execute_mutating_code_mode` as applicable); the read-only Code Mode lane additionally permits exactly one required `work_on_project` bootstrap and at most one `read_tool_manifest` contract-discovery call, but no Direct read/search fallback; Code Mode also requires complete persisted composition evidence; missing or mismatched capture is `partial`, never fabricated success;
+- cleanup of only the worktrees/temp state created by the orchestrator, including targeted rollback of an owned worktree registration when checkout setup fails; no global `git worktree prune` is used;
+- Host-driver process ownership currently uses POSIX process groups; Windows runs are retained explicitly as `unsupported` until equivalent descendant ownership can be guaranteed.
+
+Case manifests read by `agent_loop_report.py` and Host-driver JSON receipts read
+by the benchmark are limited to 128 nested containers before JSON decoding.
+Objects and arrays each count as one level, including the root; brackets inside
+strings do not count. Deeper inputs fail with a bounded-JSON contract error even
+if the Python interpreter would accept them. This explicit limit replaces
+reliance on interpreter-dependent recursion checks.
+
+Example:
+
+```bash
+python3 scripts/agent_loop_benchmark.py \
+  --base-revision "$(git rev-parse HEAD)" \
+  --driver "python3 /path/to/real_host_driver.py" \
+  --pairs 2 \
+  --output /tmp/webcodex-agent-loop-benchmark.json
+```
+
+For each invocation the driver receives `WEBCODEX_BENCH_WORKSPACE`,
+`WEBCODEX_BENCH_CASE_ID`, `WEBCODEX_BENCH_VARIANT`,
+`WEBCODEX_BENCH_SURFACE`, `WEBCODEX_BENCH_BASE_REVISION`,
+`WEBCODEX_BENCH_CASE_FINGERPRINT`, `WEBCODEX_BENCH_PROMPT`, and
+`WEBCODEX_BENCH_DRIVER_RESULT`. It writes one bounded JSON receipt to the last
+path. The receipt is capped at 64 KiB; malformed/decode-pathological JSON fails closed as a retained failed sample, and driver stdout/stderr is not retained by the orchestrator. `status` is required and is one of `pass/fail/partial/unsupported`. Relative `audit_db` and `trace_root` paths are resolved against the fresh sample workspace; absolute paths remain absolute.
+Non-unsupported samples also provide the authoritative ActionAudit database path
+and Workflow Session id; optional trace root, repair-turn annotation, and task timing
+use the existing reporter semantics. Correctness verdicts are optional only when an
+independent fixture oracle can establish the task result. For non-oracle cases, a
+driver-reported pass needs `correctness.task_verdict="pass"`; validation-required
+cases also need the corresponding passing validation verdict, otherwise the sample
+remains partial. The durable benchmark result does not persist runtime Project,
+Window, tunnel, Job, or Host-private ids. Job identity is correlated only through
+the existing payload-safe salted ActionAudit relation; the benchmark driver does not
+supply or certify a second Job-identity receipt.
+
+The default lane is exactly `readonly_review`, `guarded_multi_file_edit`, and
+`long_validation_handoff`, matching #822. The handoff case requires exactly one
+`cargo_test` launch. Direct and Code Mode both require one canonical pending
+relation, a correlated follow-up, and same-relation terminal timing from ActionAudit.
+For Code Mode, the canonical ModelErgonomics producer derives that pending relation
+from the nested `effect_receipt.children` Job handoff. The reporter joins that salted
+relation internally and emits only payload-safe counts/timing grouped by the pending
+origin tool. Continuity context may support the relation/timing join, but benchmark
+success additionally requires the terminal evidence row itself to belong to the
+selected ActionAudit run; for Code Mode that selected chain must originate from
+`execute_effectful_code_mode`. Persisted composition must independently show exactly
+one consequential validator handoff and no known or unknown substitute result. A
+synchronous completion, redispatch, unrelated outer Job, uncorrelated/substitute
+process, or pending without terminal evidence remains `partial`/`unsupported`,
+never upgraded to success.
+The guarded multi-file case is likewise not a pass from final bytes alone: persisted Direct canonical-call or Code Mode composition evidence must show exactly one `edit_project_files` call, at least one admitted search call, and at least two `read_files` calls (pre-edit and post-edit phases). Direct additionally requires the existing authoritative ModelErgonomics edit outcome to be exactly `applied`. Code Mode requires exactly one consequential known-result child, zero Job handoffs/outcome-unknown/nested failures, and the aggregate canonical mutation evidence to show one `state_changed=true` mutation and zero known no-change mutations, in addition to the fixture-side exact-byte oracle. A dry-run/no-op edit plus shell/process/write fallback therefore cannot be promoted to a pass. Current composition does not prove nested child ordering, so the benchmark does not claim stronger sequencing evidence than is persisted.
+
+The paired benchmark JSON also includes `paired_delta_summary` per case.
+It aggregates only pairs whose Direct and Code Mode reports passed the existing
+same-case/base and correctness/validation throughput gates. For task wall
+time, model-visible outer-call count (`outer_calls.total`), serialized
+`ToolResult` bytes, and annotated contract-repair turns, it reports the
+candidate-minus-Direct delta count, observed sum, and deterministic nearest-rank
+p50/p95. Each metric includes qualified-sample and missing counts; incomplete
+metrics have `total=null`, and cases with no qualified pairs never report a
+fabricated zero. The human summary prints the qualified pair count and a
+task-wall p50 delta only when all qualified pairs have timing evidence.
+These descriptive aggregates are not a causal speedup estimate, complete
+HTTP/token measurements, or exact model-turn counts. Use paired sample order,
+correctness, and end-to-end Host evidence before recommending defaults.
+
+This command coordinates real captures; it is not itself evidence that a model made
+fewer inference turns. Deterministic runtime/script acceptance and fixture oracles
+prove runtime mechanics and final state. Direct-vs-Code Mode ergonomics require a
+real Host/model capture. Exact model round trips remain unavailable unless the Host
+records turn identity; meaningful outer calls remain only the documented proxy.
+Report cold/warm context, pair order, sample count, and dispersion rather than
+treating one run or one ordering as causal proof.
+
+## Free tool-selection experiment
+
+The six `selection_*` cases in the same manifest measure task outcomes while
+allowing any admitted mix of Direct tools, native batches, Host Code Mode, and
+experimental WebCodex Code Mode. Native batching is an invocation shape, not a
+fourth execution surface. These cases use `experiment=tool_selection` and the
+report variant/surface `tool_selection`. They cannot be relabeled as controlled
+Direct/Code Mode cases. The original forced-lane runtime evidence gates remain
+unchanged.
+
+- `selection_single_read`: obtain one exact fixture value and preserve files.
+- `selection_batch_read`: reconcile two fixture values and preserved sentinels.
+- `selection_cross_tool_review`: inspect Git state and locate the current query
+  matching implementation, without prescribing tools or a preferred conclusion.
+- `selection_compound_source_context`: locate match-derived source-context reads,
+  explain overlap coalescing with read/byte-budget qualifications and zero-match
+  behavior, and cite current implementation and tests without prescribing tools.
+- `selection_failed_test_recovery`: observe the deliberately failing isolated
+  Rust fixture, repair its implementation, retain its test, and verify success.
+- `selection_session_recovery`: save a decision/progress note, then explicitly
+  recover the same Session in a second real ChatGPT Web conversation.
+
+The intentionally failing Rust fixture has its own workspace and is not a
+production workspace test. The driver must verify the initial failed test and
+final passing test independently. A matching final file alone does not prove
+that a model observed the failure, selected useful tools, or recovered a Session.
+Unlike old exact-edit fixtures, a successful file oracle never supplies the free
+selection task verdict: the driver must provide independent answer/workflow
+correctness. A receipt verdict is an external annotation, not automatic proof
+that an answer is true. Retain the actual final answer and a separate check
+against source at the exact tested revision; for repository review also check
+actual Git state. The compound source oracle checks that the fixture contains
+the relevant implementation/tests, not that the model found or explained them.
+Missing correctness leaves a sample partial. Missing canonical Audit metadata
+cannot satisfy strict selection acceptance even when the driver declares pass.
+Tool counts prove neither correctness nor unnecessary reads.
+
+The default selection suite contains the first four cases above. Any admitted
+tool mix is permitted: sufficient context returned by a compound operation needs
+no redundant follow-up read, and separate search/read calls remain valid. The
+compound regression must distinguish planned member counts from coalesced output
+and must not claim every search always produces one physical read. The two
+recovery cases remain explicit opt-ins. This suite is separate from the fixed
+three-task, three-pair [efficiency experiment](agent-efficiency-upgrade.md).
+Stage 2 depends on the generic runtime-evidence acceptance work in
+[PR #1162](https://github.com/yyjeqhc/webcodex/pull/1162); selection annotations do
+not replace that stage's case-specific proofs.
+
+After the manifest is recorded at the tested checkout's exact HEAD, run:
+
+```sh
+python3 scripts/agent_loop_benchmark.py \
+  --experiment tool_selection --repo . --base-revision <40-hex-fixture-base> \
+  --driver '<real-host-driver-command>' --samples 3 \
+  --case-id selection_single_read --case-id selection_batch_read \
+  --case-id selection_cross_tool_review --case-id selection_compound_source_context \
+  --output /tmp/tool-selection.json
+```
+
+The caller-owned driver receives the existing receipt/workspace/prompt variables
+plus `WEBCODEX_BENCH_EXPERIMENT=tool_selection`. It must leave tool choice free,
+collect ordinary ActionAudit evidence, and produce the existing bounded receipt
+and independent correctness verdict. Selection reports can be compared with
+other selection reports for the exact same case fingerprint and fixture Git base;
+controlled-lane reports cannot be mixed into that comparison. Repetitions retain
+failed, partial and unsupported observations without declaring a winner.
+
+There is no bundled authenticated ChatGPT Web driver. Scripted MCP or loopback
+tests are useful runtime validation and must not be reported as real model-choice
+or Web acceptance. For actual Web captures use an isolated candidate Server and
+Runner and a disposable registered Project; record model/mode, connection path,
+Server/Runner build identities and source changes separately. The report cannot
+prove which schemas the Host loaded or restore unsaved Host messages. A driver
+without two real conversation contexts must mark the recovery case unsupported.
+
+### Offline discovery relevance
+
+`scripts/agent_tool_discovery_cases.json` contains 48 labeled English/Chinese
+requests, including exact names, paraphrases, ambiguity, no-match and OAuth-scope
+negatives. Every fourth case is the predetermined heldout set. Labels are scorer
+inputs, never hints to the evaluated model or keywords to copy into production.
+Scope fixtures describe OAuth authority and must be applied by the capture driver,
+not passed as manifest arguments. Discovery is not execution authorization.
+
+The capture JSON has `schema_version=1`, the exact corpus SHA-256
+`corpus_fingerprint`, a 40-hex `base_revision`, and `results` containing
+`{case_id, returned_tools}` rows in actual retrieval order. Capture real canonical
+manifest responses; an exact-contract response contributes its returned tool name.
+No-match captures use an empty array. Do not fill omitted cases with empty arrays.
+
+```sh
+python3 scripts/agent_loop_report.py discovery \
+  --results /private/path/discovery-capture.json --output /tmp/discovery-report.json
+```
+
+The scorer validates identity, bounds and labels, computes top-five relevance and
+forbidden leakage, and keeps missing split metrics unavailable. Low baseline
+relevance is an observation, not a harness failure or proof of a fixed bug.
+
+### Native batch request evidence
+
+New optional ModelErgonomics v13 `native_batch` records capture admitted outer
+`read_files` requested items or `search_project_texts` requested queries, each
+bounded to 1..8. They contain no paths, query text, results, or credentials.
+The profiler's `native_batch` section distinguishes observed multi-item calls
+from complete totals. Missing/legacy/malformed records stay unavailable, as does
+coverage when an outer call lacks canonical identity. These counts prove requested
+cardinality, not completed work; nested Code Mode children remain unmeasured.
+
+## Manual ChatGPT Web selection baseline — 2026-10-12
+
+The user operated the ChatGPT Web App against an isolated Server/Runner and a
+disposable Project. These are manual acceptance observations, not results from
+the automated benchmark driver. Each reported answer was checked against current
+fixture bytes, Git state, and persisted Session/ActionAudit evidence. The user
+confirmed that the continuity case used two distinct new Web conversations.
+
+The source base was `8153ef8caace55ab5c385e9f70f371d1c0c421c0` with the
+uncommitted PR1 telemetry changes, built with `experimental-code-mode`. The
+fixture snapshot was `cac416c3b2c33cd36597a7192cb216e4b2d398d3`.
+The running binaries were recorded separately by SHA-256:
+
+```text
+webcodex-server d90da9a6cbba59e5bd8b1afab834e3697f5efc60b42290e6b864dc5ac23b90fc
+webcodex-runner 7ed037ed0259e90704812e243e54ccef200b7ce96d669bafffcdc8a8114e9993
+```
+
+Later offline scorer/reporting and documentation changes did not change those
+Rust binaries. Connection credentials, exact Session identifiers, private chat
+links and original local evidence remain outside the repository. The model/effort
+was tentatively reported by the user as “6-sol, 极高”; its exact identity was not
+independently verified. One continuity conversation URL was supplied, with no
+stage mapping; other conversation URLs are unavailable.
+
+| Case | Independently verified outcome | Selected evidence and limits |
+| --- | --- | --- |
+| `selection_single_read` | Correct `before` value; unchanged files | One successful outer `read_files`, requested cardinality 1 |
+| `selection_batch_read` | Both values `before`, both sentinels `keep`; unchanged files | One successful outer `read_files`, requested cardinality 2 |
+| `selection_cross_tool_review` | Correct clean Git state, branch and source-supported AND matching conclusion | One successful outer `search_project_texts`, requested cardinality 4 |
+| `selection_failed_test_recovery` | Test exit 101 before edit, same test target exit 0 after; unchanged test and unrelated function; independent local rerun passed | Session events and final bytes corroborate recovery; Session-linked audit coverage is partial |
+| `selection_session_recovery` | Explicit resume reused the original Session and saved decision/progress; exact final `after`/`keep` bytes | Fresh file read preceded guarded edit; only alpha changed from the pre-case byte snapshot; prior greeting repair remained intact |
+
+The failed-test repair was preserved for the continuity case. A pre-case tracked
+file hash snapshot independently established that continuity changed only alpha;
+the inherited repair was not counted as a new continuity edit. This manual run
+therefore does not claim the automated fresh-worktree fixture oracle was used.
+
+An earlier batch-read answer named a different Project and had no matching
+isolated-runtime Session. It remains an unavailable connection attempt; only the
+subsequent correctly bound run is accepted. During recovery, some successful
+business calls omitted the outer recorder. Their Session events verify business
+outcomes, but they do not establish complete Session-selected outer-call totals.
+These baseline limitations remain visible; this PR does not fix tool choice or
+change recorder authority. Exact model turns, whole-task timing and repair-turn
+counts are unavailable. No latency, token, speedup or framework comparison is
+claimed from these five samples.
+
+Separately, actual canonical manifest retrievals on the unchanged discovery
+implementation were scored for the 36 development cases: 9/25 positive Top-5
+hits (36%), recall@5 32.67%, and 11/11 negative rejections with no forbidden
+returns. These are local deterministic retrieval measurements, not Web model
+performance. The 12 fixed heldout cases were not captured for this baseline;
+their baseline metrics remain unavailable. The corpus fingerprint is
+`e03448281d1ab1fcb6c5447836eda07216257838175ed9542d7507a72c126d10`.
+
+## Typed Surface v1 observed dogfood — 2026-09-18
+
+A real self-hosted dogfood build from the Typed Surface v1 branch ran the three
+fixed acceptance tasks below. Each pair used the same task definition and Git
+base, and the bounded annotation recorded zero contract-repair turns. These are
+observations from this run, not a general speed claim.
+
+These measurements predate the later `search_and_read_project_texts` compound Direct primitive
+added on main. Future paired runs must include that tool when it is the simplest
+sufficient Direct control. The A/B outer-call deltas below remain evidence for the
+recorded Git base, not an estimate of the current-main advantage; rebaseline them
+before drawing a new throughput conclusion.
+
+The exact Code Mode callable contracts measured 9,209 bytes for `read_only`,
+12,108 bytes for `validation`, and 11,766 bytes for `guarded_edit`. All stayed
+below the 16 KiB hard cap; ordinary Direct discovery did not carry the sidecar.
+
+| Task | Direct outer / meaningful | Code Mode outer / meaningful | Nested evidence | Result bytes | Outcome |
+| --- | ---: | ---: | --- | ---: | --- |
+| A — bounded repository review | 4 / 4 | 3 / 2 | 3 children, `max_in_flight=3`; 86,298 raw bytes → 1,930 returned bytes | 90,987 → 19,773 | Both runs reached the same clean-worktree, no-diff, timing-contract, and search-location conclusions with zero repairs. |
+| B — adaptive read → one guarded edit | 5 / 5 | 4 / 3 | 4 children, `max_in_flight=2`; 3,262 raw bytes → 295 returned bytes | 8,274 → 21,304 | Both edits succeeded on the first attempt, produced the same one-file change, preserved the unrelated function, and passed `cargo check`. The Code Mode result-byte total was larger because one progressive-discovery contract cost about 12 KiB on this tiny task. |
+| C — validation launch → Job continuation | 11 / 11* | 5 / 4* | `validation` launched one validator child plus one independent read; `job_handoffs=1`; 46,882 raw bytes → 918 returned bytes | 70,722 → 29,326* | Both runs launched validation exactly once, retained the same execution/continuation identity through terminal success, and did not redispatch validation. |
+
+`*` Task C's raw outer-call and result-byte counts are not a clean throughput
+comparison. The client/tool wrapper used short waits while a roughly 50-second
+validation ran, producing eight Direct and two Code Mode `observe_jobs` polls of
+their respective same-execution continuations. That cadence is Host/tooling
+behavior, not model reasoning. The decision-relevant correctness fact is that
+both paths launched one validation execution, received one canonical Job
+continuation identity, and followed that same execution to terminal success.
+
+Across A and B, the observed `model_round_trip_proxy` fell by two meaningful
+outer calls in each pair, with no invalid-argument, wrong-result-shape, or child
+call repair. Task A also materially reduced model-visible result bytes. Task B
+shows the opposite byte tradeoff for a very small edit: progressive typed
+discovery can cost more bytes than it saves when the task itself has little raw
+evidence. That is a reason to keep the contract progressive rather than preload it
+into every startup response.
+
+## Capture and summarize a run
+
+Record the exact Workflow Session id and 40-hex Git base revision transiently for
+each real run. Session selection is authoritative only through ActionAudit;
+trace-only input cannot apply `--workflow-session-id`.
+
+Start each benchmark run with its fresh `work_on_project` bootstrap; that call
+links its own ActionAudit row through the canonical `WorkOnProject` relation.
+For `readonly_review`, the benchmark gate admits the one bootstrap plus at most one `read_tool_manifest` discovery call when the selected Code Mode callable contract is not already retained. That contract-discovery call is not Direct repository inspection; any outer `read_files`, search, or other fallback still fails the lane check closed.
+Once the bootstrap returns the exact run Session id, every subsequent model-facing
+outer call in the run must pass that id as `recording_session_id`. A business
+`session_id` does not substitute for ActionAudit recorder provenance. Code Mode
+calls that require a business Session should pass both fields with the same exact
+benchmark Session id.
+
+A Direct summary with optional sidecar:
+
+```bash
+python3 scripts/agent_loop_report.py summarize \
+  --audit-db <server-sqlite-db> \
+  --workflow-session-id <workflow-session-id> \
+  --case-id <case-id> \
+  --variant direct \
+  --surface direct \
+  --base-revision <40-hex-base> \
+  --run-annotation <direct-run-annotation.json> \
+  --output <direct-report.json>
+```
+
+A Host Code Mode summary:
+
+```bash
+python3 scripts/agent_loop_report.py summarize \
+  --audit-db <server-sqlite-db> \
+  --workflow-session-id <workflow-session-id> \
+  --case-id <case-id> \
+  --variant host_code_mode \
+  --surface host_code_mode \
+  --base-revision <40-hex-base> \
+  --run-annotation <host-code-mode-run-annotation.json> \
+  --output <host-code-mode-report.json>
+```
+
+A Code Mode summary:
+
+```bash
+python3 scripts/agent_loop_report.py summarize \
+  --audit-db <server-sqlite-db> \
+  --workflow-session-id <workflow-session-id> \
+  --case-id <case-id> \
+  --variant code_mode \
+  --surface <read_only-or-validation-or-guarded_edit> \
+  --base-revision <40-hex-base> \
+  --run-annotation <code-mode-run-annotation.json> \
+  --output <code-mode-report.json>
+```
+
+When an `events.jsonl` trace tree was captured and Runner enqueue observations are
+useful, add `--trace-root <tool-request-trace-root>`.
+
+## Reported metrics
+
+The schema-v1 JSON summary reports, when evidence is available:
+
+- exact `model_round_trips` remains unavailable because ActionAudit does not persist
+  a model response/turn identity; parallel meaningful outer calls may share one
+  model response.
+- `model_round_trip_proxy`: the existing meaningful outer-call count, retained only
+  as an explicit round-trip-pressure proxy. Nested Code Mode children never count.
+- outer model-facing calls: total, meaningful, success/failure, and tool-name
+  distribution;
+- Direct and Host Code Mode canonical-call counts from outer `model_ergonomics` records;
+- `host_short_chain`: exact same-Window serial transition count, multi-call chain count, calls participating in those chains, maximum chain length, and observed tool-pair distribution. An exact predecessor outside the selected benchmark run is a chain boundary; a declared serial transition whose exact predecessor cannot be resolved makes the aggregate unavailable. This is ordering evidence only; `same_model_turn_proven` is always false because ActionAudit has no Host-cell/model-response identity;
+- authoritative Code Mode composition: nested calls/successes/failures,
+  `max_in_flight`, nested tool counts, consequential known/Job/unknown outcomes,
+  internal duration, slot wait, optional program input bytes, and nested raw versus
+  returned bytes;
+- `child_calls.failed`: authoritative Code Mode nested failure count when the
+  composition summary is complete;
+- WebCodex service time, ToolRuntime duration, canonical outside-WebCodex serial
+  gaps, and overlap;
+- exact serialized outer `ToolResult` byte totals/distributions;
+- optional `repair_turns`, `task_wall_time_ms`, and correctness verdicts from
+  the bounded sidecar;
+- structured outer `error_kind`, `failure_kind`, and `recovery_kind`
+  distributions;
+- observed Runner enqueue count/request-kind distribution from trace JSONL.
+
+The summary includes an explicit `availability` object. Consumers must inspect it
+rather than assuming an absent metric is zero.
+
+### Input ergonomics (ModelErgonomics v13+)
+
+`input_ergonomics` reads the existing `action_events.summary_json.model_ergonomics`
+record. It adds no production table or migration. The report envelope stays schema
+v1, consistent with its existing additive metric sections; the persisted telemetry
+producer moves from v12 to v13 so old missing fields are not counted as zero use.
+
+The section reports `normalization_events`, `normalization_by_code`, and
+`normalization_by_tool`, plus `invalid_argument_rejections` and
+`invalid_arguments_by_tool`. Only successful canonical outer invocation records
+with a known closed normalization code contribute to normalization counts. Success
+is the invocation outcome, including successful durable admission, not a promise
+that an asynchronous command eventually succeeds. Failed results do not contribute
+even if malformed historical data contains a normalization field.
+
+Coverage is explicit: `measured_canonical_calls`, `eligible_events` (v13+),
+`eligible_successful_events`, `legacy_schema_events`, and
+`missing_or_invalid_record_events`. The rate is exactly
+`normalization_events / eligible_successful_events`; legacy v12 rows and records
+missing canonical identity/outcome evidence never enter that denominator. Zero
+eligible successes yields null, not zero. Unknown/malformed codes are omitted and
+counted in `unrecognized_normalization_events`; they make rate availability false
+rather than silently reporting an artificially low rate. The offline reader has a
+closed v13 wire-contract allowlist, not a runtime normalization/alias registry.
+Consult `availability.input_ergonomics` before interpreting the rate.
+
+`immediate_same_tool_repair_proxy` considers each selected canonical meaningful
+`success=false, error_kind=invalid_arguments` call. It inspects only the next
+meaningful call in the same exact ClientWindow and principal correlation. Both
+calls must have non-streaming, eligible continuity and ordered request/handoff
+timestamps; the successor must persist the exact predecessor trace relation with
+`window_transition_kind=serial`, have canonical telemetry, and not have ambiguous
+trace/predecessor identity. Count only a same-tool successful successor. Never skip
+an intervening meaningful call (including one without telemetry), cross principals,
+or use an arbitrary seconds threshold. Existing continuity lookup may resolve an
+unlinked intervening call or the exact successor outside the selected Session;
+those context rows never expand the normalization denominator.
+
+This is a **WebCodex-observed immediate same-tool corrective-call proxy**. It does
+not prove model turn identity, a causal repair, or that field spelling caused the
+failure. Legacy canonical records may contribute when they retain all necessary
+continuity evidence. Missing successor, streaming/overlap, incomplete identities,
+or context limits make the proxy `available=false` with null `count`/`by_tool`.
+`observed_count`/`observed_by_tool` retain only the proven subset; coverage and
+`unavailable_by_reason` explain the gap. A different immediate tool is a measured
+non-match, not permission to search ahead for eventual same-tool success. Existing
+manually annotated `repair_turns` remain separate and are never filled from this
+proxy. Trace-only reports mark input ergonomics unavailable.
+
+No raw arguments, parser error text, hints, stdout, Window/principal identities or
+per-event payloads are emitted by this section. Normalization counts describe use,
+not an experiment proving saved model turns. Collect v13 coverage after an explicit
+deployment, compare repeated correction patterns and known provider spellings,
+and measure proposed descriptor bytes before deciding whether another alias has
+concrete value. Do not infer the misspelled field from this aggregate alone.
+
+### Authoritative, annotated, and unavailable facts
+
+**Authoritative from ActionAudit:** meaningful outer calls (also reported as the
+`model_round_trip_proxy`), outer success/failure/tool distribution, service timing
+when timestamps exist, serialized result bytes when persisted, canonical serial gaps
+and Host short-chain ordering evidence when continuity evidence exists, and Code Mode
+composition counts/timing/bytes/concurrency.
+
+**Manual bounded annotation:** repair turns, full task wall time, and final
+correctness/validation verdicts.
+
+**Unavailable when not explicitly recorded:**
+
+- exact model round trips. ActionAudit can prove meaningful model-facing outer tool
+  calls and overlap, but it does not persist the model response/turn identity needed
+  to prove how many inference round trips produced those calls.
+- whether two serial Host Code Mode calls came from one JavaScript cell or one model response. `host_short_chain` intentionally does not infer that fact;
+- per-child Code Mode failure-kind distribution. Current composition persists the
+  authoritative nested failure count but not each child failure category.
+- native batch item counts. A `read_files` or `search_project_texts` child call
+  is visible, but ActionAudit does not persist payload-safe item/query counts.
+- exact `Promise.all` usage. `max_in_flight > 1` proves overlapping nested
+  execution; it does not prove which JavaScript syntax created it.
+- generic same-execution Job handoff count and terminal-observation count outside
+  the authoritative consequential-child receipt evidence.
+- resolved recovery count. `recovery_kind` is guidance on one failed result, not
+  proof that a later call resolved it.
+- complete Runner-request total from trace files; trace persistence has no
+  completeness fence.
+
+Contract/surface failure analysis uses existing structured outer
+`error_kind`/`failure_kind`/`recovery_kind` distributions directly. For
+example, `invalid_arguments`, `child_call_failed`, or Code Mode runtime failure
+kinds are counted when they are actually present. The profiler does not invent a
+larger taxonomy or parse error prose to infer one.
+
+## Compare two reports
+
+```bash
+python3 scripts/agent_loop_report.py compare \
+  --baseline <direct-report.json> \
+  --candidate <code-mode-report.json> \
+  --output <comparison.json>
+```
+
+JSON is the authoritative comparison shape. A Direct baseline can be paired with
+either a Host Code Mode candidate or a typed Code Mode candidate. Numeric entries
+carry baseline, candidate, candidate-minus-baseline delta, and a `comparable` flag.
+The paired output includes at least:
+
+- meaningful outer-call/`model_round_trip_proxy` delta;
+- Host short-chain serial-transition, multi-call-chain, participating-call, maximum-chain-length deltas, plus side-by-side observed tool-pair distributions;
+- repair-turn delta and side-by-side repair reason counts;
+- failed outer-call delta;
+- failed Code Mode child calls;
+- structured contract/surface failure and recovery distributions;
+- outside-WebCodex gap and service time;
+- Code Mode nested-call count and `max_in_flight`;
+- nested raw-result bytes versus returned bytes;
+- task wall time when independently annotated;
+- full evidence availability for both runs.
+
+`case_compatibility` requires the same case id, exact base revision, and exact
+case fingerprint. `pair_compatibility` additionally requires Direct as the baseline
+and either Host Code Mode with `surface=host_code_mode`, or Code Mode with an
+explicit `read_only`, `validation`, or `guarded_edit` surface, as the candidate.
+`correctness_compatibility` requires both runs to pass the case correctness gate
+and any required validation. `throughput_compatibility` is true only when both
+the pair and correctness gates pass.
+
+The profiler still emits descriptive numeric deltas when a gate is closed so the
+raw evidence is inspectable, but those deltas are not treated as a valid throughput
+comparison. No metric ordering, score, winner, or automatic “better” judgment is
+produced.
+
+## Privacy and non-inferences
+
+The report never emits raw `ClientWindow` values, principal ids, Workflow Session
+ids, trace ids, runtime Project ids, tunnel/instance ids, commands, patches, file
+contents, credentials, or tool arguments. The run annotation rejects unknown
+fields so it cannot become a catch-all payload store.
+
+These measurements cannot establish model reasoning time, reasoning quality,
+intent, exact JavaScript source usage, causal attribution for outside-WebCodex
+gaps, or a general claim that Code Mode is faster. They provide bounded
+observations for controlled Direct-vs-Code-Mode experiments only.

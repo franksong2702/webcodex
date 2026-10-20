@@ -5,11 +5,33 @@ pub const MIN_SEARCH_PROJECT_TEXTS_RESULT_BYTES: usize = 8 * 1024;
 pub const DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES: usize = 64 * 1024;
 pub const MIN_READ_FILES_RESULT_BYTES: usize = 8 * 1024;
 pub const DEFAULT_READ_FILES_RESULT_BYTES: usize = 64 * 1024;
+/// Stable model-facing ceiling for explicitly requested broad/deep batch inspection.
+pub const MODEL_INSPECTION_MAX_RESULT_BYTES: usize = 512 * 1024;
 pub const FILE_READ_MAX_SERIALIZED_OUTPUT_BYTES: usize = 256 * 1024;
 pub const FILE_READ_DEFAULT_LIMIT: usize = 2000;
 pub const FILE_READ_MAX_LIMIT: usize = 2000;
-pub const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 512;
+/// Raw producer-page budget for `git_diff_hunks`, independent of the final
+/// serialized model-facing result ceiling.
+pub const MIN_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 16 * 1024;
+/// Keep producer stdout comfortably below the ordinary 256 KiB per-stream
+/// Runner result-retention default, leaving headroom for framing and metadata.
+pub const MAX_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 192 * 1024;
+/// Broad review should use the full safe producer page by default. Smaller pages
+/// only add Runner round-trips and repeat the same Git source scan; callers can
+/// still request a tighter page explicitly when useful.
+pub const DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES: usize = MAX_GIT_DIFF_HUNKS_PAGE_BYTES;
+pub const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 192;
 pub const DEFAULT_OBSERVE_JOBS_TAIL_LINES: usize = 40;
+/// Maximum explicit bounded wait for observing already-accepted Job work.
+/// This is intentionally separate from execution timeouts and initial
+/// synchronous handoff grace budgets.
+pub const MAX_JOB_OBSERVATION_WAIT_SECS: u64 = 100;
+/// Historical transport-agnostic suggested Job observation wait. MCP adapters
+/// may further normalize this to the configured Host timing policy.
+pub const DEFAULT_JOB_CONTINUATION_WAIT_SECS: u64 = 55;
+/// Intrinsic structured-execution synchronous-grace ceiling. This is a runtime
+/// capability bound, not an MCP Host deadline; MCP transport applies a separate
+/// Server-side clamp before dispatch.
 pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = 60;
 
 pub const MAX_SKILL_LIST_LIMIT: usize = 64;
@@ -37,20 +59,118 @@ pub const RECOVERY_KIND_VALUES: [&str; 7] = [
     "user_action",
     "none",
 ];
-pub const RECOVERY_TOOL_VALUES: [&str; 7] = [
-    "list_jobs",
-    "computer_find_elements",
-    "computer_list_windows",
-    "computer_list_applications",
-    "computer_list_displays",
-    "computer_snapshot_display",
-    "read_project_artifact_metadata",
+
+pub const GENERATED_FOLLOW_UP_KIND_VALUES: [&str; 2] =
+    ["mechanically_followable", "fallback_recovery"];
+
+/// Host-facing execution posture for a server-generated parser-ready tool call.
+///
+/// MechanicallyFollowable means the Server has already resolved the semantic
+/// choice needed for this exact follow-up, for example deterministic paging.
+/// FallbackRecovery means the call is available only as an explicit recovery,
+/// detail, or blocked-dependency path and must not be auto-followed merely
+/// because it is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedFollowUpKind {
+    MechanicallyFollowable,
+    FallbackRecovery,
+}
+
+impl GeneratedFollowUpKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MechanicallyFollowable => "mechanically_followable",
+            Self::FallbackRecovery => "fallback_recovery",
+        }
+    }
+}
+
+/// Closed model-facing vocabulary for continuing successful or partial
+/// observations. This is deliberately separate from failure recovery,
+/// authorization, retry/idempotency, execution identity, and resource ownership.
+pub const CONTINUATION_KIND_VALUES: [&str; 5] =
+    ["page", "batch", "observe", "checkpoint", "refine"];
+pub const CONTINUATION_CARRIER_VALUES: [&str; 6] = [
+    "position",
+    "index",
+    "opaque_token",
+    "observation_token",
+    "revision",
+    "none",
 ];
 
-pub const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
-pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 9;
-pub const BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS: usize = 8;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationKind {
+    Page,
+    Batch,
+    Observe,
+    Checkpoint,
+    Refine,
+}
 
+impl ContinuationKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::Batch => "batch",
+            Self::Observe => "observe",
+            Self::Checkpoint => "checkpoint",
+            Self::Refine => "refine",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationCarrier {
+    Position,
+    Index,
+    OpaqueToken,
+    ObservationToken,
+    Revision,
+    None,
+}
+
+impl ContinuationCarrier {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Position => "position",
+            Self::Index => "index",
+            Self::OpaqueToken => "opaque_token",
+            Self::ObservationToken => "observation_token",
+            Self::Revision => "revision",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ContinuationSemantics {
+    pub kind: ContinuationKind,
+    pub carrier: ContinuationCarrier,
+}
+
+impl ContinuationSemantics {
+    pub const fn new(kind: ContinuationKind, carrier: ContinuationCarrier) -> Self {
+        Self { kind, carrier }
+    }
+
+    pub fn to_value(self) -> serde_json::Value {
+        serde_json::to_value(self).expect("ContinuationSemantics serialization is infallible")
+    }
+}
+
+pub const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
+pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 29;
+/// Per-field bootstrap prose ceiling, independent of aggregate startup/context byte budgets.
+/// Allows first-use, reuse, refresh and authority boundaries without lossy compression.
+pub const BUILTIN_BOOTSTRAP_GUIDANCE_MAX_CHARS: usize = 1536;
+/// Ergonomic regression targets for built-in model guidance. These are not
+/// wire/schema limits; the serialized startup budget remains the hard bound.
+pub const BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEMS: usize = 8;
+pub const BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEM_CHARS: usize = 320;
 /// Validate a Runner project path without applying host-local filesystem semantics.
 /// The Server may route to an agent on another OS, so both POSIX and Windows
 /// absolute-path shapes are accepted; the Runner remains authoritative for

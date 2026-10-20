@@ -521,7 +521,7 @@ fn urgent_guidance_attention_is_bounded_safe_and_also_decorates_failure_results(
     assert_eq!(failed.output["session_hint"]["attention_required"], true);
     assert_eq!(
         failed.output["session_hint"]["attention_reason"],
-        "high_priority_guidance_requires_ack"
+        "session_message_requires_ack"
     );
     let body_bytes: usize = attention["messages"]
         .as_array()
@@ -581,6 +581,7 @@ async fn observe_session_messages_collaboration_recorder_target_scope_fences() {
     assert!(allowed.success, "{:?}", allowed.error);
     assert!(allowed.output["messages"].as_array().unwrap().is_empty());
     assert!(allowed.output["observation_token"].as_str().is_some());
+    assert!(allowed.output.get("continuation_semantics").is_none());
     let baseline_token = allowed.output["observation_token"]
         .as_str()
         .unwrap()
@@ -629,6 +630,7 @@ async fn observe_session_messages_collaboration_recorder_target_scope_fences() {
     assert_eq!(invalid_token.output["recovery_kind"], "fix_input");
     assert!(invalid_token.output.get("recovery_tool").is_none());
     assert!(invalid_token.output.get("observation_token").is_none());
+    assert!(invalid_token.output.get("continuation_semantics").is_none());
 
     let cross_project = call_with_recorder(
         &runtime,
@@ -842,13 +844,13 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
 
     let handoff = call_with_recorder(
         &runtime,
-        "session_handoff_summary",
+        "read_session_handoff",
         json!({
             "session_id": coordinator.session_id,
             "include_workspace": false,
             "include_checkpoints": false,
             "include_validation": false,
-            "summary_only": true
+            "diagnostic": true
         }),
         Some(&worker.session_id),
         &auth,
@@ -885,6 +887,25 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
         .get_assignment(&coordinator.session_id, &todo_id)
         .unwrap()
         .assignment_fence;
+    let forged_author_error = super::super::ToolCall::from_tool_name(
+        "complete_session_message",
+        json!({
+            "session_id": coordinator.session_id,
+            "message_id": todo_id,
+            "answer": "No findings. Revalidated the authoritative synthetic source after review.",
+            "completion_key": "worker-review-v1",
+            "expected_assignment_fence": assignment_fence.clone(),
+            "tags": ["review", "done"],
+            "priority": "normal",
+            "author_session_id": "wc_sess_forged_should_be_ignored"
+        }),
+    )
+    .expect_err("caller-controlled completion author must fail closed");
+    assert!(
+        forged_author_error.contains("unknown field `author_session_id`"),
+        "{forged_author_error}"
+    );
+
     let completed = call_with_recorder(
         &runtime,
         "complete_session_message",
@@ -896,7 +917,6 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
             "expected_assignment_fence": assignment_fence.clone(),
             "tags": ["review", "done"],
             "priority": "normal",
-            "author_session_id": "wc_sess_forged_should_be_ignored"
         }),
         Some(&worker.session_id),
         &auth,
@@ -975,7 +995,7 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
 
     let worker_tools = tool_names(&runtime, &worker.session_id);
     for expected in [
-        "session_handoff_summary",
+        "read_session_handoff",
         "list_session_messages",
         "complete_session_message",
     ] {
@@ -990,7 +1010,7 @@ async fn collaboration_two_sessions_keep_execution_history_and_explicit_provenan
         .any(|tool| tool == "post_session_message"));
     assert!(!coordinator_tools
         .iter()
-        .any(|tool| tool == "session_handoff_summary"));
+        .any(|tool| tool == "read_session_handoff"));
     assert!(!coordinator_tools
         .iter()
         .any(|tool| tool == "complete_session_message"));
@@ -1226,6 +1246,107 @@ async fn collaboration_cross_project_recorder_fails_closed_before_completion() {
 }
 
 #[tokio::test]
+async fn ack_ref_accumulates_retained_and_newly_projected_session_attention() {
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let session = start_authorized_unscoped_session(&runtime, "cumulative ACK ref", &auth);
+    let mut ids = Vec::new();
+    for index in 0..6 {
+        ids.push(
+            runtime
+                .sessions
+                .post_message_with_ack(
+                    PostSessionMessageInput {
+                        session_id: session.session_id.clone(),
+                        kind: SessionMessageKind::Guidance,
+                        message: format!("cumulative-guidance-{index}"),
+                        tags: Vec::new(),
+                        reply_to: None,
+                        priority: SessionMessagePriority::Normal,
+                    },
+                    true,
+                )
+                .unwrap()
+                .message_id,
+        );
+    }
+
+    let first = call_with_recorder(
+        &runtime,
+        "list_tools",
+        json!({}),
+        Some(&session.session_id),
+        &auth,
+        None,
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    let first_messages = first.output["session_attention"]["messages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        first_messages.len(),
+        super::super::SESSION_ATTENTION_MAX_MESSAGES
+    );
+    let first_ref = first.output["session_attention"]["ack_ref"]
+        .as_str()
+        .expect("first bounded projection should mint ACK ref")
+        .to_string();
+
+    let second = call_with_recorder_metadata(
+        &runtime,
+        "list_tools",
+        json!({}),
+        Some(&session.session_id),
+        ToolInvocationMetadata {
+            ack_ref: Some(first_ref.clone()),
+            ..Default::default()
+        },
+        &auth,
+        None,
+    )
+    .await;
+    assert!(second.success, "{:?}", second.error);
+    assert_eq!(
+        second.output["session_attention"]["ack"]["accepted_count"],
+        3
+    );
+    let second_messages = second.output["session_attention"]["messages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(second_messages.len(), 3);
+    let second_ref = second.output["session_attention"]["ack_ref"]
+        .as_str()
+        .expect("retained plus newly projected ACK set should mint replacement ref")
+        .to_string();
+    assert_ne!(second_ref, first_ref);
+
+    let third = call_with_recorder_metadata(
+        &runtime,
+        "list_tools",
+        json!({}),
+        Some(&session.session_id),
+        ToolInvocationMetadata {
+            ack_ref: Some(second_ref.clone()),
+            ..Default::default()
+        },
+        &auth,
+        None,
+    )
+    .await;
+    assert!(third.success, "{:?}", third.error);
+    assert_eq!(
+        third.output["session_attention"]["ack"]["accepted_count"],
+        ids.len()
+    );
+    assert!(third.output["session_attention"]["messages"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(third.output["session_attention"]["ack_ref"], second_ref);
+}
+
+#[tokio::test]
 async fn foreign_recording_session_is_denied_before_ordinary_tool_recording() {
     let runtime = test_runtime();
     let alice = shared_key_auth_context("ordinary-recorder-alice");
@@ -1241,13 +1362,35 @@ async fn foreign_recording_session_is_denied_before_ordinary_tool_recording() {
     .await;
     assert!(started.success, "{:?}", started.error);
     let session_id = started.output["session_id"].as_str().unwrap().to_string();
+    let ack_message = runtime
+        .sessions
+        .post_message_with_ack(
+            PostSessionMessageInput {
+                session_id: session_id.clone(),
+                kind: SessionMessageKind::Guidance,
+                message: "Alice-only ACK evidence".to_string(),
+                tags: Vec::new(),
+                reply_to: None,
+                priority: SessionMessagePriority::High,
+            },
+            true,
+        )
+        .unwrap();
+    let ack_ref = runtime
+        .sessions
+        .issue_ack_ref(&session_id, std::slice::from_ref(&ack_message.message_id))
+        .expect("Alice Session ACK set should mint a ref");
     let before = runtime.sessions.summary(&session_id, Some(100)).unwrap();
 
-    let denied = call_with_recorder(
+    let denied = call_with_recorder_metadata(
         &runtime,
         "list_projects",
         json!({}),
         Some(&session_id),
+        ToolInvocationMetadata {
+            ack_ref: Some(ack_ref),
+            ..Default::default()
+        },
         &bob,
         None,
     )
@@ -1259,6 +1402,20 @@ async fn foreign_recording_session_is_denied_before_ordinary_tool_recording() {
     assert!(!tool_names(&runtime, &session_id)
         .iter()
         .any(|tool| tool == "list_projects"));
+    let message_after_denial = runtime
+        .sessions
+        .list_messages(
+            &session_id,
+            sessions::ListSessionMessagesFilter {
+                message_id: Some(ack_message.message_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        message_after_denial[0].first_ack_observed_at.is_none(),
+        "foreign principal must not turn possession of ack_ref into ACK authority"
+    );
 
     let allowed = call_with_recorder(
         &runtime,
@@ -1528,7 +1685,7 @@ async fn project_scoped_session_authority_rejects_recycled_project_identity() {
 
     let oauth_read = call_with_recorder(
         &runtime,
-        "session_summary",
+        "read_session_summary",
         json!({"session_id": session_id}),
         None,
         &alice_oauth,
@@ -1559,7 +1716,7 @@ async fn project_scoped_session_authority_rejects_recycled_project_identity() {
     .await;
     let before = runtime.sessions.summary(&session_id, Some(100)).unwrap();
     let denied_calls = [
-        ("session_summary", json!({"session_id": session_id})),
+        ("read_session_summary", json!({"session_id": session_id})),
         (
             "list_session_messages",
             json!({"session_id": session_id, "message_id": todo_id}),
@@ -1579,17 +1736,17 @@ async fn project_scoped_session_authority_rejects_recycled_project_identity() {
             }),
         ),
         (
-            "session_discussion_summary",
+            "read_session_discussion_summary",
             json!({"session_id": session_id}),
         ),
         (
-            "session_handoff_summary",
+            "read_session_handoff",
             json!({
                 "session_id": session_id,
                 "include_workspace": false,
                 "include_checkpoints": false,
                 "include_validation": false,
-                "summary_only": true
+                "diagnostic": true
             }),
         ),
         ("close_session", json!({"session_id": session_id})),
@@ -1657,7 +1814,7 @@ async fn project_scoped_session_authority_rejects_recycled_project_identity() {
     .await;
     let restored_owner = call_with_recorder(
         &runtime,
-        "session_summary",
+        "read_session_summary",
         json!({"session_id": session_id}),
         None,
         &alice,
@@ -1709,7 +1866,7 @@ async fn projectless_session_owner_authority_blocks_known_ids_from_foreign_princ
         .assignment_fence;
 
     let denied_calls = [
-        ("session_summary", json!({"session_id": session_id})),
+        ("read_session_summary", json!({"session_id": session_id})),
         (
             "post_session_message",
             json!({"session_id": session_id, "kind": "note", "message": "Bob note"}),
@@ -1733,17 +1890,17 @@ async fn projectless_session_owner_authority_blocks_known_ids_from_foreign_princ
             }),
         ),
         (
-            "session_discussion_summary",
+            "read_session_discussion_summary",
             json!({"session_id": session_id}),
         ),
         (
-            "session_handoff_summary",
+            "read_session_handoff",
             json!({
                 "session_id": session_id,
                 "include_workspace": false,
                 "include_checkpoints": false,
                 "include_validation": false,
-                "summary_only": true
+                "diagnostic": true
             }),
         ),
         ("close_session", json!({"session_id": session_id})),
@@ -1760,7 +1917,7 @@ async fn projectless_session_owner_authority_blocks_known_ids_from_foreign_princ
 
     let alice_summary = call_with_recorder(
         &runtime,
-        "session_summary",
+        "read_session_summary",
         json!({"session_id": session_id}),
         None,
         &alice,
@@ -1825,7 +1982,7 @@ async fn projectless_owner_fingerprint_survives_restart_without_raw_principal_ma
     let restored = test_runtime().with_session_ledger(&ledger);
     let alice_read = call_with_recorder(
         &restored,
-        "session_summary",
+        "read_session_summary",
         json!({"session_id": session_id}),
         None,
         &alice,
@@ -1835,7 +1992,7 @@ async fn projectless_owner_fingerprint_survives_restart_without_raw_principal_ma
     assert!(alice_read.success, "{:?}", alice_read.error);
     let bob_read = call_with_recorder(
         &restored,
-        "session_summary",
+        "read_session_summary",
         json!({"session_id": session_id}),
         None,
         &bob,
@@ -1893,7 +2050,7 @@ async fn legacy_projectless_owner_hash_is_not_accepted_after_restart() {
     assert!(restored.sessions.summary(&session_id, None).is_some());
     let denied = call_with_recorder(
         &restored,
-        "session_summary",
+        "read_session_summary",
         json!({"session_id": session_id}),
         None,
         &alice,

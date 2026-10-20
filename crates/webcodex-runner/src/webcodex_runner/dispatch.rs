@@ -1,29 +1,31 @@
 use super::external_tools::ExternalRoute;
+use super::job_manager::{decode_failure_prestart_lifecycle, JobManager, PendingJobStart};
 use super::lsp::{handle_lsp_operation, LspSupervisor};
 use super::transport::ResultSubmission;
 use super::validation::handle_validation_request;
 use super::{
-    handle_computer_operation, handle_prepare_managed_worktree_operation,
+    handle_browser_operation, handle_computer_operation, handle_prepare_managed_worktree_operation,
     handle_project_lifecycle_operation, handle_project_operation,
-    handle_resolve_or_register_project_operation, handle_skill_store_request,
-    run_internal_posix_script_with_profiles_and_execution_state,
+    handle_resolve_or_register_project_operation, handle_runner_instruction_request,
+    handle_runner_skill_request, run_internal_posix_script_with_profiles_and_execution_state,
     run_internal_search_script_with_profiles_and_execution_state,
     run_process_with_profiles_and_execution_state, run_script_with_profiles_and_execution_state,
-    run_shell_with_profiles_and_execution_state, run_ssh_shell_with_execution_state, CommandResult,
-    HotRunnerConfig, PersistentShellManager, ReloadableRunnerConfig, RunnerSink,
+    run_shell_with_profiles_and_execution_state,
+    run_skill_resource_with_profiles_and_execution_state, run_ssh_shell_with_execution_state,
+    CommandResult, HotRunnerConfig, PersistentShellManager, ReloadableRunnerConfig, RunnerSink,
     ShellCommandResult, SubmitResultError,
 };
-use crate::runner_protocol::{
-    PersistentShellResult, RunnerConfigAction, RunnerConfigOperationRequest,
-    RunnerJobUpdateRequest, RunnerRequest, EXTERNAL_SEARCH_REQUEST_PREFIX,
-    RUNNER_CONFIG_RESPONSE_MAX_BYTES,
-};
-use crate::{handle_file_operation, JobManager, PendingJobStart};
+use crate::webcodex_runner::file_dispatch::handle_file_operation_with_artifact_store;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use webcodex_core::runner_operation::{
     RunnerFileOperation, RunnerJobOperation, RunnerOperation, RunnerProjectOperation,
     RunnerProjectOperationKind, RunnerShellOperation,
+};
+use webcodex_core::runner_protocol::{
+    PersistentShellResult, RunnerConfigAction, RunnerConfigOperationRequest,
+    RunnerJobUpdateRequest, RunnerRequest, EXTERNAL_SEARCH_REQUEST_PREFIX,
+    RUNNER_CONFIG_RESPONSE_MAX_BYTES,
 };
 
 fn internal_search_script(command: &str) -> Option<&str> {
@@ -112,12 +114,26 @@ fn run_native_shell_or_internal_search(
                 "invalid_internal_search_request: generated search script is missing; command was not started",
             ));
         };
+        #[cfg(windows)]
+        if let Some(result) = super::run_windows_native_search_with_profiles(
+            config.generation,
+            &config.policy,
+            &config.shell,
+            project_registry_dir,
+            jobs.prepared_profiles(),
+            operation.cwd.as_deref(),
+            operation.stdin.as_deref(),
+            operation.timeout_secs,
+            Some(runtime.shutdown_flag()),
+        ) {
+            return result;
+        }
         return run_internal_search_script_with_profiles_and_execution_state(
             config.generation,
             &config.policy,
             &config.shell,
             project_registry_dir,
-            &jobs.prepared_profiles,
+            jobs.prepared_profiles(),
             operation.cwd.as_deref(),
             script,
             operation.timeout_secs,
@@ -129,9 +145,11 @@ fn run_native_shell_or_internal_search(
         &config.policy,
         &config.shell,
         project_registry_dir,
-        &jobs.prepared_profiles,
+        jobs.prepared_profiles(),
         operation.cwd.as_deref(),
         &operation.command,
+        operation.shell,
+        operation.login,
         operation.stdin.as_deref(),
         operation.timeout_secs,
         Some(runtime.shutdown_flag()),
@@ -180,7 +198,7 @@ fn submit_invalid_job_start(sink: &RunnerSink, request: &RunnerRequest, error: S
     } else {
         format!("invalid Runner Job request: {error}")
     };
-    let command_execution_state = crate::decode_failure_prestart_lifecycle(request);
+    let command_execution_state = decode_failure_prestart_lifecycle(request);
     let _ = sink.send_job_update(&RunnerJobUpdateRequest {
         client_id: sink.client_id().to_string(),
         runner_instance_id: sink.runner_instance_id().to_string(),
@@ -190,14 +208,15 @@ fn submit_invalid_job_start(sink: &RunnerSink, request: &RunnerRequest, error: S
         status: "failed".to_string(),
         stdout_chunk: None,
         stderr_chunk: None,
-        stdout_tail: None,
-        stderr_tail: None,
         log_snapshot: None,
         exit_code: None,
         duration_ms: Some(0),
         error: Some(error),
         command_execution_state,
         validation_progress: None,
+        test_count_evidence: None,
+        format_mutation: None,
+        build_artifacts: None,
         activity: None,
         finished: true,
     });
@@ -220,7 +239,8 @@ fn submit_decode_failure(
         | "start_validation_job"
         | "start_process_job"
         | "start_detached_process_job"
-        | "start_script_job" => {
+        | "start_script_job"
+        | "start_skill_resource_job" => {
             if submit_invalid_job_start(sink, &request, error.clone()) {
                 Ok(true)
             } else {
@@ -250,8 +270,8 @@ fn submit_decode_failure(
         "mcp_gateway" => sink
             .submit_mcp_gateway_result(
                 request_id,
-                crate::mcp_gateway::McpGatewayResponse::error(
-                    crate::mcp_gateway::McpGatewayDispatchState::NotStarted,
+                webcodex_core::mcp_gateway::McpGatewayResponse::error(
+                    webcodex_core::mcp_gateway::McpGatewayDispatchState::NotStarted,
                     "invalid_bridge_request",
                     error,
                 ),
@@ -293,7 +313,7 @@ fn submit_decode_failure(
                 runtime,
             )
             .map(|_| true),
-        "run_process" | "run_script" | "run_internal_posix_script" => sink
+        "run_process" | "run_script" | "run_internal_posix_script" | "skill_resource_execution" => sink
             .submit_shell_result_with_metadata(
                 request_id,
                 ShellCommandResult::not_started(invalid_command(format!(
@@ -337,6 +357,7 @@ pub(crate) fn dispatch_request_with_outcome(
     persistent_shells: &PersistentShellManager,
     project_registry_dir: &Path,
     lsp: &LspSupervisor,
+    browser: &webcodex_browser::BrowserSupervisor,
     request: RunnerRequest,
 ) -> Result<RunnerDispatchOutcome, SubmitResultError> {
     if runner_tool_trace_enabled() {
@@ -394,9 +415,46 @@ pub(crate) fn dispatch_request_with_outcome(
         RunnerOperation::McpGateway(operation) => sink
             .submit_mcp_gateway_result(request_id, runtime.mcp_gateway().handle(operation))
             .map(|_| true),
-        RunnerOperation::PluginGateway(operation) => sink
-            .submit_plugin_gateway_result(request_id, runtime.plugins().handle(operation))
-            .map(|_| true),
+        RunnerOperation::PluginGateway(operation) => {
+            let response = match operation {
+                webcodex_core::plugin::PluginGatewayRequest::ProjectCatalog { project_id } => {
+                    runtime
+                        .plugins()
+                        .handle_project_catalog(&project_id, project_registry_dir)
+                }
+                operation => runtime
+                    .plugins()
+                    .handle_with_project_registry(operation, project_registry_dir),
+            };
+            sink.submit_plugin_gateway_result(request_id, response)
+                .map(|_| true)
+        }
+        RunnerOperation::RunnerInstruction(operation) => {
+            let mut result = handle_runner_instruction_request(
+                config.generation,
+                &config.instructions,
+                operation,
+            );
+            let current = runtime.snapshot();
+            if current.generation != config.generation {
+                // Carry the new generation in the typed response itself. The
+                // best-effort metadata envelope follows the result and may not
+                // have reached Control when it decides which rules to retain.
+                result.stdout = Some(serde_json::to_string(
+                    &webcodex_core::runner_instruction::RunnerInstructionSnapshotResponse {
+                        format: webcodex_core::runner_instruction::RUNNER_INSTRUCTION_RESPONSE_FORMAT.into(),
+                        generation: current.generation,
+                        scan_complete: false,
+                        files: Vec::new(),
+                    },
+                ).expect("instruction snapshot serialization"));
+                result.exit_code = Some(0);
+                result.stderr = None;
+                result.error = None;
+            }
+            sink.submit_result_with_metadata(request_id, result, &current, runtime)
+                .map(|_| true)
+        }
         RunnerOperation::RunnerConfig(operation) => {
             let result = handle_runner_config_operation(runtime, &operation);
             // A reload may have replaced the snapshot passed into dispatch_request.
@@ -419,8 +477,9 @@ pub(crate) fn dispatch_request_with_outcome(
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
-        RunnerOperation::SkillStore(operation) => {
-            let result = handle_skill_store_request(
+        RunnerOperation::Skill(operation) => {
+            let result = handle_runner_skill_request(
+                &config.skills,
                 runtime.client_id(),
                 runtime.server_url(),
                 policy,
@@ -430,7 +489,35 @@ pub(crate) fn dispatch_request_with_outcome(
                 .map(|_| true)
         }
         RunnerOperation::Computer(operation) => {
-            let result = handle_computer_operation(&operation);
+            let result = if super::computer_session::configured() {
+                super::computer_session::dispatch(&operation)
+            } else {
+                handle_computer_operation(&operation)
+            };
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::RunSkillResource(operation) => {
+            let result = run_skill_resource_with_profiles_and_execution_state(
+                config.generation,
+                &config.skills,
+                runtime.client_id(),
+                runtime.server_url(),
+                policy,
+                shell,
+                project_registry_dir,
+                jobs.prepared_profiles(),
+                operation.cwd.as_deref(),
+                &operation.request,
+                operation.timeout_secs,
+                Some(runtime.shutdown_flag()),
+                None,
+            );
+            sink.submit_shell_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::Browser(operation) => {
+            let result = handle_browser_operation(browser, policy, &operation);
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -440,7 +527,7 @@ pub(crate) fn dispatch_request_with_outcome(
                 policy,
                 shell,
                 project_registry_dir,
-                &jobs.prepared_profiles,
+                jobs.prepared_profiles(),
                 operation.cwd.as_deref(),
                 &operation.process.executable,
                 &operation.process.args,
@@ -457,7 +544,7 @@ pub(crate) fn dispatch_request_with_outcome(
                 policy,
                 shell,
                 project_registry_dir,
-                &jobs.prepared_profiles,
+                jobs.prepared_profiles(),
                 operation.cwd.as_deref(),
                 &operation.script,
                 operation.stdin.as_deref(),
@@ -473,7 +560,7 @@ pub(crate) fn dispatch_request_with_outcome(
                 policy,
                 shell,
                 project_registry_dir,
-                &jobs.prepared_profiles,
+                jobs.prepared_profiles(),
                 operation.cwd.as_deref(),
                 &operation.script.script,
                 operation.timeout_secs,
@@ -520,7 +607,7 @@ pub(crate) fn dispatch_request_with_outcome(
             if let Some(resource) = ssh_resource {
                 let result = match ssh_session_id {
                     Some(session_id) => run_ssh_shell_with_execution_state(
-                        &jobs.ssh_pool,
+                        jobs.ssh_pool(),
                         config.generation,
                         &config.ssh,
                         policy,
@@ -536,6 +623,19 @@ pub(crate) fn dispatch_request_with_outcome(
                         "ssh_session_required: an SSH resource requires a Workflow Session id; command was not started",
                     )),
                 };
+                sink.submit_shell_result_with_metadata(request_id, result, config, runtime)
+                    .map(|_| true)
+            } else if operation.shell.is_some() {
+                // An explicit semantic shell selection is authoritative. Do not
+                // let command-shape routing consume the request under another
+                // interpreter before the native selector is applied.
+                let result = run_native_shell_or_internal_search(
+                    config,
+                    runtime,
+                    jobs,
+                    project_registry_dir,
+                    &operation,
+                );
                 sink.submit_shell_result_with_metadata(request_id, result, config, runtime)
                     .map(|_| true)
             } else {
@@ -576,7 +676,11 @@ pub(crate) fn dispatch_request_with_outcome(
             }
         }
         RunnerOperation::File(operation) => {
-            let result = handle_file_operation(policy, &operation);
+            let result = handle_file_operation_with_artifact_store(
+                policy,
+                &operation,
+                Some(project_registry_dir),
+            );
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -627,6 +731,21 @@ pub(crate) fn dispatch_request_with_outcome(
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
+        RunnerOperation::PlanProjectValidation(payload) => {
+            let result = super::validation::project::handle(policy, project_registry_dir, &payload);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::PlanProjectBuild(payload) => {
+            let result = super::project_build::handle(policy, project_registry_dir, &payload);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::PlanProjectFormat(payload) => {
+            let result = super::project_format::handle(policy, project_registry_dir, &payload);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
         RunnerOperation::Validation { payload, .. } => {
             let result = handle_validation_request(
                 policy,
@@ -634,6 +753,28 @@ pub(crate) fn dispatch_request_with_outcome(
                 &payload,
                 Some(runtime.shutdown_flag()),
             );
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::JobInput(input) => {
+            let result = match jobs.write_input(&input, policy, sink.runner_instance_id()) {
+                Ok(receipt) => CommandResult {
+                    exit_code: Some(0),
+                    stdout: Some(
+                        serde_json::to_string(&receipt).expect("input receipt serialization"),
+                    ),
+                    stderr: None,
+                    duration_ms: None,
+                    error: None,
+                },
+                Err(error) => CommandResult {
+                    exit_code: Some(1),
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: None,
+                    error: Some(error),
+                },
+            };
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -647,15 +788,13 @@ pub(crate) fn dispatch_request_with_outcome(
             } else {
                 jobs.enqueue(
                     sink.clone(),
-                    PendingJobStart {
-                        generation: config.generation,
-                        policy: policy.clone(),
-                        shell: shell.clone(),
-                        ssh: config.ssh.clone(),
-                        project_registry_dir: project_registry_dir.to_path_buf(),
-                        metadata: invocation_metadata,
+                    PendingJobStart::from_invocation(
+                        config,
+                        runtime,
+                        project_registry_dir,
+                        invocation_metadata,
                         operation,
-                    },
+                    ),
                 );
                 Ok(true)
             }
@@ -686,6 +825,7 @@ pub(crate) fn dispatch_request(
         persistent_shells,
         project_registry_dir,
         lsp,
+        &webcodex_browser::BrowserSupervisor::new(),
         request,
     )
     .map(|outcome| outcome.handled)

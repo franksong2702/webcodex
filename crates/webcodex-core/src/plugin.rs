@@ -19,15 +19,18 @@ pub const PLUGIN_MAX_TOOL_NAME_BYTES: usize = 128;
 pub const PLUGIN_MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const PLUGIN_MAX_SCHEMA_BYTES: usize = 64 * 1024;
 pub const PLUGIN_MAX_ARGUMENT_BYTES: usize = 64 * 1024;
-pub const PLUGIN_MAX_STRUCTURED_CONTENT_BYTES: usize = 128 * 1024;
-pub const PLUGIN_MAX_TEXT_CONTENT_BYTES: usize = 64 * 1024;
-pub const PLUGIN_MAX_RESULT_BYTES: usize = 256 * 1024;
+pub const PLUGIN_MAX_STRUCTURED_CONTENT_BYTES: usize = 512 * 1024;
+pub const PLUGIN_MAX_TEXT_CONTENT_BYTES: usize = 512 * 1024;
+pub const PLUGIN_MAX_RESULT_BYTES: usize = 512 * 1024;
 pub const PLUGIN_MAX_CONTENT_ITEMS: usize = 32;
 pub const PLUGIN_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const PLUGIN_MAX_JSON_DEPTH: usize = 16;
 pub const PLUGIN_MAX_JSON_NODES: usize = 4_096;
-pub const PLUGIN_MAX_JSON_STRING_BYTES: usize = 64 * 1024;
+pub const PLUGIN_MAX_JSON_STRING_BYTES: usize = 512 * 1024;
 pub const PLUGIN_MAX_CHECK_DETAIL_BYTES: usize = 512;
+pub const PLUGIN_PROJECT_CATALOG_REVISION_PREFIX: &str = "wc_plugcat_";
+pub const PLUGIN_MAX_PROJECT_CATALOG_DESCRIPTION_BYTES: usize = 512;
+pub const PLUGIN_MAX_PROJECT_CATALOG_ENTRIES: usize = PLUGIN_MAX_PROVIDERS * PLUGIN_MAX_TOOL_COUNT;
 pub const PLUGIN_SCHEMA_MAX_PROPERTIES: usize = 128;
 pub const PLUGIN_SCHEMA_MAX_REQUIRED: usize = 128;
 pub const PLUGIN_SCHEMA_MAX_ENUM_VALUES: usize = 128;
@@ -40,6 +43,9 @@ pub enum PluginGatewayRequest {
         provider_id: String,
     },
     Reload,
+    ProjectCatalog {
+        project_id: String,
+    },
     ProvidersList,
     ToolsList {
         provider_id: String,
@@ -51,7 +57,18 @@ pub enum PluginGatewayRequest {
         name: String,
         arguments: Value,
         expected_schema: PluginSchemaObservation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_target: Option<PluginProjectTarget>,
     },
+}
+
+/// Server-authorized exact Project observation. The Runner rechecks its local
+/// registry and the provider's launch cwd before dispatch; this is not a sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginProjectTarget {
+    pub project_id: String,
+    pub root_fingerprint: String,
 }
 
 impl PluginGatewayRequest {
@@ -66,7 +83,10 @@ impl PluginGatewayRequest {
                 provider_instance_id,
                 ..
             } => Some((provider_id, provider_instance_id)),
-            Self::Check { .. } | Self::Reload | Self::ProvidersList => None,
+            Self::Check { .. }
+            | Self::Reload
+            | Self::ProjectCatalog { .. }
+            | Self::ProvidersList => None,
         }
     }
 }
@@ -83,6 +103,13 @@ pub enum PluginDispatchState {
 #[serde(deny_unknown_fields)]
 pub struct PluginTool {
     pub name: String,
+    /// Authority requirement, deliberately not an advisory annotation.
+    #[serde(
+        default,
+        rename = "projectBound",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub project_bound: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +129,12 @@ pub struct PluginTool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginSchemaObservation {
+    #[serde(
+        default,
+        rename = "projectBound",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub project_bound: bool,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
     #[serde(
@@ -117,6 +150,7 @@ pub struct PluginSchemaObservation {
 impl PluginTool {
     pub fn schema_observation(&self) -> PluginSchemaObservation {
         PluginSchemaObservation {
+            project_bound: self.project_bound,
             input_schema: self.input_schema.clone(),
             output_schema: self.output_schema.clone(),
             annotations: self.annotations.clone(),
@@ -185,6 +219,83 @@ pub struct PluginProviderView {
     pub error_code: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSelectionAnnotations {
+    #[serde(
+        default,
+        rename = "readOnlyHint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub read_only_hint: Option<bool>,
+    #[serde(
+        default,
+        rename = "destructiveHint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub destructive_hint: Option<bool>,
+    #[serde(
+        default,
+        rename = "idempotentHint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idempotent_hint: Option<bool>,
+    #[serde(
+        default,
+        rename = "openWorldHint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub open_world_hint: Option<bool>,
+}
+
+impl PluginSelectionAnnotations {
+    pub fn from_value(value: Option<&Value>) -> Self {
+        let boolean = |key| {
+            value
+                .and_then(Value::as_object)
+                .and_then(|object| object.get(key))
+                .and_then(Value::as_bool)
+        };
+        Self {
+            read_only_hint: boolean("readOnlyHint"),
+            destructive_hint: boolean("destructiveHint"),
+            idempotent_hint: boolean("idempotentHint"),
+            open_world_hint: boolean("openWorldHint"),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.read_only_hint.is_none()
+            && self.destructive_hint.is_none()
+            && self.idempotent_hint.is_none()
+            && self.open_world_hint.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPluginCatalogEntry {
+    pub plugin: String,
+    pub name: String,
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "PluginSelectionAnnotations::is_empty")]
+    pub annotations: PluginSelectionAnnotations,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPluginCatalog {
+    pub catalog_revision: String,
+    /// Complete count before transport truncation; revision also covers all entries.
+    pub total_count: usize,
+    /// Deterministic sorted prefix that fits the Plugin gateway response bound.
+    pub entries: Vec<ProjectPluginCatalogEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginReloadFailure {
@@ -249,6 +360,9 @@ pub enum PluginGatewayResponsePayload {
     },
     Providers {
         providers: Vec<PluginProviderView>,
+    },
+    ProjectCatalog {
+        catalog: ProjectPluginCatalog,
     },
     Reloaded {
         providers: Vec<PluginProviderView>,
@@ -358,6 +472,16 @@ pub fn validate_request(request: &PluginGatewayRequest) -> Result<(), String> {
     match request {
         PluginGatewayRequest::Check { provider_id } => validate_provider_id(provider_id),
         PluginGatewayRequest::Reload | PluginGatewayRequest::ProvidersList => Ok(()),
+        PluginGatewayRequest::ProjectCatalog { project_id } => {
+            if project_id.trim().is_empty()
+                || project_id.len() > 512
+                || project_id.chars().any(char::is_control)
+            {
+                Err("project_id is invalid for Plugin project catalog discovery".to_string())
+            } else {
+                Ok(())
+            }
+        }
         PluginGatewayRequest::ToolsList {
             provider_id,
             provider_instance_id,
@@ -372,8 +496,18 @@ pub fn validate_request(request: &PluginGatewayRequest) -> Result<(), String> {
             name,
             arguments,
             expected_schema,
-            ..
+            project_target,
         } => {
+            if let Some(target) = project_target {
+                for value in [&target.project_id, &target.root_fingerprint] {
+                    if value.trim().is_empty()
+                        || value.len() > 512
+                        || value.chars().any(char::is_control)
+                    {
+                        return Err("invalid Plugin Project target".to_string());
+                    }
+                }
+            }
             validate_provider_id(provider_id)?;
             validate_provider_instance_id(provider_instance_id)?;
             validate_tool_name(name)?;
@@ -451,6 +585,19 @@ pub fn validate_plugin_catalog_digest(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_project_plugin_catalog_revision(value: &str) -> Result<(), String> {
+    let Some(encoded) = value.strip_prefix(PLUGIN_PROJECT_CATALOG_REVISION_PREFIX) else {
+        return Err("project Plugin catalog revision has invalid namespace".to_string());
+    };
+    if crate::compact::decode::<32>(encoded).is_none() {
+        return Err(
+            "project Plugin catalog revision must contain one canonical compact SHA-256 digest"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SchemaProfileFailureKind {
     Invalid,
@@ -506,8 +653,9 @@ fn parse_plugin_schema_type(value: &str) -> Option<PluginSchemaType> {
 fn preflight_plugin_schema_profile(
     schema: &Value,
     require_object_root: bool,
+    max_string_schema_length: usize,
 ) -> Result<(), SchemaProfileFailure> {
-    let schema_type = preflight_plugin_schema_node(schema, 0)?;
+    let schema_type = preflight_plugin_schema_node(schema, 0, max_string_schema_length)?;
     if require_object_root && schema_type != PluginSchemaType::Object {
         return Err(SchemaProfileFailure::invalid(
             "tool schema root type must be object",
@@ -519,6 +667,7 @@ fn preflight_plugin_schema_profile(
 fn preflight_plugin_schema_node(
     schema: &Value,
     depth: usize,
+    max_string_schema_length: usize,
 ) -> Result<PluginSchemaType, SchemaProfileFailure> {
     if depth > PLUGIN_MAX_JSON_DEPTH {
         return Err(SchemaProfileFailure::invalid(
@@ -606,7 +755,7 @@ fn preflight_plugin_schema_node(
         }
         if let Some(properties) = properties {
             for child in properties.values() {
-                preflight_plugin_schema_node(child, depth + 1)?;
+                preflight_plugin_schema_node(child, depth + 1, max_string_schema_length)?;
             }
         }
 
@@ -661,8 +810,8 @@ fn preflight_plugin_schema_node(
         ));
     }
     if schema_type == PluginSchemaType::String {
-        let minimum = bounded_schema_usize(object.get("minLength"), PLUGIN_MAX_JSON_STRING_BYTES)?;
-        let maximum = bounded_schema_usize(object.get("maxLength"), PLUGIN_MAX_JSON_STRING_BYTES)?;
+        let minimum = bounded_schema_usize(object.get("minLength"), max_string_schema_length)?;
+        let maximum = bounded_schema_usize(object.get("maxLength"), max_string_schema_length)?;
         if minimum
             .zip(maximum)
             .is_some_and(|(minimum, maximum)| minimum > maximum)
@@ -693,7 +842,7 @@ fn preflight_plugin_schema_node(
             ));
         }
         if let Some(items) = object.get("items") {
-            preflight_plugin_schema_node(items, depth + 1)?;
+            preflight_plugin_schema_node(items, depth + 1, max_string_schema_length)?;
         }
     }
 
@@ -715,12 +864,16 @@ fn bounded_schema_usize(
     Ok(Some(value))
 }
 
-fn validate_plugin_tool_schema_profile(schema: &Value, field: &str) -> Result<(), String> {
+fn validate_plugin_tool_schema_profile(
+    schema: &Value,
+    field: &str,
+    max_string_schema_length: usize,
+) -> Result<(), String> {
     if !schema.is_object() {
         return Err(format!("{field} must be a JSON object"));
     }
     validate_json_value(schema, PLUGIN_MAX_SCHEMA_BYTES, field)?;
-    preflight_plugin_schema_profile(schema, true)
+    preflight_plugin_schema_profile(schema, true, max_string_schema_length)
         .map_err(|failure| format!("{field}: {}", failure.message))
 }
 
@@ -728,7 +881,11 @@ pub fn validate_plugin_input_arguments(
     input_schema: &Value,
     arguments: &Value,
 ) -> Result<(), String> {
-    validate_plugin_tool_schema_profile(input_schema, "tool inputSchema")?;
+    validate_plugin_tool_schema_profile(
+        input_schema,
+        "tool inputSchema",
+        PLUGIN_MAX_ARGUMENT_BYTES,
+    )?;
     validate_json_value(arguments, PLUGIN_MAX_ARGUMENT_BYTES, "tool arguments")?;
     if !plugin_schema_matches(input_schema, arguments, 0) {
         return Err("tool arguments do not match the admitted Plugin Schema Profile".to_string());
@@ -740,7 +897,11 @@ pub fn validate_plugin_structured_output(
     output_schema: &Value,
     structured_content: &Value,
 ) -> Result<(), String> {
-    validate_plugin_tool_schema_profile(output_schema, "tool outputSchema")?;
+    validate_plugin_tool_schema_profile(
+        output_schema,
+        "tool outputSchema",
+        PLUGIN_MAX_STRUCTURED_CONTENT_BYTES,
+    )?;
     validate_json_value(
         structured_content,
         PLUGIN_MAX_STRUCTURED_CONTENT_BYTES,
@@ -921,6 +1082,7 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
         field: &'static str,
         value: &Value,
         invalid_code: &'static str,
+        max_string_schema_length: Option<usize>,
     ) -> Option<PluginCheckDiagnostic> {
         if !value.is_object() {
             return Some(diagnostic(invalid_code, Some(tool), Some(field)));
@@ -933,8 +1095,10 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
             };
             return Some(diagnostic(code, Some(tool), Some(field)));
         }
-        if field != "annotations" {
-            if let Err(failure) = preflight_plugin_schema_profile(value, true) {
+        if let Some(max_string_schema_length) = max_string_schema_length {
+            if let Err(failure) =
+                preflight_plugin_schema_profile(value, true, max_string_schema_length)
+            {
                 let code = match failure.kind {
                     SchemaProfileFailureKind::UnsupportedKeyword => "schema_keyword_unsupported",
                     SchemaProfileFailureKind::Invalid => invalid_code,
@@ -980,13 +1144,18 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
             "inputSchema",
             &tool.input_schema,
             "input_schema_invalid",
+            Some(PLUGIN_MAX_ARGUMENT_BYTES),
         ) {
             return diagnostic;
         }
         if let Some(output) = tool.output_schema.as_ref() {
-            if let Some(diagnostic) =
-                schema_failure(&tool.name, "outputSchema", output, "output_schema_invalid")
-            {
+            if let Some(diagnostic) = schema_failure(
+                &tool.name,
+                "outputSchema",
+                output,
+                "output_schema_invalid",
+                Some(PLUGIN_MAX_STRUCTURED_CONTENT_BYTES),
+            ) {
                 return diagnostic;
             }
         }
@@ -996,6 +1165,7 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
                 "annotations",
                 annotations,
                 "annotations_invalid",
+                None,
             ) {
                 return diagnostic;
             }
@@ -1005,9 +1175,17 @@ pub fn diagnose_invalid_tools(tools: &[PluginTool]) -> PluginCheckDiagnostic {
 }
 
 pub fn validate_schema_observation(observation: &PluginSchemaObservation) -> Result<(), String> {
-    validate_plugin_tool_schema_profile(&observation.input_schema, "tool inputSchema")?;
+    validate_plugin_tool_schema_profile(
+        &observation.input_schema,
+        "tool inputSchema",
+        PLUGIN_MAX_ARGUMENT_BYTES,
+    )?;
     if let Some(output) = observation.output_schema.as_ref() {
-        validate_plugin_tool_schema_profile(output, "tool outputSchema")?;
+        validate_plugin_tool_schema_profile(
+            output,
+            "tool outputSchema",
+            PLUGIN_MAX_STRUCTURED_CONTENT_BYTES,
+        )?;
     }
     if let Some(annotations) = observation.annotations.as_ref() {
         if !annotations.is_object() {
@@ -1079,6 +1257,9 @@ pub fn validate_response(response: &PluginGatewayResponse) -> Result<(), String>
             PluginGatewayResponsePayload::Providers { providers } => {
                 validate_provider_views(providers)?
             }
+            PluginGatewayResponsePayload::ProjectCatalog { catalog } => {
+                validate_project_plugin_catalog(catalog)?
+            }
             PluginGatewayResponsePayload::Reloaded {
                 providers,
                 failures,
@@ -1119,6 +1300,10 @@ pub fn validate_response_for_request(
         }
         (PluginGatewayRequest::Reload, Some(PluginGatewayResponsePayload::Reloaded { .. }))
         | (
+            PluginGatewayRequest::ProjectCatalog { .. },
+            Some(PluginGatewayResponsePayload::ProjectCatalog { .. }),
+        )
+        | (
             PluginGatewayRequest::ProvidersList,
             Some(PluginGatewayResponsePayload::Providers { .. }),
         )
@@ -1133,6 +1318,39 @@ pub fn validate_response_for_request(
         _ => {
             return Err("Plugin gateway response kind does not match request operation".to_string())
         }
+    }
+    Ok(())
+}
+
+pub fn validate_project_plugin_catalog(catalog: &ProjectPluginCatalog) -> Result<(), String> {
+    validate_project_plugin_catalog_revision(&catalog.catalog_revision)?;
+    if catalog.total_count < catalog.entries.len()
+        || catalog.total_count > PLUGIN_MAX_PROJECT_CATALOG_ENTRIES
+    {
+        return Err("project Plugin catalog count is invalid".to_string());
+    }
+    let mut previous: Option<(&str, &str)> = None;
+    for entry in &catalog.entries {
+        validate_provider_id(&entry.plugin)?;
+        validate_provider_name(&entry.name)?;
+        validate_tool_name(&entry.tool)?;
+        if let Some(title) = entry.title.as_deref() {
+            if title.is_empty() || title.len() > PLUGIN_MAX_PROVIDER_NAME_BYTES {
+                return Err("project Plugin catalog tool title is invalid".to_string());
+            }
+            validate_text_controls(title, "project Plugin catalog tool title")?;
+        }
+        if let Some(description) = entry.description.as_deref() {
+            if description.len() > PLUGIN_MAX_PROJECT_CATALOG_DESCRIPTION_BYTES {
+                return Err("project Plugin catalog description exceeds bound".to_string());
+            }
+            validate_text_controls(description, "project Plugin catalog description")?;
+        }
+        let current = (entry.plugin.as_str(), entry.tool.as_str());
+        if previous.is_some_and(|previous| previous >= current) {
+            return Err("project Plugin catalog entries are not strictly ordered".to_string());
+        }
+        previous = Some(current);
     }
     Ok(())
 }
@@ -1317,6 +1535,7 @@ mod tests {
 
     fn tool() -> PluginTool {
         PluginTool {
+            project_bound: false,
             name: "echo".to_string(),
             title: None,
             description: Some("Echo input".to_string()),
@@ -1324,6 +1543,45 @@ mod tests {
             output_schema: None,
             annotations: None,
         }
+    }
+
+    #[test]
+    fn project_bound_is_authority_metadata_and_part_of_the_schema_fence() {
+        let ordinary = tool();
+        let mut bound = ordinary.clone();
+        bound.project_bound = true;
+        assert_ne!(ordinary.schema_observation(), bound.schema_observation());
+        assert_eq!(serde_json::to_value(&bound).unwrap()["projectBound"], true);
+        assert!(serde_json::to_value(&ordinary)
+            .unwrap()
+            .get("projectBound")
+            .is_none());
+        let decoded: PluginTool =
+            serde_json::from_value(serde_json::to_value(&bound).unwrap()).unwrap();
+        assert!(decoded.project_bound);
+    }
+
+    #[test]
+    fn exact_project_target_is_bounded_and_does_not_accept_caller_metadata() {
+        for (project_id, root_fingerprint) in
+            [("", "root"), ("project", ""), ("bad\nproject", "root")]
+        {
+            let request = PluginGatewayRequest::ToolsCall {
+                project_target: Some(PluginProjectTarget {
+                    project_id: project_id.into(),
+                    root_fingerprint: root_fingerprint.into(),
+                }),
+                provider_id: "repo-tools".into(),
+                provider_instance_id: "instance_1".into(),
+                name: "echo".into(),
+                arguments: json!({}),
+                expected_schema: tool().schema_observation(),
+            };
+            assert!(validate_request(&request).is_err());
+        }
+        assert!(serde_json::from_value::<PluginProjectTarget>(json!({
+            "project_id":"project", "root_fingerprint":"root", "_meta":{"openai/session":"not-authority"}
+        })).is_err());
     }
 
     #[test]
@@ -1335,6 +1593,7 @@ mod tests {
     #[test]
     fn request_requires_object_arguments_and_bounded_schema() {
         let request = PluginGatewayRequest::ToolsCall {
+            project_target: None,
             provider_id: "repo-tools".to_string(),
             provider_instance_id: "instance_1".to_string(),
             name: "echo".to_string(),
@@ -1408,6 +1667,14 @@ mod tests {
 
     #[test]
     fn schema_and_result_bounds_fail_closed() {
+        assert_eq!(PLUGIN_MAX_ARGUMENT_BYTES, 64 * 1024);
+        assert_eq!(PLUGIN_MAX_SCHEMA_BYTES, 64 * 1024);
+        assert_eq!(PLUGIN_MAX_TEXT_CONTENT_BYTES, 512 * 1024);
+        assert_eq!(PLUGIN_MAX_STRUCTURED_CONTENT_BYTES, 512 * 1024);
+        assert_eq!(PLUGIN_MAX_RESULT_BYTES, 512 * 1024);
+        assert_eq!(PLUGIN_MAX_JSON_STRING_BYTES, 512 * 1024);
+        assert_eq!(PLUGIN_MAX_MESSAGE_BYTES, 1024 * 1024);
+
         let mut oversized_schema_tool = tool();
         oversized_schema_tool.input_schema = json!({
             "type": "object",
@@ -1415,14 +1682,96 @@ mod tests {
         });
         assert!(validate_tools(&[oversized_schema_tool]).is_err());
 
-        let oversized_result = PluginToolResult {
+        let oversized_arguments = json!({"value": "x".repeat(PLUGIN_MAX_ARGUMENT_BYTES)});
+        assert!(validate_json_value(
+            &oversized_arguments,
+            PLUGIN_MAX_ARGUMENT_BYTES,
+            "tool arguments"
+        )
+        .is_err());
+
+        let mut unreachable_input_schema = tool();
+        unreachable_input_schema.input_schema = json!({
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "minLength": PLUGIN_MAX_ARGUMENT_BYTES + 1
+                }
+            }
+        });
+        assert!(validate_tools(&[unreachable_input_schema.clone()]).is_err());
+        assert_eq!(
+            diagnose_invalid_tools(&[unreachable_input_schema]).code,
+            "input_schema_invalid"
+        );
+
+        let large_text = PluginToolResult {
+            content: vec![PluginContent::Text {
+                text: "x".repeat(384 * 1024),
+            }],
+            structured_content: None,
+            is_error: false,
+        };
+        validate_tool_result(&large_text).unwrap();
+
+        let large_structured = PluginToolResult {
+            content: vec![],
+            structured_content: Some(json!({"payload": "x".repeat(384 * 1024)})),
+            is_error: false,
+        };
+        validate_tool_result(&large_structured).unwrap();
+
+        let output_schema = json!({
+            "type": "object",
+            "properties": {
+                "payload": {"type": "string", "maxLength": 256 * 1024}
+            },
+            "required": ["payload"],
+            "additionalProperties": false
+        });
+        let mut large_output_schema_tool = tool();
+        large_output_schema_tool.output_schema = Some(output_schema.clone());
+        validate_tools(&[large_output_schema_tool]).unwrap();
+        validate_plugin_structured_output(
+            &output_schema,
+            &json!({"payload": "x".repeat(192 * 1024)}),
+        )
+        .unwrap();
+        assert!(validate_plugin_input_arguments(
+            &output_schema,
+            &json!({"payload": "x".repeat(80 * 1024)}),
+        )
+        .is_err());
+
+        let aggregate_oversized = PluginToolResult {
+            content: vec![PluginContent::Text {
+                text: "x".repeat(300 * 1024),
+            }],
+            structured_content: Some(json!({"payload": "y".repeat(300 * 1024)})),
+            is_error: false,
+        };
+        assert!(validate_tool_result(&aggregate_oversized)
+            .unwrap_err()
+            .contains("aggregate"));
+
+        let oversized_text = PluginToolResult {
             content: vec![PluginContent::Text {
                 text: "x".repeat(PLUGIN_MAX_TEXT_CONTENT_BYTES + 1),
             }],
             structured_content: None,
             is_error: false,
         };
-        assert!(validate_tool_result(&oversized_result).is_err());
+        assert!(validate_tool_result(&oversized_text).is_err());
+
+        let oversized_structured = PluginToolResult {
+            content: vec![],
+            structured_content: Some(json!({
+                "payload": "x".repeat(PLUGIN_MAX_STRUCTURED_CONTENT_BYTES + 1)
+            })),
+            is_error: false,
+        };
+        assert!(validate_tool_result(&oversized_structured).is_err());
     }
 
     #[test]

@@ -1,19 +1,77 @@
-import { useEffect, useState } from "react";
+import { useFlowingSelection } from "../../../../../frontend/src/ui/useFlowingSelection";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { CircleHelp, Database, FolderLock, Info, Monitor, Network, Settings2 } from "lucide-react";
 import { desktopApi } from "../../lib/desktop-api";
+import { desktopIdentity, readDesktopObservation } from "../../lib/desktop-observation";
 import type { DesktopError, DesktopState, TunnelProxyMode } from "../../models/topology";
-import { useLocale } from "../../i18n/locale";
+import { LANGUAGES, useLocale } from "../../i18n/locale";
 import { desktopErrorPresentation, normalizeDesktopError } from "../../i18n/presentation";
-import { TunnelConfigDiagnostics } from "../connection/TunnelConfigDiagnostics";
+import { useProduct } from "../../i18n/product";
+import type { RunnerSettings } from "../../models/topology";
+import { ComputerPermissions } from "./ComputerPermissions";
+import { RunnerFileAccess } from "./RunnerFileAccess";
 import { PowerShellInstallGuidance } from "./PowerShellInstallGuidance";
+import { APPEARANCES, useAppearance } from "../../hooks/useAppearance";
+import { AccentPicker } from "../../components/AccentPicker";
+import { RunnerCapacityPanel } from "./RunnerCapacityPanel";
+import { RuntimePanel } from "./RuntimePanel";
+import { DiagnosticsPanel } from "./DiagnosticsPanel";
+import { AboutPanel } from "./AboutPanel";
+import { LocalServicesPanel } from "./LocalServicesPanel";
+import type { RuntimeUpdates } from "../../hooks/useRuntimeUpdates";
 
-export function SettingsPanel({
-  state,
-  onState,
-}: {
+import { ConfigurationDataPanel } from "./ConfigurationDataPanel";
+import { useConfigurationData } from "../../i18n/configuration-data";
+import { exposureStatusKey } from "../workspace/WorkspaceStatus";
+
+const SECTIONS = ["general", "access", "network", "runtime", "configuration", "diagnostics", "about"] as const;
+type SettingsSection = typeof SECTIONS[number];
+const SECTION_ICONS = { general: Settings2, access: FolderLock, network: Network, runtime: Monitor, configuration: Database, diagnostics: CircleHelp, about: Info };
+
+type SettingsPanelProps = {
   state: DesktopState;
   onState: (state: DesktopState) => void;
+  onChangeSetup?: () => void;
+  onStopRuntime?: () => void;
+  onActivity?: () => void;
+  onConnection?: () => void;
+  initialSection?: "diagnostics" | "runtime" | "network" | "access";
+  updates?: RuntimeUpdates;
+};
+
+export function SettingsPanel(props: SettingsPanelProps) {
+  const { initialSection } = props;
+  const [section, setSection] = useState<SettingsSection>(initialSection ?? "general");
+  const [visited, setVisited] = useState<SettingsSection[]>([initialSection ?? "general"]);
+  const selectSection = (next: SettingsSection) => {
+    setSection(next);
+    setVisited(current => current.includes(next) ? current : [...current, next]);
+  };
+  useEffect(() => { if (initialSection) selectSection(initialSection); }, [initialSection]);
+  // Category navigation survives retargeting; the target's drafts and pending
+  // work do not. Same-target category changes keep their editors mounted.
+  return <SettingsView key={desktopIdentity(props.state)} {...props} section={section} visited={visited} selectSection={selectSection} />;
+}
+
+function SettingsView({
+  state, onState, onChangeSetup, onStopRuntime, onActivity, onConnection, updates,
+  section, visited, selectSection,
+}: SettingsPanelProps & {
+  section: SettingsSection;
+  visited: SettingsSection[];
+  selectSection: (section: SettingsSection) => void;
 }) {
   const { locale, setLocale, t } = useLocale();
+  const { appearance, setAppearance, accent, setAccent } = useAppearance();
+  const p = useProduct();
+  const c = useConfigurationData();
+  const selectionRef = useRef<HTMLDivElement | null>(null);
+  useFlowingSelection(selectionRef, section);
+  const [runnerSettings, setRunnerSettings] = useState<RunnerSettings | null>(null);
+  const [loadingRunnerSettings, setLoadingRunnerSettings] = useState(true);
+  const [runnerSettingsError, setRunnerSettingsError] = useState<DesktopError | null>(null);
+  const [restartingRunner, setRestartingRunner] = useState(false);
+  const [runnerError, setRunnerError] = useState<DesktopError | null>(null);
   const [proxyMode, setProxyMode] = useState<TunnelProxyMode>(state.tunnel_proxy.mode);
   const [customProxy, setCustomProxy] = useState(state.tunnel_proxy.custom_url ?? "");
   const [savingProxy, setSavingProxy] = useState(false);
@@ -22,175 +80,193 @@ export function SettingsPanel({
   const [savingLaunchAtLogin, setSavingLaunchAtLogin] = useState(false);
   const [launchAtLoginError, setLaunchAtLoginError] = useState<DesktopError | null>(null);
   const operationBusy = Boolean(state.current_operation);
+  const configuredProxyMode = state.tunnel_proxy.mode === "auto" ? t("settings.tunnelProxyAuto") : state.tunnel_proxy.mode === "direct" ? t("settings.tunnelProxyDirect") : t("settings.tunnelProxyCustom");
+  const effectiveProxyPath = state.tunnel_proxy.effective_source === "system" ? p("systemProxy") : state.tunnel_proxy.effective_source === "environment" ? p("environmentProxy") : state.tunnel_proxy.effective_source === "custom" ? p("customProxy") : state.tunnel_proxy.effective_source === "invalid_custom" ? t("settings.tunnelProxyCustom") : t("settings.tunnelProxyDirectValue");
+  const detectedProxy = state.tunnel_proxy.effective_source === "environment" ? p("environmentProxy") : state.tunnel_proxy.system_proxy_detected ? p("systemProxy") : p("notConfigured");
+  const labels: Record<SettingsSection, string> = { general: p("general"), access: p("accessAndPermissions"), network: p("network"), runtime: p("runtimeAndServices"), configuration: c("title"), diagnostics: p("troubleshooting"), about: p("aboutAndUpdates") };
+  const descriptions: Record<SettingsSection, string> = { general: p("generalSummary"), access: p("accessSummary"), network: p("networkSummary"), runtime: p("runtimeSummary"), configuration: c("summary"), diagnostics: p("diagnosticsSummary"), about: p("aboutSummary") };
 
+  const identity = desktopIdentity(state);
+  const expectedTarget = useRef(state.workspace_runner).current;
+  const alive = useRef(true);
+  const reading = useRef<AbortController | null>(null);
+  const generation = useRef(0);
+  const action = useRef<"proxy" | "restart" | null>(null);
+  const launchAction = useRef(false);
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; reading.current?.abort(); generation.current++; };
+  }, []);
+  const refreshRunnerSettings = useCallback(async () => {
+    reading.current?.abort();
+    const controller = new AbortController();
+    reading.current = controller;
+    const request = ++generation.current;
+    const current = () => alive.current && !controller.signal.aborted && request === generation.current;
+    setLoadingRunnerSettings(true); setRunnerSettingsError(null);
+    try {
+      const next = await readDesktopObservation(identity, controller.signal, desktopApi.runnerSettings);
+      if (!current()) return;
+      if (expectedTarget && (next.target.client_id !== expectedTarget.client_id
+        || next.target.server_url !== expectedTarget.server_url || next.target.config_path !== expectedTarget.config_path)) {
+        throw { code: "runner_settings_changed", message: "Runner settings no longer match the selected Runner.", next_action: "Refresh the current Runtime." };
+      }
+      setRunnerSettings(next);
+    } catch (value) {
+      if (current()) setRunnerSettingsError(normalizeDesktopError(value));
+    } finally {
+      if (current()) setLoadingRunnerSettings(false);
+    }
+  }, [identity, expectedTarget]);
+  useEffect(() => { void refreshRunnerSettings(); }, [refreshRunnerSettings]);
+  const previousOperation = useRef(state.current_operation?.kind);
+  useEffect(() => {
+    const wasRefresh = previousOperation.current === "runtime_refresh";
+    previousOperation.current = state.current_operation?.kind;
+    if (wasRefresh && !operationBusy && runnerSettingsError
+      && ["desktop_operation_busy", "desktop_state_unavailable"].includes(runnerSettingsError.code)) {
+      void refreshRunnerSettings();
+    }
+  }, [state.current_operation?.kind, operationBusy, runnerSettingsError, refreshRunnerSettings]);
   useEffect(() => {
     let cancelled = false;
-    void desktopApi.getLaunchAtLogin().then((enabled) => {
+    void desktopApi.getLaunchAtLogin().then(enabled => {
       if (!cancelled) setLaunchAtLogin(enabled);
-    }).catch((value) => {
+    }).catch(value => {
       if (!cancelled) setLaunchAtLoginError(normalizeDesktopError(value));
     });
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
-
+  const acceptRunnerSettings = (next: RunnerSettings) => {
+    if (!alive.current) return;
+    // An action's canonical readback supersedes an older mount/manual read.
+    reading.current?.abort(); generation.current++;
+    setRunnerSettings(next); setRunnerSettingsError(null); setLoadingRunnerSettings(false);
+  };
   const saveProxy = async () => {
-    if (operationBusy) return;
-    setSavingProxy(true);
-    setProxyError(null);
+    if (operationBusy || action.current || !alive.current) return;
+    action.current = "proxy"; setSavingProxy(true); setProxyError(null);
     try {
-      onState(await desktopApi.updateTunnelProxy(proxyMode, customProxy));
+      const next = await desktopApi.updateTunnelProxy(proxyMode, customProxy);
+      if (alive.current) onState(next);
     } catch (value) {
-      setProxyError(normalizeDesktopError(value));
+      if (alive.current) setProxyError(normalizeDesktopError(value));
     } finally {
-      setSavingProxy(false);
+      action.current = null;
+      if (alive.current) setSavingProxy(false);
     }
   };
-
-  const updateLaunchAtLogin = async (enabled: boolean) => {
-    if (savingLaunchAtLogin) return;
-    setSavingLaunchAtLogin(true);
-    setLaunchAtLoginError(null);
+  const restartRunner = async () => {
+    if (!runnerSettings?.can_restart || operationBusy || loadingRunnerSettings || runnerSettingsError || action.current || !alive.current) return;
+    action.current = "restart"; setRestartingRunner(true); setRunnerError(null);
     try {
-      setLaunchAtLogin(await desktopApi.setLaunchAtLogin(enabled));
+      const next = await desktopApi.restartOwnedRunner(runnerSettings.target);
+      if (alive.current) onState(next);
     } catch (value) {
-      setLaunchAtLoginError(normalizeDesktopError(value));
+      if (alive.current) setRunnerError(normalizeDesktopError(value));
     } finally {
-      setSavingLaunchAtLogin(false);
+      action.current = null;
+      if (alive.current) setRestartingRunner(false);
+    }
+  };
+  const updateLaunchAtLogin = async (enabled: boolean) => {
+    if (launchAction.current || !alive.current) return;
+    launchAction.current = true; setSavingLaunchAtLogin(true); setLaunchAtLoginError(null);
+    try {
+      const next = await desktopApi.setLaunchAtLogin(enabled);
+      if (alive.current) setLaunchAtLogin(next);
+    } catch (value) {
+      if (alive.current) setLaunchAtLoginError(normalizeDesktopError(value));
+    } finally {
+      launchAction.current = false;
+      if (alive.current) setSavingLaunchAtLogin(false);
     }
   };
   return (
-    <section className="page-section" aria-labelledby="settings-title" data-webcodex-page="settings">
-      <div className="eyebrow">{t("settings.eyebrow")}</div>
-      <h1 id="settings-title">{t("settings.title")}</h1>
-      <p className="lede">{t("settings.description")}</p>
-
-      <section className="settings-section" aria-labelledby="settings-interface-title">
-        <h2 id="settings-interface-title">{t("settings.interface")}</h2>
-        <div className="detail-card setting-row">
-          <label htmlFor="desktop-settings-locale">{t("locale.label")}</label>
-          <select
-            id="desktop-settings-locale"
-            value={locale}
-            onChange={(event) => setLocale(event.target.value as typeof locale)}
-            data-webcodex-control="locale"
-          >
-            <option value="zh-CN">{t("locale.zh")}</option>
-            <option value="en-US">{t("locale.en")}</option>
-          </select>
-        </div>
-      </section>
-
-      <section className="settings-section" aria-labelledby="settings-background-title">
-        <h2 id="settings-background-title">{t("settings.backgroundStartup")}</h2>
-        <article className="detail-card setting-row">
-          <div className="field-group">
-            <label htmlFor="desktop-launch-at-login">{t("settings.launchAtLogin")}</label>
-            <span className="field-help">{t("settings.launchAtLoginHelp")}</span>
-          </div>
-          <input
-            id="desktop-launch-at-login"
-            type="checkbox"
-            checked={launchAtLogin ?? false}
-            onChange={(event) => void updateLaunchAtLogin(event.target.checked)}
-            disabled={launchAtLogin === null || savingLaunchAtLogin}
-            data-webcodex-control="launch-at-login"
-          />
-        </article>
+    <section className="page-section workspace-page settings-page" aria-labelledby="settings-title" data-webcodex-page="settings">
+      <header className="page-heading-row"><h1 id="settings-title">{t("settings.title")}</h1></header>
+      <div className="settings-layout">
+      <div ref={selectionRef} className="settings-navigation" role="tablist" aria-label={t("settings.title")} aria-orientation="vertical">
+        {SECTIONS.map(value => {
+          const Icon = SECTION_ICONS[value];
+          return <button type="button" role="tab" key={value} id={`settings-tab-${value}`} aria-controls={`desktop-settings-${value}`} aria-selected={section === value} tabIndex={section === value ? 0 : -1} onClick={() => selectSection(value)} onKeyDown={event => {
+            if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const next = event.key === "Home" ? SECTIONS[0] : event.key === "End" ? SECTIONS[SECTIONS.length - 1] : SECTIONS[(SECTIONS.indexOf(value) + (event.key === "ArrowDown" ? 1 : SECTIONS.length - 1)) % SECTIONS.length];
+            selectSection(next); document.getElementById(`settings-tab-${next}`)?.focus();
+          }}><Icon size={18} aria-hidden="true" /><span>{labels[value]}</span></button>;
+        })}
+      </div>
+      <div className="settings-content">
+      <p className="settings-description">{descriptions[section]}</p>
+      {/* Keep visited views mounted so switching categories preserves drafts and
+          in-flight operations. Plain containers keep controls reachable in WebKit. */}
+      <div id="desktop-settings-general" hidden={section !== "general"}>
+      <section className="settings-section" aria-labelledby="settings-general-title">
+        <h2 id="settings-general-title">{p("general")}</h2>
+        <div className="setting-row"><label htmlFor="desktop-settings-locale">{t("locale.label")}</label><select id="desktop-settings-locale" value={locale} onChange={event => setLocale(event.target.value as typeof locale)} data-webcodex-control="locale">{LANGUAGES.map(language => <option key={language.value} value={language.value}>{language.label}</option>)}</select></div>
+        <div className="setting-row"><label htmlFor="desktop-settings-appearance">{t("appearance.label")}</label><select id="desktop-settings-appearance" value={appearance} onChange={event => setAppearance(event.target.value as typeof appearance)} data-webcodex-control="appearance">{APPEARANCES.map(value => <option key={value} value={value}>{t(`appearance.${value}`)}</option>)}</select></div>
+        <div className="setting-row"><span>{t("accent.label")}</span><AccentPicker color={accent} onChange={setAccent} /></div>
+        <div className="setting-row"><label htmlFor="desktop-launch-at-login">{t("settings.launchAtLogin")}</label><input id="desktop-launch-at-login" className="desktop-switch" type="checkbox" checked={launchAtLogin ?? false} onChange={event => void updateLaunchAtLogin(event.target.checked)} disabled={launchAtLogin === null || savingLaunchAtLogin} data-webcodex-control="launch-at-login" /></div>
         {launchAtLoginError && <SettingsError error={launchAtLoginError} />}
+        <div className="setting-row"><span>{p("background")}</span><span className="setting-value">{p("keepRunning")}</span></div>
       </section>
-
-      <section className="settings-section" aria-labelledby="settings-tunnel-title">
-        <h2 id="settings-tunnel-title">{t("settings.tunnel")}</h2>
-        <TunnelConfigDiagnostics state={state} onState={onState} />
-        <article className="detail-card tunnel-proxy-settings">
-          <div className="field-group">
-            <label htmlFor="desktop-tunnel-proxy-mode">{t("settings.tunnelProxy")}</label>
-            <select
-              id="desktop-tunnel-proxy-mode"
-              value={proxyMode}
-              onChange={(event) => setProxyMode(event.target.value as TunnelProxyMode)}
-              disabled={savingProxy || operationBusy}
-              data-webcodex-control="tunnel-proxy-mode"
-            >
-              <option value="auto">{t("settings.tunnelProxyAuto")}</option>
-              <option value="direct">{t("settings.tunnelProxyDirect")}</option>
-              <option value="custom">{t("settings.tunnelProxyCustom")}</option>
-            </select>
-            {proxyMode === "auto" && <span className="field-help">{t("settings.tunnelProxyAutoHelp")}</span>}
-          </div>
-          {proxyMode === "custom" && (
-            <div className="field-group">
-              <label htmlFor="desktop-tunnel-proxy-url">{t("settings.tunnelProxyCustomUrl")}</label>
-              <input
-                id="desktop-tunnel-proxy-url"
-                value={customProxy}
-                onChange={(event) => setCustomProxy(event.target.value)}
-                placeholder="http://127.0.0.1:7890"
-                disabled={savingProxy || operationBusy}
-                spellCheck={false}
-                data-webcodex-control="tunnel-proxy-url"
-              />
-              <span className="field-help">{t("settings.tunnelProxyCustomHelp")}</span>
-            </div>
-          )}
-          <dl className="detail-list tunnel-proxy-status">
-            <div>
-              <dt>{t("settings.tunnelProxyEffective")}</dt>
-              <dd>{state.tunnel_proxy.effective_url ?? t("settings.tunnelProxyDirectValue")}</dd>
-            </div>
-            {state.tunnel_proxy.detected_url && (
-              <div>
-                <dt>{t("settings.tunnelProxyDetected")}</dt>
-                <dd>{state.tunnel_proxy.detected_url}</dd>
-              </div>
-            )}
-          </dl>
-          <button
-            type="button"
-            className="secondary-button tunnel-proxy-save"
-            onClick={() => void saveProxy()}
-            disabled={savingProxy || operationBusy || (proxyMode === "custom" && !customProxy.trim())}
-            data-webcodex-action="save-tunnel-proxy"
-          >
-            {savingProxy ? t("common.checking") : t("settings.saveTunnelProxy")}
-          </button>
-          {proxyError && <SettingsError error={proxyError} />}
-        </article>
-      </section>
-
-      <section className="settings-section" aria-labelledby="settings-diagnostics-title">
-        <h2 id="settings-diagnostics-title">{t("settings.diagnostics")}</h2>
+      </div>
+      <div id="desktop-settings-access" hidden={section !== "access"}>
+      <RunnerFileAccess state={state} settings={runnerSettings} loading={loadingRunnerSettings} disabled={operationBusy || loadingRunnerSettings || Boolean(runnerSettingsError)} onState={onState} onSettings={acceptRunnerSettings} />
+      {runnerSettingsError && <SettingsError error={runnerSettingsError} onRetry={() => void refreshRunnerSettings()} />}
+      {visited.includes("access") && <ComputerPermissions />}
+      </div>
+      <div id="desktop-settings-diagnostics" hidden={section !== "diagnostics"}>
+        {visited.includes("diagnostics") && <DiagnosticsPanel state={state} onState={onState} onActivity={onActivity} onRuntime={() => selectSection("runtime")} onConnection={onConnection} />}
+      </div>
+      <div id="desktop-settings-network" hidden={section !== "network"} className="settings-network">
+        <h2>{t("settings.tunnelProxy")}</h2>
+        <div className="field-group"><label htmlFor="desktop-tunnel-proxy-mode">{t("settings.tunnelProxy")}</label><select id="desktop-tunnel-proxy-mode" value={proxyMode} onChange={event => setProxyMode(event.target.value as TunnelProxyMode)} disabled={savingProxy || operationBusy} data-webcodex-control="tunnel-proxy-mode"><option value="auto">{t("settings.tunnelProxyAuto")}</option><option value="direct">{t("settings.tunnelProxyDirect")}</option><option value="custom">{t("settings.tunnelProxyCustom")}</option></select></div>
+        {proxyMode === "custom" && <div className="field-group"><label htmlFor="desktop-tunnel-proxy-url">{t("settings.tunnelProxyCustomUrl")}</label><input id="desktop-tunnel-proxy-url" value={customProxy} onChange={event => setCustomProxy(event.target.value)} placeholder="http://127.0.0.1:7890" disabled={savingProxy || operationBusy} spellCheck={false} data-webcodex-control="tunnel-proxy-url" /></div>}
+        <dl className="detail-list" data-webcodex-tunnel-routing>
+          <div><dt>{p("configuredMode")}</dt><dd>{configuredProxyMode}</dd></div>
+          <div><dt>{p("detectedProxy")}</dt><dd>{detectedProxy}</dd></div>
+          <div><dt>{p("effectiveConnectionPath")}</dt><dd>{effectiveProxyPath}</dd></div>
+          <div><dt>{p("tunnelStatus")}</dt><dd>{p(exposureStatusKey(state.readiness.exposure))}</dd></div>
+        </dl>
+        <button type="button" className="secondary-button" onClick={() => void saveProxy()} disabled={savingProxy || operationBusy || (proxyMode === "custom" && !customProxy.trim())} data-webcodex-action="save-tunnel-proxy">{savingProxy ? p("loading") : p("saveApply")}</button>
+        {proxyError && <SettingsError error={proxyError} />}
+      </div>
+      <div id="desktop-settings-runtime" hidden={section !== "runtime"}>
+        {visited.includes("runtime") && <RunnerCapacityPanel state={state} onState={onState} active={section === "runtime"} />}
+        <section className="settings-section">
+        <h2>{p("serviceControls")}</h2><p className="field-help">{p("serviceControlsHelp")}</p>
+        {visited.includes("runtime") && <LocalServicesPanel state={state} onState={onState} />}
+        <details className="workspace-technical"><summary>{p("advanced")}</summary>
+        <div className="connection-actions">
+          {onChangeSetup && <button type="button" className="secondary-button" disabled={operationBusy} onClick={onChangeSetup}>{p("changeServer")}</button>}
+          {!state.persistent_environment && onStopRuntime && state.topology?.server.kind === "local" && state.readiness.runtime_ready && <button type="button" className="secondary-button" disabled={operationBusy} onClick={onStopRuntime}>{p("stop")} WebCodex</button>}
+        </div>
+        {!state.persistent_environment && runnerSettings && <><p className="field-help">{p("restartRunnerHelp")}</p><button type="button" className="secondary-button" disabled={operationBusy || restartingRunner || loadingRunnerSettings || Boolean(runnerSettingsError) || !runnerSettings.can_restart} data-webcodex-action="restart-owned-runner" onClick={() => void restartRunner()}>{p("restartRunner")}</button></>}
+        {runnerError && <SettingsError error={runnerError} />}
+        {runnerSettingsError && <SettingsError error={runnerSettingsError} onRetry={() => void refreshRunnerSettings()} />}
+        {runnerSettings && <details className="workspace-technical"><summary>{p("details")}</summary><dl className="detail-list"><div><dt>Runner</dt><dd>{runnerSettings.target.config_path}</dd></div></dl></details>}
+        </details>
         <PowerShellInstallGuidance state={state} onState={onState} />
-        <article className="detail-card">
-        {state.binaries ? (
-          <dl className="detail-list">
-            <div><dt>{t("settings.version")}</dt><dd>{state.binaries.version}</dd></div>
-            <div><dt>{t("settings.sourceRevision")}</dt><dd>{state.binaries.git_commit}</dd></div>
-            <div><dt>{t("settings.binaryDirectory")}</dt><dd>{state.binaries.directory}</dd></div>
-            <div><dt>{t("settings.binaryResolution")}</dt><dd>{state.binaries.source}</dd></div>
-          </dl>
-        ) : (
-          <p>{t("settings.binariesPending")}</p>
-        )}
-        </article>
-      </section>
-
-      <section className="settings-section" aria-labelledby="settings-advanced-title">
-        <h2 id="settings-advanced-title">{t("settings.advanced")}</h2>
-        <article className="detail-card">
-          <dl className="detail-list">
-            <div><dt>{t("settings.runtimeProjectId")}</dt><dd>{state.project?.runtime_project_id ?? t("settings.notEstablished")}</dd></div>
-          </dl>
-        </article>
-      </section>
+        </section>
+        {visited.includes("runtime") && <RuntimePanel state={state} onState={onState} onActivity={onActivity} onUpdates={() => selectSection("about")} />}
+      </div>
+      <div id="desktop-settings-configuration" hidden={section !== "configuration"}>
+        {visited.includes("configuration") && <ConfigurationDataPanel state={state} />}
+      </div>
+      <div id="desktop-settings-about" hidden={section !== "about"}>
+        {visited.includes("about") && <AboutPanel state={state} updates={updates} />}
+      </div>
+      </div>
+      </div>
     </section>
   );
 }
 
-function SettingsError({ error }: { error: DesktopError }) {
+function SettingsError({ error, onRetry }: { error: DesktopError; onRetry?: () => void }) {
   const { t } = useLocale();
+  const p = useProduct();
   const presentation = desktopErrorPresentation(error, t);
   return (
     <div className="error-card" role="alert">
@@ -201,7 +277,7 @@ function SettingsError({ error }: { error: DesktopError }) {
         <code>{error.code}</code>
         <p>{error.message}</p>
       </details>
+      {onRetry && <button type="button" className="secondary-button" onClick={onRetry}>{p("refresh")}</button>}
     </div>
   );
 }
-

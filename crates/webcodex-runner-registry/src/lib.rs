@@ -7,14 +7,29 @@
 mod access;
 mod access_control;
 mod capabilities;
+mod console_snapshot;
+mod dispatch_fence;
+pub use console_snapshot::{
+    ActiveJobAggregate, ConsoleRegistrySnapshot, WorkspaceObservationIdentity,
+};
+mod execution_admission;
+pub use execution_admission::ExecutionAdmissionError;
+mod job_index;
+mod job_input;
 mod job_status;
 mod job_updates;
 mod jobs;
+mod maintenance;
 mod polling;
 mod project_inventory;
 mod projects;
 mod protocol;
+mod receipts;
 mod reconciliation;
+pub use receipts::{
+    JobReceiptStore, JobTerminalEvent, JobTerminalEventSink, JobTerminalRegistrationSnapshot,
+    RetainedJobReceipt,
+};
 mod registry;
 mod requests;
 mod runners;
@@ -39,23 +54,20 @@ pub(crate) mod test_support {
     use crate::RunnerRegistry;
     use std::sync::atomic::{AtomicU64, Ordering};
     use webcodex_core::runner_protocol::{
-        RunnerCapabilities, RunnerProjectSummary, RunnerRegisterRequest, ShellProjectInventoryPage,
-        PROJECT_INVENTORY_PAGE_MAX_SUMMARIES, RUNNER_PROTOCOL_GENERATION_V2,
-        RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES,
+        RunnerCapabilities, RunnerCapabilityId, RunnerProjectSummary, RunnerRegisterRequest,
+        ShellProjectInventoryPage, PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
+        RUNNER_PROTOCOL_GENERATION_V2,
     };
 
     pub(crate) fn current_runner_capabilities(
-        capabilities: RunnerCapabilities,
+        mut capabilities: RunnerCapabilities,
     ) -> RunnerCapabilities {
-        let mut value =
-            serde_json::to_value(capabilities).expect("serialize Runner test capabilities");
-        let object = value
-            .as_object_mut()
-            .expect("Runner test capabilities must serialize as an object");
-        for capability in RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
-            object.insert((*capability).to_string(), serde_json::Value::Bool(true));
+        for capability in RunnerCapabilityId::all() {
+            if capability.is_v2_baseline() {
+                capabilities.set(*capability, true);
+            }
         }
-        serde_json::from_value(value).expect("deserialize canonical Runner test capabilities")
+        capabilities
     }
 
     pub(crate) fn current_runner_registration(
@@ -122,10 +134,14 @@ pub use access::{DetachedInitiatorIdentity, RunnerAccess, RunnerAccessGroup};
 pub use capabilities::{RunnerFeature, RunnerFeatureSet};
 pub use job_status::job_status_is_active;
 pub use job_updates::{
-    JobLogWait, JobLogWaitOutcome, ShellJobLogObservation, ShellJobStartMetadata,
-    StructuredJobExecution,
+    JobAttentionSnapshot, JobLogWait, JobLogWaitOutcome, JobTelemetrySnapshot, JobValidationOutput,
+    RuntimeJobAggregateSnapshot, RuntimeJobRunnerCounts, ShellJobLogObservation,
+    ShellJobStartMetadata, StructuredJobExecution, MAX_JOB_TELEMETRY_SNAPSHOTS,
 };
 pub use jobs::{command_preview, process_preview, script_preview, COMMAND_PREVIEW_MAX_CHARS};
+pub use maintenance::{
+    MaintenanceGrant, MaintenanceScope, MaintenanceStore, SavedMaintenanceLease,
+};
 pub(crate) use protocol::AcceptedRunnerProtocol;
 pub use reconciliation::recovery_timeout_sweep;
 pub use registry::{
@@ -135,8 +151,10 @@ pub use registry::{
     TRANSPORT_POLLING, TRANSPORT_QUIC, TRANSPORT_WEBSOCKET,
 };
 pub(crate) use registry::{
-    now_ts, MAX_OUTPUT_BYTES, MAX_QUEUED_REQUESTS_PER_RUNNER, MAX_RETIRED_INSTANCES_PER_RUNNER,
+    now_ts, LIVE_JOB_STREAM_RETENTION_BYTES, MAX_QUEUED_REQUESTS_PER_RUNNER,
+    MAX_RETIRED_INSTANCES_PER_RUNNER, ORDINARY_RESULT_STREAM_RETENTION_BYTES,
 };
-pub use requests::EnqueueLspError;
+pub use requests::{EnqueueLspError, EnqueueRunnerSkillError};
+pub use state::{JobRecoveryPhase, JobRecoveryReason};
 pub use state::{RunnerSemanticView, ShellJobVisibility};
-pub use telemetry::{NoopRunnerRegistryTelemetry, RunnerRegistryTelemetry};
+pub use telemetry::{NoopRunnerRegistryTelemetry, RunnerRegistryTelemetry, ValidatedMcpToolResult};

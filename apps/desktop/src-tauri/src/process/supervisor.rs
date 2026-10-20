@@ -21,22 +21,33 @@ const GRACEFUL_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const LOCAL_EOF_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 const PROCESS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
+#[cfg(test)]
+#[path = "tests/startup.rs"]
+mod startup_tests;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum ProcessKind {
+#[serde(tag = "kind", content = "tunnel_profile_id", rename_all = "snake_case")]
+pub enum ProcessKey {
     LocalServer,
     LocalRunner,
     QuickShare,
-    RegularTunnel,
+    RegularTunnel(crate::connection_id::TunnelProfileId),
 }
 
-impl ProcessKind {
+impl ProcessKey {
+    pub fn tunnel_profile_id(self) -> Option<crate::connection_id::TunnelProfileId> {
+        match self {
+            Self::RegularTunnel(id) => Some(id),
+            _ => None,
+        }
+    }
+
     fn source(self) -> &'static str {
         match self {
             Self::LocalServer => "service",
             Self::LocalRunner => "runner",
             Self::QuickShare => "quick_share",
-            Self::RegularTunnel => "regular_tunnel",
+            Self::RegularTunnel(_) => "regular_tunnel",
         }
     }
 }
@@ -53,7 +64,8 @@ pub enum ProcessPhase {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProcessSnapshot {
-    pub kind: ProcessKind,
+    pub kind: ProcessKey,
+    pub generation: u64,
     pub phase: ProcessPhase,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
@@ -61,12 +73,26 @@ pub struct ProcessSnapshot {
 }
 
 struct ManagedProcess {
+    generation: u64,
     child: ManagedChild,
     phase: ProcessPhase,
     exit_code: Option<i32>,
-    logs: Arc<Mutex<VecDeque<String>>>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    logs: Arc<Mutex<VecDeque<String>>>,
+}
+
+impl ManagedProcess {
+    fn snapshot(&self, kind: ProcessKey) -> ProcessSnapshot {
+        ProcessSnapshot {
+            kind,
+            generation: self.generation,
+            phase: self.phase,
+            pid: Some(self.child.id()),
+            exit_code: self.exit_code,
+            owned_by_desktop: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -84,6 +110,7 @@ struct MachineEventSender {
 }
 
 pub(crate) struct MachineEventReceiver {
+    key: Option<ProcessKey>,
     state: Arc<Mutex<MachineEventState>>,
     notify: Arc<Notify>,
 }
@@ -96,7 +123,11 @@ fn machine_event_channel() -> (MachineEventSender, MachineEventReceiver) {
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
         },
-        MachineEventReceiver { state, notify },
+        MachineEventReceiver {
+            key: None,
+            state,
+            notify,
+        },
     )
 }
 
@@ -116,7 +147,14 @@ impl MachineEventReceiver {
                         "dropped_critical": dropped,
                     }));
                 }
-                if let Some(value) = state.queue.pop_front() {
+                if let Some(mut value) = state.queue.pop_front() {
+                    if let (Some(id), Some(object)) = (
+                        self.key.and_then(ProcessKey::tunnel_profile_id),
+                        value.as_object_mut(),
+                    ) {
+                        // The supervisor owns attribution, never the child payload.
+                        object.insert("tunnel_profile_id".into(), serde_json::json!(id));
+                    }
                     return Some(value);
                 }
                 if state.closed {
@@ -205,7 +243,8 @@ fn machine_event_is_terminal(value: &Value) -> bool {
 }
 
 pub struct ProcessSupervisor {
-    processes: HashMap<ProcessKind, ManagedProcess>,
+    processes: HashMap<ProcessKey, ManagedProcess>,
+    next_generation: u64,
     activity: ActivityLog,
 }
 
@@ -213,13 +252,14 @@ impl ProcessSupervisor {
     pub fn new(activity: ActivityLog) -> Self {
         Self {
             processes: HashMap::new(),
+            next_generation: 1,
             activity,
         }
     }
 
     pub async fn spawn_owned(
         &mut self,
-        kind: ProcessKind,
+        kind: ProcessKey,
         mut command: Command,
         machine_stdout: bool,
     ) -> DesktopResult<Option<MachineEventReceiver>> {
@@ -240,8 +280,17 @@ impl ProcessSupervisor {
             // A terminal direct child may still own live descendants. Keep the
             // exact ManagedChild generation until its whole tree is reclaimed;
             // never retarget cleanup by a remembered numeric PID/PGID.
-            self.stop(kind).await;
+            self.stop_checked(kind).await?;
         }
+
+        let generation = self.next_generation;
+        self.next_generation = generation.checked_add(1).ok_or_else(|| {
+            DesktopError::new(
+                "process_generation_exhausted",
+                "Process generations are exhausted",
+                "Restart Desktop.",
+            )
+        })?;
 
         // stdin is the Desktop parent-liveness lease for every long-lived
         // generation. Quick Share/Tunnel already consume EOF; Local Server and
@@ -254,7 +303,7 @@ impl ProcessSupervisor {
         // silently break descendants away from the Desktop's outer Job to avoid
         // nested-Job incompatibilities (notably Git for Windows/MSYS) while
         // preserving exact ownership at both lifecycle layers.
-        let silent_child_breakaway = kind == ProcessKind::LocalRunner;
+        let silent_child_breakaway = kind == ProcessKey::LocalRunner;
         let mut child = ManagedChild::spawn_with_options(
             &mut command,
             platform::managed_spawn_options(silent_child_breakaway),
@@ -285,19 +334,32 @@ impl ProcessSupervisor {
 
         let logs = Arc::new(Mutex::new(VecDeque::new()));
         let (machine_tx, machine_rx) = if machine_stdout {
-            let (tx, rx) = machine_event_channel();
+            let (tx, mut rx) = machine_event_channel();
+            rx.key = Some(kind);
             (Some(tx), Some(rx))
         } else {
             (None, None)
         };
         let stdout_logs = Arc::clone(&logs);
         let stdout_task = tokio::task::spawn_blocking(move || {
-            drain_stream(stdout, stdout_logs, machine_tx, machine_stdout)
+            drain_stream(
+                stdout,
+                stdout_logs,
+                machine_tx,
+                machine_stdout || matches!(kind, ProcessKey::RegularTunnel(_)),
+            )
         });
         let stderr_logs = Arc::clone(&logs);
-        let stderr_task =
-            tokio::task::spawn_blocking(move || drain_stream(stderr, stderr_logs, None, false));
-        self.activity.push(
+        let stderr_task = tokio::task::spawn_blocking(move || {
+            drain_stream(
+                stderr,
+                stderr_logs,
+                None,
+                matches!(kind, ProcessKey::RegularTunnel(_)),
+            )
+        });
+        self.activity.push_for_profile(
+            kind.tunnel_profile_id(),
             ActivityEventKind::ProcessStarted,
             kind.source(),
             ActivityLevel::Info,
@@ -306,15 +368,28 @@ impl ProcessSupervisor {
         self.processes.insert(
             kind,
             ManagedProcess {
+                generation,
                 child,
                 phase: ProcessPhase::Starting,
                 exit_code: None,
-                logs,
                 stdout_task,
                 stderr_task,
+                logs,
             },
         );
+        self.activity
+            .record_lifecycle(crate::lifecycle_log::LifecycleEvent::ProcessObserved {
+                snapshot: self.processes[&kind].snapshot(kind),
+            });
         Ok(machine_rx)
+    }
+
+    // Clone the current generation's buffer before cleanup removes the process.
+    // Read it after cleanup has given both existing drain tasks time to finish.
+    pub(crate) fn server_startup_diagnostics(&self) -> Option<super::startup::StartupDiagnostics> {
+        self.processes
+            .get(&ProcessKey::LocalServer)
+            .map(|process| super::startup::StartupDiagnostics(Arc::clone(&process.logs)))
     }
 
     pub fn refresh(&mut self) {
@@ -325,6 +400,7 @@ impl ProcessSupervisor {
             ) {
                 continue;
             }
+            let previous_phase = process.phase;
             match process.child.try_wait() {
                 Ok(Some(status)) => {
                     process.exit_code = status.code();
@@ -333,7 +409,8 @@ impl ProcessSupervisor {
                     } else {
                         ProcessPhase::Failed
                     };
-                    self.activity.push(
+                    self.activity.push_for_profile(
+                        kind.tunnel_profile_id(),
                         ActivityEventKind::ProcessExited,
                         kind.source(),
                         if status.success() {
@@ -347,7 +424,8 @@ impl ProcessSupervisor {
                 Ok(None) => process.phase = ProcessPhase::Running,
                 Err(_) => {
                     process.phase = ProcessPhase::Failed;
-                    self.activity.push(
+                    self.activity.push_for_profile(
+                        kind.tunnel_profile_id(),
                         ActivityEventKind::ProcessObservationFailed,
                         kind.source(),
                         ActivityLevel::Error,
@@ -355,41 +433,42 @@ impl ProcessSupervisor {
                     );
                 }
             }
+            if process.phase != previous_phase {
+                self.activity.record_lifecycle(
+                    crate::lifecycle_log::LifecycleEvent::ProcessObserved {
+                        snapshot: process.snapshot(*kind),
+                    },
+                );
+            }
         }
     }
 
-    pub fn snapshot(&mut self, kind: ProcessKind) -> Option<ProcessSnapshot> {
+    pub fn snapshot(&mut self, kind: ProcessKey) -> Option<ProcessSnapshot> {
         self.refresh();
-        self.processes.get(&kind).map(|process| ProcessSnapshot {
-            kind,
-            phase: process.phase,
-            pid: Some(process.child.id()),
-            exit_code: process.exit_code,
-            owned_by_desktop: true,
-        })
-    }
-
-    pub fn logs(&self, kind: ProcessKind) -> Vec<String> {
         self.processes
             .get(&kind)
-            .map(|process| {
-                process
-                    .logs
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .iter()
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+            .map(|process| process.snapshot(kind))
     }
 
-    pub async fn stop(&mut self, kind: ProcessKind) {
+    pub async fn stop(&mut self, kind: ProcessKey) {
         self.stop_until(kind, Deadline::after(GRACEFUL_STOP_TIMEOUT))
             .await;
     }
 
-    pub async fn stop_until(&mut self, kind: ProcessKind, deadline: Deadline) {
+    /// Replacement must not overwrite a generation whose cleanup is uncertain.
+    pub async fn stop_checked(&mut self, kind: ProcessKey) -> DesktopResult<()> {
+        self.stop(kind).await;
+        if self.processes.contains_key(&kind) {
+            return Err(DesktopError::new(
+                "process_stop_unconfirmed",
+                "Process cleanup could not be confirmed",
+                "Retry stopping the Desktop-owned process before replacing it.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn stop_until(&mut self, kind: ProcessKey, deadline: Deadline) {
         let Some(mut process) = self.processes.remove(&kind) else {
             return;
         };
@@ -402,7 +481,12 @@ impl ProcessSupervisor {
             ProcessPhase::Starting | ProcessPhase::Running
         ) {
             process.phase = ProcessPhase::Stopping;
-            self.activity.push(
+            self.activity
+                .record_lifecycle(crate::lifecycle_log::LifecycleEvent::ProcessObserved {
+                    snapshot: process.snapshot(kind),
+                });
+            self.activity.push_for_profile(
+                kind.tunnel_profile_id(),
                 ActivityEventKind::ProcessStopping,
                 kind.source(),
                 ActivityLevel::Info,
@@ -411,7 +495,7 @@ impl ProcessSupervisor {
 
             let now = tokio::time::Instant::now();
             let eof_deadline =
-                if matches!(kind, ProcessKind::QuickShare | ProcessKind::RegularTunnel) {
+                if matches!(kind, ProcessKey::QuickShare | ProcessKey::RegularTunnel(_)) {
                     deadline.instant()
                 } else {
                     std::cmp::min(deadline.instant(), now + LOCAL_EOF_GRACE)
@@ -438,9 +522,34 @@ impl ProcessSupervisor {
             let _ = process.child.terminate_tree();
             let _ = wait_for_tree_exit(&mut process.child, deadline.instant()).await;
         }
+        if !process.child.try_tree_exit().unwrap_or(false) {
+            process.phase = ProcessPhase::Stopping;
+            self.processes.insert(kind, process);
+            self.activity.push_for_profile(
+                kind.tunnel_profile_id(),
+                ActivityEventKind::ProcessObservationFailed,
+                kind.source(),
+                ActivityLevel::Error,
+                "Process cleanup is unconfirmed; Desktop retained ownership for retry",
+            );
+            return;
+        }
+        if let Ok(Some(status)) = process.child.try_wait() {
+            process.exit_code = status.code();
+            process.phase = if status.success() {
+                ProcessPhase::Exited
+            } else {
+                ProcessPhase::Failed
+            };
+        }
+        self.activity
+            .record_lifecycle(crate::lifecycle_log::LifecycleEvent::ProcessStopped {
+                snapshot: process.snapshot(kind),
+            });
         finish_drain_task(process.stdout_task, deadline.instant()).await;
         finish_drain_task(process.stderr_task, deadline.instant()).await;
-        self.activity.push(
+        self.activity.push_for_profile(
+            kind.tunnel_profile_id(),
             ActivityEventKind::ProcessStopped,
             kind.source(),
             ActivityLevel::Info,
@@ -448,15 +557,57 @@ impl ProcessSupervisor {
         );
     }
 
-    pub async fn stop_all(&mut self) {
-        for kind in [
-            ProcessKind::QuickShare,
-            ProcessKind::RegularTunnel,
-            ProcessKind::LocalRunner,
-            ProcessKind::LocalServer,
-        ] {
-            self.stop(kind).await;
+    pub fn keys(&mut self) -> Vec<ProcessKey> {
+        self.refresh();
+        self.processes.keys().copied().collect()
+    }
+
+    /// A stale monitor may reclaim only its own generation, never a replacement.
+    pub async fn stop_generation(&mut self, key: ProcessKey, generation: u64) {
+        if self
+            .processes
+            .get(&key)
+            .is_some_and(|p| p.generation == generation)
+        {
+            self.stop(key).await;
         }
+    }
+
+    pub async fn stop_all(&mut self) {
+        // Ordinary application exit keeps the established per-process grace;
+        // only OS session shutdown uses one absolute deadline.
+        for key in self.prepare_stopping_all() {
+            self.stop(key).await;
+        }
+    }
+
+    pub(crate) async fn stop_all_until(&mut self, deadline: Deadline) {
+        for key in self.prepare_stopping_all() {
+            self.stop_until(key, deadline).await;
+        }
+    }
+
+    fn prepare_stopping_all(&mut self) -> Vec<ProcessKey> {
+        // Stop exposures before the shared runtime, including every profile.
+        let mut keys = self.keys();
+        keys.sort_by_key(|key| match key {
+            ProcessKey::QuickShare => 0,
+            ProcessKey::RegularTunnel(_) => 1,
+            ProcessKey::LocalRunner => 2,
+            ProcessKey::LocalServer => 3,
+        });
+        // All exposures receive their generation-scoped EOF lease together.
+        // Waiting on a busy profile first must not leave the other profiles
+        // connected until Windows has exhausted the owner's shutdown budget.
+        // Keep the shared Server available while admitted tunnel work drains.
+        for key in &keys {
+            if matches!(key, ProcessKey::QuickShare | ProcessKey::RegularTunnel(_)) {
+                if let Some(process) = self.processes.get_mut(key) {
+                    drop(process.child.child_mut().stdin.take());
+                }
+            }
+        }
+        keys
     }
 }
 
@@ -606,17 +757,17 @@ mod tests {
     async fn supervisor_only_stops_children_it_owns() {
         let activity = ActivityLog::default();
         let mut supervisor = ProcessSupervisor::new(activity);
-        supervisor.stop(ProcessKind::LocalRunner).await;
-        assert!(supervisor.snapshot(ProcessKind::LocalRunner).is_none());
+        supervisor.stop(ProcessKey::LocalRunner).await;
+        assert!(supervisor.snapshot(ProcessKey::LocalRunner).is_none());
     }
 
     #[test]
     fn process_kind_has_no_generic_process_surface() {
         let kinds = [
-            ProcessKind::LocalServer,
-            ProcessKind::LocalRunner,
-            ProcessKind::QuickShare,
-            ProcessKind::RegularTunnel,
+            ProcessKey::LocalServer,
+            ProcessKey::LocalRunner,
+            ProcessKey::QuickShare,
+            ProcessKey::RegularTunnel(crate::connection_id::TunnelProfileId::DEFAULT),
         ];
         assert_eq!(kinds.len(), 4);
     }
@@ -644,10 +795,10 @@ mod tests {
         let activity = ActivityLog::default();
         let mut supervisor = ProcessSupervisor::new(activity);
         supervisor
-            .spawn_owned(ProcessKind::LocalServer, command, false)
+            .spawn_owned(ProcessKey::LocalServer, command, false)
             .await
             .expect("start local parent-liveness fixture");
-        supervisor.stop(ProcessKind::LocalServer).await;
+        supervisor.stop(ProcessKey::LocalServer).await;
 
         assert!(
             marker.is_file(),
@@ -679,10 +830,10 @@ mod tests {
         let activity = ActivityLog::default();
         let mut supervisor = ProcessSupervisor::new(activity);
         supervisor
-            .spawn_owned(ProcessKind::QuickShare, command, false)
+            .spawn_owned(ProcessKey::QuickShare, command, false)
             .await
             .expect("start Quick Share EOF fixture");
-        supervisor.stop(ProcessKind::QuickShare).await;
+        supervisor.stop(ProcessKey::QuickShare).await;
 
         assert!(marker.is_file(), "Quick Share child must observe stdin EOF");
         let _ = std::fs::remove_file(marker);
@@ -714,7 +865,11 @@ mod tests {
         let activity = ActivityLog::default();
         let mut supervisor = ProcessSupervisor::new(activity);
         supervisor
-            .spawn_owned(ProcessKind::RegularTunnel, command, false)
+            .spawn_owned(
+                ProcessKey::RegularTunnel(crate::connection_id::TunnelProfileId::DEFAULT),
+                command,
+                false,
+            )
             .await
             .expect("start EOF fixture");
         let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -731,7 +886,11 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        supervisor.stop(ProcessKind::RegularTunnel).await;
+        supervisor
+            .stop(ProcessKey::RegularTunnel(
+                crate::connection_id::TunnelProfileId::DEFAULT,
+            ))
+            .await;
 
         assert_eq!(
             std::fs::read_to_string(&marker)

@@ -1,5 +1,5 @@
 use super::RunnerCapabilityRequirement::FileWrite;
-use super::ToolVisibility::ModelVisible;
+use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
     adaptive_runtime_direct, def, model_spec, permission_risk, ToolDefinition,
     PERMISSION_RISK_WRITE, TOOL_CATEGORY_EDIT,
@@ -9,9 +9,6 @@ use crate::metadata::{
     ToolRisk::ProjectWrite,
     PROJECT_WRITE, TOOL_PROVIDER_RUNNER,
 };
-use crate::registry::input_schemas::{
-    apply_text_edits_input_schema, write_project_file_input_schema,
-};
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     permission_risk(
@@ -19,7 +16,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             def(
             "write_project_file",
             super::ToolAuditPolicy::TYPED_CANONICAL,
-            ModelVisible,
+            ModelHidden,
             TOOL_CATEGORY_EDIT,
             Some(FileWrite),
             TOOL_PROVIDER_RUNNER,
@@ -36,16 +33,15 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Create new files or intentional whole-file rewrites. Existing-file overwrite requires the exact current expected_sha256. For ordinary model-generated changes after read_file/read_files, prefer apply_text_edits with the returned current SHA. Use apply_patch only when contextual or multi-hunk patch form is materially clearer, not merely because many lines change. Inspect current content and worktree changes before replacing a file.",
-            write_project_file_input_schema,
-        ),
+            "Create a new file or perform an intentional whole-file replacement. Existing-file replacement requires expected_read_revision from read_files; ToolRuntime resolves that model-facing snapshot handle to the Runner guard, so the model does not copy a digest. Failures expose minimal error facts and at most one parser-ready read_files recovery call when a fresh read is required. Choose this path when whole-file replacement is genuinely the clearest reliable mutation, then inspect the resulting diff and validate the final source.",
+        ).with_discovery_keywords(&["create", "write", "overwrite", "file", "contents", "创建", "写入", "覆盖", "文件", "内容"]),
         PERMISSION_RISK_WRITE,
     ),
     adaptive_runtime_direct(
         permission_risk(
             model_spec(
                 def(
-                "apply_text_edits",
+                "edit_project_files",
                 super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_EDIT,
@@ -63,12 +59,17 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+                )
+                .with_composition_policy(super::ToolCompositionPolicy::Sequential)
+                .with_host_orchestration_hint(
+                    super::ToolHostOrchestrationHint::sequential()
+                        .with_native_batch_field("changes"),
                 ),
-                "Canonical default guarded edit path after read_file/read_files for ordinary model-generated changes on the current worktree. Transactional and SHA-guarded: pass each existing file's current read SHA as expected_sha256; exact matches are unique by default, occurrence remains global source order, and optional line_scope fences matches. Supports transactional multi-file edits. Many changed lines alone are not a reason to choose apply_patch; use apply_patch only when contextual or large multi-hunk patch form is materially clearer. Use apply_unified_diff only for an external raw diff.",
-                apply_text_edits_input_schema,
-            ),
+                "Project editor: read_files → edit_project_files. Use review_changes when Git review is useful, then task-appropriate validation. One change per file. For existing-file edits/deletes/renames, set expected_read_revision from read_files.read_revision; create requires content. Exact edits fail closed on ambiguity; replace_range edits 1-based inclusive lines from that snapshot. Batches preflight transactionally; Runner rechecks source before mutation. dry_run plans only. Stale state returns read_files recovery; outcome_unknown requires workspace observation before writing.",
+            ).with_discovery_keywords(&["replace", "exact", "snippets", "edit", "existing", "files", "text", "insert", "delete", "rename", "move", "替换", "编辑", "修改", "文字", "文本", "插入", "删除", "重命名", "移动", "文件"]),
             PERMISSION_RISK_WRITE,
         ),
         60,
+        super::ToolDirectReason::CoreWorkflow,
     ),
 ];

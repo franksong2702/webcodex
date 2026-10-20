@@ -1,0 +1,740 @@
+{
+  "schema_version": 1,
+  "fixture_reference": {
+    "name": "coding-loop-eval-v1",
+    "source": "scripts/eval_coding_loop.sh",
+    "description": "Reuse the disposable Rust project recipe already owned by eval_coding_loop.sh; do not create a second runtime eval harness.",
+    "generic_source": "scripts/e2e_generic_agent_ws.py",
+    "generic_description": "Reuse only the deterministic fixture recipes for fresh disposable ordinary-directory Projects. The scripted MCP driver is runtime acceptance, not a real ChatGPT sample. Prepare and fingerprint identical inputs before each real Direct/Host Code Mode/Code Mode run; record the exact harness Git base and independent correctness evidence with the existing reporter and bounded annotation. Case-specific external writes and pipe release are fixture coordination, not a model runtime or new report schema. Use only admitted tools; keep Job tools outside nested Code Mode."
+  },
+  "protocol": {
+    "same_case_requires_same_base_revision": true,
+    "fresh_clean_workspace_per_run": true,
+    "variants": [
+      "direct",
+      "host_code_mode",
+      "code_mode"
+    ]
+  },
+  "cases": [
+    {
+      "id": "readonly_review",
+      "title": "Read-only review",
+      "target": "webcodex_repository",
+      "prompt": "Perform a read-only review. Inspect git status, read src/tool_runtime/window_activity.rs and docs/architecture/tool-composition-research.md, search for project_window_loop_timings references, inspect the current git diff, and report concrete findings. Do not modify files and do not run mutation tools.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "git status",
+          "window_activity implementation",
+          "tool-composition research timing contract",
+          "git diff"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      },
+      "code_mode_surface": "read_only"
+    },
+    {
+      "id": "focused_edit_validation",
+      "title": "Focused structured edit plus validation",
+      "target": "coding_loop_eval_fixture",
+      "prompt": "In the disposable coding-loop eval Rust project, change greeting() from \"hello\" to \"hello baseline\" without changing topic(). Inspect the resulting diff, run cargo check successfully, and report the final changed file and validation result.",
+      "correctness": {
+        "changed_files": [
+          "src/lib.rs"
+        ],
+        "required_final_text": "\"hello baseline\"",
+        "forbidden_final_text": "\"hello\" as the greeting return value",
+        "topic_must_remain_unchanged": true
+      },
+      "validation": {
+        "required": true,
+        "command": "cargo check",
+        "expected_exit_code": 0
+      },
+      "code_mode_surface": "guarded_edit"
+    },
+    {
+      "id": "guarded_multi_file_edit",
+      "title": "Search, guarded multi-file edit, and post-edit inspection",
+      "target": "webcodex_repository",
+      "prompt": "Search for BENCH_TARGET_ALPHA and BENCH_TARGET_BETA, read only the two matched fixture files, then make exactly one guarded edit_project_files request containing both file changes: BENCH_TARGET_ALPHA=before to BENCH_TARGET_ALPHA=after and BENCH_TARGET_BETA=before to BENCH_TARGET_BETA=after using the read revisions you just observed. Post-read both files, inspect the resulting diff, and report the two changed paths. Preserve ALPHA_UNRELATED_SENTINEL=keep and BETA_UNRELATED_SENTINEL=keep exactly. Do not edit any other file.",
+      "correctness": {
+        "changed_files": [
+          "tests/fixtures/agent-loop-multi-file/alpha.txt",
+          "tests/fixtures/agent-loop-multi-file/beta.txt"
+        ],
+        "one_guarded_edit_request_required": true,
+        "post_edit_read_required": true,
+        "fixture_oracle": {
+          "changed_files": [
+            "tests/fixtures/agent-loop-multi-file/alpha.txt",
+            "tests/fixtures/agent-loop-multi-file/beta.txt"
+          ],
+          "files": {
+            "tests/fixtures/agent-loop-multi-file/alpha.txt": {
+              "expected_text": "BENCH_TARGET_ALPHA=after\nALPHA_UNRELATED_SENTINEL=keep\n"
+            },
+            "tests/fixtures/agent-loop-multi-file/beta.txt": {
+              "expected_text": "BENCH_TARGET_BETA=after\nBETA_UNRELATED_SENTINEL=keep\n"
+            }
+          }
+        }
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Fixture-side oracle checks the exact two-file diff and preserved unrelated sentinels; no code validation is required."
+      },
+      "code_mode_surface": "guarded_edit"
+    },
+    {
+      "id": "failed_validation_recovery",
+      "title": "Failed validation recovery",
+      "target": "coding_loop_eval_fixture",
+      "prompt": "Use test-first recovery in the disposable coding-loop eval Rust project. First add a unit test named greeting_matches_recovery_target asserting greeting() == \"hello recovered\" and run cargo test while greeting() still returns \"hello\"; inspect the expected failing diagnostic. Then change greeting() to \"hello recovered\", rerun cargo test successfully, inspect the final diff, and report both the observed failing validation and the successful rerun.",
+      "correctness": {
+        "changed_files": [
+          "src/lib.rs"
+        ],
+        "required_final_text": "\"hello recovered\"",
+        "required_test_name": "greeting_matches_recovery_target",
+        "must_observe_failed_validation_before_fix": true
+      },
+      "validation": {
+        "required": true,
+        "command": "cargo test",
+        "expected_sequence": [
+          "failed",
+          "success"
+        ]
+      },
+      "code_mode_surface": "guarded_edit"
+    },
+    {
+      "id": "long_validation_handoff",
+      "title": "Long validation and same-execution Job handoff",
+      "target": "webcodex_repository",
+      "prompt": "Do not modify files. Start cargo test --lib with a sufficient total timeout using the published validation options; let the Server control synchronous handoff timing. If it hands off, preserve that exact Job identity; while it runs, independently inspect the timing terminology in docs/architecture/tool-composition-research.md, then observe the same Job to terminal completion. Do not redispatch cargo test. If the validation finishes synchronously before handoff, report that this run does not satisfy the handoff case instead of fabricating one.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "same_execution_must_be_preserved": true,
+        "redispatch_forbidden": true,
+        "requires_real_handoff_for_valid_case": true
+      },
+      "validation": {
+        "required": true,
+        "command": "cargo test --lib",
+        "expected_terminal_result": "success"
+      },
+      "code_mode_surface": "validation"
+    },
+    {
+      "id": "independent_observations",
+      "title": "Independent read-only observations",
+      "target": "webcodex_repository",
+      "prompt": "Perform a read-only readiness check for the Agent Loop baseline. Report whether the workspace is clean, whether the current worktree diff contains changes, where CODE_MODE_TOOLS is defined, and the documented meaning of observed_span_ms. Inspect the relevant repository sources and report only those facts. Do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "independent_observations",
+        "model_round_trips",
+        "max_in_flight",
+        "argument_accuracy"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "git status",
+          "worktree diff",
+          "CODE_MODE_TOOLS definition",
+          "observed_span_ms semantics"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "adaptive_search_read",
+      "title": "Adaptive search then targeted read",
+      "target": "webcodex_repository",
+      "prompt": "Locate the repository references that define outside_webcodex_gap_ms, then inspect the most relevant matched ranges and explain when a serial gap is measured versus unavailable. Keep the workspace unchanged.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "adaptive_search_read",
+        "result_field_usage",
+        "model_round_trips",
+        "repair_turns"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "search results for outside_webcodex_gap_ms",
+          "targeted read of defining code or protocol text",
+          "measured versus unavailable semantics"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "native_batching_observations",
+      "title": "Related multi-file and multi-query observations",
+      "target": "webcodex_repository",
+      "prompt": "Cross-check the Agent Loop protocol across AGENTS.md, docs/experiments/agent-loop-baseline.md, and scripts/agent_loop_cases.json. Also locate references to model_round_trips and nested_raw_result_bytes_total. Report the protocol rule for clean paired runs, the wall-time caveat, and where the two metrics are represented. Do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "native_batching",
+        "related_reads",
+        "related_searches",
+        "child_call_count",
+        "result_bytes"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "AGENTS.md",
+          "agent-loop baseline protocol",
+          "case manifest",
+          "model_round_trips references",
+          "nested_raw_result_bytes_total references"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "result_shape_pressure",
+      "title": "Layered search-result follow-up",
+      "target": "webcodex_repository",
+      "prompt": "Find same_case_requires_same_base_revision in the repository, report the first matching file and line, then read the surrounding manifest protocol and the corresponding Agent Loop documentation. State whether the two sources agree about paired-run base revisions. Do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "result_shape",
+        "search_match_projection",
+        "optional_fields",
+        "repair_turns"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "first structured search match path and line",
+          "manifest protocol value",
+          "documentation agreement"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "known_business_failure",
+      "title": "Expected missing-file business failure with fallback",
+      "target": "coding_loop_eval_fixture",
+      "prompt": "Inspect docs/task-notes.md in the disposable coding-loop eval project. That optional note may be absent; if the read reports it missing, treat that as the expected business result and continue by reading README.md. Report the README title and the stable phrase describing why the project exists. Do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "known_business_failure",
+        "failed_child_calls",
+        "normal_recovery",
+        "failure_kind_distinction"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "expected_missing_path": "docs/task-notes.md",
+        "required_fallback": "README.md",
+        "required_final_fact": "coding-loop eval"
+      },
+      "validation": {
+        "required": false,
+        "expectation": "The missing optional file is an expected business failure; no code validation is required."
+      }
+    },
+    {
+      "id": "compact_projection",
+      "title": "Large read evidence with compact final projection",
+      "target": "webcodex_repository",
+      "prompt": "Read the relevant guidance in AGENTS.md, docs/agent/tool-contract-guidelines.md, and docs/experiments/agent-loop-baseline.md. Return exactly three concise facts: the rule for independent versus adaptive observations, what observed_span_ms does not mean, and the authorization rule for deploy/restart. Do not quote long passages and do not modify files.",
+      "code_mode_surface": "read_only",
+      "dogfood_focus": [
+        "compact_projection",
+        "nested_raw_result_bytes",
+        "returned_bytes",
+        "context_pressure"
+      ],
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_final_facts": [
+          "independent versus adaptive observation rule",
+          "observed_span_ms is not task wall time",
+          "deploy/restart requires explicit authorization"
+        ],
+        "final_fact_count": 3
+      },
+      "validation": {
+        "required": false,
+        "expectation": "No code validation is required; final workspace must remain unchanged."
+      }
+    },
+    {
+      "id": "generic_mixed_files_conflict",
+      "title": "Organize mixed files and preserve destination conflict",
+      "target": "generic_agent_disposable_fixture",
+      "prompt": "In the prepared ordinary-directory Project, organize input/note.txt, pixel.png, document.pdf and bytes.bin into sorted/. Preserve all sources and the existing sorted/note.txt; copy the incoming note to sorted/note-2.txt. Use artifact transfer for binaries. Check final paths, file counts, binary signatures and SHA-256 equality with the inputs; report the observed conflict policy and outputs. Do not overwrite the conflict.",
+      "code_mode_surface": "validation",
+      "correctness": {
+        "fixture": {
+          "source": "GenericSmoke.files and binary_fixtures",
+          "initial_paths": [
+            "input/note.txt",
+            "input/pixel.png",
+            "input/document.pdf",
+            "input/bytes.bin",
+            "sorted/note.txt"
+          ],
+          "text": "input/note.txt = original note followed by LF; sorted/note.txt = keep conflict followed by LF; deterministic binaries from binary_fixtures()",
+          "environment": "Disposable loopback Runner Project; fixed GenericSmoke locale/timezone/Python environment; record source hashes before the timed run."
+        },
+        "required_assertions": [
+          "4 unchanged source files",
+          "5 destination files",
+          "sorted/note.txt unchanged",
+          "note-2.txt and three binary copies match original SHA-256",
+          "valid PNG 1x1, PDF structure and 1024 binary bytes"
+        ]
+      },
+      "validation": {
+        "required": true,
+        "expectation": "Independent fixture-side enumeration and SHA-256 checks of every original/copy and preserved conflict; independently parse PNG/PDF structures. Neither script stdout nor metadata alone passes this case."
+      }
+    },
+    {
+      "id": "generic_encoded_csv",
+      "title": "Merge CSV encodings and reconcile statistics",
+      "target": "generic_agent_disposable_fixture",
+      "prompt": "Merge a.csv (UTF-8 columns name,value) and b.csv (UTF-16 columns 姓名,数量) into UTF-8 merged.csv with columns name,value and LF lines; retain input order and integer values. Write report.json containing count and total. Preserve both inputs. Verify actual CSV bytes/rows and recompute statistics, then finish with these two output paths when the deployed contract supports outputs. Record whether output receipts are supported; do not claim a baseline has them.",
+      "code_mode_surface": "validation",
+      "correctness": {
+        "fixture": {
+          "source": "GenericSmoke.data",
+          "a.csv": "name,value\nAlice,2\nBob,3\n",
+          "b.csv": "姓名,数量\n陈,5\n丁,7\n encoded UTF-16 with BOM",
+          "environment": "Same fixed fixture environment and input hashes in each variant; baseline finish omits unsupported outputs; upgraded declares merged.csv/report.json. Record this contract difference; do not pool different profiles."
+        },
+        "required_assertions": [
+          "both input SHA-256 unchanged",
+          "merged.csv exact name,value\nAlice,2\nBob,3\n陈,5\n丁,7\n bytes in UTF-8",
+          "4 records and sum 17",
+          "report.json equals count 4/total 17",
+          "upgraded finish receipt verifies both actual files"
+        ]
+      },
+      "validation": {
+        "required": true,
+        "expectation": "Independent fixture-side byte comparison, CSV parse and arithmetic plus input SHA-256 checks; receipt hashes must agree with independent disk hashes if requested."
+      }
+    },
+    {
+      "id": "generic_failure_repair",
+      "title": "Inspect a nonzero command and repair it",
+      "target": "generic_agent_disposable_fixture",
+      "prompt": "In this disposable Project run the prepared pressure command: print pressure-0 through pressure-2499, print GENERIC_ACCEPTANCE_UNIQUE_SENTINEL_9d06, print expected failure to stderr, and exit 7. Inspect the observed exit code and diagnostic. Repair only the intentional failure by removing the stderr/exit lines, rerun once, and confirm exit 0 and the sentinel. Report both outcomes; never count the expected failure as a contract repair turn.",
+      "code_mode_surface": "validation",
+      "correctness": {
+        "fixture": {
+          "source": "GenericSmoke.failure_logs",
+          "command": "Python script with exactly the sequence described in the prompt",
+          "environment": "Fixed Python/locale/timezone; no real secrets or external endpoints; use existing structured command or run_script tools."
+        },
+        "required_assertions": [
+          "initial command exit 7 observed",
+          "stderr expected failure observed",
+          "repair exit 0 observed",
+          "unique stdout sentinel retained in actual MCP response",
+          "no credentials/headers in saved evidence"
+        ]
+      },
+      "validation": {
+        "required": true,
+        "expectation": "Independent inspection of exit statuses and retained logs from the same executions; count sentinel occurrences in actual bounded MCP envelopes without recording credential headers."
+      }
+    },
+    {
+      "id": "generic_pending_independent_join",
+      "title": "Pending Job with independent work and one join",
+      "target": "generic_agent_disposable_fixture",
+      "prompt": "Start exactly one interactive Python process that reads stdin to EOF and then prints controlled-job-complete. It must return a pending Job; retain its identity/continuation. While it waits, write independent.txt with independent work completed. Close stdin on the original Job through write_job_input, then perform one bounded wait_for_job_readiness join and observe that same Job to terminal exit 0. Do not redispatch, immediately poll while independent work remains, or repeat waits. If there is no genuine pending handoff, mark the case unsatisfied.",
+      "code_mode_surface": "validation",
+      "correctness": {
+        "fixture": {
+          "source": "GenericSmoke.pending, InteractiveSmoke.start_pipe/write/terminal",
+          "process": "import sys; sys.stdin.read(); print('controlled-job-complete',flush=True)",
+          "initial_paths": [],
+          "environment": "Disposable Runner; interactive pipe only, no PTY; 30-second child timeout and one 30-second readiness wait. EOF is the deterministic release, not timing sleeps."
+        },
+        "required_assertions": [
+          "one process dispatch",
+          "real pending identity retained",
+          "independent file exists before releasing input",
+          "one readiness join",
+          "terminal observation matches original Job",
+          "exit 0 and controlled-job-complete observed"
+        ]
+      },
+      "validation": {
+        "required": true,
+        "expectation": "Independent fixture-side check of independent.txt bytes and tool/audit order, one dispatch, one wait and identical Job identity through release/observation; script claims alone cannot establish order."
+      }
+    },
+    {
+      "id": "generic_stale_read_revision",
+      "title": "Reject stale edit and preserve external writer change",
+      "target": "generic_agent_disposable_fixture",
+      "prompt": "Read stale.txt and retain read_revision. After that first read, the fixture operator directly appends EXTERNAL_WRITER_SENTINEL_c741 followed by LF to the file and confirms the write before you proceed. Attempt exactly one edit_project_files replacement task value: before to task value: after using the original expected_read_revision; it must fail as stale_file_revision without any byte change. Independently verify those unchanged bytes, perform a fresh read_files call, reconsider the current content, and retry the intended replacement using the new revision. Verify the final file contains the task change and the exact external sentinel line. Do not manufacture the external write through a model tool, omit the revision fence or replay the stale write. If fixture coordination did not happen, mark this case unsatisfied.",
+      "code_mode_surface": "guarded_edit",
+      "correctness": {
+        "fixture": {
+          "source": "GenericSmoke.stale_edit",
+          "initial_bytes": "task value: before\n",
+          "external_append": "EXTERNAL_WRITER_SENTINEL_c741\n",
+          "coordination": "Fixture operator waits for first read, directly writes appended bytes outside tool caches, captures SHA-256, signals completion before stale edit, and checks disk immediately after rejection and recovery. The deterministic acceptance driver owns this write itself; real ChatGPT replay needs the same operator boundary.",
+          "environment": "Same disposable Project, content and source fingerprint for all variants; supported in baseline and upgraded."
+        },
+        "required_assertions": [
+          "old revision edit returns success=false/error_kind stale_file_revision/state_changed=false",
+          "rejected edit leaves exact external bytes unchanged",
+          "fresh read returns a different revision before next edit",
+          "final bytes task value: after\nEXTERNAL_WRITER_SENTINEL_c741\n",
+          "external sentinel preserved exactly once"
+        ]
+      },
+      "validation": {
+        "required": true,
+        "expectation": "Independent fixture-side exact byte/SHA-256 checks before external write, after rejection and after recovery; verify call order and revisions separately from tool success flags."
+      }
+    },
+    {
+      "id": "generic_missing_output",
+      "title": "Missing declared output blocks closeout",
+      "target": "generic_agent_disposable_fixture",
+      "prompt": "In the disposable Project, independently confirm missing-result.csv does not exist. Finish the task while declaring outputs=[missing-result.csv]. Inspect task_outputs and task_outcome: the file must remain unverified and the task must remain blocked/fail. Report this expected negative result as a successfully exercised closeout guard, not a successful user deliverable. Do not create the file or silently omit the declared output. If the deployed contract does not support outputs, mark this upgrade-only case unsupported rather than fabricating a receipt.",
+      "code_mode_surface": "validation",
+      "correctness": {
+        "fixture": {
+          "source": "GenericSmoke.missing_output",
+          "initial_paths": [],
+          "absent_path": "missing-result.csv",
+          "environment": "Upgrade profile only; fresh task Session in disposable ordinary-directory Project; use existing canonical finish tool and admitted gateway when needed."
+        },
+        "required_assertions": [
+          "missing-result.csv absent before and after",
+          "task_outputs missing_count 1/verified_count 0",
+          "blocking_reasons includes task_outputs_unverified",
+          "task_outcome status fail and blocking true",
+          "absence not represented as verified output"
+        ]
+      },
+      "validation": {
+        "required": true,
+        "expectation": "Independent fixture-side filesystem absence check and structured receipt/outcome inspection; baseline is unsupported, not a pass or comparable upgrade sample."
+      }
+    },
+    {
+      "id": "selection_single_read",
+      "title": "Choose tools for one exact observation",
+      "prompt": "What is the current BENCH_TARGET_ALPHA value in tests/fixtures/agent-loop-multi-file/alpha.txt? Report the value and its source. Do not modify files.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "BENCH_TARGET_ALPHA=before"
+        ],
+        "fixture_oracle": {
+          "files": {
+            "tests/fixtures/agent-loop-multi-file/alpha.txt": {
+              "expected_text": "BENCH_TARGET_ALPHA=before\nALPHA_UNRELATED_SENTINEL=keep\n"
+            }
+          }
+        }
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent source-value verification and unchanged workspace."
+      },
+      "target": "webcodex_repository",
+      "experiment": "tool_selection"
+    },
+    {
+      "id": "selection_batch_read",
+      "title": "Choose tools for related observations",
+      "prompt": "Report the BENCH_TARGET_ALPHA and BENCH_TARGET_BETA values from tests/fixtures/agent-loop-multi-file/alpha.txt and tests/fixtures/agent-loop-multi-file/beta.txt, and confirm whether both unrelated sentinel values equal keep. Cite both files. Do not modify files.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "BENCH_TARGET_ALPHA=before",
+          "BENCH_TARGET_BETA=before",
+          "both sentinels equal keep"
+        ],
+        "fixture_oracle": {
+          "files": {
+            "tests/fixtures/agent-loop-multi-file/alpha.txt": {
+              "expected_text": "BENCH_TARGET_ALPHA=before\nALPHA_UNRELATED_SENTINEL=keep\n"
+            },
+            "tests/fixtures/agent-loop-multi-file/beta.txt": {
+              "expected_text": "BENCH_TARGET_BETA=before\nBETA_UNRELATED_SENTINEL=keep\n"
+            }
+          }
+        }
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent answer check against both fixture files; unchanged workspace."
+      },
+      "target": "webcodex_repository",
+      "experiment": "tool_selection"
+    },
+    {
+      "id": "selection_cross_tool_review",
+      "title": "Choose tools for a bounded repository investigation",
+      "prompt": "Determine whether this checkout is clean, locate the implementation that filters tool discovery queries, and explain from its source whether every query word must match. Include the branch and source location. Do not modify files.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "current branch and worktree cleanliness",
+          "actual discovery query implementation",
+          "all-word matching conclusion supported by source"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Reviewer verifies answer against the exact tested revision and independent Git status; no prescribed tool sequence."
+      },
+      "target": "webcodex_repository",
+      "experiment": "tool_selection"
+    },
+    {
+      "id": "selection_compound_source_context",
+      "title": "Choose tools for bounded source context",
+      "prompt": "Locate the implementation that turns project text search matches into bounded source-context reads. Explain from the current source whether overlapping matches necessarily repeat source content, how read limits and byte-budget fallback qualify coalescing, and what happens when there are no matches. Cite the implementation and relevant regression tests. Use whichever admitted tools provide sufficient evidence; stop when the returned context is sufficient. Do not modify files.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "match-derived context reads have a bounded global read limit shared across independent queries",
+          "overlapping ranges can coalesce and successfully materialized source content is returned once; byte-budget fallback may retain original members",
+          "planned read_request_count and actual coalesced_read_count are distinct; one physical read is not guaranteed for every query",
+          "no matches returns no source reads and read_request_count zero",
+          "answer cites current implementation and relevant regression tests at the tested revision"
+        ],
+        "fixture_oracle": {
+          "files": {
+            "src/tool_runtime/search_and_read.rs": {
+              "required_text": [
+                "let items = fair_match_read_items",
+                "if items.is_empty() {",
+                "\"reads\": []",
+                "\"read_request_count\": 0",
+                "read_files_coalesced_resolved",
+                "\"coalesced_read_count\": coalesced_reads",
+                ".clamp(1, MAX_READS)",
+                "Keep original members for canonical byte-ceiling fallback"
+              ]
+            },
+            "src/tool_runtime/tests/search_and_read.rs": {
+              "required_text": [
+                "async fn search_and_read_returns_one_source_block_for_overlapping_matches",
+                "compound output must not re-expand overlapping member ranges",
+                "async fn search_and_read_no_matches_does_not_dispatch_a_read",
+                "assert_eq!(result.output[\"read_request_count\"], 0);",
+                "async fn search_and_read_byte_ceiling_fallback_keeps_original_member_continuation"
+              ]
+            }
+          }
+        }
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent answer review against the exact tested implementation and regression tests, including budget/fallback qualifications and zero-match behavior; unchanged workspace. The source oracle checks fixture eligibility only, not answer correctness. No prescribed tool sequence or redundant follow-up read when returned context is sufficient."
+      },
+      "target": "webcodex_repository",
+      "experiment": "tool_selection"
+    },
+    {
+      "id": "selection_failed_test_recovery",
+      "title": "Choose tools to diagnose and repair a failing test",
+      "prompt": "The isolated Rust project under tests/fixtures/agent-selection has a failing greeting test. Observe its failure before changing files, fix the implementation while preserving the test and unrelated function, then verify tests pass. Report the failure, fix and final validation. Change only that fixture implementation.",
+      "correctness": {
+        "fixture_oracle": {
+          "changed_files": [
+            "tests/fixtures/agent-selection/src/lib.rs"
+          ],
+          "files": {
+            "tests/fixtures/agent-selection/src/lib.rs": {
+              "expected_text": "pub fn greeting() -> &'static str {\n    \"hello recovered\"\n}\n\npub fn topic() -> &'static str {\n    \"keep\"\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn greeting_matches_target() {\n        assert_eq!(super::greeting(), \"hello recovered\");\n        assert_eq!(super::topic(), \"keep\");\n    }\n}\n"
+            }
+          }
+        },
+        "required_observations": [
+          "test fails before implementation edit",
+          "same unchanged test passes after implementation edit"
+        ]
+      },
+      "validation": {
+        "required": true,
+        "expectation": "Independent fixture-side cargo test before and after; retain failing and passing execution evidence; no test weakening."
+      },
+      "target": "webcodex_repository",
+      "experiment": "tool_selection"
+    },
+    {
+      "id": "selection_session_recovery",
+      "title": "Recover a selected task in a new conversation",
+      "prompt": "In this first conversation, inspect tests/fixtures/agent-loop-multi-file/alpha.txt without editing it and save a decision to preserve ALPHA_UNRELATED_SENTINEL=keep plus a progress note that BENCH_TARGET_ALPHA must next become after. Report the exact saved task identity and stop. In a fresh conversation, recover that explicitly selected saved task, verify current files, perform the remaining change and report its validation. Do not create a replacement task or infer its identity by title or recency.",
+      "correctness": {
+        "fixture_oracle": {
+          "changed_files": [
+            "tests/fixtures/agent-loop-multi-file/alpha.txt"
+          ],
+          "files": {
+            "tests/fixtures/agent-loop-multi-file/alpha.txt": {
+              "expected_text": "BENCH_TARGET_ALPHA=after\nALPHA_UNRELATED_SENTINEL=keep\n"
+            }
+          }
+        },
+        "required_observations": [
+          "two actual fresh ChatGPT Web conversations",
+          "same explicitly selected Workflow Session",
+          "saved decision and progress available after recovery",
+          "external file state verified before edit",
+          "no replacement task or execution"
+        ]
+      },
+      "validation": {
+        "required": true,
+        "expectation": "Driver must coordinate two real conversations, verify explicit Session identity and retained notes from runtime evidence, and independently verify final bytes. Single-conversation or scripted-only runs cannot establish this scenario."
+      },
+      "target": "webcodex_repository",
+      "experiment": "tool_selection"
+    },
+    {
+      "id": "knowledge_identifier",
+      "title": "Free identifier lookup",
+      "target": "knowledge_skill_disposable_fixture",
+      "experiment": "tool_selection",
+      "prompt": "Find the actual receipt identifier policy, distinguishing similarly named files. Report receipt-prefix and receipt-width from its current implementation. Choose whichever admitted tools you find useful. Do not edit the project or execute Skill scripts. End with one JSON object containing facts (the requested key=value strings, preserving source spelling) and sources (objects with path, start_line and end_line, one-based inclusive). Cite the lines that establish each fact.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "source content and citations match the independently prepared fixture",
+          "task facts and actual resource adoption are assessed separately",
+          "coordinator-owned source changes only; all other bytes and Git identity preserved"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent factual/range oracle plus exact fixture, Session/Project and bounded actual capture checks; driver declarations alone cannot qualify. Updates require an independently observed first read before the coordinator changes one source."
+      }
+    },
+    {
+      "id": "knowledge_procedure",
+      "title": "Free project procedure lookup",
+      "target": "knowledge_skill_disposable_fixture",
+      "experiment": "tool_selection",
+      "prompt": "Determine the current receipt audit procedure for this project. Report audit-order, audit-marker and audit-batch, distinguishing historical or similarly named material. Choose whichever admitted tools you find useful. Do not edit the project or execute Skill scripts. End with one JSON object containing facts (the requested key=value strings, preserving source spelling) and sources (objects with path, start_line and end_line, one-based inclusive). Cite the lines that establish each fact.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "source content and citations match the independently prepared fixture",
+          "task facts and actual resource adoption are assessed separately",
+          "coordinator-owned source changes only; all other bytes and Git identity preserved"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent factual/range oracle plus exact fixture, Session/Project and bounded actual capture checks; driver declarations alone cannot qualify. Updates require an independently observed first read before the coordinator changes one source."
+      }
+    },
+    {
+      "id": "knowledge_paraphrase",
+      "title": "Chinese project knowledge lookup",
+      "target": "knowledge_skill_disposable_fixture",
+      "experiment": "tool_selection",
+      "prompt": "请使用本项目提供的知识资源，查明收据台账保留多久、由哪个工作组负责，注意区分近似名称的旧材料。报告 ledger-window 和 ledger-owner，并引用当前来源。自行发现所需能力，不要求特定工具或调用顺序。 Do not edit the project or execute Skill scripts. End with one JSON object containing facts (the requested key=value strings, preserving source spelling) and sources (objects with path, start_line and end_line, one-based inclusive). Cite the lines that establish each fact.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "source content and citations match the independently prepared fixture",
+          "task facts and actual resource adoption are assessed separately",
+          "coordinator-owned source changes only; all other bytes and Git identity preserved"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent factual/range oracle plus exact fixture, Session/Project and bounded actual capture checks; driver declarations alone cannot qualify. Updates require an independently observed first read before the coordinator changes one source."
+      }
+    },
+    {
+      "id": "knowledge_source_update",
+      "title": "Project knowledge source update",
+      "target": "knowledge_skill_disposable_fixture",
+      "experiment": "tool_selection",
+      "prompt": "Use the project knowledge resources to establish the current ledger-window and ledger-owner. After reading the source, pause and report that you are ready for the operator source-change checkpoint; do not give the final answer yet. When the operator confirms the change, verify the previous source reference, refresh knowledge if needed, and report only the current facts with current citations. Do not edit the project or execute Skill scripts. End with one JSON object containing facts (the requested key=value strings, preserving source spelling) and sources (objects with path, start_line and end_line, one-based inclusive). Cite the lines that establish each fact.",
+      "correctness": {
+        "workspace_must_remain_clean": false,
+        "required_observations": [
+          "source content and citations match the independently prepared fixture",
+          "task facts and actual resource adoption are assessed separately",
+          "coordinator-owned source changes only; all other bytes and Git identity preserved"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent factual/range oracle plus exact fixture, Session/Project and bounded actual capture checks; driver declarations alone cannot qualify. Updates require an independently observed first read before the coordinator changes one source."
+      }
+    },
+    {
+      "id": "knowledge_skill_read",
+      "title": "Project Skill body and reference",
+      "target": "knowledge_skill_disposable_fixture",
+      "experiment": "tool_selection",
+      "prompt": "Use the project receipt audit Skill to determine audit-order, audit-marker and audit-batch. Discover the relevant Skill and read enough of its body and references to support the answer; distinguish near-name historical material. No particular tool or call order is prescribed. Do not edit the project or execute Skill scripts. End with one JSON object containing facts (the requested key=value strings, preserving source spelling) and sources (objects with path, start_line and end_line, one-based inclusive). Cite the lines that establish each fact.",
+      "correctness": {
+        "workspace_must_remain_clean": true,
+        "required_observations": [
+          "source content and citations match the independently prepared fixture",
+          "task facts and actual resource adoption are assessed separately",
+          "coordinator-owned source changes only; all other bytes and Git identity preserved"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent factual/range oracle plus exact fixture, Session/Project and bounded actual capture checks; driver declarations alone cannot qualify. Updates require an independently observed first read before the coordinator changes one source."
+      }
+    },
+    {
+      "id": "knowledge_skill_update",
+      "title": "Project Skill definition update",
+      "target": "knowledge_skill_disposable_fixture",
+      "experiment": "tool_selection",
+      "prompt": "Use the project receipt audit Skill to establish audit-order, audit-marker and audit-batch. Once its definition and necessary references have been read, pause for the operator checkpoint. After the operator confirms the definition changed, check the previously selected revision, recover current content, and report only the current facts and citations. Do not edit the project or execute Skill scripts. End with one JSON object containing facts (the requested key=value strings, preserving source spelling) and sources (objects with path, start_line and end_line, one-based inclusive). Cite the lines that establish each fact.",
+      "correctness": {
+        "workspace_must_remain_clean": false,
+        "required_observations": [
+          "source content and citations match the independently prepared fixture",
+          "task facts and actual resource adoption are assessed separately",
+          "coordinator-owned source changes only; all other bytes and Git identity preserved"
+        ]
+      },
+      "validation": {
+        "required": false,
+        "expectation": "Independent factual/range oracle plus exact fixture, Session/Project and bounded actual capture checks; driver declarations alone cannot qualify. Updates require an independently observed first read before the coordinator changes one source."
+      }
+    }
+  ]
+}

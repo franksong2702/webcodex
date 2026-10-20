@@ -5,8 +5,10 @@
 __pycache__/
 *.pyc
 
-# Local runtime data (SQLite DB and durable runtime state)
-data*
+# Root runtime data directories (WEBCODEX_DATA defaults to ./data).
+# Keep local variants/backups protected without hiding data*.rs or nested source.
+# Custom data paths outside these directories belong in .git/info/exclude.
+/data*/
 
 # Local Codex CLI workspace
 .codex
@@ -50,3 +52,26 @@ data*
 
 # Watched frontend development output.
 /frontend/.dev-dist/
+
+# Regenerable isolated UI verification output; curated screenshots live in docs/ux/.
+/artifacts/issue470-ui/
+/artifacts/liquid-glass-ui/
+/artifacts/docx-viewer/
+/artifacts/desktop-workflow/
+/artifacts/desktop-runtime-probe/
+/artifacts/desktop-runtime-simple/
+/artifacts/desktop-clarity/
+/artifacts/projects-runtime/
+/artifacts/web-soft-surfaces/
+/artifacts/web-page-consistency/
+/artifacts/pdf-reader/
+/artifacts/mcp-workspaces/
+/artifacts/runtime-call-stream/
+/scripts/ui-smoke/node_modules/
+
+# Desktop solid-surface verification and root Vite temporary modules.
+/artifacts/desktop-soft-surfaces/
+/node_modules/
+
+# Generated motion acceptance reports, screenshots and videos
+/artifacts/flowing-selection/

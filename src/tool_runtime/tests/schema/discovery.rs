@@ -1,5 +1,357 @@
 use super::*;
 
+#[tokio::test]
+async fn discovery_materializes_only_the_requested_contract_shape() {
+    use crate::tool_runtime::kernel::ToolProtocolCapabilities;
+    use webcodex_tool_contracts::take_tool_materialization_counts_for_test as take_counts;
+    let runtime = test_runtime();
+    take_counts();
+    let exact = runtime
+        .tool_manifest(
+            None,
+            Some("run_process".into()),
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(exact.success, "{:?}", exact.error);
+    assert_eq!(
+        take_counts(),
+        (1, 0),
+        "exact discovery projects one input and no outputs"
+    );
+    assert_eq!(
+        exact.output["contract"]["input_schema"],
+        webcodex_tool_contracts::input_schema_for_tool("run_process")
+    );
+    let category = runtime
+        .tool_manifest(
+            None,
+            None,
+            Some("execution".into()),
+            None,
+            false,
+            true,
+            None,
+            None,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(category.success);
+    assert!(category.output["count"].as_u64().unwrap() > 0);
+    assert_eq!(take_counts(), (0, 0));
+    let mut projected = category;
+    crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut projected);
+    assert_eq!(
+        take_counts(),
+        (0, 0),
+        "description lookup must not rebuild full specs"
+    );
+    let hidden = runtime
+        .tool_manifest(
+            None,
+            Some("read_memory".into()),
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(
+        !hidden.success,
+        "metadata must not grant extension admission"
+    );
+    assert_eq!(take_counts(), (0, 0));
+    let summary = runtime.list_tools_payload(crate::tool_runtime::tool_inputs::ListToolsOptions {
+        category: None,
+        features: None,
+        limit: Some(1),
+        summary_only: true,
+    });
+    assert_eq!(summary["count"], 1);
+    assert_eq!(take_counts(), (0, 0));
+    let full = runtime.list_tools_payload(crate::tool_runtime::tool_inputs::ListToolsOptions {
+        category: None,
+        features: None,
+        limit: Some(1),
+        summary_only: false,
+    });
+    assert_eq!(full["count"], 1);
+    assert_eq!(
+        take_counts(),
+        (1, 1),
+        "full list must select before materializing"
+    );
+}
+
+#[cfg(feature = "experimental-code-mode")]
+use std::collections::HashMap;
+#[cfg(feature = "experimental-code-mode")]
+use std::sync::Arc;
+#[cfg(feature = "experimental-code-mode")]
+use webcodex_code_mode::{
+    CodeModeExecuteRequest, CodeModeHost, CodeModeHostError, CodeModeHostFuture,
+    CodeModeToolRequest, CodeModeToolResponse,
+};
+
+#[tokio::test]
+async fn stop_job_manifest_remains_one_gateway_canonical_mutation() {
+    let mut result = test_runtime()
+        .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
+            tool_name: Some("stop_job".into()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(result.success, "{:?}", result.error);
+    crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut result);
+    assert_eq!(result.output["name"], "stop_job");
+    assert_eq!(result.output["route"]["primary"]["mode"], "gateway");
+    assert_eq!(
+        result.output["route"]["primary"]["tool"],
+        "call_runtime_tool"
+    );
+    assert_eq!(result.output["route"]["primary"]["target"], "stop_job");
+    assert!(result.output["route"]["fallback"].is_null());
+    assert_eq!(result.output["effect"], "mutate");
+    assert_eq!(result.output["idempotency"], "desired_state");
+    assert_eq!(
+        result.output["input_schema"],
+        webcodex_tool_contracts::input_schema_for_tool("stop_job")
+    );
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[tokio::test]
+async fn code_mode_job_tools_stay_outside_all_typed_surfaces_and_host_admission() {
+    use crate::tool_runtime::code_mode::{code_mode_orchestration_policy, CodeModeCallableStage};
+    use crate::tool_runtime::kernel::ToolTransport;
+    use crate::tool_runtime::orchestration_host::CanonicalOrchestrationHost;
+    let runtime = runtime_with_agent_project("job-admission-fixture");
+    register_agent(&runtime, "job-admission-fixture", None, Default::default()).await;
+    let project = agent_test_project_id("job-admission-fixture");
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let auth = bootstrap_auth_context();
+    for stage in [
+        CodeModeCallableStage::ReadOnly,
+        CodeModeCallableStage::Validation,
+        CodeModeCallableStage::GuardedEdit,
+    ] {
+        let policy = code_mode_orchestration_policy(stage);
+        let result = runtime
+            .dispatch(ToolCall::ToolManifest {
+                query: None,
+                limit: None,
+                tool_name: Some(stage.entry_tool().into()),
+                category: None,
+                intent: None,
+                include_recommended_flows: false,
+                include_risk_summary: false,
+            })
+            .await;
+        assert!(result.success, "{:?}", result.error);
+        let names = result.output["code_mode_callable_contract"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["tool"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, policy.admitted_tools);
+        let host = CanonicalOrchestrationHost::new(
+            runtime.clone(),
+            Some(&auth),
+            project.clone(),
+            session.session_id.clone(),
+            ToolTransport::Mcp,
+            None,
+            policy,
+        );
+        for (index, name) in [
+            "observe_jobs",
+            "list_jobs",
+            "wait_for_job_terminal",
+            "stop_job",
+            "present_job_terminal_continuation",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(!names.contains(&name));
+            assert!(!policy.is_admitted(name));
+            let denied = host
+                .invoke_tool(index + 1, name.to_string(), json!({}))
+                .await;
+            assert_eq!(denied.unwrap_err().failure_kind(), crate::tool_runtime::orchestration_host::OrchestrationHostFailureKind::ToolNotAdmitted, "{} admitted {name}", stage.entry_tool());
+        }
+        assert!(probe_patch_agent_request(&runtime, "job-admission-fixture")
+            .await
+            .is_none());
+    }
+}
+
+#[cfg(feature = "experimental-code-mode")]
+struct CallableExampleHost {
+    input_schemas: HashMap<String, Value>,
+}
+
+#[cfg(feature = "experimental-code-mode")]
+impl CodeModeHost for CallableExampleHost {
+    fn invoke_tool(
+        &self,
+        request: CodeModeToolRequest,
+    ) -> CodeModeHostFuture<'_, Result<CodeModeToolResponse, CodeModeHostError>> {
+        Box::pin(async move {
+            let schema = self.input_schemas.get(&request.tool_name).ok_or_else(|| {
+                CodeModeHostError::new(format!("unexpected example tool {}", request.tool_name))
+            })?;
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &request.arguments,
+                schema,
+            )
+            .map_err(|error| {
+                CodeModeHostError::new(format!(
+                    "{} example arguments drifted from callable input: {error}",
+                    request.tool_name
+                ))
+            })?;
+            let output = match request.tool_name.as_str() {
+                "search_project_texts" => json!({
+                    "items": [{
+                        "success": true,
+                        "output": {
+                            "matches": [{
+                                "path": "src/tool_runtime/code_mode.rs",
+                                "line": 1,
+                                "preview": "CanonicalOrchestrationHost",
+                                "read_hint": {"start_line": 1, "limit": 80}
+                            }]
+                        }
+                    }]
+                }),
+                "read_files" => json!({
+                    "items": [{
+                        "path": "src/tool_runtime/code_mode.rs",
+                        "success": true,
+                        "output": {
+                            "text": "detail",
+                            "read_revision": 1,
+                            "returned_lines": 1,
+                            "has_more": false
+                        }
+                    }]
+                }),
+                "get_git_status" => json!({"stdout": "## clean"}),
+                "project_validate" => json!({
+                    "execution_state": "pending",
+                    "continuation": {"follow_up_kind": "fallback_recovery", "tool": "observe_jobs",
+                        "arguments": {"items":[{"job_id":"wc_job_example"}]}}
+                }),
+                // Current sparse success retains changed, not the duplicate
+                // state_changed/execution_state presentation fields.
+                "edit_project_files" => json!({"changed":true}),
+                other => {
+                    return Err(CodeModeHostError::new(format!(
+                        "example unexpectedly invoked {other}"
+                    )))
+                }
+            };
+            Ok(CodeModeToolResponse {
+                success: true,
+                output,
+                error: None,
+            })
+        })
+    }
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[tokio::test]
+async fn code_mode_callable_projection_examples_execute_against_projected_inputs() {
+    let runtime = test_runtime();
+    for entry_tool in [
+        "execute_code_mode",
+        "execute_effectful_code_mode",
+        "execute_mutating_code_mode",
+    ] {
+        let manifest = runtime
+            .dispatch(ToolCall::ToolManifest {
+                query: None,
+                limit: None,
+                tool_name: Some(entry_tool.to_string()),
+                category: None,
+                intent: None,
+                include_recommended_flows: false,
+                include_risk_summary: false,
+            })
+            .await;
+        assert!(manifest.success, "{entry_tool}: {:?}", manifest.error);
+        let projection = &manifest.output["code_mode_callable_contract"];
+        let tools = projection["tools"]
+            .as_array()
+            .expect("projected callable tools");
+        let input_schemas = tools
+            .iter()
+            .map(|tool| {
+                (
+                    tool["tool"]
+                        .as_str()
+                        .expect("projected tool name")
+                        .to_string(),
+                    tool["input"].clone(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let allowed_tools = tools
+            .iter()
+            .map(|tool| tool["tool"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        for example in projection["examples"]
+            .as_array()
+            .expect("callable usage examples")
+        {
+            let source = example["source"]
+                .as_str()
+                .expect("Code Mode example source")
+                .to_string();
+            let result = webcodex_code_mode::execute(
+                Arc::new(CallableExampleHost {
+                    input_schemas: input_schemas.clone(),
+                }),
+                CodeModeExecuteRequest {
+                    source,
+                    allowed_tools: allowed_tools.clone(),
+                    timeout_ms: Some(2_000),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} example {} failed: {error}",
+                    projection["stage"], example["name"]
+                )
+            });
+            assert!(
+                !result.content.is_empty(),
+                "{}: {}",
+                projection["stage"],
+                example["name"]
+            );
+        }
+    }
+}
+
 #[test]
 fn discovery_output_schemas_cover_runtime_payload_keys() {
     use crate::tool_runtime::tool_definition::TOOL_CATEGORY_GIT;
@@ -20,7 +372,7 @@ fn discovery_output_schemas_cover_runtime_payload_keys() {
         output_schema_properties(list_tools_spec),
     );
 
-    let tool_manifest_spec = spec_named(&specs, "tool_manifest");
+    let tool_manifest_spec = spec_named(&specs, "read_tool_manifest");
     let tool_manifest_payload = runtime
         .compact_tool_manifest_payload_bounded(
             Some(vec![TOOL_CATEGORY_GIT.to_string()]),
@@ -29,7 +381,7 @@ fn discovery_output_schemas_cover_runtime_payload_keys() {
         )
         .unwrap();
     assert_payload_keys_declared(
-        "tool_manifest",
+        "read_tool_manifest",
         &tool_manifest_payload,
         output_schema_properties(tool_manifest_spec),
     );
@@ -207,221 +559,58 @@ fn assert_no_response_too_large(surface: &str, payload: &Value) {
     );
 }
 
-fn allowed_tool_definition_categories_for_discovery_group(group: &str) -> &'static [&'static str] {
-    match group {
-        "checkpoint" => &["checkpoint"],
-        "cleanup" => &["checkpoint", "cleanup"],
-        "coding_agent" => &["coding_agent"],
-        "agent_task" => &["agent_task"],
-        "communication" => &["communication"],
-        "edit" => &["artifact", "edit", "patch"],
-        "file_transfer" => &["artifact"],
-        "git" => &["checkpoint", "cleanup", "file", "git"],
-        "inspect" => &[
-            "checkpoint",
-            "computer",
-            "file",
-            "git",
-            "job",
-            "lsp",
-            "project",
-            "runtime",
-            "session",
-            "workflow",
-        ],
-        "jobs" => &["job"],
-        "patch" => &["patch"],
-        "projects" => &["project"],
-        "review" => &["checkpoint", "cleanup", "file", "git", "workflow"],
-        "runtime" => &["checkpoint", "project", "runtime", "session", "workflow"],
-        "shell" => &["job", "validation"],
-        "validation" => &["validation"],
-        other => panic!("missing discovery group category allowlist for {other}"),
-    }
-}
-
-fn expected_cross_listed_discovery_groups(tool: &str) -> Option<&'static [&'static str]> {
-    match tool {
-        "apply_patch" => Some(&["edit", "patch"]),
-        "apply_unified_diff" => Some(&["edit", "patch"]),
-        "cargo_check" => Some(&["shell", "validation"]),
-        "cargo_fmt" => Some(&["shell", "validation"]),
-        "cargo_test" => Some(&["shell", "validation"]),
-        "discard_untracked" => Some(&["cleanup", "git"]),
-        "finish_coding_task" => Some(&["review", "runtime"]),
-        "artifact_upload_abort"
-        | "artifact_upload_begin"
-        | "artifact_upload_chunk"
-        | "artifact_upload_finish"
-        | "export_project_artifact"
-        | "import_conversation_files_to_project"
-        | "read_project_artifact"
-        | "read_project_artifact_metadata"
-        | "save_project_artifact" => Some(&["edit", "file_transfer"]),
-        "git_diff" => Some(&["git", "inspect", "review"]),
-        "git_diff_hunks" => Some(&["git", "inspect", "review"]),
-        "git_review_summary" => Some(&["git", "inspect", "review"]),
-        "git_diff_summary" => Some(&["git", "inspect", "review"]),
-        "git_log" => Some(&["git", "inspect", "review"]),
-        "git_restore_paths" => Some(&["cleanup", "git"]),
-        "git_status" => Some(&["git", "inspect", "review"]),
-        "list_runners" => Some(&["inspect", "runtime"]),
-        "list_projects" => Some(&["inspect", "projects", "runtime"]),
-        "list_tools" => Some(&["inspect", "runtime"]),
-        "run_job" => Some(&["jobs", "shell"]),
-        "run_detached_process" => Some(&["jobs", "shell"]),
-        "run_process" | "run_script" => Some(&["inspect", "shell"]),
-        "run_shell" => Some(&["inspect", "shell"]),
-        "open_session_shell"
-        | "session_shell_exec"
-        | "session_shell_status"
-        | "close_session_shell" => Some(&["jobs", "shell"]),
-        "runtime_status" => Some(&["inspect", "runtime"]),
-        "show_changes" => Some(&["git", "inspect", "review"]),
-        "work_on_project" => Some(&["inspect", "runtime"]),
-        "workspace_checkpoint_create" => Some(&["checkpoint", "git", "runtime"]),
-        "workspace_checkpoint_delete" => Some(&["checkpoint", "cleanup", "runtime"]),
-        "workspace_checkpoint_list" => Some(&["checkpoint", "inspect", "review", "runtime"]),
-        "workspace_checkpoint_restore" => Some(&["checkpoint", "git", "runtime"]),
-        "workspace_checkpoint_show" => Some(&["checkpoint", "inspect", "review", "runtime"]),
-        _ => None,
-    }
-}
-
 #[test]
-fn tool_discovery_groups_drive_tool_categories() {
-    use crate::tool_runtime::tool_definition::{
-        is_model_visible_tool_name, lookup_tool_definition, model_visible_tool_definitions,
-        TOOL_DISCOVERY_GROUPS,
-    };
-    use std::collections::{BTreeMap, BTreeSet};
-
+fn canonical_categories_match_list_and_manifest_without_overlapping_groups() {
+    let runtime = test_runtime();
     let categories = registered_tool_categories();
-    let category_map = categories.as_object().expect("categories object");
-    let actual_category_names = category_map
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let expected_group_names = TOOL_DISCOVERY_GROUPS
-        .iter()
-        .map(|group| group.name)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        actual_category_names, expected_group_names,
-        "registered_tool_categories keys must come only from TOOL_DISCOVERY_GROUPS"
-    );
-
-    let mut memberships: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-
-    for group in TOOL_DISCOVERY_GROUPS {
-        let actual_tools = string_array(
-            category_map
-                .get(group.name)
-                .unwrap_or_else(|| panic!("{} discovery category missing", group.name)),
-            group.name,
-        );
-        let tools = group
-            .tools
+    let manifest = runtime.compact_tool_manifest_payload();
+    assert_eq!(categories, manifest["categories"]);
+    let mut seen = BTreeSet::new();
+    for (category, members) in categories.as_object().unwrap() {
+        let members = members.as_array().unwrap();
+        let names = members
             .iter()
-            .map(|name| {
-                let definition = lookup_tool_definition(name)
-                    .unwrap_or_else(|| panic!("{name} discovery group entry missing definition"));
-                assert!(
-                    definition.visibility.is_model_visible(),
-                    "{name} discovery group entry must be model-visible"
-                );
-                assert!(
-                    is_model_visible_tool_name(name),
-                    "{name} discovery group entry must pass visibility facade"
-                );
-                assert!(
-                    allowed_tool_definition_categories_for_discovery_group(group.name)
-                        .contains(&definition.category),
-                    "{} discovery group entry {} has ToolDefinition category {}, which is not in the explicit allowlist",
-                    group.name,
-                    name,
-                    definition.category
-                );
-                memberships.entry(name).or_default().push(group.name);
-                Value::String((*name).to_string())
-            })
+            .map(|name| name.as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(
-            category_map.get(group.name),
-            Some(&Value::Array(tools)),
-            "{} category must derive from ToolDefinition discovery groups",
-            group.name
-        );
-        assert_eq!(
-            actual_tools,
-            group
-                .tools
-                .iter()
-                .map(|tool| (*tool).to_string())
-                .collect::<Vec<_>>(),
-            "{} registered category order must match TOOL_DISCOVERY_GROUPS",
-            group.name
-        );
-    }
-
-    for definition in model_visible_tool_definitions() {
-        let groups = memberships
-            .get(definition.name)
-            .unwrap_or_else(|| panic!("{} missing from discovery groups", definition.name));
-        if groups.len() == 1 {
-            continue;
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in names {
+            assert!(seen.insert(name), "duplicate category membership: {name}");
+            assert_eq!(
+                crate::tool_runtime::tool_definition::runtime_tool_category(name),
+                category
+            );
         }
-        let expected =
-            expected_cross_listed_discovery_groups(definition.name).unwrap_or_else(|| {
-                panic!(
-                    "{} appears in multiple discovery groups without an explicit allowlist: {:?}",
-                    definition.name, groups
-                )
-            });
-        let actual_groups = groups.iter().copied().collect::<BTreeSet<_>>();
-        let expected_groups = expected.iter().copied().collect::<BTreeSet<_>>();
+        let filtered = runtime.list_tools_payload(ListToolsOptions {
+            category: Some(category.clone()),
+            features: None,
+            summary_only: true,
+            limit: None,
+        });
         assert_eq!(
-            actual_groups, expected_groups,
-            "{} discovery cross-listing changed",
-            definition.name
+            tool_entry_names(&filtered["tools"], category),
+            members
+                .iter()
+                .map(|name| name.as_str().unwrap().to_string())
+                .collect(),
+            "list_tools category selection must match its advertised category"
         );
     }
-
-    for allowed in [
-        "apply_unified_diff",
-        "cargo_check",
-        "cargo_fmt",
-        "cargo_test",
-        "discard_untracked",
-        "finish_coding_task",
-        "git_diff",
-        "git_diff_hunks",
-        "git_diff_summary",
-        "git_log",
-        "git_restore_paths",
-        "git_status",
-        "list_runners",
-        "list_projects",
-        "list_tools",
-        "run_job",
-        "run_process",
-        "run_script",
-        "runtime_status",
-        "show_changes",
-        "work_on_project",
-        "workspace_checkpoint_create",
-        "workspace_checkpoint_delete",
-        "workspace_checkpoint_list",
-        "workspace_checkpoint_restore",
-        "workspace_checkpoint_show",
+    let specs = registered_tool_specs();
+    assert_eq!(seen, specs.iter().map(|spec| spec.name.as_str()).collect());
+    for obsolete_group in [
+        "inspect",
+        "shell",
+        "jobs",
+        "projects",
+        "review",
+        "file_transfer",
     ] {
-        assert!(
-            memberships
-                .get(allowed)
-                .is_some_and(|groups| groups.len() > 1),
-            "{allowed} discovery cross-list allowlist must stay tied to an actual duplicate"
-        );
+        assert!(categories.get(obsolete_group).is_none(), "{obsolete_group}");
     }
+    assert!(
+        categories.get("memory").is_none(),
+        "hidden Memory is not admitted"
+    );
 }
 
 #[test]
@@ -433,20 +622,25 @@ fn tool_manifest_categories_cover_every_model_visible_definition() {
     assert_eq!(
         manifest["tool_count"],
         registered_tool_specs().len() as i64,
-        "tool_manifest tool_count must mirror model-facing ToolSpec count"
+        "read_tool_manifest tool_count must mirror model-facing ToolSpec count"
     );
     let categories = manifest["categories"]
         .as_object()
-        .expect("tool_manifest categories");
+        .expect("read_tool_manifest categories");
 
     for definition in model_visible_tool_definitions() {
         let members = categories
             .get(definition.category)
             .and_then(Value::as_array)
-            .unwrap_or_else(|| panic!("missing tool_manifest category {}", definition.category));
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing read_tool_manifest category {}",
+                    definition.category
+                )
+            });
         assert!(
             members.iter().any(|member| member == definition.name),
-            "{} ToolDefinition category {} must include the tool in tool_manifest",
+            "{} ToolDefinition category {} must include the tool in read_tool_manifest",
             definition.name,
             definition.category
         );
@@ -464,7 +658,7 @@ fn tool_manifest_compact_categories_match_single_tool_definition_category() {
     let manifest = runtime.compact_tool_manifest_payload();
     let categories = manifest["categories"]
         .as_object()
-        .expect("tool_manifest categories");
+        .expect("read_tool_manifest categories");
     let visible_names = model_visible_tool_definitions()
         .map(|definition| definition.name)
         .collect::<BTreeSet<_>>();
@@ -498,7 +692,7 @@ fn tool_manifest_compact_categories_match_single_tool_definition_category() {
     assert_eq!(
         memberships.len(),
         visible_names.len(),
-        "compact tool_manifest categories must cover every model-visible tool exactly once"
+        "compact read_tool_manifest categories must cover every model-visible tool exactly once"
     );
     for definition in model_visible_tool_definitions() {
         let member_categories = memberships
@@ -511,17 +705,18 @@ fn tool_manifest_compact_categories_match_single_tool_definition_category() {
             definition.name
         );
     }
-
-    let tools = manifest["tools"].as_array().expect("tool_manifest tools");
+    let tools = manifest["tools"]
+        .as_array()
+        .expect("read_tool_manifest tools");
     assert_eq!(
         tools.len(),
         visible_names.len(),
-        "unfiltered compact tool_manifest must list every model-visible tool"
+        "unfiltered compact read_tool_manifest must list every model-visible tool"
     );
     for tool in tools {
         let name = tool["name"]
             .as_str()
-            .expect("tool_manifest tool name must be a string");
+            .expect("read_tool_manifest tool name must be a string");
         let definition = lookup_tool_definition(name)
             .unwrap_or_else(|| panic!("{name} compact manifest entry missing ToolDefinition"));
         assert!(
@@ -546,12 +741,12 @@ fn compact_tool_manifest_categories_match_bounded_list_tools_categories() {
         .sum();
 
     let manifest = runtime.compact_tool_manifest_payload();
-    let manifest_categories = category_member_sets(&manifest["categories"], "tool_manifest");
+    let manifest_categories = category_member_sets(&manifest["categories"], "read_tool_manifest");
     assert_eq!(
         manifest_categories, expected_categories,
-        "compact tool_manifest categories must be grouped by ToolDefinition category"
+        "compact read_tool_manifest categories must be grouped by ToolDefinition category"
     );
-    assert_categories_hide_runtime_only_tools(&manifest_categories, "tool_manifest");
+    assert_categories_hide_runtime_only_tools(&manifest_categories, "read_tool_manifest");
 
     let list_tools = runtime.list_tools_payload(ListToolsOptions {
         category: None,
@@ -562,7 +757,7 @@ fn compact_tool_manifest_categories_match_bounded_list_tools_categories() {
     let list_categories = category_member_sets(&list_tools["categories"], "list_tools");
     assert_eq!(
         list_categories, manifest_categories,
-        "bounded list_tools categories must match compact tool_manifest categories"
+        "bounded list_tools categories must match compact read_tool_manifest categories"
     );
     assert_categories_hide_runtime_only_tools(&list_categories, "list_tools");
     assert_eq!(manifest["tool_count"].as_u64(), Some(expected_count as u64));
@@ -587,7 +782,7 @@ fn tool_manifest_category_filter_matches_tool_definition_categories() {
     let expected_categories = definition_category_member_sets();
     let all_manifest_categories = category_member_sets(
         &runtime.compact_tool_manifest_payload()["categories"],
-        "unfiltered tool_manifest",
+        "unfiltered read_tool_manifest",
     );
 
     for (category, expected_tools) in expected_categories {
@@ -615,31 +810,37 @@ fn tool_manifest_category_filter_matches_tool_definition_categories() {
         assert_eq!(manifest["truncated"], false);
         assert_eq!(manifest["limit_applied"], false);
         assert!(manifest["total_count"].as_u64().unwrap() >= expected_tools.len() as u64);
-        assert_no_response_too_large("tool_manifest", &manifest);
+        assert_no_response_too_large("read_tool_manifest", &manifest);
 
         let filtered_categories = category_member_sets(
             &manifest["categories"],
-            &format!("tool_manifest filtered {category} categories"),
+            &format!("read_tool_manifest filtered {category} categories"),
         );
         assert_eq!(
             filtered_categories, all_manifest_categories,
-            "filtered compact tool_manifest currently preserves the full categories map"
+            "filtered compact read_tool_manifest currently preserves the full categories map"
         );
-        assert_categories_hide_runtime_only_tools(&filtered_categories, "filtered tool_manifest");
+        assert_categories_hide_runtime_only_tools(
+            &filtered_categories,
+            "filtered read_tool_manifest",
+        );
 
         let returned_tools = tool_entry_names(
             &manifest["tools"],
-            &format!("tool_manifest filtered {category} tools"),
+            &format!("read_tool_manifest filtered {category} tools"),
         );
         assert_eq!(
             returned_tools, expected_tools,
-            "tool_manifest category filter must return exactly the ToolDefinition category members"
+            "read_tool_manifest category filter must return exactly the ToolDefinition category members"
         );
-        for tool in manifest["tools"].as_array().expect("tool_manifest tools") {
+        for tool in manifest["tools"]
+            .as_array()
+            .expect("read_tool_manifest tools")
+        {
             assert_eq!(
                 tool["category"].as_str(),
                 Some(category.as_str()),
-                "filtered tool_manifest must not mix categories: {tool:?}"
+                "filtered read_tool_manifest must not mix categories: {tool:?}"
             );
         }
     }
@@ -724,18 +925,21 @@ fn list_tools_category_filter_matches_tool_definition_categories() {
 #[test]
 fn tool_manifest_recommended_flows_reference_visible_defined_tools() {
     use crate::tool_runtime::tool_definition::{
-        is_model_visible_tool_name, lookup_tool_definition, TOOL_RECOMMENDED_FLOWS,
+        is_model_visible_tool_name, lookup_tool_definition, model_visible_recommended_flows,
     };
 
     let runtime = test_runtime();
     let manifest = runtime.compact_tool_manifest_payload();
-    let manifest_categories = category_member_sets(&manifest["categories"], "tool_manifest");
+    let manifest_categories = category_member_sets(&manifest["categories"], "read_tool_manifest");
     let flows = manifest["recommended_flows"]
         .as_array()
-        .expect("tool_manifest recommended_flows");
-    assert_eq!(flows.len(), TOOL_RECOMMENDED_FLOWS.len());
+        .expect("read_tool_manifest recommended_flows");
+    assert_eq!(flows.len(), model_visible_recommended_flows().count());
+    for restored in ["agent_continuation_setup", "goal_agent_wait_orchestration"] {
+        assert!(flows.iter().any(|flow| flow["name"] == restored));
+    }
 
-    for (actual, expected) in flows.iter().zip(TOOL_RECOMMENDED_FLOWS) {
+    for (actual, expected) in flows.iter().zip(model_visible_recommended_flows()) {
         assert_eq!(actual["name"], expected.name);
         assert_eq!(actual["purpose"], expected.manifest_purpose);
         let tools = actual["tools"]
@@ -776,6 +980,8 @@ async fn tool_manifest_omits_recommended_flows_when_disabled() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: None,
             intent: None,
@@ -794,7 +1000,7 @@ async fn tool_manifest_omits_recommended_flows_when_disabled() {
 #[tokio::test]
 async fn tool_manifest_without_intent_keeps_compat_shape_and_lists_available_intents() {
     let runtime = test_runtime();
-    let call = ToolCall::from_tool_name("tool_manifest", json!({})).unwrap();
+    let call = ToolCall::from_tool_name("read_tool_manifest", json!({})).unwrap();
     let result = runtime.dispatch(call).await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["schema_version"], 1);
@@ -802,12 +1008,14 @@ async fn tool_manifest_without_intent_keeps_compat_shape_and_lists_available_int
     assert_eq!(result.output["filtered"], false);
     assert!(
         result.output["count"].as_u64().unwrap() > 20,
-        "unfiltered tool_manifest should still return the broad compact tool set"
+        "unfiltered read_tool_manifest should still return the broad compact tool set"
     );
     let available = string_array(&result.output["available_intents"], "available_intents");
     assert_eq!(
         available,
         vec![
+            "maintenance".to_string(),
+            "resources".to_string(),
             "coding".to_string(),
             "audit".to_string(),
             "exploration".to_string(),
@@ -817,9 +1025,9 @@ async fn tool_manifest_without_intent_keeps_compat_shape_and_lists_available_int
         ]
     );
     assert_payload_keys_declared(
-        "tool_manifest",
+        "read_tool_manifest",
         &result.output,
-        output_schema_properties(spec_named(&registered_tool_specs(), "tool_manifest")),
+        output_schema_properties(spec_named(&registered_tool_specs(), "read_tool_manifest")),
     );
 }
 
@@ -835,7 +1043,7 @@ async fn tool_manifest_all_available_intents_parse_and_filter_through_tool_call(
         "discovery",
     ] {
         let call = ToolCall::from_tool_name(
-            "tool_manifest",
+            "read_tool_manifest",
             json!({
                 "intent": intent,
                 "include_recommended_flows": false,
@@ -864,6 +1072,8 @@ async fn tool_manifest_intent_coding_returns_ranked_compact_tools() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: None,
             intent: Some("coding".to_string()),
@@ -902,9 +1112,98 @@ async fn tool_manifest_intent_coding_returns_ranked_compact_tools() {
     assert!(result.output["risk_summary"].is_object());
     assert_eq!(
         names,
-        crate::tool_runtime::tool_definition::LOCAL_CODING_TOOL_NAMES,
-        "coding manifest must use the canonical local_coding order"
+        crate::tool_runtime::tool_definition::CODING_INTENT_TOOL_NAMES,
+        "coding manifest must use its independent ordered selection surface"
     );
+    for compatibility_or_overlap in [
+        "read_file",
+        "search_project_text",
+        "git_diff",
+        "git_diff_summary",
+        "job_status",
+        "job_log",
+        "run_job",
+        "apply_unified_diff",
+    ] {
+        assert!(
+            !names.contains(&compatibility_or_overlap),
+            "coding intent should not recommend {compatibility_or_overlap}: {names:?}"
+        );
+    }
+    for gateway_specialist in ["cargo_fmt", "check_workspace_hygiene", "finish_coding_task"] {
+        let tool = result.output["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == gateway_specialist)
+            .unwrap_or_else(|| panic!("missing coding specialist {gateway_specialist}"));
+        assert_eq!(tool["availability"], "gateway", "{gateway_specialist}");
+        assert_eq!(
+            tool["gateway_tool"],
+            crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+            "{gateway_specialist}"
+        );
+    }
+    for direct in [
+        "work_on_project",
+        "search_project_texts",
+        "search_file_context",
+        "read_files",
+        "edit_project_files",
+        "run_process",
+        "run_script",
+        "run_shell",
+        "observe_jobs",
+        "project_validate",
+        "review_changes",
+    ] {
+        let tool = result.output["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == direct)
+            .unwrap_or_else(|| panic!("missing canonical coding tool {direct}"));
+        assert_eq!(tool["availability"], "direct", "{direct}");
+        assert!(tool["gateway_tool"].is_null(), "{direct}");
+    }
+    for (advanced, expected_availability) in [
+        ("cargo_check", "gateway"),
+        ("cargo_test", "gateway"),
+        ("go_test", "gateway"),
+    ] {
+        assert!(
+            !names.contains(&advanced),
+            "ordinary coding intent must not recommend advanced validator {advanced}"
+        );
+        let exact = runtime
+            .dispatch(ToolCall::ToolManifest {
+                query: None,
+                limit: None,
+                tool_name: Some(advanced.to_string()),
+                category: None,
+                intent: None,
+                include_recommended_flows: false,
+                include_risk_summary: false,
+            })
+            .await;
+        assert!(exact.success, "{advanced}: {:?}", exact.error);
+        assert_eq!(
+            exact.output["contract"]["availability"],
+            expected_availability
+        );
+        if expected_availability == "direct" {
+            assert!(
+                exact.output["contract"]["gateway_tool"].is_null(),
+                "{advanced}"
+            );
+        } else {
+            assert_eq!(
+                exact.output["contract"]["gateway_tool"],
+                crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+                "{advanced}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -912,6 +1211,8 @@ async fn tool_manifest_accepts_hyphenated_intent_alias() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: None,
             intent: Some("Discovery".to_string()),
@@ -930,12 +1231,15 @@ async fn tool_manifest_accepts_hyphenated_intent_alias() {
     assert_eq!(
         names,
         vec![
-            "tool_manifest",
+            "read_tool_manifest",
             "list_tools",
-            "runtime_status",
+            "resolve_workspace",
+            "open_webcodex_workbench",
+            "search_webcodex_resources",
+            "get_runtime_status",
             "list_runners",
             "list_projects",
-            "project_overview",
+            "read_project_overview",
         ]
     );
 }
@@ -944,7 +1248,8 @@ async fn tool_manifest_accepts_hyphenated_intent_alias() {
 async fn tool_manifest_unknown_intent_returns_structured_error() {
     let runtime = test_runtime();
     let call =
-        ToolCall::from_tool_name("tool_manifest", json!({"intent": "not_a_real_intent"})).unwrap();
+        ToolCall::from_tool_name("read_tool_manifest", json!({"intent": "not_a_real_intent"}))
+            .unwrap();
     let result = runtime.dispatch(call).await;
     assert!(!result.success, "unknown intent must fail");
     assert!(
@@ -952,7 +1257,7 @@ async fn tool_manifest_unknown_intent_returns_structured_error() {
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("unknown tool_manifest intent"),
+            .contains("unknown read_tool_manifest intent"),
         "{:?}",
         result.error
     );
@@ -976,6 +1281,8 @@ async fn tool_manifest_intent_can_combine_with_category_filter() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: Some("validation".to_string()),
             intent: Some("coding".to_string()),
@@ -992,17 +1299,9 @@ async fn tool_manifest_intent_can_combine_with_category_filter() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    // Structured validation tools and validation_summary are the entire validation category.
-    assert_eq!(
-        names,
-        vec![
-            "cargo_fmt",
-            "cargo_check",
-            "cargo_test",
-            "go_test",
-            "validation_summary"
-        ]
-    );
+    // Coding intent keeps the portable project gateway plus explicit formatting;
+    // advanced ecosystem validators remain available through exact/category discovery.
+    assert_eq!(names, vec!["project_validate", "cargo_fmt"]);
 }
 
 #[tokio::test]
@@ -1011,6 +1310,8 @@ async fn audit_and_exploration_intents_exclude_shell_and_jobs() {
         let runtime = test_runtime();
         let result = runtime
             .dispatch(ToolCall::ToolManifest {
+                query: None,
+                limit: None,
                 tool_name: None,
                 category: None,
                 intent: Some(intent.to_string()),
@@ -1043,24 +1344,42 @@ async fn audit_and_exploration_intents_exclude_shell_and_jobs() {
             "{intent} must not expose retired start_coding_task: {names:?}"
         );
         if intent == "audit" {
+            assert!(
+                !names.contains(&"work_on_project"),
+                "read-only audit must not implicitly create a Session"
+            );
             for required in [
-                "work_on_project",
-                "project_overview",
-                "read_file",
-                "search_project_text",
-                "git_status",
-                "git_diff_summary",
-                "git_diff_hunks",
-                "git_log",
-                "show_changes",
-                "workspace_hygiene_check",
-                "session_handoff_summary",
-                "finish_coding_task",
-                "tool_manifest",
+                "resolve_workspace",
+                "read_project_overview",
+                "read_files",
+                "search_project_texts",
+                "get_git_status",
+                "read_git_log",
+                "review_changes",
+                "check_workspace_hygiene",
+                "read_session_handoff",
+                "read_tool_manifest",
             ] {
                 assert!(
                     names.contains(&required),
                     "audit intent must include {required}: {names:?}"
+                );
+            }
+            for demoted in webcodex_tool_contracts::ORDINARY_DISCOVERY_DEMOTED_REVIEW_TOOL_NAMES {
+                assert!(
+                    !names.contains(demoted),
+                    "audit intent should keep {demoted} out of ordinary review selection: {names:?}"
+                );
+            }
+            for compatibility_primitive in [
+                "read_file",
+                "search_project_text",
+                "git_diff",
+                "git_diff_summary",
+            ] {
+                assert!(
+                    !names.contains(&compatibility_primitive),
+                    "audit intent should keep {compatibility_primitive} exact-discovery-only: {names:?}"
                 );
             }
             for tool in result.output["tools"].as_array().unwrap() {
@@ -1101,6 +1420,8 @@ async fn release_intent_includes_list_jobs_but_not_run_shell_or_run_job() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: None,
             intent: Some("release".to_string()),
@@ -1117,8 +1438,8 @@ async fn release_intent_includes_list_jobs_but_not_run_shell_or_run_job() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
     assert!(
-        !names.contains(&"project_overview"),
-        "release intent must not include project_overview: {names:?}"
+        !names.contains(&"read_project_overview"),
+        "release intent must not include read_project_overview: {names:?}"
     );
     assert!(
         names.contains(&"list_jobs"),
@@ -1133,6 +1454,8 @@ async fn release_intent_includes_list_jobs_but_not_run_shell_or_run_job() {
 }
 
 fn assert_recommended_flows_subset_of_manifest_tools(manifest: &Value, context: &str) {
+    use crate::tool_runtime::tool_definition::TOOL_RECOMMENDED_FLOWS;
+
     let tool_names: std::collections::BTreeSet<&str> = manifest["tools"]
         .as_array()
         .expect("manifest tools")
@@ -1158,6 +1481,136 @@ fn assert_recommended_flows_subset_of_manifest_tools(manifest: &Value, context: 
                 "{context}: recommended_flows[{flow_name}] references invisible tool {tool}; visible={tool_names:?}"
             );
         }
+
+        let canonical = TOOL_RECOMMENDED_FLOWS
+            .iter()
+            .find(|candidate| candidate.name == flow_name)
+            .unwrap_or_else(|| panic!("{context}: unknown canonical flow {flow_name}"));
+        let omitted = canonical
+            .tools
+            .iter()
+            .copied()
+            .filter(|tool| !tool_names.contains(tool))
+            .collect::<Vec<_>>();
+        if omitted.is_empty() {
+            assert_ne!(
+                flow["partial"], true,
+                "{context}: complete flow {flow_name}"
+            );
+            assert!(
+                flow.get("omitted_tools").is_none(),
+                "{context}: complete flow {flow_name}"
+            );
+            assert_eq!(flow["purpose"], canonical.manifest_purpose);
+        } else {
+            assert_eq!(flow["partial"], true, "{context}: partial flow {flow_name}");
+            assert_eq!(
+                flow["omitted_tools"],
+                json!(omitted),
+                "{context}: {flow_name}"
+            );
+            let purpose = flow["purpose"]
+                .as_str()
+                .expect("partial recommended flow purpose");
+            assert!(
+                purpose.starts_with("Partial projection of the canonical flow"),
+                "{context}: partial flow purpose must identify projection: {flow}"
+            );
+            assert!(
+                purpose.contains("not selected into this projection"),
+                "{context}: partial flow purpose must distinguish sparse selection from availability: {flow}"
+            );
+            assert!(
+                !purpose.contains("unavailable"),
+                "{context}: partial flow purpose must not misclassify omitted tools as unavailable: {flow}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_manifest_default_flows_follow_exact_vs_discovery_shape_end_to_end() {
+    let runtime = test_runtime();
+
+    let exact = runtime
+        .dispatch(
+            ToolCall::from_tool_name("read_tool_manifest", json!({"tool_name": "cargo_test"}))
+                .unwrap(),
+        )
+        .await;
+    assert!(exact.success, "{:?}", exact.error);
+    assert!(exact.output.get("recommended_flows").is_none());
+
+    for specialist in ["cargo_check", "cargo_test"] {
+        let specialist_true = runtime
+            .dispatch(
+                ToolCall::from_tool_name(
+                    "read_tool_manifest",
+                    json!({
+                        "tool_name": specialist,
+                        "include_recommended_flows": true
+                    }),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            specialist_true.success,
+            "{specialist}: {:?}",
+            specialist_true.error
+        );
+        assert!(
+            specialist_true.output["recommended_flows"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "{specialist}"
+        );
+    }
+
+    let ordinary_true = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "read_tool_manifest",
+                json!({
+                    "tool_name": "project_validate",
+                    "include_recommended_flows": true
+                }),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(ordinary_true.success, "{:?}", ordinary_true.error);
+    assert!(ordinary_true.output["recommended_flows"]
+        .as_array()
+        .is_some_and(|flows| !flows.is_empty()));
+
+    let exact_false = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "read_tool_manifest",
+                json!({
+                    "tool_name": "cargo_test",
+                    "include_recommended_flows": false
+                }),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(exact_false.success, "{:?}", exact_false.error);
+    assert!(exact_false.output.get("recommended_flows").is_none());
+
+    for arguments in [
+        json!({}),
+        json!({"category": "validation"}),
+        json!({"intent": "coding"}),
+    ] {
+        let result = runtime
+            .dispatch(ToolCall::from_tool_name("read_tool_manifest", arguments).unwrap())
+            .await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output["recommended_flows"]
+            .as_array()
+            .is_some_and(|flows| !flows.is_empty()));
     }
 }
 
@@ -1168,6 +1621,8 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
     // intent=coding
     let coding = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: None,
             intent: Some("coding".to_string()),
@@ -1185,16 +1640,16 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     assert!(
-        coding_names.contains(&"apply_text_edits"),
+        coding_names.contains(&"edit_project_files"),
         "coding intent tools should expose canonical precise edits: {coding_names:?}"
     );
     assert!(
-        coding_names.contains(&"apply_patch"),
-        "coding intent tools should expose model-generated Codex patch mutation: {coding_names:?}"
+        !coding_names.contains(&"apply_patch"),
+        "exact-manifest patch specialist should stay outside ordinary coding intent: {coding_names:?}"
     );
     assert!(
-        coding_names.contains(&"apply_unified_diff"),
-        "coding intent tools should expose canonical unified-diff mutation: {coding_names:?}"
+        !coding_names.contains(&"apply_unified_diff"),
+        "external raw unified-diff compatibility path should stay outside ordinary coding intent: {coding_names:?}"
     );
     assert!(
         !coding_names.contains(&"replace_line_range"),
@@ -1204,6 +1659,8 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
     // single category filter
     let file_only = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: Some("file".to_string()),
             intent: None,
@@ -1277,12 +1734,12 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     assert!(
-        with_patch_tools.contains(&"apply_patch"),
-        "with patch category, tools should include apply_patch: {with_patch_tools:?}"
+        !with_patch_tools.contains(&"apply_patch"),
+        "coding intent must not reintroduce exact-manifest apply_patch even when patch category is requested: {with_patch_tools:?}"
     );
     assert!(
-        with_patch_tools.contains(&"apply_unified_diff"),
-        "with patch category, tools should include apply_unified_diff: {with_patch_tools:?}"
+        !with_patch_tools.contains(&"apply_unified_diff"),
+        "coding intent should keep external raw unified-diff mutation exact/category-only: {with_patch_tools:?}"
     );
     let edit_flow = with_patch["recommended_flows"]
         .as_array()
@@ -1295,16 +1752,16 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
             .as_array()
             .unwrap()
             .iter()
-            .any(|tool| tool == "apply_patch"),
-        "with patch category, edit flow may include apply_patch: {edit_flow}"
+            .all(|tool| tool != "apply_patch"),
+        "filtered coding edit flow must not reintroduce exact-manifest apply_patch: {edit_flow}"
     );
     assert!(
         edit_flow["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|tool| tool == "apply_unified_diff"),
-        "with patch category, edit flow may include apply_unified_diff: {edit_flow}"
+            .all(|tool| tool != "apply_unified_diff"),
+        "filtered coding edit flow should not reintroduce apply_unified_diff: {edit_flow}"
     );
 
     // limit truncation after intent ordering
@@ -1316,11 +1773,344 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
     assert_recommended_flows_subset_of_manifest_tools(&limited, "intent=coding limit=3");
 }
 
+#[cfg(feature = "experimental-code-mode")]
+#[tokio::test]
+async fn code_mode_exact_manifest_projects_canonical_stage_callable_contracts() {
+    use crate::tool_runtime::code_mode::{
+        code_mode_callable_stage_for_entry_tool, code_mode_orchestration_policy,
+    };
+    use crate::tool_runtime::orchestration_host::is_server_owned_orchestration_argument;
+
+    let runtime = test_runtime();
+    let specs = registered_tool_specs();
+    let cases = [
+        ("execute_code_mode", "read_only"),
+        ("execute_effectful_code_mode", "validation"),
+        ("execute_mutating_code_mode", "guarded_edit"),
+    ];
+
+    for (entry_tool, expected_stage) in cases {
+        let result = runtime
+            .dispatch(ToolCall::ToolManifest {
+                query: None,
+                limit: None,
+                tool_name: Some(entry_tool.to_string()),
+                category: None,
+                intent: None,
+                include_recommended_flows: false,
+                include_risk_summary: false,
+            })
+            .await;
+        assert!(result.success, "{entry_tool}: {:?}", result.error);
+        let projection = &result.output["code_mode_callable_contract"];
+        assert_eq!(projection["version"], 2);
+        assert_eq!(
+            projection["result_envelope"],
+            json!(["success", "output", "error"])
+        );
+        assert_eq!(projection["output_fields_scope"], "output");
+        assert_eq!(projection["stage"], expected_stage, "{entry_tool}");
+        assert_eq!(projection["entry_tool"], entry_tool, "{entry_tool}");
+        assert_eq!(projection["authority"], "presentation_only", "{entry_tool}");
+        let mut sparse = crate::tool_runtime::ToolResult::ok(result.output.clone());
+        crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut sparse);
+        assert_eq!(
+            sparse.output["code_mode_callable_contract"], *projection,
+            "{entry_tool} sparse model projection must preserve the bounded callable contract"
+        );
+
+        let stage =
+            code_mode_callable_stage_for_entry_tool(entry_tool).expect("Code Mode entry stage");
+        let policy = code_mode_orchestration_policy(stage);
+        assert_eq!(
+            projection["constraints"]["max_mutation_calls"],
+            json!(policy.max_mutation_calls)
+        );
+        assert_eq!(
+            projection["constraints"]["validation_after_successful_known_mutation"],
+            policy.validation_after_mutation
+        );
+        assert!(
+            projection["constraints"]
+                .get("nested_sync_wait_max_secs")
+                .is_none(),
+            "{entry_tool} must not expose internal return timing"
+        );
+        assert!(
+            !projection["examples"]
+                .to_string()
+                .contains("sync_wait_secs"),
+            "{entry_tool} examples must not teach hidden compatibility timing"
+        );
+        let projected_names = projection["tools"]
+            .as_array()
+            .expect("projected callable tools")
+            .iter()
+            .map(|tool| tool["tool"].as_str().expect("projected tool name"))
+            .collect::<Vec<_>>();
+        assert_eq!(projected_names, policy.admitted_tools, "{entry_tool}");
+        assert!(!projected_names
+            .iter()
+            .any(|name| name.starts_with("execute_code_mode")));
+
+        for tool in projection["tools"].as_array().unwrap() {
+            let tool_name = tool["tool"].as_str().unwrap();
+            let canonical = spec_named(&specs, tool_name);
+            let input = &tool["input"];
+            let input_properties = input["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{tool_name} projected input properties"));
+            assert!(
+                !input_properties.contains_key("sync_wait_secs"),
+                "{tool_name} callable projection must keep legacy sync_wait_secs hidden"
+            );
+            assert!(
+                input_properties
+                    .keys()
+                    .all(|field| !is_server_owned_orchestration_argument(field)),
+                "{tool_name} exposed a server-owned input: {input_properties:?}"
+            );
+            if let Some(required) = input.get("required").and_then(Value::as_array) {
+                assert!(required.iter().all(|field| {
+                    field
+                        .as_str()
+                        .is_none_or(|field| !is_server_owned_orchestration_argument(field))
+                }));
+            }
+            let output_fields = tool["output_fields"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{tool_name} output_fields"));
+            assert!(
+                !output_fields.is_empty(),
+                "{tool_name} must expose bounded useful output fields"
+            );
+            assert!(
+                output_fields.len()
+                    <= crate::tool_runtime::surface::CODE_MODE_OUTPUT_FIELDS_PER_TOOL_MAX,
+                "{tool_name} output projection exceeded its per-tool field bound: {}",
+                output_fields.len()
+            );
+            assert!(
+                output_fields.iter().all(|field| field
+                    .as_str()
+                    .is_none_or(|field| !field.contains("job_attention"))),
+                "{tool_name} nested callable projection must not advertise outer-only job_attention"
+            );
+            assert_eq!(
+                input["additionalProperties"], canonical.input_schema["additionalProperties"],
+                "{tool_name} closed-object semantics drifted"
+            );
+        }
+
+        assert_eq!(
+            projection["bounds"]["output_fields_per_tool_max"],
+            crate::tool_runtime::surface::CODE_MODE_OUTPUT_FIELDS_PER_TOOL_MAX
+        );
+        let bytes = serde_json::to_vec(projection).unwrap().len();
+        println!("code_mode_callable_projection stage={expected_stage} bytes={bytes}");
+        let soft_max_bytes = match expected_stage {
+            "read_only" => 10 * 1024,
+            "validation" => 13 * 1024,
+            // E2c adds both canonical validators to the guarded-edit projection;
+            // the shared 16 KiB hard transport bound remains unchanged.
+            "guarded_edit" => 15 * 1024,
+            _ => unreachable!(),
+        };
+        assert!(
+            bytes <= soft_max_bytes,
+            "{expected_stage} projection is {bytes} bytes; soft cap is {soft_max_bytes}"
+        );
+        assert!(
+            bytes <= crate::tool_runtime::surface::CODE_MODE_CALLABLE_CONTRACT_HARD_MAX_BYTES,
+            "{expected_stage} projection is {bytes} bytes"
+        );
+    }
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[tokio::test]
+async fn code_mode_callable_projection_preserves_key_input_constraints_and_output_handoffs() {
+    fn qualified_output_fields(tool: &Value) -> Vec<Value> {
+        // Reconstruct the same path assertions from the shared envelope and
+        // relative paths; compact presentation must not lose these semantics.
+        let mut fields = vec![json!("success"), json!("error")];
+        fields.extend(
+            tool["output_fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|field| json!(format!("output.{}", field.as_str().unwrap()))),
+        );
+        fields
+    }
+    let runtime = test_runtime();
+
+    let read_only = runtime
+        .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
+            tool_name: Some("execute_code_mode".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(read_only.success, "{:?}", read_only.error);
+    let read_tools = read_only.output["code_mode_callable_contract"]["tools"]
+        .as_array()
+        .unwrap();
+    let read_files = read_tools
+        .iter()
+        .find(|tool| tool["tool"] == "read_files")
+        .expect("read_files projection");
+    assert_eq!(read_files["input"]["required"], json!(["items"]));
+    assert_eq!(read_files["input"]["properties"]["items"]["maxItems"], 8);
+    assert_eq!(
+        read_files["input"]["properties"]["items"]["items"]["properties"]["start_line"]["minimum"],
+        0
+    );
+    assert!(read_files["input"]["properties"].get("project").is_none());
+    assert!(read_files["input"]["properties"]
+        .get("session_id")
+        .is_none());
+    let read_outputs = qualified_output_fields(read_files);
+    for field in [
+        "output.items[].path",
+        "output.items[].output.text",
+        "output.items[].output.read_revision",
+        "output.items[].output.returned_lines",
+        "output.items[].output.has_more",
+    ] {
+        assert!(read_outputs.contains(&json!(field)), "missing {field}");
+    }
+    let search = read_tools
+        .iter()
+        .find(|tool| tool["tool"] == "search_project_texts")
+        .expect("search_project_texts projection");
+    let search_outputs = qualified_output_fields(search);
+    for field in [
+        "output.items[].output.matches",
+        "output.items[].output.matches[].path",
+        "output.items[].output.matches[].line",
+        "output.items[].output.matches[].preview",
+        "output.items[].output.matches[].read_hint",
+    ] {
+        assert!(search_outputs.contains(&json!(field)), "missing {field}");
+    }
+
+    let validation = runtime
+        .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
+            tool_name: Some("execute_effectful_code_mode".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(validation.success, "{:?}", validation.error);
+    let validation_tools = validation.output["code_mode_callable_contract"]["tools"]
+        .as_array()
+        .unwrap();
+    let cargo_test = validation_tools
+        .iter()
+        .find(|tool| tool["tool"] == "cargo_test")
+        .expect("cargo_test projection");
+    assert_eq!(cargo_test["input"]["properties"]["min_tests"]["minimum"], 1);
+    assert!(cargo_test["input"]["properties"]
+        .get("result_expectation")
+        .is_none());
+    let cargo_test_outputs = qualified_output_fields(cargo_test);
+    for field in [
+        "success",
+        "output.execution_state",
+        "output.terminal",
+        "output.passed",
+        "output.source_state",
+        "output.source_state.freshness",
+        "output.source_state.observed_mutation_fence",
+        "output.failure_kind",
+        "output.job_id",
+        "output.continuation",
+        "output.diagnostics",
+    ] {
+        assert!(
+            cargo_test_outputs.contains(&json!(field)),
+            "missing {field}"
+        );
+    }
+
+    let guarded = runtime
+        .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
+            tool_name: Some("execute_mutating_code_mode".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(guarded.success, "{:?}", guarded.error);
+    assert_eq!(
+        guarded.output["code_mode_callable_contract"]["constraints"]
+            ["validation_after_successful_known_mutation"],
+        true
+    );
+    assert_eq!(
+        guarded.output["code_mode_callable_contract"]["constraints"]["max_mutation_calls"],
+        1
+    );
+    let guarded_tools = guarded.output["code_mode_callable_contract"]["tools"]
+        .as_array()
+        .unwrap();
+    let edit = guarded_tools
+        .iter()
+        .find(|tool| tool["tool"] == "edit_project_files")
+        .expect("apply_text_edits projection");
+    assert_eq!(edit["input"]["properties"]["changes"]["maxItems"], 16);
+    assert!(edit["input"]["properties"].get("project").is_none());
+    let edit_outputs = qualified_output_fields(edit);
+    for field in [
+        "success",
+        "output.state_changed",
+        "output.execution_state",
+        "output.error_kind",
+        "output.change_index",
+        "output.edit_index",
+        "output.conflicting_edit_indices",
+        "output.conflicting_edit_ranges",
+        "output.recovery",
+    ] {
+        assert!(edit_outputs.contains(&json!(field)), "missing {field}");
+    }
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[test]
+fn experimental_tool_manifest_schema_declares_callable_contract_sidecar() {
+    let specs = registered_tool_specs();
+    let manifest = spec_named(&specs, "read_tool_manifest");
+    assert!(output_schema_properties(manifest).contains_key("code_mode_callable_contract"));
+}
+
+#[cfg(not(feature = "experimental-code-mode"))]
+#[test]
+fn default_tool_manifest_schema_omits_callable_contract_sidecar() {
+    let specs = registered_tool_specs();
+    let manifest = spec_named(&specs, "read_tool_manifest");
+    assert!(!output_schema_properties(manifest).contains_key("code_mode_callable_contract"));
+}
+
 #[tokio::test]
 async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: Some("cargo_test".to_string()),
             category: None,
             intent: None,
@@ -1340,20 +2130,22 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
     assert!(contract["description"].as_str().is_some());
     assert_eq!(contract["input_schema"]["type"], "object");
     assert!(contract["input_schema"]["properties"]["package"].is_object());
-    let sync_wait = &contract["input_schema"]["properties"]["sync_wait_secs"];
-    assert_eq!(sync_wait["type"], "integer");
-    assert_eq!(sync_wait["minimum"], 1);
-    assert_eq!(sync_wait["maximum"], 60);
+    assert!(
+        contract["input_schema"]["properties"]
+            .get("sync_wait_secs")
+            .is_none(),
+        "read_tool_manifest must not re-expose legacy sync_wait_secs tuning"
+    );
     assert!(contract["annotations"].is_object());
     let specs = registered_tool_specs();
-    let manifest_spec = spec_named(&specs, "tool_manifest");
+    let manifest_spec = spec_named(&specs, "read_tool_manifest");
     let contract_schema =
         &manifest_spec.output_schema["properties"]["output"]["properties"]["contract"]["anyOf"][0];
     let contract_schema_properties = contract_schema["properties"].as_object().unwrap();
     for key in contract.as_object().unwrap().keys() {
         assert!(
             contract_schema_properties.contains_key(key),
-            "tool_manifest exact contract runtime key {key} is missing from output_schema"
+            "read_tool_manifest exact contract runtime key {key} is missing from output_schema"
         );
     }
     for key in ["effect", "risk", "approval", "idempotency"] {
@@ -1363,16 +2155,218 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
                 .unwrap()
                 .iter()
                 .any(|required| required == key),
-            "tool_manifest exact contract output_schema must require {key}"
+            "read_tool_manifest exact contract output_schema must require {key}"
         );
     }
-    assert_eq!(contract["availability"], "direct");
-    assert!(contract["gateway_tool"].is_null());
+    assert_eq!(contract["availability"], "gateway");
+    assert_eq!(
+        contract["gateway_tool"],
+        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
     assert!(contract.get("output_schema").is_none());
     assert_eq!(result.output["tools"][0]["name"], "cargo_test");
-    assert_eq!(result.output["tools"][0]["availability"], "direct");
-    assert!(result.output["tools"][0]["gateway_tool"].is_null());
+    assert_eq!(result.output["tools"][0]["availability"], "gateway");
+    assert_eq!(
+        result.output["tools"][0]["gateway_tool"],
+        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
     assert!(result.output["tools"][0].get("input_schema").is_none());
+}
+
+#[tokio::test]
+async fn exact_tool_manifest_projects_bounded_host_orchestration_from_tool_definition_only() {
+    let runtime = test_runtime();
+    let cases = [
+        (
+            "read_files",
+            json!({
+                "guidance_only": true,
+                "concurrency": "independent_parallel_read",
+                "native_batch_field": "items",
+                "compound_preferred": false,
+            }),
+        ),
+        (
+            "search_file_context",
+            json!({
+                "guidance_only": true,
+                "concurrency": "independent_parallel_read",
+                "native_batch_field": "queries",
+                "compound_preferred": true,
+            }),
+        ),
+        (
+            "cargo_check",
+            json!({
+                "guidance_only": true,
+                "concurrency": "sequential",
+                "native_batch_field": "packages",
+                "compound_preferred": false,
+            }),
+        ),
+    ];
+
+    for (tool_name, expected) in cases {
+        let result = runtime
+            .dispatch(ToolCall::ToolManifest {
+                query: None,
+                limit: None,
+                tool_name: Some(tool_name.to_string()),
+                category: None,
+                intent: None,
+                include_recommended_flows: false,
+                include_risk_summary: false,
+            })
+            .await;
+        assert!(result.success, "{tool_name}: {:?}", result.error);
+        assert_eq!(result.output["host_orchestration"], expected, "{tool_name}");
+        assert_no_response_too_large(tool_name, &result.output);
+
+        let definition =
+            crate::tool_runtime::tool_definition::lookup_tool_definition(tool_name).unwrap();
+        assert_eq!(
+            result.output["host_orchestration"]["concurrency"],
+            definition.host_orchestration.concurrency.as_str(),
+            "{tool_name}"
+        );
+    }
+
+    let no_hint = runtime
+        .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
+            tool_name: Some("run_shell".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(no_hint.success, "{:?}", no_hint.error);
+    assert!(no_hint.output.get("host_orchestration").is_none());
+
+    let specs = registered_tool_specs();
+    let manifest_spec = spec_named(&specs, "read_tool_manifest");
+    let output_properties = output_schema_properties(manifest_spec);
+    let schema = &output_properties["host_orchestration"];
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["concurrency"]["enum"],
+        json!(["unspecified", "independent_parallel_read", "sequential"])
+    );
+
+    let specs = registered_tool_specs();
+    for tool_name in [
+        "read_files",
+        "search_project_texts",
+        "search_file_context",
+        "cargo_check",
+        "edit_project_files",
+    ] {
+        let serialized = serde_json::to_string(spec_named(&specs, tool_name)).unwrap();
+        assert!(
+            !serialized.contains("host_orchestration"),
+            "{tool_name} default ToolSpec must not carry Host orchestration metadata"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_manifest_projects_canonical_execution_selection_for_exact_and_filtered_views() {
+    let runtime = test_runtime();
+    let expected = json!({
+        "form": "shell_command",
+        "lifetime": "runner",
+        "start": "sync_first",
+        "continuation": "observe_jobs",
+    });
+
+    let exact = runtime
+        .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
+            tool_name: Some("run_shell".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(exact.success, "{:?}", exact.error);
+    assert_eq!(exact.output["contract"]["execution"], expected);
+    assert_eq!(exact.output["tools"][0]["execution"], expected);
+    assert_eq!(exact.output["contract"]["availability"], "direct");
+
+    let specs = registered_tool_specs();
+    let manifest_spec = spec_named(&specs, "read_tool_manifest");
+    let output_properties = output_schema_properties(manifest_spec);
+    let execution_schema = &output_properties["execution"];
+    assert_eq!(
+        execution_schema["properties"]["form"]["enum"],
+        json!([
+            "native_argv",
+            "typed_script",
+            "shell_command",
+            "structured_validation",
+            "persistent_shell_command"
+        ])
+    );
+    assert_eq!(
+        execution_schema["properties"]["lifetime"]["enum"],
+        json!(["runner", "supervisor", "session_shell"])
+    );
+    assert_eq!(
+        execution_schema["properties"]["start"]["enum"],
+        json!(["sync_first", "async_immediate", "existing_session"])
+    );
+    assert_eq!(
+        execution_schema["properties"]["continuation"]["enum"],
+        json!(["observe_jobs", "session_shell", "none"])
+    );
+
+    let mut sparse_exact = crate::tool_runtime::ToolResult::ok(exact.output.clone());
+    crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut sparse_exact);
+    assert_eq!(sparse_exact.output["execution"], expected);
+    assert_payload_keys_declared(
+        "read_tool_manifest sparse exact execution",
+        &sparse_exact.output,
+        output_properties,
+    );
+
+    let filtered = runtime
+        .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
+            tool_name: None,
+            category: Some("execution".to_string()),
+            intent: Some("coding".to_string()),
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(filtered.success, "{:?}", filtered.error);
+    let run_shell = filtered.output["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "run_shell")
+        .expect("filtered run_shell");
+    assert_eq!(run_shell["execution"], expected);
+
+    let read_files = runtime
+        .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
+            tool_name: Some("read_files".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(read_files.success, "{:?}", read_files.error);
+    assert!(read_files.output["contract"].get("execution").is_none());
+    assert!(read_files.output["tools"][0].get("execution").is_none());
 }
 
 #[tokio::test]
@@ -1380,6 +2374,8 @@ async fn tool_manifest_exact_persistent_shell_tool_surfaces_its_reuse_flow() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: Some("open_session_shell".to_string()),
             category: None,
             intent: None,
@@ -1402,8 +2398,8 @@ async fn tool_manifest_exact_persistent_shell_tool_surfaces_its_reuse_flow() {
     for tool in [
         "update_session_context",
         "open_session_shell",
-        "session_shell_exec",
-        "session_shell_status",
+        "execute_session_shell",
+        "get_session_shell_status",
         "close_session_shell",
         "run_process",
     ] {
@@ -1419,6 +2415,8 @@ async fn tool_manifest_exact_fleet_tool_surfaces_exact_runner_targeting_route() 
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: Some("list_runners".to_string()),
             category: None,
             intent: None,
@@ -1434,7 +2432,7 @@ async fn tool_manifest_exact_fleet_tool_surfaces_exact_runner_targeting_route() 
         .find(|flow| flow["name"] == "discovery")
         .expect("discovery flow");
     let purpose = flow["purpose"].as_str().expect("discovery purpose");
-    assert!(purpose.contains("runtime_status(client_id=...)"));
+    assert!(purpose.contains("get_runtime_status(client_id=...)"));
     assert!(purpose.contains("list_projects(client_id=...)"));
     assert!(purpose.contains("list_runners"));
     assert!(!purpose.contains("list_agents"));
@@ -1446,7 +2444,7 @@ async fn tool_manifest_projects_canonical_semantic_contracts() {
     let runtime = test_runtime();
     for (tool_name, effect, risk, approval, idempotency, read_only) in [
         (
-            "read_file",
+            "read_files",
             "observe",
             "read_only",
             "none",
@@ -1462,7 +2460,7 @@ async fn tool_manifest_projects_canonical_semantic_contracts() {
             false,
         ),
         (
-            "coding_agent_start",
+            "start_coding_agent",
             "execute",
             "job_run",
             "standard",
@@ -1470,7 +2468,7 @@ async fn tool_manifest_projects_canonical_semantic_contracts() {
             false,
         ),
         (
-            "coding_agent_cancel",
+            "cancel_coding_agent",
             "mutate",
             "run_control",
             "inherit_from_start",
@@ -1480,6 +2478,8 @@ async fn tool_manifest_projects_canonical_semantic_contracts() {
     ] {
         let result = runtime
             .dispatch(ToolCall::ToolManifest {
+                query: None,
+                limit: None,
                 tool_name: Some(tool_name.to_string()),
                 category: None,
                 intent: None,
@@ -1503,77 +2503,54 @@ async fn tool_manifest_projects_canonical_semantic_contracts() {
 }
 
 #[tokio::test]
-async fn tool_manifest_surface_routing_metadata_tracks_current_model_surface() {
-    use crate::model_surface::ModelSurface;
-
-    for (surface, tool_name, availability, gateway_tool) in [
+async fn tool_manifest_routing_metadata_uses_canonical_adaptive_routes() {
+    let runtime = test_runtime();
+    for (tool_name, availability, gateway_tool) in [
+        ("run_process", "direct", None),
+        ("run_shell", "direct", None),
+        ("import_host_files", "direct", None),
+        ("inspect_project_artifact", "direct", None),
+        ("read_session_discussion_summary", "direct", None),
+        ("list_jobs", "direct", None),
+        ("review_changes", "direct", None),
         (
-            ModelSurface::LocalCoding,
-            "computer_snapshot",
-            "unavailable",
-            None,
-        ),
-        (ModelSurface::AdaptiveRuntime, "run_process", "direct", None),
-        (ModelSurface::AdaptiveRuntime, "run_shell", "direct", None),
-        (
-            ModelSurface::AdaptiveRuntime,
-            "import_conversation_files_to_project",
-            "direct",
-            None,
-        ),
-        (
-            ModelSurface::AdaptiveRuntime,
-            "export_project_artifact",
-            "direct",
-            None,
-        ),
-        (
-            ModelSurface::AdaptiveRuntime,
-            "session_discussion_summary",
-            "direct",
-            None,
-        ),
-        (ModelSurface::AdaptiveRuntime, "list_jobs", "direct", None),
-        (
-            ModelSurface::AdaptiveRuntime,
-            "git_diff_hunks",
-            "direct",
-            None,
-        ),
-        (
-            ModelSurface::AdaptiveRuntime,
-            "run_script",
+            "read_workspace_changes",
             "gateway",
             Some("call_runtime_tool"),
         ),
+        ("read_git_diff_hunks", "gateway", Some("call_runtime_tool")),
         (
-            ModelSurface::AdaptiveRuntime,
+            "read_git_review_summary",
+            "gateway",
+            Some("call_runtime_tool"),
+        ),
+        ("run_script", "direct", None),
+        (
+            "check_workspace_hygiene",
+            "gateway",
+            Some("call_runtime_tool"),
+        ),
+        ("finish_coding_task", "gateway", Some("call_runtime_tool")),
+        (
             "save_project_artifact",
             "gateway",
             Some("call_runtime_tool"),
         ),
         (
-            ModelSurface::AdaptiveRuntime,
-            "read_project_artifact",
+            "read_project_artifact_chunk",
             "gateway",
             Some("call_runtime_tool"),
         ),
         (
-            ModelSurface::AdaptiveRuntime,
-            "artifact_upload_begin",
+            "begin_artifact_upload",
             "gateway",
             Some("call_runtime_tool"),
-        ),
-        (
-            ModelSurface::FullOperatorRuntime,
-            "run_script",
-            "direct",
-            None,
         ),
     ] {
-        let runtime = test_runtime().with_model_surface(surface);
         let result = runtime
             .dispatch(ToolCall::ToolManifest {
+                query: None,
+                limit: None,
                 tool_name: Some(tool_name.to_string()),
                 category: None,
                 intent: None,
@@ -1581,11 +2558,7 @@ async fn tool_manifest_surface_routing_metadata_tracks_current_model_surface() {
                 include_risk_summary: false,
             })
             .await;
-        assert!(
-            result.success,
-            "{surface:?} {tool_name}: {:?}",
-            result.error
-        );
+        assert!(result.success, "{tool_name}: {:?}", result.error);
         assert_eq!(result.output["contract"]["availability"], availability);
         assert_eq!(
             result.output["contract"]["gateway_tool"],
@@ -1596,27 +2569,43 @@ async fn tool_manifest_surface_routing_metadata_tracks_current_model_surface() {
             result.output["tools"][0]["gateway_tool"],
             gateway_tool.map_or(Value::Null, |name| json!(name))
         );
+        if tool_name == "run_script" {
+            let expected = json!({
+                "form": "typed_script",
+                "lifetime": "runner",
+                "start": "sync_first",
+                "continuation": "observe_jobs",
+            });
+            assert_eq!(result.output["contract"]["execution"], expected);
+            assert_eq!(result.output["tools"][0]["execution"], expected);
+        }
     }
 }
 
 #[tokio::test]
 async fn tool_manifest_operator_extensions_require_explicit_family_capabilities() {
-    use crate::model_surface::ModelSurface;
     use crate::tool_runtime::kernel::ToolProtocolCapabilities;
 
-    let runtime = test_runtime().with_model_surface(ModelSurface::AdaptiveRuntime);
+    let runtime = test_runtime();
+    let admin = crate::auth::AuthContext {
+        is_bootstrap: true,
+        ..crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap)
+    };
     let manifest = |tool_name: &'static str, capabilities: ToolProtocolCapabilities| {
         runtime.tool_manifest(
+            Some(&admin),
             Some(tool_name.to_string()),
             None,
             None,
             false,
             false,
+            None,
+            None,
             capabilities,
         )
     };
 
-    let no_capability = manifest("skill_list", ToolProtocolCapabilities::default()).await;
+    let no_capability = manifest("list_skills", ToolProtocolCapabilities::default()).await;
     assert!(!no_capability.success);
     assert_eq!(no_capability.output["code"], "unknown_tool_manifest_tool");
 
@@ -1624,14 +2613,22 @@ async fn tool_manifest_operator_extensions_require_explicit_family_capabilities(
         skill_runtime: true,
         ..Default::default()
     };
-    let skill = manifest("skill_list", skill_only).await;
-    assert!(skill.success, "{:?}", skill.error);
-    assert_eq!(skill.output["contract"]["availability"], "gateway");
-    assert_eq!(
-        skill.output["contract"]["gateway_tool"],
-        "call_runtime_tool"
-    );
-    for hidden_without_skill_cap in ["skill_install", "memory_search", "read_tool_trace"] {
+    for name in ["list_skills", "read_skill_file"] {
+        let skill = manifest(name, skill_only).await;
+        assert!(skill.success, "{:?}", skill.error);
+        assert_eq!(skill.output["contract"]["availability"], "gateway");
+        assert_eq!(
+            skill.output["contract"]["gateway_tool"],
+            "call_runtime_tool"
+        );
+        assert!(skill.output["contract"]["input_schema"].is_object());
+        assert!(
+            !manifest(name, ToolProtocolCapabilities::default())
+                .await
+                .success
+        );
+    }
+    for hidden_without_skill_cap in ["install_skill", "search_memory", "read_tool_trace"] {
         let hidden = manifest(hidden_without_skill_cap, skill_only).await;
         assert!(
             !hidden.success,
@@ -1644,8 +2641,23 @@ async fn tool_manifest_operator_extensions_require_explicit_family_capabilities(
         memory_surface: true,
         ..Default::default()
     };
-    assert!(manifest("memory_search", memory_only).await.success);
-    assert!(!manifest("skill_list", memory_only).await.success);
+    let memory = manifest("search_memory", memory_only).await;
+    assert!(memory.success, "{:?}", memory.error);
+    assert_eq!(memory.output["contract"]["availability"], "gateway");
+    assert_eq!(
+        memory.output["contract"]["gateway_tool"],
+        "call_runtime_tool"
+    );
+    let canonical = crate::tool_runtime::memory_runtime_tool_specs().remove(0);
+    assert_eq!(
+        memory.output["contract"]["description"],
+        canonical.description
+    );
+    assert_eq!(
+        memory.output["contract"]["input_schema"],
+        canonical.input_schema
+    );
+    assert!(!manifest("list_skills", memory_only).await.success);
     assert!(!manifest("read_tool_trace", memory_only).await.success);
 
     let diagnostic_only = ToolProtocolCapabilities {
@@ -1653,54 +2665,21 @@ async fn tool_manifest_operator_extensions_require_explicit_family_capabilities(
         ..Default::default()
     };
     assert!(manifest("read_tool_trace", diagnostic_only).await.success);
-    assert!(!manifest("memory_search", diagnostic_only).await.success);
-
-    let local = test_runtime().with_model_surface(ModelSurface::LocalCoding);
-    let local_with_capability = local
-        .tool_manifest(
-            Some("skill_list".to_string()),
-            None,
-            None,
-            false,
-            false,
-            skill_only,
-        )
-        .await;
-    assert!(
-        !local_with_capability.success,
-        "unsupported Local Coding surface must not expose operator extensions even with inconsistent internal capability input"
-    );
-    assert_eq!(
-        local_with_capability.output["code"],
-        "unknown_tool_manifest_tool"
-    );
+    assert!(!manifest("search_memory", diagnostic_only).await.success);
 
     let management_only = ToolProtocolCapabilities {
         skill_management: true,
         ..Default::default()
     };
-    assert!(manifest("skill_install", management_only).await.success);
-    assert!(!manifest("skill_list", management_only).await.success);
-}
-
-#[tokio::test]
-async fn tool_manifest_is_not_a_project_connector_runtime_route() {
-    let runtime = test_runtime()
-        .with_runtime_exposure(crate::model_surface::RuntimeExposure::ProjectConnector);
-    let result = runtime
-        .dispatch(ToolCall::ToolManifest {
-            tool_name: Some("run_process".to_string()),
-            category: None,
-            intent: None,
-            include_recommended_flows: false,
-            include_risk_summary: false,
-        })
-        .await;
-    assert!(!result.success);
-    assert!(result
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("project_connector")));
+    assert!(manifest("install_skill", management_only).await.success);
+    assert!(!manifest("list_skills", management_only).await.success);
+    let versions = manifest("list_skill_versions", management_only).await;
+    assert!(versions.success, "{:?}", versions.error);
+    assert_eq!(versions.output["contract"]["availability"], "gateway");
+    assert_eq!(
+        versions.output["contract"]["gateway_tool"],
+        "call_runtime_tool"
+    );
 }
 
 #[tokio::test]
@@ -1708,6 +2687,8 @@ async fn tool_manifest_exact_tool_fails_closed_for_unknown_or_mixed_filters() {
     let runtime = test_runtime();
     let unknown = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: Some("not_a_real_webcodex_tool".to_string()),
             category: None,
             intent: None,
@@ -1720,6 +2701,8 @@ async fn tool_manifest_exact_tool_fails_closed_for_unknown_or_mixed_filters() {
 
     let mixed = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: Some("cargo_test".to_string()),
             category: Some("validation".to_string()),
             intent: None,
@@ -1733,11 +2716,13 @@ async fn tool_manifest_exact_tool_fails_closed_for_unknown_or_mixed_filters() {
 
 #[tokio::test]
 async fn unfiltered_tool_manifest_keeps_full_recommended_flows() {
-    use crate::tool_runtime::tool_definition::TOOL_RECOMMENDED_FLOWS;
+    use crate::tool_runtime::tool_definition::model_visible_recommended_flows;
 
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ToolManifest {
+            query: None,
+            limit: None,
             tool_name: None,
             category: None,
             intent: None,
@@ -1752,16 +2737,378 @@ async fn unfiltered_tool_manifest_keeps_full_recommended_flows() {
         .expect("unfiltered recommended_flows");
     assert_eq!(
         flows.len(),
-        TOOL_RECOMMENDED_FLOWS.len(),
-        "unfiltered recommended_flows must keep full global set"
+        model_visible_recommended_flows().count(),
+        "unfiltered recommended_flows must keep the full currently callable set"
     );
     let serialized = result.output["recommended_flows"]
         .to_string()
         .to_lowercase();
     assert!(
-        serialized.contains("run_shell")
-            && serialized.contains("shell semantics or one tightly related observation goal")
-            && serialized.contains("do not combine validation, commit, push, deploy, restart"),
-        "unfiltered flows must keep run_shell selection and effect-boundary guidance: {serialized}"
+        serialized.contains("runner-owned sync-first")
+            && serialized.contains("run_job is runner-owned immediate async")
+            && serialized.contains("run_detached_process is supervisor-owned immediate async")
+            && serialized
+                .contains("execute_session_shell continues an existing persistent session shell"),
+        "unfiltered flows must keep the canonical execution selection vocabulary: {serialized}"
     );
+}
+
+#[cfg(not(feature = "workspace-checkpoints"))]
+#[tokio::test]
+async fn workspace_checkpoints_disabled_manifest_and_parser() {
+    let runtime = test_runtime();
+    let result = runtime
+        .dispatch(ToolCall::from_tool_name("read_tool_manifest", json!({})).unwrap())
+        .await;
+    assert!(result.success, "{result:?}");
+    assert!(!result.output.to_string().contains("workspace_checkpoint_"));
+    for suffix in ["create", "list", "show", "restore", "delete"] {
+        let name = format!("workspace_checkpoint_{suffix}");
+        assert!(ToolCall::from_tool_name(&name, json!({"project": "demo"})).is_err());
+    }
+}
+
+#[tokio::test]
+async fn keyword_discovery_is_bounded_schema_free_and_new_maintenance_tools_stay_gateway() {
+    use crate::tool_runtime::kernel::ToolProtocolCapabilities;
+    use webcodex_tool_contracts::take_tool_materialization_counts_for_test as take_counts;
+    let runtime = test_runtime();
+    take_counts();
+    let found = runtime
+        .tool_manifest(
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            Some("batch unregister".into()),
+            Some(3),
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(found.success, "{found:?}");
+    assert!(found.output["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "unregister_projects"));
+    assert_eq!(
+        take_counts(),
+        (0, 0),
+        "keyword selection must not expand all schemas"
+    );
+    for name in ["resolve_workspace", "unregister_projects"] {
+        let exact = runtime
+            .tool_manifest(
+                None,
+                Some(name.into()),
+                None,
+                None,
+                false,
+                false,
+                None,
+                None,
+                ToolProtocolCapabilities::default(),
+            )
+            .await;
+        assert!(exact.success, "{exact:?}");
+        assert_eq!(exact.output["route"]["primary"]["mode"], "gateway");
+    }
+    let list = runtime
+        .tool_manifest(
+            None,
+            None,
+            None,
+            Some("maintenance".into()),
+            false,
+            false,
+            None,
+            None,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(list.success);
+    assert!(list.output["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tool| tool["name"] != "work_on_project"));
+    let hidden = runtime
+        .tool_manifest(
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            Some("read_memory".into()),
+            None,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(hidden.success);
+    assert_eq!(hidden.output["count"], 0);
+}
+
+#[tokio::test]
+async fn keyword_discovery_finds_git_specialists_by_user_task_not_internal_taxonomy() {
+    let runtime = test_runtime();
+    for (query, expected) in [
+        ("staged diff", "read_git_diff_hunks"),
+        ("workspace summary", "read_workspace_changes"),
+        ("committed statistics", "read_git_review_summary"),
+        ("symbol documentation", "read_symbol_hover"),
+        ("remove registrations", "unregister_projects"),
+    ] {
+        let result = runtime
+            .dispatch(
+                ToolCall::from_tool_name("read_tool_manifest", json!({"query":query,"limit":10}))
+                    .unwrap(),
+            )
+            .await;
+        assert!(result.success, "{result:?}");
+        assert!(
+            result.output["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == expected),
+            "{query}: {result:?}"
+        );
+        assert!(
+            result.output["contract"].is_null(),
+            "keyword search is not schema expansion"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_manifest_ignores_irrelevant_presentation_limit() {
+    let runtime = test_runtime();
+    for limit in [0, 1, 10_000] {
+        let result = runtime
+            .dispatch(
+                ToolCall::from_tool_name(
+                    "read_tool_manifest",
+                    json!({"tool_name":"resolve_workspace","limit":limit}),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["contract"]["name"], "resolve_workspace");
+        assert_eq!(result.output["route"]["primary"]["mode"], "gateway");
+    }
+}
+
+#[tokio::test]
+async fn natural_language_discovery_preserves_filters_bounds_and_exact_contracts() {
+    use crate::tool_runtime::kernel::ToolProtocolCapabilities;
+    use webcodex_tool_contracts::take_tool_materialization_counts_for_test as take_counts;
+    let runtime = test_runtime();
+    for (query, category, expected) in [
+        (
+            "Please show source context surrounding matches",
+            "file",
+            "search_file_context",
+        ),
+        ("查询已提交范围的变更统计", "git", "read_git_review_summary"),
+        (
+            "执行程序，使用参数而无需 shell 解释",
+            "execution",
+            "run_process",
+        ),
+        (
+            "Can I inspect symbol documentation?",
+            "lsp",
+            "read_symbol_hover",
+        ),
+    ] {
+        take_counts();
+        let result = runtime
+            .tool_manifest(
+                None,
+                None,
+                Some(category.into()),
+                None,
+                false,
+                false,
+                Some(query.into()),
+                Some(5),
+                ToolProtocolCapabilities::default(),
+            )
+            .await;
+        assert!(result.success, "{query}: {result:?}");
+        assert!(
+            result.output["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == expected),
+            "{query}: {result:?}"
+        );
+        assert_eq!(take_counts(), (0, 0), "retrieval must stay schema-free");
+        assert!(result.output["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["category"] == category));
+        assert!(result.output["contract"].is_null());
+        assert!(result.output.get("discovery_keywords").is_none());
+    }
+    for query in ["   READ_FILES   ", "read_files", "read_file"] {
+        let result = runtime
+            .dispatch(
+                ToolCall::from_tool_name("read_tool_manifest", json!({"query":query,"limit":1}))
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(result.output["tools"][0]["name"], "read_files");
+        assert_eq!(result.output["returned_count"], 1);
+    }
+    let partial = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "read_tool_manifest",
+                json!({"query":"edit_project","limit":5}),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(partial.output["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "edit_project_files"));
+    let filtered = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "read_tool_manifest",
+                json!({"query":"read_files","category":"git"}),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert!(filtered.output["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tool| tool["name"] != "read_files" && tool["category"] == "git"));
+    for query in [
+        "teleport_workspace_now",
+        "不存在的火星咒语",
+        "the and please",
+        "does",
+    ] {
+        let result = runtime
+            .dispatch(
+                ToolCall::from_tool_name("read_tool_manifest", json!({"query":query})).unwrap(),
+            )
+            .await;
+        assert_eq!(result.output["count"], 0, "{query}: {result:?}");
+    }
+    for query in ["x".repeat(201), "read\nfile".into()] {
+        let result = runtime
+            .tool_manifest(
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Some(query),
+                None,
+                ToolProtocolCapabilities::default(),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("invalid_discovery_query"));
+    }
+    let exact = runtime
+        .dispatch(
+            ToolCall::from_tool_name("read_tool_manifest", json!({"tool_name":"run_process"}))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(exact.output["contract"]["name"], "run_process");
+    assert!(exact.output["contract"]["input_schema"]["properties"]
+        .get("executable")
+        .is_some());
+    assert!(exact.output["contract"].get("discovery_keywords").is_none());
+    let intent = runtime
+        .dispatch(
+            ToolCall::from_tool_name(
+                "read_tool_manifest",
+                json!({"query":"运行程序","intent":"coding","limit":1}),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(intent.output["intent"], "coding");
+    assert_eq!(intent.output["count"], 1);
+    assert_eq!(intent.output["tools"][0]["name"], "run_process");
+}
+
+#[test]
+fn natural_language_discovery_weights_fields_and_breaks_ties_stably() {
+    use webcodex_tool_contracts::registry::ToolDescriptor;
+    let descriptor = |name: &str, description: &str, discovery_keywords| ToolDescriptor {
+        name: name.into(),
+        description: description.into(),
+        discovery_keywords,
+    };
+    let descriptors = [
+        descriptor("zulu", "needle", &[]),
+        descriptor("alpha", "needle", &[]),
+        descriptor("task", "", &["needle"]),
+        descriptor("needle_reader", "", &[]),
+        descriptor("needle", "", &[]),
+    ];
+    for order in [vec![0, 1, 2, 3, 4], vec![4, 3, 2, 1, 0]] {
+        let mut selected = order.into_iter().map(|i| &descriptors[i]).collect();
+        super::super::super::surface::discovery::rank(&mut selected, "needle");
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            ["needle", "needle_reader", "task", "alpha", "zulu"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn natural_language_discovery_exact_names_rank_first_across_admitted_catalog() {
+    use crate::tool_runtime::kernel::ToolProtocolCapabilities;
+
+    let runtime = test_runtime();
+    let catalog = runtime
+        .tool_manifest(
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(catalog.success, "{catalog:?}");
+    let tools = catalog.output["tools"].as_array().unwrap();
+    assert!(!tools.is_empty());
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        let result = runtime
+            .dispatch(
+                ToolCall::from_tool_name("read_tool_manifest", json!({"query": name, "limit": 1}))
+                    .unwrap(),
+            )
+            .await;
+        assert!(result.success, "{name}: {result:?}");
+        assert_eq!(result.output["tools"][0]["name"], name, "{result:?}");
+        assert_eq!(result.output["returned_count"], 1);
+    }
 }

@@ -1,17 +1,27 @@
+#[cfg(feature = "workspace-checkpoints")]
 use super::auth::auth_context;
 use super::runtime::test_runtime;
 use crate::runner_http::RunnerRegistry;
 use crate::runner_protocol::{
     RunnerCapabilities, RunnerJobUpdateRequest, RunnerPolicySummary, RunnerPollRequest,
-    RunnerProjectSummary, RunnerRegisterRequest, RunnerRequest, RunnerResultRequest,
-    ShellProfileSummaryEntry, EXTERNAL_SEARCH_REQUEST_PREFIX,
+    RunnerProjectSummary, RunnerRegisterRequest, RunnerRequest, RunnerResultPayload,
+    RunnerResultRequest, ShellCommandExecutionState, ShellProfileSummaryEntry,
+    EXTERNAL_SEARCH_REQUEST_PREFIX,
 };
-use crate::tool_runtime::{RuntimeInfo, ToolCall, ToolResult, ToolRuntime};
+#[cfg(feature = "workspace-checkpoints")]
+use crate::tool_runtime::ToolResult;
+use crate::tool_runtime::{RuntimeInfo, ToolCall, ToolRuntime};
+#[cfg(feature = "workspace-checkpoints")]
 use crate::workspace_checkpoint::{create_workspace_checkpoint, restore_workspace_checkpoint};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use webcodex_core::runner_skill::{
+    RunnerSkillExecutionRequest, RUNNER_SKILL_EXECUTION_REQUEST_KIND,
+};
+
+const RUNNER_TEST_COMMAND_TIMEOUT_SECS: u64 = 45;
 
 pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path(
     runtime: &ToolRuntime,
@@ -19,10 +29,81 @@ pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path(
     project_id: &str,
     root: &Path,
 ) -> String {
+    register_runner_project_at_path_with_coding_agents(runtime, client_id, project_id, root, None)
+        .await
+}
+
+pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path_with_coding_agents(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project_id: &str,
+    root: &Path,
+    providers: Option<Vec<webcodex_core::coding_agent::CodingAgentProvider>>,
+) -> String {
+    let coding_agent_runs = providers
+        .as_ref()
+        .is_some_and(|providers| !providers.is_empty());
     let project_path = root.to_string_lossy().to_string();
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: providers,
+            coding_agent_inventory: coding_agent_runs.then(Default::default),
+            client_id: client_id.to_string(),
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            display_name: None,
+            owner: None,
+            hostname: None,
+            host_context: None,
+            capabilities: crate::test_support::current_runner_capabilities(RunnerCapabilities {
+                shell: true,
+                explicit_shell_selection: true,
+                bash_login_shell: true,
+                git: true,
+                file_read: true,
+                file_write: true,
+                internal_posix_script: true,
+                coding_agent_runs,
+                ..Default::default()
+            }),
+            policy: None,
+        })
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client_id,
+        "inst",
+        vec![named_registered_project(
+            client_id,
+            project_id,
+            project_id,
+            &project_path,
+            1,
+        )],
+    )
+    .await;
+    crate::tool_runtime::runner_project_runtime_id(client_id, project_id)
+}
+
+pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path_with_capabilities(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project_id: &str,
+    root: &Path,
+    capabilities: RunnerCapabilities,
+) -> String {
+    let project_path = root.to_string_lossy().to_string();
+    runtime
+        .runner_registry
+        .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -36,14 +117,7 @@ pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path(
             owner: None,
             hostname: None,
             host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(RunnerCapabilities {
-                shell: true,
-                git: true,
-                file_read: true,
-                file_write: true,
-                internal_posix_script: true,
-                ..Default::default()
-            }),
+            capabilities: crate::test_support::current_runner_capabilities(capabilities),
             policy: None,
         })
         .await
@@ -76,6 +150,7 @@ pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path_with
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -119,6 +194,87 @@ pub(in crate::tool_runtime::tests) async fn register_runner_project_at_path_with
     )
     .await;
     crate::tool_runtime::runner_project_runtime_id(client_id, project_id)
+}
+
+fn usable_skill_test_python_command() -> std::process::Command {
+    let mut candidates = vec![("python3", Vec::<&str>::new()), ("python", Vec::new())];
+    if cfg!(windows) {
+        candidates.push(("py", vec!["-3"]));
+    }
+    for (program, prefix) in candidates {
+        let status = std::process::Command::new(program)
+            .args(&prefix)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if status.is_ok_and(|status| status.success()) {
+            let mut command = std::process::Command::new(program);
+            command.args(prefix);
+            return command;
+        }
+    }
+    panic!("no usable Python interpreter is available for the Skill execution test fixture");
+}
+
+pub(in crate::tool_runtime::tests) fn run_runner_skill_resource_request_locally(
+    req: &RunnerRequest,
+    script: &str,
+) -> (i32, String, String) {
+    assert_eq!(req.kind, RUNNER_SKILL_EXECUTION_REQUEST_KIND);
+    let skill = serde_json::from_str::<RunnerSkillExecutionRequest>(
+        req.content
+            .as_deref()
+            .expect("Skill execution request must carry typed content"),
+    )
+    .expect("decode Skill execution request");
+    let target = skill.path.as_str();
+    let extension = std::path::Path::new(target)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut command = match extension.as_str() {
+        "py" => {
+            const WRAPPER: &str = concat!(
+                "import os, sys\n",
+                "p = sys.argv[1]\n",
+                "a = sys.argv[2:]\n",
+                "src = sys.stdin.read()\n",
+                "sys.argv = [p, *a]\n",
+                "sys.path[0] = os.path.dirname(p)\n",
+                "g = {'__name__': '__main__', '__file__': p, '__package__': None, '__spec__': None, '__builtins__': __builtins__}\n",
+                "exec(compile(src, p, 'exec'), g, g)\n",
+            );
+            let mut command = usable_skill_test_python_command();
+            command.args(["-B", "-c", WRAPPER, target]);
+            command.args(&skill.args);
+            command
+        }
+        "sh" => {
+            let mut command =
+                std::process::Command::new(crate::tool_runtime::helpers::test_shell());
+            command.args(["-c", "script=$(cat) || exit $?; eval \"$script\"", target]);
+            command.args(&skill.args);
+            command
+        }
+        other => panic!("unsupported Skill test interpreter: {other}"),
+    };
+    if let Some(cwd) = req.cwd.as_deref() {
+        command.current_dir(cwd);
+    }
+    let (exit_code, stdout, stderr, _elapsed_ms, timed_out) =
+        crate::tool_runtime::helpers::run_test_command_with_timeout(
+            command,
+            Some(script.as_bytes()),
+            RUNNER_TEST_COMMAND_TIMEOUT_SECS,
+        );
+    assert!(
+        !timed_out,
+        "Runner Skill fixture command exceeded {RUNNER_TEST_COMMAND_TIMEOUT_SECS}s: {stderr}"
+    );
+    (exit_code, stdout, stderr)
 }
 
 pub(in crate::tool_runtime::tests) fn run_runner_shell_request_locally(
@@ -174,6 +330,8 @@ pub(in crate::tool_runtime::tests) fn run_runner_shell_request_locally(
         let mut command = std::process::Command::new(&process.executable);
         command.args(&process.args);
         (command, req.stdin.clone())
+    } else if req.kind == RUNNER_SKILL_EXECUTION_REQUEST_KIND {
+        panic!("use run_runner_skill_resource_request_locally with the Runner-owned package source")
     } else if let Some(script) = internal_posix {
         let mut command = std::process::Command::new(crate::tool_runtime::helpers::test_shell());
         command.arg("-s");
@@ -197,35 +355,19 @@ pub(in crate::tool_runtime::tests) fn run_runner_shell_request_locally(
     if let Some(cwd) = req.cwd.as_deref() {
         command.current_dir(cwd);
     }
-    if stdin_payload.is_some() {
-        command.stdin(std::process::Stdio::piped());
-    }
-    let mut child = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn agent shell request");
-    if let Some(stdin) = stdin_payload.as_deref() {
-        use std::io::Write;
-        let write_result = child
-            .stdin
-            .take()
-            .expect("agent shell request stdin")
-            .write_all(stdin.as_bytes());
-        if let Err(error) = write_result {
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::BrokenPipe,
-                "agent shell request stdin write failed: {error}"
-            );
-        }
-    }
-    let output = child.wait_with_output().unwrap();
-    (
-        output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    )
+    let stdin_payload = stdin_payload.as_deref().map(str::as_bytes);
+    let (exit_code, stdout, stderr, _elapsed_ms, timed_out) =
+        crate::tool_runtime::helpers::run_test_command_with_timeout(
+            command,
+            stdin_payload,
+            RUNNER_TEST_COMMAND_TIMEOUT_SECS,
+        );
+    assert!(
+        !timed_out,
+        "Runner fixture command kind={} exceeded {RUNNER_TEST_COMMAND_TIMEOUT_SECS}s: {stderr}",
+        req.kind
+    );
+    (exit_code, stdout, stderr)
 }
 
 fn run_runner_file_list_request_locally(req: &RunnerRequest) -> (i32, String, String) {
@@ -425,7 +567,7 @@ fn run_runner_project_overview_request_locally(req: &RunnerRequest) -> (i32, Str
         return (
             -1,
             String::new(),
-            "project_overview missing cwd".to_string(),
+            "read_project_overview missing cwd".to_string(),
         );
     };
     let requested_path = req.path.as_deref().unwrap_or(".");
@@ -472,14 +614,14 @@ pub(in crate::tool_runtime::tests) async fn complete_project_overview_agent_requ
         .content
         .as_deref()
         .and_then(|content| serde_json::from_str::<Value>(content).ok())
-        .expect("project_overview agent options");
+        .expect("read_project_overview agent options");
     let output = crate::project_overview::build_project_overview(
-        Path::new(req.cwd.as_deref().expect("project_overview cwd")),
-        req.path.as_deref().expect("project_overview path"),
+        Path::new(req.cwd.as_deref().expect("read_project_overview cwd")),
+        req.path.as_deref().expect("read_project_overview path"),
         options["max_depth"].as_u64().map(|value| value as usize),
         options["limit"].as_u64().map(|value| value as usize),
     )
-    .expect("Runner-side project_overview scan");
+    .expect("Runner-side read_project_overview scan");
     complete_patch_agent_request(
         runtime,
         client_id,
@@ -491,6 +633,7 @@ pub(in crate::tool_runtime::tests) async fn complete_project_overview_agent_requ
     .await;
 }
 
+#[cfg(feature = "workspace-checkpoints")]
 pub(in crate::tool_runtime::tests) fn run_runner_checkpoint_request_locally(
     req: &RunnerRequest,
 ) -> (i32, String, String) {
@@ -531,6 +674,7 @@ fn request_root(req: &RunnerRequest) -> PathBuf {
     }
 }
 
+#[cfg(feature = "workspace-checkpoints")]
 pub(in crate::tool_runtime::tests) async fn dispatch_checkpoint_with_local_agent(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -604,6 +748,7 @@ pub(in crate::tool_runtime::tests) async fn register_agent(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -648,6 +793,7 @@ pub(in crate::tool_runtime::tests) async fn register_agent_with_instance(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -704,6 +850,8 @@ pub(in crate::tool_runtime::tests) fn registered_project(
         hooks: Vec::new(),
         disabled: false,
         revision: None,
+        root_fingerprint: None,
+        lineage: None,
         git_branch: None,
         git_head: None,
         git_dirty: None,
@@ -731,6 +879,8 @@ pub(in crate::tool_runtime::tests) fn named_registered_project(
         hooks: Vec::new(),
         disabled: false,
         revision: None,
+        root_fingerprint: None,
+        lineage: None,
         git_branch: None,
         git_head: None,
         git_dirty: None,
@@ -750,6 +900,7 @@ pub(in crate::tool_runtime::tests) async fn register_agent_projects(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -789,6 +940,7 @@ pub(in crate::tool_runtime::tests) async fn register_agent_projects_for_auth(
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -847,12 +999,13 @@ pub(in crate::tool_runtime::tests) async fn probe_agent_request_for_instance(
     None
 }
 
-pub(in crate::tool_runtime::tests) async fn wait_for_runner_request_for_instance(
+pub(in crate::tool_runtime::tests) async fn wait_for_runner_request_for_instance_with_timeout(
     runtime: &ToolRuntime,
     client_id: &str,
     runner_instance_id: &str,
+    timeout: Duration,
 ) -> RunnerRequest {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(request) = runtime
             .runner_registry
@@ -867,11 +1020,26 @@ pub(in crate::tool_runtime::tests) async fn wait_for_runner_request_for_instance
         }
         if Instant::now() >= deadline {
             panic!(
-                "Runner request readiness failed for client {client_id} instance {runner_instance_id} within 10 seconds"
+                "Runner request readiness failed for client {client_id} instance {runner_instance_id} within {} ms",
+                timeout.as_millis()
             );
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+pub(in crate::tool_runtime::tests) async fn wait_for_runner_request_for_instance(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    runner_instance_id: &str,
+) -> RunnerRequest {
+    wait_for_runner_request_for_instance_with_timeout(
+        runtime,
+        client_id,
+        runner_instance_id,
+        Duration::from_secs(10),
+    )
+    .await
 }
 
 pub(in crate::tool_runtime::tests) async fn wait_for_runner_request_for_client(
@@ -924,14 +1092,15 @@ pub(in crate::tool_runtime::tests) async fn seed_session_projection_job(
             status: "running".to_string(),
             stdout_chunk: (!stdout.is_empty()).then(|| stdout.to_string()),
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: false,
         })
@@ -973,14 +1142,15 @@ pub(in crate::tool_runtime::tests) async fn finish_session_projection_job(
             status: status.to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: (status == "completed").then_some(0),
             duration_ms: Some(1),
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: true,
         })
@@ -1048,21 +1218,7 @@ pub(in crate::tool_runtime::tests) async fn probe_patch_agent_request(
     runtime: &ToolRuntime,
     client_id: &str,
 ) -> Option<RunnerRequest> {
-    for _ in 0..20 {
-        let req = runtime
-            .runner_registry
-            .poll(RunnerPollRequest {
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-            })
-            .await
-            .unwrap();
-        if req.is_some() {
-            return req;
-        }
-        tokio::task::yield_now().await;
-    }
-    None
+    probe_agent_request_for_instance(runtime, client_id, "inst").await
 }
 
 /// Wait for a request that the test requires to be dispatched. Unlike
@@ -1114,6 +1270,34 @@ pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request(
     .await;
 }
 
+pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request_with_truncation(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    request_id: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) {
+    runtime
+        .runner_registry
+        .complete(RunnerResultRequest {
+            client_id: client_id.to_string(),
+            runner_instance_id: "inst".to_string(),
+            request_id: request_id.to_string(),
+            exit_code: Some(exit_code),
+            stdout: Some(stdout.to_string()),
+            stderr: Some(stderr.to_string()),
+            stdout_truncated,
+            stderr_truncated,
+            duration_ms: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+}
+
 pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request_for_instance(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -1132,8 +1316,47 @@ pub(in crate::tool_runtime::tests) async fn complete_patch_agent_request_for_ins
             exit_code: Some(exit_code),
             stdout: Some(stdout.to_string()),
             stderr: Some(stderr.to_string()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
+        })
+        .await
+        .unwrap();
+}
+
+/// Complete one synchronous structured execution. Domain fixtures retain their
+/// explicit duration, exit state and diagnostics; no Job update is fabricated.
+pub(in crate::tool_runtime::tests) async fn complete_patch_agent_execution(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    request_id: String,
+    state: ShellCommandExecutionState,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    error: Option<&str>,
+    duration_ms: u64,
+) {
+    runtime
+        .runner_registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
+                client_id: client_id.to_string(),
+                runner_instance_id: "inst".to_string(),
+                request_id,
+                exit_code,
+                stdout: Some(stdout.to_string()),
+                stderr: Some(stderr.to_string()),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration_ms: Some(duration_ms),
+                error: error.map(str::to_string),
+            },
+            command_execution_state: Some(state),
+            mcp_gateway: None,
+            plugin_gateway: None,
+            coding_agent: None,
         })
         .await
         .unwrap();
@@ -1170,9 +1393,21 @@ pub(in crate::tool_runtime::tests) async fn register_agent_with_projects(
     caps: RunnerCapabilities,
     projects: Vec<RunnerProjectSummary>,
 ) {
+    register_agent_with_projects_and_policy(runtime, client_id, owner, caps, projects, None).await;
+}
+
+pub(in crate::tool_runtime::tests) async fn register_agent_with_projects_and_policy(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    owner: Option<&str>,
+    caps: RunnerCapabilities,
+    projects: Vec<RunnerProjectSummary>,
+    policy: Option<RunnerPolicySummary>,
+) {
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -1187,7 +1422,7 @@ pub(in crate::tool_runtime::tests) async fn register_agent_with_projects(
             hostname: None,
             host_context: None,
             capabilities: crate::test_support::current_runner_capabilities(caps),
-            policy: None,
+            policy,
         })
         .await
         .unwrap();
@@ -1209,34 +1444,17 @@ pub(in crate::tool_runtime::tests) async fn register_agent_with_shell_profiles(
     policy: Option<RunnerPolicySummary>,
     projects: Vec<RunnerProjectSummary>,
 ) {
-    runtime
-        .runner_registry
-        .register(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
-            owner: None,
-            hostname: None,
-            host_context: None,
-            capabilities: crate::test_support::current_runner_capabilities(
-                RunnerCapabilities::default(),
-            ),
-            policy,
-        })
-        .await
-        .unwrap();
-    crate::test_support::apply_project_inventory_snapshot(
-        &runtime.runner_registry,
+    register_agent_with_projects_and_policy(
+        runtime,
         client_id,
-        "inst",
+        None,
+        RunnerCapabilities {
+            explicit_shell_selection: true,
+            bash_login_shell: true,
+            ..Default::default()
+        },
         projects,
+        policy,
     )
     .await;
 }

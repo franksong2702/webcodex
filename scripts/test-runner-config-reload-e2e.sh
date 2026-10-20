@@ -57,7 +57,7 @@ diagnostics() {
 import json, sys
 try:
     d = json.load(open(sys.argv[1], encoding="utf-8"))
-    c = next(iter(d.get("output", {}).get("agents", {}).get("clients", [])), {})
+    c = next(iter(d.get("output", {}).get("runners", {}).get("clients", [])), {})
     safe = {k: c.get(k) for k in ("client_id", "connected", "display_name", "transport")}
     safe["tool_providers"] = c.get("tool_providers")
     print("[agent-reload-e2e][diagnostic] last_status=" + json.dumps(safe, sort_keys=True))
@@ -155,7 +155,7 @@ status_matches() {
         "$result" "$error" "$restart" "$fields" "$strategy" "$enabled" <<'PY' >/dev/null 2>&1
 import json, sys
 d = json.load(open(sys.argv[1], encoding="utf-8"))
-c = next(x for x in d["output"]["agents"]["clients"] if x["client_id"] == sys.argv[2])
+c = next(x for x in d["output"]["runners"]["clients"] if x["client_id"] == sys.argv[2])
 assert c["connected"] and c["display_name"] == sys.argv[3] and c["projects_count"] == 1
 p = c["tool_providers"]
 r = p["config_reload"]
@@ -191,8 +191,13 @@ request_body() {
     python3 -c 'import json,sys; print(json.dumps({"project":sys.argv[1],"command":sys.argv[2],"timeout_secs":5}))' \
         "$RUNTIME_PROJECT" "$1"
 }
+runtime_tool_call() {
+    local tool="$1"
+    local params="$2"
+    api_post /api/tools/call "{\"tool\":\"${tool}\",\"params\":${params}}"
+}
 run_shell_request() {
-    api_post /api/projects/run_shell "$(request_body "$1")" >"$RESPONSE_FILE"
+    runtime_tool_call "run_shell" "$(request_body "$1")" >"$RESPONSE_FILE"
 }
 assert_marker() {
     run_shell_request 'printf %s "$WEBCODEX_RELOAD_MARKER"'
@@ -200,12 +205,12 @@ assert_marker() {
         "$RESPONSE_FILE" "$1" || fail "shell marker was not $1"
 }
 start_job() {
-    api_post /api/projects/run_job "$(request_body "$1")" | python3 -c \
+    runtime_tool_call "run_job" "$(request_body "$1")" | python3 -c \
         'import json,sys; d=json.load(sys.stdin); assert d["success"]; print(d["output"]["job_id"])'
 }
 job_status() {
-    api_post /api/jobs/status "{\"job_id\":\"$1\"}" | python3 -c \
-        'import json,sys; d=json.load(sys.stdin); assert d["success"]; print(d["output"]["status"])'
+    runtime_tool_call "observe_jobs" "{\"items\":[{\"job_id\":\"$1\"}],\"tail_lines\":1}" | python3 -c \
+        'import json,sys; d=json.load(sys.stdin); assert d["success"]; item=d["output"]["items"][0]; assert item["job_id"]==sys.argv[1]; print(item["status"])' "$1"
 }
 for command in awk curl git mv python3 setsid tail "$CARGO_BIN"; do require_command "$command"; done
 cd "$ROOT"

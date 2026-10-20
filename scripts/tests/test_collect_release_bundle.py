@@ -15,7 +15,8 @@ from scripts import collect_release_bundle as collector
 
 SOURCE_SHA = "a" * 40
 RUN_ID = 123456
-VERSION = "0.4.0"
+VERSION = "0.4.3"
+SOURCE_REF = f"release/v{VERSION}"
 
 
 def _archive_bytes(platform: str) -> bytes:
@@ -30,7 +31,7 @@ def _archive_bytes(platform: str) -> bytes:
     return output.getvalue()
 
 
-def _write_bundle(root: Path, tag: str, build_kind: str) -> tuple[str, dict[str, str]]:
+def _write_bundle(root: Path, tag: str, build_kind: str, *, unified: bool = False, guarded: bool = False) -> tuple[str, dict[str, str]]:
     stem = (
         f"webcodex-v{VERSION}"
         if build_kind == "release"
@@ -49,7 +50,7 @@ def _write_bundle(root: Path, tag: str, build_kind: str) -> tuple[str, dict[str,
         checksum_lines.append(f"{digest}  {filename}")
 
     desktop_artifacts: dict[str, dict[str, str]] = {}
-    for platform in collector.DESKTOP_PLATFORMS:
+    for platform in collector.primary_desktop_platforms_for_version(VERSION):
         desktop_name = collector.desktop_artifact_filename(
             VERSION,
             platform,
@@ -62,6 +63,58 @@ def _write_bundle(root: Path, tag: str, build_kind: str) -> tuple[str, dict[str,
         desktop_digest = hashlib.sha256(desktop_payload).hexdigest()
         checksum_lines.append(f"{desktop_digest}  {desktop_name}")
         desktop_artifacts[platform] = {"filename": desktop_name, "sha256": desktop_digest}
+    installer_artifacts = {}
+    installer_manifest = {}
+    if unified:
+        source_records = {}
+        for platform in collector.PLATFORMS:
+            source_name = f"webcodex-source-v{VERSION}-{platform}.json"
+            guarded_cli_info = {"schema_version": 1, "binary": "webcodex", "version": VERSION, "git_commit": SOURCE_SHA, "git_dirty": False, "windows_guarded_bootstrap_contract": 1}
+            source_payload = json.dumps({
+                "schema_version": 1,
+                "version": VERSION,
+                "source_sha": SOURCE_SHA,
+                "source_workflow_run_id": RUN_ID,
+                "source_workflow_ref": f"{collector.DEFAULT_REPO}/.github/workflows/release-build.yml@refs/tags/v{VERSION}" if guarded else "test/.github/workflows/release-build.yml@refs/tags/v0.4.3",
+                **({"artifacts": {"webcodex": {"build_info": guarded_cli_info, "build_info_sha256": hashlib.sha256(json.dumps(guarded_cli_info, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}}} if guarded and platform.startswith("win32-") else {}),
+                "platform": platform,
+            }).encode()
+            (root / source_name).write_bytes(source_payload)
+            source_digest = hashlib.sha256(source_payload).hexdigest()
+            checksum_lines.append(f"{source_digest}  {source_name}")
+            source_records[platform] = (source_name, source_digest)
+        for target, (platform, package_format) in collector.INSTALLER_TARGETS.items():
+            filename = collector.installer_artifact_filename(VERSION, target)
+            magic = {
+                "deb": b"!<arch>\n",
+                "rpm": bytes.fromhex("edabeedb"),
+                "pkg": b"xar!",
+                "exe": b"MZ",
+            }[package_format]
+            payload = magic + b"synthetic installer"
+            (root / filename).write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            checksum_lines.append(f"{digest}  {filename}")
+            source_name, source_digest = source_records[platform]
+            installer_artifacts[target] = {
+                "filename": filename,
+                "sha256": digest,
+                "source_manifest_filename": source_name,
+                "source_manifest_sha256": source_digest,
+                **({
+                    "inner_sha256": hashlib.sha256(b"inner payload").hexdigest(),
+                    "candidate_manifest_sha256": source_digest if guarded else hashlib.sha256(b"candidate manifest").hexdigest(),
+                } if platform.startswith("win32-") else {}),
+            }
+            installer_manifest[target] = {
+                "platform": platform,
+                "format": package_format,
+                "filename": filename,
+                "url": f"https://github.com/{collector.DEFAULT_REPO}/releases/download/v{VERSION}/{filename}",
+                "sha256": digest,
+                "source_manifest_url": f"https://github.com/{collector.DEFAULT_REPO}/releases/download/v{VERSION}/{source_name}",
+                "source_manifest_sha256": source_digest,
+            }
     (root / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="ascii")
     (root / "linux-x64-elf.txt").write_text("ELF x64\n", encoding="utf-8")
     (root / "linux-arm64-elf.txt").write_text("ELF arm64\n", encoding="utf-8")
@@ -75,12 +128,14 @@ def _write_bundle(root: Path, tag: str, build_kind: str) -> tuple[str, dict[str,
         "archive_stem": stem,
         "artifacts": artifact_payload,
         "desktop_artifacts": desktop_artifacts,
+        **({"installer_artifacts": installer_artifacts} if unified else {}),
     }
     (root / "release-build.json").write_text(json.dumps(release_build) + "\n", encoding="utf-8")
     if build_kind == "release":
         manifest = {
             "version": VERSION,
             "binaries": list(collector.BINARIES),
+            **({"installers": installer_manifest} if unified else {}),
             "artifacts": {
                 platform: {
                     "url": f"https://github.com/{collector.DEFAULT_REPO}/releases/download/v{VERSION}/{stem}-{platform}.tar.gz",
@@ -90,6 +145,9 @@ def _write_bundle(root: Path, tag: str, build_kind: str) -> tuple[str, dict[str,
             },
         }
         (root / "manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        if unified:
+            checksum_lines.append(f"{collector.sha256_file(root / 'manifest.json')}  manifest.json")
+            (root / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="ascii")
     return stem, artifact_hashes
 
 
@@ -148,7 +206,7 @@ class ArtifactSelectionTests(unittest.TestCase):
         with self.assertRaises(collector.CollectionError):
             collector.select_bundle_artifact(expired, RUN_ID, SOURCE_SHA)
 
-    def test_run_requires_success_main_and_exact_source(self) -> None:
+    def test_run_requires_success_and_exact_source_independent_of_dispatch_ref(self) -> None:
         run = {
             "id": RUN_ID,
             "status": "completed",
@@ -156,17 +214,123 @@ class ArtifactSelectionTests(unittest.TestCase):
             "head_sha": SOURCE_SHA,
             "event": "workflow_dispatch",
             "path": collector.RELEASE_WORKFLOW_PATH,
-            "head_branch": "main",
+            "head_branch": f"v{VERSION}",
         }
         collector.validate_run(run, RUN_ID, SOURCE_SHA)
-        for key, bad in (("conclusion", "failure"), ("head_sha", "b" * 40), ("head_branch", "other")):
+        for key, bad in (("conclusion", "failure"), ("head_sha", "b" * 40)):
             changed = dict(run)
             changed[key] = bad
             with self.assertRaises(collector.CollectionError):
                 collector.validate_run(changed, RUN_ID, SOURCE_SHA)
 
+    def test_release_source_ref_validation(self) -> None:
+        self.assertEqual(collector.normalize_source_ref("main"), "main")
+        self.assertEqual(collector.normalize_source_ref(SOURCE_REF), SOURCE_REF)
+        for value in ("feature/x", "release/foo", "refs/heads/main", "release/v0.4.3/extra"):
+            with self.assertRaises(collector.CollectionError):
+                collector.normalize_source_ref(value)
+
 
 class BundleTests(unittest.TestCase):
+    def test_required_unified_contract_cannot_be_downgraded_to_legacy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stem, _ = _write_bundle(root, f"v{VERSION}", "release")
+            kwargs = dict(repo=collector.DEFAULT_REPO, run_id=RUN_ID,
+                          expected_source_sha=SOURCE_SHA, expected_tag=f"v{VERSION}",
+                          artifact_name=f"{stem}-bundle")
+            collector.verify_bundle_directory(root, **kwargs)
+            with self.assertRaisesRegex(collector.CollectionError, "required unified installer"):
+                collector.verify_bundle_directory(root, **kwargs, require_unified_installers=True)
+            path = root / "release-build.json"
+            metadata = json.loads(path.read_text())
+            metadata["installer_artifacts"] = None
+            path.write_text(json.dumps(metadata))
+            for strict in (False, True):
+                with self.assertRaisesRegex(collector.CollectionError, "eight unified installer"):
+                    collector.verify_bundle_directory(root, **kwargs, require_unified_installers=strict)
+
+    def test_strict_unified_contract_requires_all_sources_manifest_and_checksums(self):
+        for missing in ("manifest.json", "SHA256SUMS",
+                        f"webcodex-source-v{VERSION}-linux-x64.json",
+                        collector.installer_artifact_filename(VERSION, "linux-arm64-rpm")):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                stem, _ = _write_bundle(root, f"v{VERSION}", "release", unified=True)
+                kwargs = dict(repo=collector.DEFAULT_REPO, run_id=RUN_ID,
+                              expected_source_sha=SOURCE_SHA, expected_tag=f"v{VERSION}",
+                              artifact_name=f"{stem}-bundle", require_unified_installers=True)
+                collector.verify_bundle_directory(root, **kwargs)
+                (root / missing).unlink()
+                with self.assertRaises(collector.CollectionError):
+                    collector.verify_bundle_directory(root, **kwargs)
+
+    def test_release_bundle_contract_with_eight_unified_installer_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stem, _hashes = _write_bundle(root, f"v{VERSION}", "release", unified=True)
+            summary = collector.verify_bundle_directory(
+                root,
+                repo=collector.DEFAULT_REPO,
+                run_id=RUN_ID,
+                expected_source_sha=SOURCE_SHA,
+                expected_tag=f"v{VERSION}",
+                artifact_name=f"{stem}-bundle",
+            )
+            self.assertEqual(set(summary["installer_artifacts"]), set(collector.INSTALLER_TARGETS))
+            self.assertEqual(
+                summary["installer_artifacts"]["linux-x64-deb"]["filename"],
+                f"webcodex-unified-v{VERSION}-linux-x64.deb",
+            )
+            self.assertEqual(
+                summary["installer_artifacts"]["linux-x64-rpm"]["filename"],
+                f"webcodex-unified-v{VERSION}-linux-x64.rpm",
+            )
+            self.assertEqual(
+                summary["installer_artifacts"]["linux-x64-deb"]["source_manifest_sha256"],
+                summary["installer_artifacts"]["linux-x64-rpm"]["source_manifest_sha256"],
+            )
+            (root / summary["installer_artifacts"]["win32-x64-exe"]["filename"]).write_bytes(b"broken")
+            with self.assertRaises(collector.CollectionError):
+                collector.verify_bundle_directory(
+                    root,
+                    repo=collector.DEFAULT_REPO,
+                    run_id=RUN_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_tag=f"v{VERSION}",
+                    artifact_name=f"{stem}-bundle",
+                )
+
+    def test_guarded_capability_must_match_same_built_outer_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stem, _ = _write_bundle(root, f"v{VERSION}", "release", unified=True, guarded=True)
+            kwargs = dict(repo=collector.DEFAULT_REPO, run_id=RUN_ID, expected_source_sha=SOURCE_SHA,
+                expected_tag=f"v{VERSION}", artifact_name=f"{stem}-bundle")
+            summary = collector.verify_bundle_directory(root, **kwargs)
+            self.assertNotIn("guarded_handoff_version", summary["installer_artifacts"]["win32-x64-exe"])
+            build = json.loads((root / "release-build.json").read_text())
+            build["installer_artifacts"]["win32-x64-exe"]["candidate_manifest_sha256"] = "c" * 64
+            (root / "release-build.json").write_text(json.dumps(build))
+            with self.assertRaisesRegex(collector.CollectionError, "capability does not match"):
+                collector.verify_bundle_directory(root, **kwargs)
+
+    def test_release_bundle_rejects_tampered_public_source_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stem, _ = _write_bundle(root, f"v{VERSION}", "release", unified=True)
+            source_name = f"webcodex-source-v{VERSION}-linux-x64.json"
+            (root / source_name).write_bytes(b"tampered")
+            with self.assertRaisesRegex(collector.CollectionError, "source manifest SHA-256 mismatch"):
+                collector.verify_bundle_directory(
+                    root,
+                    repo=collector.DEFAULT_REPO,
+                    run_id=RUN_ID,
+                    expected_source_sha=SOURCE_SHA,
+                    expected_tag=f"v{VERSION}",
+                    artifact_name=f"{stem}-bundle",
+                )
+
     def test_release_bundle_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -181,10 +345,7 @@ class BundleTests(unittest.TestCase):
             )
             self.assertEqual(summary["artifacts"], hashes)
             self.assertEqual(summary["build_kind"], "release")
-            self.assertEqual(
-                summary["desktop_artifacts"]["darwin-x64"]["filename"],
-                f"webcodex-desktop-v{VERSION}-darwin-x64.dmg",
-            )
+            self.assertNotIn("darwin-x64", summary["desktop_artifacts"])
             self.assertEqual(
                 summary["desktop_artifacts"]["darwin-arm64"]["filename"],
                 f"webcodex-desktop-v{VERSION}-darwin-arm64.dmg",
@@ -192,6 +353,10 @@ class BundleTests(unittest.TestCase):
             self.assertEqual(
                 summary["desktop_artifacts"]["win32-x64"]["filename"],
                 f"webcodex-desktop-v{VERSION}-win32-x64-setup.exe",
+            )
+            self.assertEqual(
+                summary["desktop_artifacts"]["win32-arm64"]["filename"],
+                f"webcodex-desktop-v{VERSION}-win32-arm64-setup.exe",
             )
 
     def test_release_bundle_rejects_missing_desktop(self) -> None:
@@ -216,7 +381,7 @@ class BundleTests(unittest.TestCase):
             root = Path(temp)
             stem, _hashes = _write_bundle(root, f"v{VERSION}", "release")
             metadata = json.loads((root / "release-build.json").read_text(encoding="utf-8"))
-            desktop_name = metadata["desktop_artifacts"]["darwin-x64"]["filename"]
+            desktop_name = metadata["desktop_artifacts"]["darwin-arm64"]["filename"]
             (root / desktop_name).write_bytes(b"drifted-dmg")
             with self.assertRaises(collector.CollectionError):
                 collector.verify_bundle_directory(
@@ -234,9 +399,9 @@ class BundleTests(unittest.TestCase):
             stem, _hashes = _write_bundle(root, f"v{VERSION}", "release")
             metadata_path = root / "release-build.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            item = metadata["desktop_artifacts"]["darwin-x64"]
+            item = metadata["desktop_artifacts"]["darwin-arm64"]
             old_name = item["filename"]
-            bad_name = "webcodex-desktop-v0.4.0-macos-x64.dmg"
+            bad_name = f"webcodex-desktop-v{VERSION}-macos-arm64.dmg"
             (root / old_name).rename(root / bad_name)
             item["filename"] = bad_name
             metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
@@ -314,6 +479,70 @@ class BundleTests(unittest.TestCase):
                 collector.safe_extract_zip(path, root / "extract")
             self.assertFalse((root / "escape").exists())
 
+
+
+class RuntimeManifestBundleTests(unittest.TestCase):
+    def add_manifest(self, directory: Path, *, corrupt: bool = False) -> None:
+        path = directory / "webcodex-release-manifest.json"
+        value = {
+            "schema_version": 1,
+            "release_version": VERSION,
+            "runtime_version": VERSION,
+            "desktop_runtime_contract": {"min_generation": 1, "max_generation": 1},
+        }
+        if corrupt:
+            value["desktop_runtime_contract"]["min_generation"] = 0
+        path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        metadata_path = directory / "release-build.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata["runtime_manifest"] = {"filename": path.name, "sha256": digest}
+        metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        sums = directory / "SHA256SUMS"
+        sums.write_text(
+            sums.read_text(encoding="ascii") + f"{digest}  {path.name}\n",
+            encoding="ascii",
+        )
+
+    def verify(self, directory: Path) -> dict:
+        return collector.verify_bundle_directory(
+            directory,
+            repo=collector.DEFAULT_REPO,
+            run_id=RUN_ID,
+            expected_source_sha=SOURCE_SHA,
+            expected_tag=f"v{VERSION}",
+            artifact_name=f"webcodex-v{VERSION}-bundle",
+        )
+
+    def test_valid_manifest_is_collected_with_strict_digest_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write_bundle(root, f"v{VERSION}", "release")
+            self.add_manifest(root)
+            summary = self.verify(root)
+            self.assertEqual(
+                summary["runtime_manifest"]["filename"],
+                "webcodex-release-manifest.json",
+            )
+
+    def test_invalid_contract_rejected_even_when_checksums_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write_bundle(root, f"v{VERSION}", "release")
+            self.add_manifest(root, corrupt=True)
+            with self.assertRaises(collector.CollectionError):
+                self.verify(root)
+
+    def test_present_but_null_manifest_is_not_legacy_absence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write_bundle(root, f"v{VERSION}", "release")
+            path = root / "release-build.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["runtime_manifest"] = None
+            path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            with self.assertRaises(collector.CollectionError):
+                self.verify(root)
 
 if __name__ == "__main__":
     unittest.main()

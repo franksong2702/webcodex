@@ -9,17 +9,13 @@ use crate::metadata::{
     ToolRisk::{JobRun, Read},
     CODING_AGENT_RUN, TOOL_PROVIDER_RUNNER,
 };
-use crate::registry::input_schemas::{
-    coding_agent_cancel_input_schema, coding_agent_observe_input_schema,
-    coding_agent_start_input_schema,
-};
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     permission_risk(
         model_spec(
             require_all_scopes(
                 def(
-                    "coding_agent_start",
+                    "start_coding_agent",
                     super::ToolAuditPolicy::typed_fields(&[
                         super::ToolAuditResultField::value("run_id"),
                         super::ToolAuditResultField::value("project"),
@@ -52,14 +48,13 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 ),
                 &[CODING_AGENT_RUN, webcodex_core::authority::SCOPE_PROJECT_WRITE],
             ),
-            "Start one idempotent delegated ACP coding-agent Run on an exact registered Project and logical Runner provider. Autonomous execution may outlive this request; after any uncertain start, reuse the same idempotency key and observe the same Run rather than dispatching a replacement.",
-            coding_agent_start_input_schema,
+            "Start one idempotent delegated ACP Run on an exact Project and logical Runner provider; configured model API adapters can perform text reasoning/review. Optional context_session_id quotes an independently authorized bounded handoff and explicit Goal context; no source resume, recorder inference, or authority transfer. Current files/Git are not fetched. The context snapshot is part of the intent: a changed snapshot under the same key conflicts. Autonomous execution may outlive this request; after any uncertain start observe the same Run rather than dispatching a replacement. Choose providers only from the exact Runner inventory; no automatic quota/model switching.",
         ),
         PERMISSION_RISK_JOB,
     ),
     model_spec(
         def(
-            "coding_agent_observe",
+            "observe_coding_agent",
             super::ToolAuditPolicy::typed_semantic(
                 super::ToolAuditSemanticResultPolicy::CodingAgentObservation,
             ),
@@ -81,12 +76,11 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE,
         ),
         "Observe bounded normalized events and lifecycle for one existing CodingAgentRun. Return the opaque token for only-new follow-ups; history loss/reset is explicit. Observation never starts, retries, or resumes ACP work.",
-        coding_agent_observe_input_schema,
     ),
     permission_risk(
         model_spec(
             def(
-            "coding_agent_cancel",
+            "cancel_coding_agent",
             super::ToolAuditPolicy::typed_fields(&[
                 super::ToolAuditResultField::value("run_id"),
                 super::ToolAuditResultField::value("project"),
@@ -120,7 +114,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolSessionEvidencePolicy::NONE,
             ),
             "Request cancellation of one existing CodingAgentRun. This does not grant permission, retry a prompt, or create a replacement Run; observe the same run_id for authoritative terminal state.",
-            coding_agent_cancel_input_schema,
         ),
         PERMISSION_RISK_WRITE,
     ),

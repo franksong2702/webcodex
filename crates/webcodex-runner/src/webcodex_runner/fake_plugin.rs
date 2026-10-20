@@ -37,7 +37,9 @@ fn main() -> io::Result<()> {
         )?;
         append(
             marker,
-            if env::var_os("WEBCODEX_AGENT_TOKEN").is_none() {
+            if env::var_os("WEBCODEX_AGENT_TOKEN").is_none()
+                && env::var_os("WEBCODEX_PAT").is_none()
+            {
                 "sensitive-env-cleared\n"
             } else {
                 "sensitive-env-leaked\n"
@@ -79,7 +81,13 @@ fn main() -> io::Result<()> {
         match method.as_str() {
             "initialize" => {
                 append(marker, "initialize\n")?;
-                if scenario == "init_crash" || scenario == "check_init_crash" {
+                if matches!(
+                    scenario,
+                    "init_crash" | "check_init_crash" | "check_init_crash_stderr"
+                ) {
+                    if scenario == "check_init_crash_stderr" {
+                        eprintln!("diagnostic-only-secret-looking-initialize-stderr");
+                    }
                     return Ok(());
                 }
                 if scenario == "check_init_timeout" {
@@ -223,7 +231,25 @@ fn main() -> io::Result<()> {
                 } else {
                     "string"
                 };
-                let tool_name = if scenario == "check_v2" { "echo_v2" } else { "echo" };
+                let tool_name = match scenario {
+                    "project_repo_context" => "repo_context",
+                    "project_safe_delete" => "safe_delete",
+                    "check_v2" => "echo_v2",
+                    _ => "echo",
+                };
+                let tool_title = if scenario == "project_repo_context" {
+                    r#","title":"Repository context""#
+                } else {
+                    ""
+                };
+                let project_binding = if scenario.starts_with("project_bound") {
+                    r#","projectBound":true"#
+                } else { "" };
+                let annotations = match scenario {
+                    "project_repo_context" => r#","annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}"#,
+                    "project_safe_delete" => r#","annotations":{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}"#,
+                    _ => "",
+                };
                 let startup_padding = if scenario == "check_startup_large_schema" {
                     "x".repeat(40 * 1024)
                 } else {
@@ -241,6 +267,8 @@ fn main() -> io::Result<()> {
                 }
                 let output_schema = if scenario == "output_schema_invalid" {
                     r#","outputSchema":{"type":"object","properties":{"call":{"type":"string"}},"required":["call"],"additionalProperties":false}"#.to_string()
+                } else if scenario == "large_structured_result" {
+                    r#","outputSchema":{"type":"object","properties":{"payload":{"type":"string","maxLength":262144}},"required":["payload"],"additionalProperties":false}"#.to_string()
                 } else {
                     String::new()
                 };
@@ -252,7 +280,7 @@ fn main() -> io::Result<()> {
                 send(
                     &mut writer,
                     &format!(
-                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"{tool_name}","description":"Native plugin echo","inputSchema":{{"type":"object","description":"{startup_padding}","properties":{{"value":{{"type":"{value_type}"}}}}}}{output_schema}}}]}}}}"#
+                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"{tool_name}"{tool_title}{project_binding},"description":"Native plugin echo","inputSchema":{{"type":"object","description":"{startup_padding}","properties":{{"value":{{"type":"{value_type}"}}}}}}{output_schema}{annotations}}}]}}}}"#
                     ),
                 )?;
                 if matches!(
@@ -286,6 +314,13 @@ fn main() -> io::Result<()> {
                         thread::sleep(Duration::from_millis(750));
                         send_result(&mut writer, id, calls)?;
                     }
+                    "project_bound_hold" => {
+                        let release = marker.expect("hold fixture marker").with_extension("release");
+                        while !release.exists() {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        send_result(&mut writer, id, calls)?;
+                    }
                     "slow" => {
                         thread::sleep(Duration::from_millis(750));
                         send_result(&mut writer, id, calls)?;
@@ -294,6 +329,27 @@ fn main() -> io::Result<()> {
                         &mut writer,
                         &format!(
                             r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":-32001,"message":"fixture error"}}}}"#
+                        ),
+                    )?,
+                    "large_text_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"{}"}}],"isError":false}}}}"#,
+                            "x".repeat(192 * 1024)
+                        ),
+                    )?,
+                    "large_structured_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[],"structuredContent":{{"payload":"{}"}},"isError":false}}}}"#,
+                            "x".repeat(192 * 1024)
+                        ),
+                    )?,
+                    "oversized_result" => send(
+                        &mut writer,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"{}"}}],"isError":false}}}}"#,
+                            "x".repeat(520 * 1024)
                         ),
                     )?,
                     "bad_result" => send(

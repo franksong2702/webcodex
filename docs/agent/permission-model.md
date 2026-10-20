@@ -36,9 +36,9 @@ WEBCODEX_AUTHORITY_MODE = trusted_agent | restricted
 | Unset / empty / whitespace | **`trusted_agent`** (self-hosted single-operator product default), source reported as `default` |
 | Explicit known value | `trusted_agent` or `restricted`, source `env:WEBCODEX_AUTHORITY_MODE` |
 | Unknown non-empty value | Invalid configuration → consequential tools **fail closed** with reason `invalid_authority_mode:{value}` |
-| Legacy values | `dev_auto_approve` aliases `trusted_agent`; `require_approval` aliases `restricted`, in either environment variable. Legacy-only configuration reports `migrated_env:WEBCODEX_PERMISSION_MODE`. Both variables may agree; conflicting values and unknown legacy values (including `audit_only`) remain invalid. |
+| Retired configuration | v0.5 does not migrate `WEBCODEX_PERMISSION_MODE` or accept `dev_auto_approve` / `require_approval`. Any set retired variable, including empty, is invalid. Unset it and explicitly select `WEBCODEX_AUTHORITY_MODE=trusted_agent` or `restricted`; the rejection guard never falls back to automatic authorization. |
 
-The resolved mode and source are projected on `runtime_status` and on internal
+The resolved mode and source are projected on `get_runtime_status` and on internal
 full startup diagnostics as the `authority` object. The canonical external
 `work_on_project` response intentionally keeps that full diagnostic block out of
 its sparse model-facing projection:
@@ -61,7 +61,7 @@ its sparse model-facing projection:
 The former `permissions` profile object
 (`policy` / `auto_approve` / `release_recommended_policy`) no longer exists on
 those payloads. The per-session permission decision **summary** (counters) in
-`finish_coding_task` / `session_handoff_summary` is unchanged except that it
+`finish_coding_task` / `read_session_handoff` is unchanged except that it
 carries the new policy names.
 
 ---
@@ -87,26 +87,14 @@ decision for consequential tools.
 
 ### `restricted`
 
-- Consequential runtime tools are **denied** with
-  `reason=restricted_requires_human_authorization`.
-- The project-bound connector `commands_run` keeps the one-time human approval
-  loop (`wc_approvals`, `task_cli approve/deny`).
+- Consequential runtime tools are **denied** with `reason=restricted_requires_human_authorization`.
+- There is no separate Connector command-approval queue or host-side task approval namespace.
 
 ### Invalid configuration
 
 - Unknown authority/legacy values and conflicting current/legacy settings are rejected: consequential tools fail closed
   (`policy=invalid`, `status=denied`, `reason=invalid_authority_mode:...`).
   Invalid configuration never falls back to allow.
-
-### Connector surface (`commands_run`)
-
-- Under `trusted_agent`, `commands_run` no longer creates approval records or
-  `approval_required` interruptions. Instead a durable task event
-  `authority_auto_authorized` is recorded with the authority mode, source,
-  resolved rule, action hash/summary, risk, principal, and project.
-- Under `restricted`, the existing one-time approval loop is unchanged.
-
----
 
 ## 3. Hard boundaries not relaxed by `trusted_agent`
 
@@ -120,6 +108,7 @@ any authority mode:
 | Project boundary / allowed roots | Model requests cannot extend roots. Explicit local operator project selection can persist the exact canonical root; path/namespace/escape checks remain. |
 | Explicitly read-only sessions deny writes and shell/jobs | Session guard **before** mutation |
 | Unknown explicit `session_id` → `unknown_session_id` | Session resolution |
+| Owning principal of a retention-expired Closed Session → `session_retention_expired` with `RecoveryKind::NoAction`; any other principal receives `unknown_session_id` | Session resolution |
 | Path and sensitive-path policy | File tools + `policy_rejected` / hard-deny detection |
 | Concurrent-overwrite guards (stale SHA / guarded edits) | Transactional edit tools |
 | Credential redaction | Logging / evidence rules |
@@ -182,9 +171,7 @@ approval records. They remain subject to hard safety.
 4. **`restricted` never silently auto-approves** runtime tools.
 5. **Read-only / not-required tools never invent approval records.**
 6. **Hard-denied tool outcomes suppress the soft authority attach.**
-7. **Every trusted-agent auto-execution remains auditable** — session-ledger
-   decision records for runtime tools, `authority_auto_authorized` durable
-   task events for the connector `commands_run` path.
+7. **Every trusted-agent auto-execution remains auditable** through the canonical runtime/session evidence path; no parallel Connector approval/event ledger is required.
 8. **External release actions stay user-task-scoped** under `trusted_agent`;
    they are not blanket-authorized by the mode.
 

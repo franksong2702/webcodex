@@ -141,6 +141,7 @@ fn registration_wire_requires_generation_capabilities_and_explicit_shell() {
     assert!(!capabilities.async_jobs);
     assert!(!capabilities.async_shell_jobs);
     assert!(!capabilities.structured_validation_argv);
+    assert!(!capabilities.structured_cargo_test_lib);
     assert!(!capabilities.structured_go_test_json);
     assert!(!capabilities.structured_go_test_tool);
     assert!(!capabilities.structured_go_test_packages);
@@ -187,12 +188,17 @@ async fn runner_supports_reflects_registered_capabilities() {
         project_path_registration: true,
         managed_worktree: false,
         structured_go_test_json: true,
+        project_validation_v1: true,
+        project_validation_package_scope_v1: true,
+        project_all_packages_v1: true,
         structured_go_test_tool: true,
         structured_go_test_packages: true,
+        structured_cargo_test_lib: true,
         ..Default::default()
     });
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -220,11 +226,23 @@ async fn runner_supports_reflects_registered_capabilities() {
         .await
         .unwrap());
     assert!(registry
+        .runner_supports("oe", RUNNER_CAPABILITY_PROJECT_VALIDATION)
+        .await
+        .unwrap());
+    assert!(registry
+        .runner_supports("oe", RUNNER_CAPABILITY_PROJECT_VALIDATION_PACKAGE_SCOPE)
+        .await
+        .unwrap());
+    assert!(registry
         .runner_supports("oe", RUNNER_CAPABILITY_ASYNC_SHELL_JOBS)
         .await
         .unwrap());
     assert!(registry
         .runner_supports("oe", RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION)
+        .await
+        .unwrap());
+    assert!(registry
+        .runner_supports("oe", RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_LIB)
         .await
         .unwrap());
     assert!(registry
@@ -243,6 +261,7 @@ async fn runner_supports_reflects_registered_capabilities() {
     assert!(view.capabilities.structured_go_test_json);
     assert!(view.capabilities.structured_go_test_tool);
     assert!(view.capabilities.structured_go_test_packages);
+    assert!(view.capabilities.structured_cargo_test_lib);
     assert!(!registry
         .runner_supports("oe", RUNNER_CAPABILITY_GIT)
         .await
@@ -272,6 +291,7 @@ async fn coding_agent_run_lookup_is_exact_when_bound_and_ambiguous_when_unbound(
         let provider_instance_id = format!("provider_{client_id}");
         registry
             .register(RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -337,6 +357,7 @@ async fn coding_agent_registration_rejects_semantically_contradictory_snapshot()
     let registry = RunnerRegistry::default();
     let register =
         |run: webcodex_core::coding_agent::CodingAgentRunSnapshot| RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -422,6 +443,7 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
     let registry = RunnerRegistry::default();
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -444,65 +466,7 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
             owner: None,
             hostname: None,
             host_context: None,
-            capabilities: RunnerCapabilities {
-                shell: true,
-                file_read: true,
-                file_write: true,
-                artifact_export_chunk_read: true,
-                artifact_export_streaming_metadata: true,
-                structured_file_delete: true,
-                apply_text_edit_occurrence: true,
-                apply_text_edit_line_scope: true,
-                apply_patch: true,
-                apply_patch_match_metadata: true,
-                apply_patch_matching_mode: true,
-                apply_patch_strict_matching: true,
-                git: true,
-                jobs: true,
-                async_jobs: true,
-                async_shell_jobs: true,
-                ssh_shell: true,
-                persistent_shell: true,
-                ssh_persistent_shell: true,
-                structured_validation_argv: true,
-                structured_cargo_test_count_assertion: true,
-                structured_cargo_test_execution_policy: true,
-                structured_go_test_json: true,
-                structured_go_test_tool: true,
-                structured_go_test_packages: true,
-                structured_process_argv: true,
-                structured_script_payload: true,
-                internal_posix_script: true,
-                structured_execution_jobs: true,
-                detached_process_jobs: true,
-                lsp_read_only_navigation: true,
-                lsp_call_hierarchy: true,
-                project_lifecycle: true,
-                project_path_registration: true,
-                managed_worktree: true,
-                skill_store_read: true,
-                skill_store_manage: true,
-                computer_observe: true,
-                computer_application_discovery: true,
-                computer_application_launch: true,
-                computer_display_observe: true,
-                computer_pointer_control: true,
-                computer_clipboard_read: true,
-                computer_clipboard_write: true,
-                computer_snapshot_region: true,
-                computer_accessibility_observe: true,
-                computer_element_state: true,
-                computer_control: true,
-                computer_scroll_to_element: true,
-                computer_key_input: true,
-                computer_window_activate: true,
-                computer_text_input: true,
-                job_state_reconciliation: true,
-                coding_agent_runs: true,
-                native_tool_plugins: true,
-                managed_ssh_resources: true,
-                runner_config_control: true,
-            },
+            capabilities: all_enabled_capabilities(),
             policy: Some(crate::runner_protocol::RunnerPolicySummary {
                 ..Default::default()
             }),

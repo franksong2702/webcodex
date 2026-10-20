@@ -11,9 +11,10 @@ use super::config::{
 use super::shell::{PreparedExecutionEnvironment, PreparedShellProfileCache};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
@@ -23,8 +24,10 @@ use webcodex_core::plugin::{
     validate_request, validate_tool_result, validate_tools, PluginCatalog, PluginCheckDiagnostic,
     PluginCheckPhase, PluginCheckReport, PluginCheckToolSummary, PluginDispatchState,
     PluginGatewayRequest, PluginGatewayResponse, PluginGatewayResponsePayload, PluginProviderView,
-    PluginReloadFailure, PluginSchemaObservation, PluginTool, PluginToolResult,
-    PLUGIN_MAX_MESSAGE_BYTES, PLUGIN_PROTOCOL_VERSION,
+    PluginReloadFailure, PluginSchemaObservation, PluginSelectionAnnotations, PluginTool,
+    PluginToolResult, ProjectPluginCatalog, ProjectPluginCatalogEntry, PLUGIN_MAX_MESSAGE_BYTES,
+    PLUGIN_MAX_PROJECT_CATALOG_DESCRIPTION_BYTES, PLUGIN_PROJECT_CATALOG_REVISION_PREFIX,
+    PLUGIN_PROTOCOL_VERSION,
 };
 use webcodex_process::ManagedChild;
 
@@ -140,6 +143,12 @@ impl PluginEnvironmentSnapshot {
 
 struct ProviderEntry {
     config: PluginProviderConfig,
+    // Frozen launch target. A changed cwd symlink must not retarget an existing process.
+    launch_root: Option<PathBuf>,
+    // Physical directory identity frozen at provider launch. Canonical path
+    // equality alone cannot detect rename + same-path replacement while the
+    // provider process keeps its old cwd inode/handle.
+    launch_root_handle: Option<same_file::Handle>,
     instance_id: String,
     timeout: Duration,
     failed: AtomicBool,
@@ -242,7 +251,7 @@ fn initialize_failure_detail(code: &str) -> &'static str {
         }
         "plugin_initialize_invalid" => "Plugin initialize result violates protocol bounds",
         "plugin_timeout" => "Plugin initialize did not complete within the provider timeout",
-        "plugin_eof" => "Plugin process ended during initialize",
+        "plugin_eof" => "Plugin protocol output ended before initialize completed; the process may have exited or closed stdout. Verify the configured command and arguments. For a generated TypeScript Plugin, run npm run build and ensure dist/plugin.js exists on the Runner host before retrying.",
         _ => "Plugin initialize did not complete successfully",
     }
 }
@@ -386,7 +395,125 @@ impl PluginManager {
             .cloned()
     }
 
+    pub(crate) fn handle_project_catalog(
+        &self,
+        project_id: &str,
+        project_registry_dir: &Path,
+    ) -> PluginGatewayResponse {
+        let request = PluginGatewayRequest::ProjectCatalog {
+            project_id: project_id.to_string(),
+        };
+        if let Err(error) = validate_request(&request) {
+            tracing::warn!(error = %error, "rejected invalid Plugin project catalog request");
+            return gateway_error(
+                PluginDispatchState::NotStarted,
+                "invalid_plugin_request",
+                "Plugin project catalog request was invalid and was not dispatched",
+            );
+        }
+        if self.stopping.load(Ordering::SeqCst) {
+            return gateway_error(
+                PluginDispatchState::NotStarted,
+                "plugin_manager_stopping",
+                "Plugin manager is stopping; request was not dispatched",
+            );
+        }
+        let Some(project) =
+            super::projects::find_project_shell_context_by_id(project_registry_dir, project_id)
+        else {
+            return gateway_error(
+                PluginDispatchState::NotStarted,
+                "project_target_unavailable",
+                "The authoritative Runner Project target is unavailable",
+            );
+        };
+        let Ok(project_root) = Path::new(&project.path).canonicalize() else {
+            return gateway_error(
+                PluginDispatchState::NotStarted,
+                "project_target_unavailable",
+                "The authoritative Runner Project root is unavailable",
+            );
+        };
+        PluginGatewayResponse::success(PluginGatewayResponsePayload::ProjectCatalog {
+            catalog: self.project_catalog_for_root(&project_root),
+        })
+    }
+
+    fn project_catalog_for_root(&self, project_root: &Path) -> ProjectPluginCatalog {
+        let committed = self
+            .committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries = Vec::new();
+        let mut hasher = Sha256::new();
+        hasher.update(b"webcodex.project-plugin-catalog.v1\0");
+        for provider in committed.providers.values() {
+            if provider.failed.load(Ordering::SeqCst) {
+                continue;
+            }
+            let Some(configured_cwd) = provider.config.cwd.as_deref() else {
+                continue;
+            };
+            let Ok(provider_root) = Path::new(configured_cwd).canonicalize() else {
+                continue;
+            };
+            if !webcodex_runner_config::paths::paths_equal(&provider_root, project_root) {
+                continue;
+            }
+            let Some(catalog) = provider.catalog.get() else {
+                continue;
+            };
+
+            // Provider-instance and frozen schema/catalog identity participate in
+            // the opaque revision without entering the model-facing projection.
+            for value in [
+                provider.config.id.as_str(),
+                provider.instance_id.as_str(),
+                provider.config.name.as_str(),
+                catalog.digest(),
+            ] {
+                hasher.update((value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+            for tool in catalog.tools() {
+                entries.push(ProjectPluginCatalogEntry {
+                    plugin: provider.config.id.clone(),
+                    name: provider.config.name.clone(),
+                    tool: tool.name.clone(),
+                    title: tool.title.clone(),
+                    description: tool
+                        .description
+                        .as_deref()
+                        .map(bounded_project_catalog_description),
+                    annotations: PluginSelectionAnnotations::from_value(tool.annotations.as_ref()),
+                });
+            }
+        }
+        let catalog_revision = format!(
+            "{PLUGIN_PROJECT_CATALOG_REVISION_PREFIX}{}",
+            webcodex_core::compact::encode(hasher.finalize())
+        );
+        bounded_project_catalog(catalog_revision, entries)
+    }
+
+    #[cfg(test)]
     pub(crate) fn handle(&self, request: PluginGatewayRequest) -> PluginGatewayResponse {
+        self.handle_in_registry(request, None)
+    }
+
+    pub(crate) fn handle_with_project_registry(
+        &self,
+        request: PluginGatewayRequest,
+        project_registry_dir: &Path,
+    ) -> PluginGatewayResponse {
+        self.handle_in_registry(request, Some(project_registry_dir))
+    }
+
+    fn handle_in_registry(
+        &self,
+        request: PluginGatewayRequest,
+        project_registry_dir: Option<&Path>,
+    ) -> PluginGatewayResponse {
         if let Err(error) = validate_request(&request) {
             tracing::warn!(error = %error, "rejected invalid Plugin gateway request");
             return gateway_error(
@@ -405,6 +532,11 @@ impl PluginManager {
         match request {
             PluginGatewayRequest::Check { provider_id } => self.check_candidate(&provider_id),
             PluginGatewayRequest::Reload => self.reload_from_path(),
+            PluginGatewayRequest::ProjectCatalog { .. } => gateway_error(
+                PluginDispatchState::NotStarted,
+                "project_target_unavailable",
+                "Plugin project catalog discovery requires an authoritative Runner Project target",
+            ),
             PluginGatewayRequest::ProvidersList => {
                 PluginGatewayResponse::success(PluginGatewayResponsePayload::Providers {
                     providers: self.provider_views(),
@@ -433,12 +565,19 @@ impl PluginManager {
                 name,
                 arguments,
                 expected_schema,
+                project_target,
             } => {
                 let Some(provider) = self.resolve_provider(&provider_id, &provider_instance_id)
                 else {
                     return stale_provider();
                 };
-                match provider.call_tool(&name, arguments, &expected_schema) {
+                match provider.call_tool(
+                    &name,
+                    arguments,
+                    &expected_schema,
+                    project_target.as_ref(),
+                    project_registry_dir,
+                ) {
                     Ok(result) => {
                         PluginGatewayResponse::success(PluginGatewayResponsePayload::ToolResult {
                             result,
@@ -787,6 +926,49 @@ impl Drop for PluginManager {
     }
 }
 
+fn bounded_project_catalog(
+    catalog_revision: String,
+    entries: Vec<ProjectPluginCatalogEntry>,
+) -> ProjectPluginCatalog {
+    let mut catalog = ProjectPluginCatalog {
+        catalog_revision,
+        total_count: entries.len(),
+        entries: Vec::new(),
+    };
+    // Individual provider catalogs are bounded, but their combined selection
+    // metadata can exceed the gateway envelope (including JSON escaping).
+    // Keep a deterministic prefix and the complete count/revision for discovery.
+    let envelope = PluginGatewayResponse::success(PluginGatewayResponsePayload::ProjectCatalog {
+        catalog: catalog.clone(),
+    });
+    let mut bytes = serde_json::to_vec(&envelope)
+        .expect("Plugin catalog metadata is serializable")
+        .len();
+    for entry in entries {
+        let entry_bytes = serde_json::to_vec(&entry)
+            .expect("Plugin catalog entry is serializable")
+            .len()
+            + usize::from(!catalog.entries.is_empty());
+        if bytes + entry_bytes > PLUGIN_MAX_MESSAGE_BYTES {
+            break;
+        }
+        bytes += entry_bytes;
+        catalog.entries.push(entry);
+    }
+    catalog
+}
+
+fn bounded_project_catalog_description(value: &str) -> String {
+    if value.len() <= PLUGIN_MAX_PROJECT_CATALOG_DESCRIPTION_BYTES {
+        return value.to_string();
+    }
+    let mut end = PLUGIN_MAX_PROJECT_CATALOG_DESCRIPTION_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 impl ProviderEntry {
     fn frozen_catalog(&self) -> Result<&PluginCatalog, ProviderFailure> {
         if self.failed.load(Ordering::SeqCst) {
@@ -861,6 +1043,8 @@ impl ProviderEntry {
         name: &str,
         arguments: Value,
         expected_schema: &PluginSchemaObservation,
+        project_target: Option<&webcodex_core::plugin::PluginProjectTarget>,
+        project_registry_dir: Option<&Path>,
     ) -> Result<PluginToolResult, ProviderFailure> {
         let catalog = self.frozen_catalog()?;
         let Some(tool) = catalog.tool(name) else {
@@ -886,6 +1070,17 @@ impl ProviderEntry {
         })?;
         let output_schema = tool.output_schema.clone();
         self.with_connection(move |connection, timeout| {
+            // Check while holding the provider's dispatch lock. Busy calls are
+            // rejected, never queued with a potentially stale Project observation.
+            if (tool.project_bound || project_target.is_some())
+                && !self.matches_project_target(project_target, project_registry_dir)
+            {
+                return Err(ProviderFailure {
+                    dispatch_state: PluginDispatchState::NotStarted,
+                    code: "plugin_project_mismatch",
+                    fatal: false,
+                });
+            }
             let result = connection.tools_call(name, arguments, timeout)?;
             if let Some(output_schema) = output_schema.as_ref() {
                 let structured = result.structured_content.as_ref().ok_or_else(|| {
@@ -897,6 +1092,41 @@ impl ProviderEntry {
             }
             Ok(result)
         })
+    }
+
+    fn matches_project_target(
+        &self,
+        target: Option<&webcodex_core::plugin::PluginProjectTarget>,
+        registry: Option<&Path>,
+    ) -> bool {
+        let (Some(target), Some(registry), Some(launch_root), Some(launch_root_handle)) = (
+            target,
+            registry,
+            self.launch_root.as_deref(),
+            self.launch_root_handle.as_ref(),
+        ) else {
+            return false;
+        };
+        let Some(project) =
+            super::projects::find_project_shell_context_by_id(registry, &target.project_id)
+        else {
+            return false;
+        };
+        if !project.allow_patch {
+            return false;
+        }
+        let Ok(root) = Path::new(&project.path).canonicalize() else {
+            return false;
+        };
+        if !root.is_dir() {
+            return false;
+        }
+        let Ok(root_handle) = same_file::Handle::from_path(&root) else {
+            return false;
+        };
+        webcodex_runner_config::paths::paths_equal(&root, launch_root)
+            && root_handle == *launch_root_handle
+            && super::projects::project_root_fingerprint(&root) == target.root_fingerprint
     }
 
     fn shutdown(&self) {
@@ -1012,8 +1242,17 @@ fn prepare_provider(
     Option<ProviderPreparationFailure>,
 ) {
     let process = Arc::new(ProviderProcess::new());
+    let launch_root = config
+        .cwd
+        .as_deref()
+        .and_then(|cwd| Path::new(cwd).canonicalize().ok());
+    let launch_root_handle = launch_root
+        .as_deref()
+        .and_then(|root| same_file::Handle::from_path(root).ok());
     let entry = Arc::new(ProviderEntry {
         config: config.clone(),
+        launch_root: launch_root.clone(),
+        launch_root_handle,
         instance_id: uuid::Uuid::new_v4().simple().to_string(),
         timeout: config
             .timeout_secs
@@ -1025,10 +1264,8 @@ fn prepare_provider(
         catalog: OnceLock::new(),
         session: Mutex::new(None),
     });
-    let cwd = config
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
+    let cwd = launch_root
+        .or_else(|| config.cwd.as_deref().map(PathBuf::from))
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     let environment = match PreparedExecutionEnvironment::prepare(

@@ -23,21 +23,21 @@ const RUST_ANALYZER_SERVER: &str = "rust-analyzer";
 const GO_LANGUAGE: &str = "go";
 const GOPLS_SERVER: &str = "gopls";
 const SEMANTIC_NAVIGATION_TOOLS: [&str; 7] = [
-    "lsp_status",
-    "document_symbols",
-    "goto_definition",
+    "get_lsp_status",
+    "list_document_symbols",
+    "find_definition",
     "find_references",
-    "document_diagnostics",
-    "hover",
-    "workspace_symbols",
+    "read_document_diagnostics",
+    "read_symbol_hover",
+    "list_workspace_symbols",
 ];
 const SEMANTIC_NAVIGATION_PREFERRED_FLOW: [&str; 6] = [
-    "document_symbols",
-    "goto_definition",
+    "list_document_symbols",
+    "find_definition",
     "find_references",
-    "hover",
-    "read_file",
-    "search_project_text",
+    "read_symbol_hover",
+    "read_files",
+    "search_project_texts",
 ];
 const RUST_SEMANTIC_NAVIGATION_LIMITATIONS: [&str; 5] = [
     "rust_only",
@@ -68,6 +68,7 @@ pub(crate) enum SemanticNavigationStartupStatus {
     // Stable serialized compatibility status retained for pre-0.4 consumers.
     #[serde(rename = "agent_capability_unavailable")]
     RunnerCapabilityUnavailable,
+    NotObserved,
     ProbeTimeout,
     ProbeFailed,
 }
@@ -132,7 +133,13 @@ impl SemanticNavigationStartupSummary {
     ) -> Self {
         Self {
             supported: true,
-            available: Some(false),
+            // A failed status probe has no executable/slot availability fact.
+            // Preserve diagnostic status/reason without inventing unavailability.
+            available: match status {
+                SemanticNavigationStartupStatus::ProbeFailed
+                | SemanticNavigationStartupStatus::ProbeTimeout => None,
+                _ => Some(false),
+            },
             recommended: false,
             status,
             language: None,
@@ -319,6 +326,7 @@ impl ToolRuntime {
     pub(crate) async fn probe_semantic_navigation_for_startup(
         &self,
         resolved: &ResolvedProject,
+        startup_completed: tokio::sync::oneshot::Receiver<()>,
     ) -> SemanticNavigationStartupSummary {
         let client_id = resolved.config.client_id.clone();
         let Some(client) = self
@@ -372,7 +380,18 @@ impl ToolRuntime {
             Ok(Ok(request)) => request,
         };
 
-        let response = match tokio::time::timeout_at(deadline, receiver).await {
+        let response = tokio::select! {
+            biased;
+            response = tokio::time::timeout_at(deadline, receiver) => response,
+            _ = startup_completed => {
+                self.runner_registry.cancel_request(&request_id).await;
+                let mut summary = SemanticNavigationStartupSummary::probe_timeout();
+                summary.status = SemanticNavigationStartupStatus::NotObserved;
+                summary.reason_code = None;
+                return summary;
+            }
+        };
+        let response = match response {
             Err(_) => {
                 self.runner_registry.cancel_request(&request_id).await;
                 return SemanticNavigationStartupSummary::probe_timeout();

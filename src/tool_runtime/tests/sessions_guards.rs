@@ -38,13 +38,17 @@ async fn unknown_session_id_fails_before_execution_or_mutation() {
     let runtime = runtime_with_project(root, "demo");
 
     let read = runtime
-        .dispatch(ToolCall::ReadFile {
+        .dispatch(ToolCall::ReadFiles {
             project: "demo".to_string(),
-            path: "README.md".to_string(),
+            items: vec![crate::tool_runtime::ReadFilesItem {
+                path: "README.md".to_string(),
+                start_line: None,
+                limit: None,
+                expected_read_revision: None,
+            }],
             session_id: Some("wc_sess_missing".to_string()),
-            start_line: None,
-            limit: None,
             with_line_numbers: None,
+            max_result_bytes: None,
         })
         .await;
     assert!(!read.success);
@@ -64,7 +68,7 @@ async fn unknown_session_id_fails_before_execution_or_mutation() {
             content: "nope".to_string(),
             session_id: Some("wc_sess_missing".to_string()),
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         })
         .await;
     assert!(!write.success);
@@ -94,13 +98,17 @@ async fn same_project_session_records_without_project_mismatch_warning() {
         async move {
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project: alpha,
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                            expected_read_revision: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&auth),
                 )
@@ -125,7 +133,7 @@ async fn same_project_session_records_without_project_mismatch_warning() {
         .sessions
         .summary(&session.session_id, Some(20))
         .unwrap();
-    let event = latest_finished_event(&summary, "read_file");
+    let event = latest_finished_event(&summary, "read_files");
     assert!(event.warning_kind.is_none());
 }
 
@@ -143,13 +151,17 @@ async fn read_only_cross_project_session_is_blocked_before_execution() {
 
     let result = runtime
         .dispatch_with_auth(
-            ToolCall::ReadFile {
+            ToolCall::ReadFiles {
                 project: bravo.clone(),
-                path: "README.md".to_string(),
+                items: vec![crate::tool_runtime::ReadFilesItem {
+                    path: "README.md".to_string(),
+                    start_line: None,
+                    limit: None,
+                    expected_read_revision: None,
+                }],
                 session_id: Some(session.session_id.clone()),
-                start_line: None,
-                limit: None,
                 with_line_numbers: None,
+                max_result_bytes: None,
             },
             Some(&auth),
         )
@@ -189,7 +201,7 @@ async fn mutation_cross_project_session_fails_before_write() {
                 content: "nope\n".to_string(),
                 session_id: Some(session.session_id.clone()),
                 overwrite: None,
-                expected_sha256: None,
+                expected_read_revision: None,
             },
             Some(&auth),
         )
@@ -306,14 +318,30 @@ async fn read_only_recording_session_does_not_guard_same_project_write() {
 #[tokio::test]
 async fn closed_recording_session_remains_provenance_only_for_business_write() {
     let tmp = tempfile::tempdir().unwrap();
-    let runtime = test_runtime();
+    let runtime = test_runtime().with_project_reference_database(std::sync::Arc::new(
+        crate::Database::open(&tmp.path().join("closed-recorder-refs.db")).unwrap(),
+    ));
     let project =
         register_runner_project_at_path(&runtime, "guard-closed-recorder", "demo", tmp.path())
             .await;
     let auth = auth_context(None, true);
+    let authority = crate::tool_runtime::workflow_session_authority_fingerprint(Some(&auth))
+        .expect("closed recorder auth should have stable authority");
     let recorder = runtime
         .sessions
-        .start_session(Some(project.clone()), Some("closed recorder".to_string()));
+        .start_session_with_options(
+            crate::tool_runtime::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("closed recorder".to_string()),
+                crate::tool_runtime::SessionMode::Normal,
+                crate::tool_runtime::SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(authority)),
+        )
+        .unwrap();
+    let recorder_ref = runtime
+        .session_reference_for_id(&recorder.session_id, Some(&auth))
+        .expect("closed recorder test should issue a Session ref before close");
     runtime
         .sessions
         .close_session(&recorder.session_id)
@@ -322,7 +350,7 @@ async fn closed_recording_session_remains_provenance_only_for_business_write() {
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
-        let recorder_id = recorder.session_id.clone();
+        let recorder_id = recorder_ref;
         let auth = auth.clone();
         async move {
             runtime
@@ -468,7 +496,7 @@ async fn start_session_mode_effective_guards_matrix() {
 }
 
 #[tokio::test]
-async fn read_only_session_allows_read_file_and_records_success() {
+async fn read_only_session_allows_read_files_and_records_success() {
     let runtime = runtime_with_agent_project("guard-read");
     register_agent(
         &runtime,
@@ -496,13 +524,17 @@ async fn read_only_session_allows_read_file_and_records_success() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project,
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                            expected_read_revision: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
@@ -534,10 +566,10 @@ async fn read_only_session_allows_read_file_and_records_success() {
     assert_eq!(summary.counts.succeeded, 1);
     assert_eq!(summary.counts.read_like, 1);
     assert_eq!(
-        finished_event(&summary, "read_file").status.as_deref(),
+        finished_event(&summary, "read_files").status.as_deref(),
         Some("succeeded")
     );
-    assert!(finished_event(&summary, "read_file").permission.is_none());
+    assert!(finished_event(&summary, "read_files").permission.is_none());
 
     let handoff = runtime
         .dispatch(ToolCall::SessionHandoffSummary {
@@ -546,7 +578,7 @@ async fn read_only_session_allows_read_file_and_records_success() {
             include_workspace: Some(false),
             include_checkpoints: Some(false),
             include_validation: Some(false),
-            summary_only: false,
+            diagnostic: true,
             limit: None,
         })
         .await;
@@ -585,7 +617,7 @@ async fn read_only_session_rejects_write_project_file_before_mutation() {
             content: "nope".to_string(),
             session_id: Some(session.session_id.clone()),
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         })
         .await;
 
@@ -719,10 +751,10 @@ async fn read_only_session_rejects_all_artifact_upload_tools_without_base64_leak
     assert_eq!(summary.counts.failed, 4);
     assert_eq!(summary.counts.write_like, 4);
     for tool_name in [
-        "artifact_upload_begin",
-        "artifact_upload_chunk",
-        "artifact_upload_finish",
-        "artifact_upload_abort",
+        "begin_artifact_upload",
+        "upload_artifact_chunk",
+        "finish_artifact_upload",
+        "abort_artifact_upload",
     ] {
         let event = finished_event(&summary, tool_name);
         assert_eq!(event.status.as_deref(), Some("failed"), "{tool_name}");
@@ -738,9 +770,9 @@ async fn read_only_session_rejects_all_artifact_upload_tools_without_base64_leak
         .iter()
         .rev()
         .find(|event| {
-            event.kind == "tool_call_started" && event.tool_name == "artifact_upload_chunk"
+            event.kind == "tool_call_started" && event.tool_name == "upload_artifact_chunk"
         })
-        .expect("started event for artifact_upload_chunk");
+        .expect("started event for upload_artifact_chunk");
     let input_summary = started.input_summary.as_ref().unwrap();
     assert_eq!(input_summary["path"], "artifacts/imports/blocked.txt");
     assert_eq!(input_summary["upload_id"], "wc_upload_test_1");
@@ -780,10 +812,12 @@ async fn read_only_session_rejects_run_shell_before_agent_enqueue() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project,
                 command: "echo should-not-run".to_string(),
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -851,7 +885,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
                 content: "x".to_string(),
                 session_id: Some(session.session_id.clone()),
                 overwrite: None,
-                expected_sha256: None,
+                expected_read_revision: None,
             },
             Some(&bootstrap),
         )
@@ -867,13 +901,17 @@ async fn deny_write_only_allows_read_and_shell_tools() {
             let bootstrap = auth_context(None, true);
             runtime
                 .dispatch_with_auth(
-                    ToolCall::ReadFile {
+                    ToolCall::ReadFiles {
                         project,
-                        path: "README.md".to_string(),
+                        items: vec![crate::tool_runtime::ReadFilesItem {
+                            path: "README.md".to_string(),
+                            start_line: None,
+                            limit: None,
+                            expected_read_revision: None,
+                        }],
                         session_id: Some(session_id),
-                        start_line: None,
-                        limit: None,
                         with_line_numbers: None,
+                        max_result_bytes: None,
                     },
                     Some(&bootstrap),
                 )
@@ -901,10 +939,12 @@ async fn deny_write_only_allows_read_and_shell_tools() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "exit 0".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -948,10 +988,12 @@ async fn deny_shell_only_allows_write_tools() {
     let denied = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project: project.clone(),
                 command: "echo blocked".to_string(),
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -976,7 +1018,7 @@ async fn deny_shell_only_allows_write_tools() {
                         content: "x".to_string(),
                         session_id: Some(session_id),
                         overwrite: None,
-                        expected_sha256: None,
+                        expected_read_revision: None,
                     },
                     Some(&bootstrap),
                 )
@@ -1019,7 +1061,7 @@ fn project_tool_schemas_include_optional_session_id() {
     assert!(start_session_output["properties"]["output"]["properties"]
         .get("lifecycle")
         .is_some());
-    let session_summary = spec_named(&specs, "session_summary");
+    let session_summary = spec_named(&specs, "read_session_summary");
     assert!(
         session_summary.output_schema["properties"]["output"]["properties"]
             .get("mode")
@@ -1041,12 +1083,12 @@ fn project_tool_schemas_include_optional_session_id() {
             .is_some()
     );
     for name in [
-        "read_file",
+        "read_files",
         "run_shell",
-        "write_project_file",
-        "git_status",
-        "git_log",
-        "show_changes",
+        "edit_project_files",
+        "get_git_status",
+        "read_git_log",
+        "read_workspace_changes",
     ] {
         let spec = spec_named(&specs, name);
         assert!(
@@ -1068,23 +1110,27 @@ fn project_tool_schemas_include_optional_session_id() {
             "{name} schema must not require session_id"
         );
     }
-    for name in ["read_file", "run_shell", "write_project_file"] {
-        let spec = spec_named(&specs, name);
-        assert!(spec.output_schema["properties"]["output"]["properties"]
-            .get("session_recorded")
-            .is_none());
-        assert!(spec.output_schema["properties"]["output"]["properties"]
-            .get("session_event_id")
-            .is_none());
-        assert!(spec.output_schema["properties"]["output"]["properties"]
-            .get("session_id")
-            .is_none());
-        let session_hint =
-            &spec.output_schema["properties"]["output"]["properties"]["session_hint"];
+    let specialist_specs = crate::tool_runtime::registry::exact_manifest_specialist_tool_specs();
+    for name in ["apply_patch", "apply_unified_diff", "write_project_file"] {
+        let spec = spec_named(&specialist_specs, name);
+        assert!(
+            spec.input_schema["properties"].get("session_id").is_some(),
+            "{name} exact specialist schema missing session_id"
+        );
+        assert!(
+            !spec.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "session_id"),
+            "{name} exact specialist schema must not require session_id"
+        );
+    }
+    let assert_session_hint_contract = |session_hint: &serde_json::Value| {
         assert_eq!(session_hint["type"], "object");
         assert_eq!(
             session_hint["properties"]["suggested_next_tool"]["enum"],
-            json!(["session_discussion_summary"])
+            json!(["read_session_discussion_summary"])
         );
         assert_eq!(
             session_hint["properties"]["attention_required"]["const"],
@@ -1092,11 +1138,11 @@ fn project_tool_schemas_include_optional_session_id() {
         );
         assert_eq!(
             session_hint["properties"]["attention_reason"]["enum"],
-            json!(["high_priority_guidance_requires_ack"])
+            json!(["session_message_requires_ack"])
         );
         assert_eq!(
             session_hint["properties"]["attention_instruction"]["enum"],
-            json!(["High-priority Session guidance is pending. Read session_discussion_summary before continuing."])
+            json!(["A Session message requiring acknowledgement is pending. Read read_session_discussion_summary before continuing."])
         );
         for optional in [
             "attention_required",
@@ -1109,5 +1155,33 @@ fn project_tool_schemas_include_optional_session_id() {
                 .iter()
                 .any(|field| field == optional));
         }
+    };
+
+    let read_files = spec_named(&specs, "read_files");
+    let read_files_outputs = read_files.output_schema["properties"]["output"]["anyOf"][0]["anyOf"]
+        .as_array()
+        .expect("read_files success output variants");
+    for output in read_files_outputs {
+        let properties = output["properties"]
+            .as_object()
+            .expect("read_files output properties");
+        for recorder_only in ["session_recorded", "session_event_id", "session_id"] {
+            assert!(properties.get(recorder_only).is_none());
+        }
+        assert_session_hint_contract(&output["properties"]["session_hint"]);
     }
+
+    let run_shell = spec_named(&specs, "run_shell");
+    let properties = &run_shell.output_schema["properties"]["output"]["properties"];
+    assert!(properties.get("session_recorded").is_none());
+    assert!(properties.get("session_event_id").is_none());
+    assert!(properties.get("session_id").is_none());
+    assert_session_hint_contract(&properties["session_hint"]);
+
+    let write_project_file = spec_named(&specialist_specs, "write_project_file");
+    let properties = &write_project_file.output_schema["properties"]["output"]["properties"];
+    assert!(properties.get("session_recorded").is_none());
+    assert!(properties.get("session_event_id").is_none());
+    assert!(properties.get("session_id").is_none());
+    assert_session_hint_contract(&properties["session_hint"]);
 }

@@ -29,35 +29,6 @@ fn with_wire_feature(
 }
 
 #[test]
-fn canonical_runner_feature_inventory_matches_wire_names_exactly() {
-    let wire_names = RUNNER_CAPABILITY_NAMES
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let canonical_names = RunnerFeature::all()
-        .iter()
-        .map(|feature| feature.as_wire_name())
-        .collect::<BTreeSet<_>>();
-
-    assert_eq!(wire_names.len(), RUNNER_CAPABILITY_NAMES.len());
-    assert_eq!(canonical_names.len(), RunnerFeature::all().len());
-    assert_eq!(canonical_names, wire_names);
-}
-
-#[test]
-fn canonical_runner_feature_wire_names_round_trip() {
-    for feature in RunnerFeature::all() {
-        assert_eq!(
-            RunnerFeature::from_wire_name(feature.as_wire_name()),
-            Some(*feature),
-            "{}",
-            feature.as_wire_name()
-        );
-    }
-    assert_eq!(RunnerFeature::from_wire_name("future_runner_feature"), None);
-}
-
-#[test]
 fn canonical_runner_feature_set_tracks_each_individual_wire_bool() {
     let all_false = RunnerFeatureSet::from_wire_for_test(&wire_capabilities_with_only(None));
     for feature in RunnerFeature::all() {
@@ -85,29 +56,33 @@ fn capability_classification_keeps_environment_dependent_features_registration_r
         RunnerFeature::Shell,
         RunnerFeature::Git,
         RunnerFeature::StructuredCargoTestExecutionPolicy,
+        RunnerFeature::StructuredCargoTestLib,
+        RunnerFeature::ProjectGoSingleModule,
+        RunnerFeature::StructuredScriptJavascript,
+        RunnerFeature::StructuredScriptTypescript,
         RunnerFeature::ApplyTextEditLineScope,
+        RunnerFeature::ApplyTextEditRange,
+        RunnerFeature::ApplyTextEditExpectedMatchCount,
+        RunnerFeature::ApplyTextEditLocalGuardWithoutSha,
         RunnerFeature::ApplyPatchMatchMetadata,
         RunnerFeature::ApplyPatchMatchingMode,
-        RunnerFeature::ApplyPatchStrictMatching,
         RunnerFeature::SshShell,
         RunnerFeature::PersistentShell,
         RunnerFeature::SshPersistentShell,
         RunnerFeature::DetachedProcessJobs,
+        RunnerFeature::BrowserObserve,
+        RunnerFeature::BrowserControl,
+        RunnerFeature::BrowserLaunch,
         RunnerFeature::ComputerObserve,
         RunnerFeature::ComputerControl,
         RunnerFeature::ComputerTextInput,
         RunnerFeature::JobStateReconciliation,
         RunnerFeature::CodingAgentRuns,
-        RunnerFeature::SkillStoreRead,
-        RunnerFeature::SkillStoreManage,
+        RunnerFeature::SkillRuntime,
+        RunnerFeature::SkillManagement,
         RunnerFeature::ManagedSshResources,
     ] {
-        assert_eq!(
-            feature.inference(),
-            RunnerFeatureInference::RegistrationRequired,
-            "{}",
-            feature.as_wire_name()
-        );
+        assert!(!feature.is_v2_baseline(), "{}", feature.as_wire_name());
     }
 
     for feature in [
@@ -116,12 +91,7 @@ fn capability_classification_keeps_environment_dependent_features_registration_r
         RunnerFeature::LspReadOnlyNavigation,
         RunnerFeature::ProjectLifecycle,
     ] {
-        assert_eq!(
-            feature.inference(),
-            RunnerFeatureInference::GenerationEligible,
-            "{}",
-            feature.as_wire_name()
-        );
+        assert!(feature.is_v2_baseline(), "{}", feature.as_wire_name());
     }
 }
 
@@ -139,18 +109,6 @@ async fn patch_contract_capabilities_require_their_prerequisites() {
     assert_eq!(
         error,
         "apply_patch_match_metadata capability requires apply_patch capability"
-    );
-
-    let mut registration = runner_registration("strict-without-metadata", "inst-b", Vec::new());
-    registration.capabilities = with_wire_feature(
-        &with_wire_feature(&v2_baseline_capabilities(), RunnerFeature::ApplyPatch, true),
-        RunnerFeature::ApplyPatchStrictMatching,
-        true,
-    );
-    let error = registry.register(registration).await.unwrap_err();
-    assert_eq!(
-        error,
-        "apply_patch_strict_matching capability requires apply_patch_match_metadata capability"
     );
 
     let mut registration =
@@ -176,7 +134,7 @@ fn v2_baseline_exactly_matches_generation_eligible_classification() {
     let generation_eligible = RunnerFeature::all()
         .iter()
         .copied()
-        .filter(|feature| feature.inference() == RunnerFeatureInference::GenerationEligible)
+        .filter(|feature| feature.is_v2_baseline())
         .map(RunnerFeature::as_wire_name)
         .collect::<BTreeSet<_>>();
 
@@ -188,7 +146,7 @@ fn v2_baseline_exactly_matches_generation_eligible_classification() {
     assert_eq!(baseline, generation_eligible);
     assert!(!baseline.contains(RunnerFeature::StructuredCargoTestExecutionPolicy.as_wire_name()));
     for feature in RunnerFeature::all() {
-        if feature.inference() == RunnerFeatureInference::RegistrationRequired {
+        if !feature.is_v2_baseline() {
             assert!(
                 !baseline.contains(feature.as_wire_name()),
                 "{}",
@@ -212,18 +170,25 @@ fn v2_generation_baseline_requires_explicit_bool_projection_without_silent_or() 
     for feature in RunnerFeature::all()
         .iter()
         .copied()
-        .filter(|feature| feature.inference() == RunnerFeatureInference::GenerationEligible)
+        .filter(|feature| feature.is_v2_baseline())
     {
         assert!(accepted.supports(feature), "{}", feature.as_wire_name());
-        let contradictory = with_wire_feature(&baseline, feature, false);
-        let error = RunnerFeatureSet::try_from_registration(&contradictory).unwrap_err();
-        assert_eq!(
-            error,
-            format!(
-                "runner generation baseline capability mismatch: {}",
-                feature.as_wire_name()
-            )
-        );
+        let mut missing = serde_json::to_value(&baseline).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove(feature.as_wire_name());
+        let missing = serde_json::from_value(missing).unwrap();
+        for contradictory in [with_wire_feature(&baseline, feature, false), missing] {
+            let error = RunnerFeatureSet::try_from_registration(&contradictory).unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "runner generation baseline capability mismatch: {}",
+                    feature.as_wire_name()
+                )
+            );
+        }
     }
 }
 
@@ -235,7 +200,7 @@ fn v2_registration_required_features_are_never_inferred_from_generation() {
     for feature in RunnerFeature::all()
         .iter()
         .copied()
-        .filter(|feature| feature.inference() == RunnerFeatureInference::RegistrationRequired)
+        .filter(|feature| !feature.is_v2_baseline())
     {
         assert!(
             !baseline_only.supports(feature),
@@ -249,6 +214,9 @@ fn v2_registration_required_features_are_never_inferred_from_generation() {
 
     for feature in [
         RunnerFeature::SshShell,
+        RunnerFeature::BrowserObserve,
+        RunnerFeature::BrowserControl,
+        RunnerFeature::BrowserLaunch,
         RunnerFeature::ComputerObserve,
         RunnerFeature::ComputerControl,
         RunnerFeature::ComputerTextInput,
@@ -256,18 +224,19 @@ fn v2_registration_required_features_are_never_inferred_from_generation() {
         RunnerFeature::CodingAgentRuns,
         RunnerFeature::ManagedSshResources,
         RunnerFeature::StructuredCargoTestExecutionPolicy,
+        RunnerFeature::StructuredCargoTestLib,
+        RunnerFeature::StructuredScriptJavascript,
+        RunnerFeature::StructuredScriptTypescript,
     ] {
-        assert_eq!(
-            feature.inference(),
-            RunnerFeatureInference::RegistrationRequired
-        );
+        assert!(!feature.is_v2_baseline());
         assert!(!baseline_only.supports(feature));
     }
 }
 
 #[test]
 fn missing_additive_wire_fields_remain_false_in_canonical_semantics() {
-    let wire: RunnerCapabilities = serde_json::from_str(r#"{}"#).unwrap();
+    let wire: RunnerCapabilities =
+        serde_json::from_str(r#"{"future_runner_feature":true}"#).unwrap();
     let semantics = RunnerFeatureSet::from_wire_for_test(&wire);
 
     assert!(semantics.supports(RunnerFeature::Shell));
@@ -283,17 +252,24 @@ fn missing_additive_wire_fields_remain_false_in_canonical_semantics() {
 async fn current_protocol_generation_never_infers_registration_required_host_features() {
     let registry = RunnerRegistry::default();
     let mut registration = runner_registration("no-inference", "inst-a", Vec::new());
-    let capabilities = v2_baseline_capabilities();
-    registration.capabilities = capabilities;
+    let mut wire = serde_json::to_value(v2_baseline_capabilities()).unwrap();
+    wire["future_runner_feature"] = true.into();
+    registration.capabilities = serde_json::from_value(wire).unwrap();
     registry.register(registration).await.unwrap();
 
     for feature in [
         RunnerFeature::SshShell,
         RunnerFeature::ManagedWorktree,
+        RunnerFeature::BrowserObserve,
+        RunnerFeature::BrowserControl,
+        RunnerFeature::BrowserLaunch,
         RunnerFeature::ComputerObserve,
         RunnerFeature::ComputerControl,
         RunnerFeature::ComputerTextInput,
         RunnerFeature::CodingAgentRuns,
+        RunnerFeature::StructuredScriptJavascript,
+        RunnerFeature::StructuredScriptTypescript,
+        RunnerFeature::StructuredCargoTestLib,
     ] {
         assert!(
             !registry
@@ -482,6 +458,21 @@ async fn coding_agent_registration_consistency_uses_canonical_feature_semantics(
     );
 }
 
+#[tokio::test]
+async fn old_runner_empty_provider_inventory_does_not_grant_coding_agent_capability() {
+    for providers in [None, Some(Vec::new())] {
+        let registry = RunnerRegistry::default();
+        let mut registration = runner_registration("old-runner", "old-instance", Vec::new());
+        registration.capabilities = v2_baseline_capabilities();
+        registration.coding_agent_providers = providers;
+        let view = registry.register(registration).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&view.capabilities).unwrap(),
+            serde_json::to_value(v2_baseline_capabilities()).unwrap()
+        );
+    }
+}
+
 async fn register_sticky_feature_state(
     registry: &RunnerRegistry,
     client_id: &str,
@@ -551,6 +542,9 @@ async fn registration_required_sticky_features_reject_same_instance_downgrade() 
         RunnerFeature::JobStateReconciliation,
         RunnerFeature::CodingAgentRuns,
         RunnerFeature::StructuredCargoTestExecutionPolicy,
+        RunnerFeature::StructuredCargoTestLib,
+        RunnerFeature::StructuredScriptJavascript,
+        RunnerFeature::StructuredScriptTypescript,
     ] {
         let registry = RunnerRegistry::default();
         let client_id = format!("sticky-{}", feature.as_wire_name());
@@ -622,4 +616,47 @@ async fn canonical_sticky_feature_fence_preserves_allowed_reconnect_transitions(
     let view = replacement.get_runner_view("replacement").await.unwrap();
     assert_eq!(view.runner_instance_id, "inst-b");
     assert!(!view.capabilities.job_state_reconciliation);
+}
+
+#[tokio::test]
+async fn build_identity_never_substitutes_for_wire_or_optional_operation_capabilities() {
+    let registry = RunnerRegistry::default();
+    let mut advertised = v2_baseline_capabilities();
+    advertised = with_wire_feature(&advertised, RunnerFeature::Shell, true);
+    advertised = with_wire_feature(&advertised, RunnerFeature::FileRead, true);
+    advertised = with_wire_feature(&advertised, RunnerFeature::Git, true);
+    advertised = with_wire_feature(&advertised, RunnerFeature::ManagedSshResources, false);
+
+    let mut registration = runner_registration("mixed-build", "inst-a", Vec::new());
+    registration.capabilities = advertised;
+    registration.build = Some(RunnerBuildInfo {
+        version: Some("0.99.0".into()),
+        git_commit: Some("abcdef012345".into()),
+        git_dirty: Some(true),
+        built_at: Some("100".into()),
+        target: Some("aarch64-apple-darwin".into()),
+        architecture: Some("aarch64".into()),
+    });
+    registry
+        .register(current_runner_registration(registration))
+        .await
+        .unwrap();
+
+    let view = registry.get_runner_view("mixed-build").await.unwrap();
+    let build = view.build.as_ref().expect("registered build identity");
+    assert_eq!(build.version.as_deref(), Some("0.99.0"));
+    assert_eq!(build.git_commit.as_deref(), Some("abcdef012345"));
+    assert_eq!(build.git_dirty, Some(true));
+    assert_eq!(
+        webcodex_core::desktop_runtime_contract::runner_protocol_compatibility(
+            view.runner_protocol_generation.get()
+        ),
+        webcodex_core::desktop_runtime_contract::ProtocolCompatibility::Compatible
+    );
+
+    let features = RunnerFeatureSet::from_wire_for_test(&view.capabilities);
+    assert!(!features.supports(RunnerFeature::ManagedSshResources));
+    assert!(features.supports(RunnerFeature::Shell));
+    assert!(features.supports(RunnerFeature::FileRead));
+    assert!(features.supports(RunnerFeature::Git));
 }

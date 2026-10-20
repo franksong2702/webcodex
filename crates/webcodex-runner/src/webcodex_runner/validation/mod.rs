@@ -8,8 +8,11 @@
 
 mod execute;
 mod path;
+pub(crate) mod project;
 mod pyright;
 mod registry;
+
+pub(crate) use path::resolve_under_project;
 
 #[cfg(test)]
 pub(crate) use registry::{adapter_metadata, registered_adapter_ids};
@@ -18,13 +21,13 @@ use super::config::RunnerPolicy;
 use super::output::CommandResult;
 use super::projects::load_runner_project_summaries_from_dir;
 use super::shell::cwd_allowed;
-use crate::validation_bridge::{
-    failure_kinds, validate_bridge_request, ValidationBridgeRequest, ValidationBridgeResponse,
-    ValidationBridgeResultEnvelope, VALIDATION_BRIDGE_PROTOCOL_VERSION,
-};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
+use webcodex_core::validation_bridge::{
+    failure_kinds, validate_bridge_request, ValidationBridgeRequest, ValidationBridgeResponse,
+    ValidationBridgeResultEnvelope, VALIDATION_BRIDGE_PROTOCOL_VERSION,
+};
 
 pub(crate) fn handle_validation_request(
     policy: &RunnerPolicy,
@@ -117,6 +120,21 @@ pub(crate) fn execute_validation_at_root(
     request: &ValidationBridgeRequest,
     max_timeout_secs: u64,
 ) -> Result<ValidationBridgeResponse, ValidationBridgeResultEnvelope> {
+    execute_validation_at_root_with_program(
+        project_root,
+        request,
+        max_timeout_secs,
+        execute::resolve_executable("WEBCODEX_PYRIGHT", "pyright"),
+    )
+}
+
+#[cfg(test)]
+fn execute_validation_at_root_with_program(
+    project_root: &Path,
+    request: &ValidationBridgeRequest,
+    max_timeout_secs: u64,
+    program: Option<PathBuf>,
+) -> Result<ValidationBridgeResponse, ValidationBridgeResultEnvelope> {
     if let Err(message) = validate_bridge_request(request) {
         return Err(ValidationBridgeResultEnvelope::err(
             failure_kinds::INVALID_ARGUMENTS,
@@ -136,11 +154,12 @@ pub(crate) fn execute_validation_at_root(
         ));
     }
     match meta.adapter_id {
-        "pyright" => Ok(pyright::run_pyright(
+        "pyright" => Ok(pyright::run_pyright_with_program(
             project_root,
             request,
             max_timeout_secs,
             None,
+            program,
         )),
         other => Err(ValidationBridgeResultEnvelope::err(
             failure_kinds::ADAPTER_NOT_FOUND,
@@ -209,3 +228,6 @@ pub(crate) fn base_response(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod project_tests;

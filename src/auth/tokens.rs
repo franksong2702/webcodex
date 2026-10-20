@@ -189,6 +189,17 @@ impl TokenVerifier for OAuth2Verifier {
         db: Option<&Arc<Database>>,
         token: &str,
     ) -> Result<Option<AuthContext>, String> {
+        Self::verify_for_ingress(config, db, token, None).await
+    }
+}
+
+impl OAuth2Verifier {
+    pub(crate) async fn verify_for_ingress(
+        config: &Config,
+        db: Option<&Arc<Database>>,
+        token: &str,
+        ingress: Option<&webcodex_store::PublicIngressFence>,
+    ) -> Result<Option<AuthContext>, String> {
         // Only handle wc_oat_* tokens. Non-matching tokens are not recognized by
         // this verifier — let PatVerifier try.
         if !token.starts_with(OAUTH2_ACCESS_TOKEN_PREFIX) {
@@ -207,6 +218,13 @@ impl TokenVerifier for OAuth2Verifier {
 
         let token_hash = hash_token(token);
         let now = chrono::Utc::now().timestamp();
+
+        if !db
+            .oauth_access_token_matches_public_ingress(&token_hash, ingress)
+            .map_err(|_| "OAuth2 ingress verification unavailable".to_string())?
+        {
+            return Err("OAuth2 token is not valid for this ingress".to_string());
+        }
 
         // Look up the access token (revoked_at IS NULL is enforced by the
         // query).
@@ -237,6 +255,26 @@ impl TokenVerifier for OAuth2Verifier {
             }
         };
 
+        if at_record
+            .scopes_vec()
+            .iter()
+            .any(|scope| scope == super::SCOPE_ADMIN)
+        {
+            return Err("admin is not a public OAuth2 scope".to_string());
+        }
+
+        // Durable admin authority is valid only for a managed grant to its own client.
+        // Never infer it from user role or another credential currently held by the user.
+        if at_record.admin_authority
+            && (at_record.subject_kind != "managed_user"
+                || at_record.shared_key_hash.is_some()
+                || !client.is_managed_user_owned()
+                || client.owner_user_id != at_record.user_id
+                || at_record.user_id.as_deref() != Some(at_record.subject_id.as_str()))
+        {
+            return Err("invalid OAuth2 admin authority subject/owner".to_string());
+        }
+
         let ctx = match at_record.subject_kind.as_str() {
             "managed_user" => {
                 let user_id = at_record
@@ -260,6 +298,13 @@ impl TokenVerifier for OAuth2Verifier {
                     return Err("user is disabled".to_string());
                 }
 
+                if !client.is_managed_user_owned() {
+                    return Err("invalid managed-user OAuth2 client/subject".to_string());
+                }
+                let mut effective_scopes = at_record.scopes_vec();
+                if at_record.admin_authority {
+                    effective_scopes.push(super::SCOPE_ADMIN.to_string());
+                }
                 AuthContext {
                     user_id: Some(user.id.clone()),
                     username: Some(user.username.clone()),
@@ -267,7 +312,7 @@ impl TokenVerifier for OAuth2Verifier {
                     // access token ID as the credential identifier.
                     api_key_id: Some(at_record.id.clone()),
                     role: Some(user.role.clone()),
-                    scopes: at_record.scopes_vec(),
+                    scopes: effective_scopes,
                     token_kind: Some("oauth2".to_string()),
                     allowed_client_id: Some(at_record.client_id.clone()),
                     ..AuthContext::new(AuthKind::OAuth2Token)

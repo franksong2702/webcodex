@@ -16,6 +16,35 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Carry only authorization request fields. Decisions, credential inputs and
+/// optional permission checkboxes belong exclusively to the consent form.
+fn authorize_hidden_fields(original_query: &str) -> String {
+    url::form_urlencoded::parse(original_query.as_bytes())
+        .filter(|(key, _)| {
+            matches!(
+                key.as_ref(),
+                "response_type"
+                    | "client_id"
+                    | "redirect_uri"
+                    | "scope"
+                    | "state"
+                    | "code_challenge"
+                    | "code_challenge_method"
+                    | "resource"
+                    | "bridge"
+            )
+        })
+        .map(|(key, value)| {
+            format!(
+                r#"  <input type="hidden" name="{}" value="{}">"#,
+                html_escape(key.as_ref()),
+                html_escape(value.as_ref()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Render the minimal authorize login page. `return_to` is the original
 /// `/oauth/authorize?...` path+query the user navigated to. It is rendered
 /// into a hidden field and revalidated on POST.
@@ -68,18 +97,7 @@ pub(super) fn authorize_consent_html(
     let resource_html = resource
         .map(|r| format!("<p>Resource: <code>{}</code></p>", html_escape(r)))
         .unwrap_or_default();
-    // Re-render the original authorize query as hidden form fields so the
-    // consent POST can revalidate every parameter from scratch.
-    let hidden_fields: String = url::form_urlencoded::parse(original_query.as_bytes())
-        .map(|(k, v)| {
-            format!(
-                r#"  <input type="hidden" name="{}" value="{}">"#,
-                html_escape(k.as_ref()),
-                html_escape(v.as_ref())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let hidden_fields = authorize_hidden_fields(original_query);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -133,16 +151,7 @@ pub(super) fn authorize_project_share_html(
     let error_html = error
         .map(|message| format!(r#"<p class="error">{}</p>"#, html_escape(message)))
         .unwrap_or_default();
-    let hidden_fields = url::form_urlencoded::parse(original_query.as_bytes())
-        .map(|(key, value)| {
-            format!(
-                r#"  <input type="hidden" name="{}" value="{}">"#,
-                html_escape(key.as_ref()),
-                html_escape(value.as_ref())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let hidden_fields = authorize_hidden_fields(original_query);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -227,16 +236,7 @@ pub(super) fn authorize_bridge_html(
         Some(message) => format!(r#"<p class="error">{}</p>"#, html_escape(message)),
         None => String::new(),
     };
-    let hidden_fields: String = url::form_urlencoded::parse(original_query.as_bytes())
-        .map(|(key, value)| {
-            format!(
-                r#"  <input type="hidden" name="{}" value="{}">"#,
-                html_escape(key.as_ref()),
-                html_escape(value.as_ref())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let hidden_fields = authorize_hidden_fields(original_query);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">

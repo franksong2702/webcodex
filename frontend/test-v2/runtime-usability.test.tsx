@@ -1,0 +1,108 @@
+import { act, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { CopyIdentity } from "../src/runtime-v2/components/ui/CopyIdentity.js";
+import { WindowActivityFeed } from "../src/runtime-v2/components/WindowActivityFeed.js";
+import { RuntimeView } from "../src/runtime-v2/views/RuntimeView.js";
+import { useRuntimeOverview } from "../src/runtime-v2/state/useRuntimeOverview.js";
+import type { RuntimeV2Client } from "../src/runtime-v2/api/client.js";
+import { runtimeOverview, windowDetail } from "./fixtures.js";
+
+describe("Runtime usability", () => {
+  it("defaults to newest first without reversing Session continuation membership", () => {
+    const base = { ended_at_ms: 10, duration_ms: 1, method: "tools/call", status: "ok", meaningful: true };
+    const detail = windowDetail({ activity: [
+      { ...base, started_at_ms: 1, server_trace_id: "a", tool_name: "session-a", workflow_sessions: [{ workflow_session_id: "session-a", relation: "recording" }] },
+      { ...base, started_at_ms: 2, server_trace_id: "b", tool_name: "continuation-a", workflow_sessions: [] },
+      { ...base, started_at_ms: 3, server_trace_id: "c", tool_name: "session-b", workflow_sessions: [{ workflow_session_id: "session-b", relation: "recording" }] },
+      { ...base, started_at_ms: 4, server_trace_id: "d", tool_name: "continuation-b", workflow_sessions: [] },
+    ], active_requests: [] });
+    const original = JSON.stringify(detail);
+    render(<WindowActivityFeed detail={detail} projects={[]} language="en" selectedSessionId="session-a" />);
+    const tools = () => screen.getAllByTestId("window-workflow-step").map(row => row.querySelector("header strong")?.textContent);
+    expect(tools()).toEqual(["continuation-a", "session-a"]);
+    fireEvent.click(screen.getByRole("radio", { name: "Oldest first" }));
+    expect(tools()).toEqual(["session-a", "continuation-a"]);
+    expect(JSON.stringify(detail)).toBe(original);
+  });
+
+  it("copies the full identity and explains clipboard failures", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const value = "window-" + "abcdef".repeat(10);
+    render(<CopyIdentity value={value} label="Window" language="en" />);
+    expect(screen.getByText(value)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Copy Window" }));
+    await screen.findByText("Copied");
+    expect(writeText).toHaveBeenCalledWith(value);
+    writeText.mockRejectedValue(new Error("blocked"));
+    fireEvent.click(screen.getByRole("button", { name: "Copy Window" }));
+    await screen.findByText("Copy unavailable; select the text to copy.");
+    delete (navigator as { clipboard?: unknown }).clipboard;
+  });
+
+  it("keeps linked Sessions selectable without retained call evidence", () => {
+    const detail = windowDetail({ client_window_key: "window-a" });
+    detail.activity = [];
+    detail.active_requests = [];
+    detail.linked_sessions = [{ workflow_session_id: "session-without-calls", project: "agent:runner:project", title: "Retained work", relations: ["active"], relation_count: 1, first_linked_at_ms: 1, last_linked_at_ms: 2 }];
+    const openRecord = vi.fn();
+    render(<WindowActivityFeed detail={detail} projects={[]} language="en" selectedSessionId="session-without-calls" onOpenSessionRecord={openRecord} />);
+    fireEvent.click(screen.getByRole("button", { name: "View Session record" }));
+    expect(openRecord).toHaveBeenCalledWith("agent:runner:project", "session-without-calls");
+    expect(screen.getByRole("option", { name: /Retained work/ })).toBeTruthy();
+    expect(screen.getByText("This Session is linked to the Window but has no retained calls.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy Session" })).toBeTruthy();
+  });
+
+  it("refreshes on focus without cancelling a slow overview request", async () => {
+    let resolve!: (value: unknown) => void;
+    const post = vi.fn().mockImplementationOnce(() => new Promise(done => { resolve = done; }))
+      .mockResolvedValue({ ok: true, status: 200, data: runtimeOverview() });
+    const client = { post } as unknown as RuntimeV2Client;
+    const unauthorized = vi.fn();
+    const hook = renderHook(() => useRuntimeOverview(client, true, unauthorized));
+    act(() => { window.dispatchEvent(new Event("focus")); hook.result.current.refresh(); });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0][2].aborted).toBe(false);
+    await act(async () => resolve({ ok: true, status: 200, data: runtimeOverview() }));
+    expect(hook.result.current.updatedAt).toBeGreaterThan(0);
+    act(() => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(hook.result.current.refreshing).toBe(false));
+  });
+
+  it("shows effective configuration with readable labels and units", () => {
+    const overview = runtimeOverview();
+    overview.effective_config = { auth: { shared_key_enabled: true, anonymous_enabled: false }, mcp_host: { profile: "default", host_budget_secs: 60, initial_job_handoff_secs: 2, max_sync_wait_secs: 10, continuation_wait_secs: 5 }, tool_request_trace_mode: "off" };
+    render(<RuntimeView client={{} as RuntimeV2Client} language="en" overview={overview} overviewAvailability="available" onOpenWork={vi.fn()} onUnauthorized={vi.fn()} />);
+    expect(screen.getByText("Server configuration")).toBeTruthy();
+    expect(screen.getByText("Shared key authentication")).toBeTruthy();
+    expect(screen.getByText("60 seconds")).toBeTruthy();
+    expect(screen.getByText("Legacy handoff hint (unused)")).toBeTruthy();
+    expect(screen.queryByText("Initial job handoff wait")).toBeNull();
+    expect(screen.getByText("Disabled")).toBeTruthy();
+  });
+});
+
+it("keeps execution facts separate from expectation matches", () => {
+  const cases = [
+    ["failed", "matched_expected_failure", "Failed · Expected result", "good"],
+    ["failed", "matched_expected_result", "Failed · Expected result", "good"],
+    ["success", "unexpected_success", "Succeeded · Expectation not met", "warn"],
+    ["failed", "expectation_mismatch", "Failed · Expectation not met", "warn"],
+    ["failed", undefined, "Failed", "warn"],
+    ["success", undefined, "Succeeded", "good"],
+  ];
+  const detail = windowDetail({ active_requests: [], activity: cases.map(([status, expectation], index) => ({
+    status: status!, failure_expectation_result: expectation, started_at_ms: index + 1,
+    ended_at_ms: index + 2, duration_ms: 1, method: "tools/call", meaningful: true,
+    workflow_sessions: [],
+  })) });
+  const { container } = render(<WindowActivityFeed detail={detail} projects={[]} language="en" />);
+  const pills = [...container.querySelectorAll(".window-call-card .status-pill")].reverse();
+  expect(pills).toHaveLength(cases.length);
+  cases.forEach(([, , label, tone], index) => {
+    expect(pills[index].textContent).toBe(label);
+    expect(pills[index].classList.contains(tone!)).toBe(true);
+  });
+});

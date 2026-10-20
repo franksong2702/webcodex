@@ -11,6 +11,7 @@ from scripts import release_readiness as readiness
 
 SOURCE = "a" * 40
 REQUEST = "rr_" + "b" * 24
+SOURCE_REF = "release/v0.4.3"
 
 
 def _state() -> dict:
@@ -18,6 +19,7 @@ def _state() -> dict:
         "schema_version": readiness.STATE_SCHEMA_VERSION,
         "kind": "release-readiness",
         "repo": collector.DEFAULT_REPO,
+        "source_ref": SOURCE_REF,
         "source_sha": SOURCE,
         "workflow_file": readiness.READINESS_WORKFLOW_FILE,
         "workflow_path": readiness.READINESS_WORKFLOW_PATH,
@@ -30,6 +32,11 @@ def _state() -> dict:
         "ci_run_url": "https://github.com/yyjeqhc/webcodex/actions/runs/777",
         "ci_run_head_sha": SOURCE,
         "ci_run_conclusion": "success",
+        "evidence_run_id": 888,
+        "evidence_run_attempt": 3,
+        "evidence_run_url": "https://github.com/yyjeqhc/webcodex/actions/runs/888",
+        "evidence_run_head_sha": SOURCE,
+        "evidence_run_conclusion": "success",
         "run_id": None,
         "run_head_sha": None,
         "source_matches": None,
@@ -45,7 +52,7 @@ def _run(run_id: int = 123) -> dict:
         "id": run_id,
         "path": readiness.READINESS_WORKFLOW_PATH,
         "event": "workflow_dispatch",
-        "head_branch": "main",
+        "head_branch": SOURCE_REF,
         "head_sha": SOURCE,
         "display_title": readiness._run_name(REQUEST, SOURCE),
         "html_url": f"https://github.com/yyjeqhc/webcodex/actions/runs/{run_id}",
@@ -54,13 +61,41 @@ def _run(run_id: int = 123) -> dict:
     }
 
 
-def _ci_run(run_id: int = 777, *, attempt: int = 2, source: str = SOURCE, conclusion: str = "success") -> dict:
+def _ci_run(
+    run_id: int = 777,
+    *,
+    attempt: int = 2,
+    source: str = SOURCE,
+    source_ref: str = SOURCE_REF,
+    conclusion: str = "success",
+) -> dict:
     return {
         "id": run_id,
         "run_attempt": attempt,
         "path": readiness.CI_WORKFLOW_PATH,
         "event": "push",
-        "head_branch": "main",
+        "head_branch": source_ref,
+        "head_sha": source,
+        "html_url": f"https://github.com/yyjeqhc/webcodex/actions/runs/{run_id}",
+        "status": "completed",
+        "conclusion": conclusion,
+    }
+
+
+def _evidence_run(
+    run_id: int = 888,
+    *,
+    attempt: int = 3,
+    source: str = SOURCE,
+    source_ref: str = SOURCE_REF,
+    conclusion: str = "success",
+) -> dict:
+    return {
+        "id": run_id,
+        "run_attempt": attempt,
+        "path": readiness.READINESS_WORKFLOW_PATH,
+        "event": "push",
+        "head_branch": source_ref,
         "head_sha": source,
         "html_url": f"https://github.com/yyjeqhc/webcodex/actions/runs/{run_id}",
         "status": "completed",
@@ -92,19 +127,58 @@ class ReadinessSelectionTests(unittest.TestCase):
         self.assertEqual(state["run_head_sha"], "c" * 40)
 
 
-class MainCiProofTests(unittest.TestCase):
-    def test_selects_exact_successful_main_push_ci(self) -> None:
-        selected = readiness.select_successful_main_ci_run({"workflow_runs": [_ci_run()]}, SOURCE)
+class SourceCiProofTests(unittest.TestCase):
+    def test_selects_exact_successful_source_push_ci(self) -> None:
+        selected = readiness.select_successful_source_ci_run(
+            {"workflow_runs": [_ci_run()]}, SOURCE, SOURCE_REF
+        )
         self.assertEqual(selected["id"], 777)
         self.assertEqual(selected["run_attempt"], 2)
 
-    def test_main_ci_proof_fails_closed_on_failure_wrong_source_or_duplicate(self) -> None:
+    def test_source_ci_proof_fails_closed_on_failure_wrong_source_ref_or_duplicate(self) -> None:
         with self.assertRaises(readiness.ReadinessError):
-            readiness.select_successful_main_ci_run({"workflow_runs": [_ci_run(conclusion="failure")]}, SOURCE)
+            readiness.select_successful_source_ci_run(
+                {"workflow_runs": [_ci_run(conclusion="failure")]}, SOURCE, SOURCE_REF
+            )
         with self.assertRaises(readiness.ReadinessError):
-            readiness.select_successful_main_ci_run({"workflow_runs": [_ci_run(source="c" * 40)]}, SOURCE)
+            readiness.select_successful_source_ci_run(
+                {"workflow_runs": [_ci_run(source="c" * 40)]}, SOURCE, SOURCE_REF
+            )
         with self.assertRaises(readiness.ReadinessError):
-            readiness.select_successful_main_ci_run({"workflow_runs": [_ci_run(1), _ci_run(2)]}, SOURCE)
+            readiness.select_successful_source_ci_run(
+                {"workflow_runs": [_ci_run(source_ref="main")]}, SOURCE, SOURCE_REF
+            )
+        with self.assertRaises(readiness.ReadinessError):
+            readiness.select_successful_source_ci_run(
+                {"workflow_runs": [_ci_run(1), _ci_run(2)]}, SOURCE, SOURCE_REF
+            )
+
+
+class SourceEvidenceProofTests(unittest.TestCase):
+    def test_selects_exact_successful_release_source_evidence(self) -> None:
+        selected = readiness.select_successful_source_evidence_run(
+            {"workflow_runs": [_evidence_run()]}, SOURCE, SOURCE_REF
+        )
+        self.assertEqual(selected["id"], 888)
+        self.assertEqual(selected["run_attempt"], 3)
+
+    def test_source_evidence_fails_closed_on_failure_wrong_source_ref_or_duplicate(self) -> None:
+        with self.assertRaises(readiness.ReadinessError):
+            readiness.select_successful_source_evidence_run(
+                {"workflow_runs": [_evidence_run(conclusion="failure")]}, SOURCE, SOURCE_REF
+            )
+        with self.assertRaises(readiness.ReadinessError):
+            readiness.select_successful_source_evidence_run(
+                {"workflow_runs": [_evidence_run(source="c" * 40)]}, SOURCE, SOURCE_REF
+            )
+        with self.assertRaises(readiness.ReadinessError):
+            readiness.select_successful_source_evidence_run(
+                {"workflow_runs": [_evidence_run(source_ref="main")]}, SOURCE, SOURCE_REF
+            )
+        with self.assertRaises(readiness.ReadinessError):
+            readiness.select_successful_source_evidence_run(
+                {"workflow_runs": [_evidence_run(1), _evidence_run(2)]}, SOURCE, SOURCE_REF
+            )
 
 
 class SnapshotFenceTests(unittest.TestCase):
@@ -135,6 +209,8 @@ class ReadinessStateTests(unittest.TestCase):
             self.assertEqual(loaded["request_id"], REQUEST)
             self.assertEqual(loaded["ci_run_id"], 777)
             self.assertEqual(loaded["ci_run_attempt"], 2)
+            self.assertEqual(loaded["evidence_run_id"], 888)
+            self.assertEqual(loaded["evidence_run_attempt"], 3)
             state_path.unlink()
             target = root / "target.json"
             target.write_text("{}\n", encoding="utf-8")
@@ -147,13 +223,77 @@ class ReadinessStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             state = _state()
             state["schema_version"] = readiness.LEGACY_STATE_SCHEMA_VERSION
-            for field in ("ci_run_id", "ci_run_attempt", "ci_run_url", "ci_run_head_sha", "ci_run_conclusion"):
+            for field in (
+                "source_ref",
+                "ci_run_id",
+                "ci_run_attempt",
+                "ci_run_url",
+                "ci_run_head_sha",
+                "ci_run_conclusion",
+                "evidence_run_id",
+                "evidence_run_attempt",
+                "evidence_run_url",
+                "evidence_run_head_sha",
+                "evidence_run_conclusion",
+            ):
                 state.pop(field)
             path = Path(temp) / "legacy.json"
             readiness._write_state(path, state)
             loaded = readiness._load_state(path)
             self.assertEqual(loaded["schema_version"], readiness.LEGACY_STATE_SCHEMA_VERSION)
             self.assertNotIn("ci_run_id", loaded)
+
+    def test_ci_proof_v2_state_defaults_to_main_source_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state = _state()
+            state["schema_version"] = readiness.CI_PROOF_STATE_SCHEMA_VERSION
+            state.pop("source_ref")
+            for field in (
+                "evidence_run_id",
+                "evidence_run_attempt",
+                "evidence_run_url",
+                "evidence_run_head_sha",
+                "evidence_run_conclusion",
+            ):
+                state.pop(field)
+            path = Path(temp) / "v2.json"
+            readiness._write_state(path, state)
+            loaded = readiness._load_state(path)
+            self.assertEqual(readiness._state_source_ref(loaded), "main")
+
+    def test_source_ref_v3_state_remains_readable_without_precomputed_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state = _state()
+            state["schema_version"] = readiness.SOURCE_REF_STATE_SCHEMA_VERSION
+            for field in (
+                "evidence_run_id",
+                "evidence_run_attempt",
+                "evidence_run_url",
+                "evidence_run_head_sha",
+                "evidence_run_conclusion",
+            ):
+                state.pop(field)
+            path = Path(temp) / "v3.json"
+            readiness._write_state(path, state)
+            loaded = readiness._load_state(path)
+            self.assertEqual(loaded["source_ref"], SOURCE_REF)
+
+    def test_main_v4_state_requires_no_release_branch_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state = _state()
+            state["source_ref"] = "main"
+            for field in (
+                "evidence_run_id",
+                "evidence_run_attempt",
+                "evidence_run_url",
+                "evidence_run_head_sha",
+                "evidence_run_conclusion",
+            ):
+                state[field] = None
+            path = Path(temp) / "main.json"
+            readiness._write_state(path, state)
+            loaded = readiness._load_state(path)
+            self.assertEqual(readiness._state_source_ref(loaded), "main")
 
 
 class _Response:
@@ -194,53 +334,130 @@ class DispatchClassificationTests(unittest.TestCase):
     def test_204_is_accepted(self) -> None:
         client = self._client()
         client.opener = _Opener(_Response())
-        readiness._post_dispatch(client, SOURCE, REQUEST, 777, 2)
+        readiness._post_dispatch(client, SOURCE_REF, SOURCE, REQUEST, 777, 2)
 
     def test_4xx_is_definite_rejection(self) -> None:
         client = self._client()
         error = urllib.error.HTTPError("https://api.github.test", 422, "bad", {}, None)
         client.opener = _Opener(error)
         with self.assertRaises(readiness.DispatchRejected):
-            readiness._post_dispatch(client, SOURCE, REQUEST, 777, 2)
+            readiness._post_dispatch(client, SOURCE_REF, SOURCE, REQUEST, 777, 2)
 
     def test_transport_failure_is_outcome_unknown(self) -> None:
         client = self._client()
         client.opener = _Opener(urllib.error.URLError("lost"))
         with self.assertRaises(readiness.DispatchOutcomeUnknown):
-            readiness._post_dispatch(client, SOURCE, REQUEST, 777, 2)
+            readiness._post_dispatch(client, SOURCE_REF, SOURCE, REQUEST, 777, 2)
 
 
 class WorkflowContractTests(unittest.TestCase):
-    def test_pre_tag_gate_reuses_exact_main_ci_and_never_builds_native_release_candidates(self) -> None:
+    def test_release_build_preflight_provisions_inventory_dependency(self) -> None:
+        workflow = Path(".github/workflows/release-build.yml").read_text(encoding="utf-8")
+        preflight = workflow.split("  preflight:\n", 1)[1].split("\n  prepare:\n", 1)[0]
+        self.assertIn("if ! command -v rg >/dev/null 2>&1; then", preflight)
+        self.assertIn("sudo apt-get update", preflight)
+        self.assertIn("sudo apt-get install --no-install-recommends -y ripgrep", preflight)
+        self.assertLess(
+            preflight.index("sudo apt-get install --no-install-recommends -y ripgrep"),
+            preflight.index("bash scripts/release_check.sh --static-only"),
+        )
+
+    def test_pre_tag_gate_combines_exact_source_ci_with_extended_native(self) -> None:
         workflow = Path(".github/workflows/release-readiness.yml").read_text(encoding="utf-8")
+        extended = Path(".github/workflows/extended-native.yml").read_text(encoding="utf-8")
         self.assertIn("  ci-proof:\n", workflow)
         self.assertIn("actions: read", workflow)
         self.assertIn("ci_run_id:", workflow)
         self.assertIn("ci_run_attempt:", workflow)
+        self.assertIn("evidence_run_id:", workflow)
+        self.assertIn("evidence_run_attempt:", workflow)
+        self.assertIn("source_ref:", workflow)
+        self.assertIn("  push:\n    branches:\n      - 'release/v*'", workflow)
+        self.assertIn("      - 'release/**'", Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
         self.assertIn("/actions/runs/{run_id}/attempts/{attempt}", workflow)
-        self.assertIn('"path": ".github/workflows/ci.yml"', workflow)
+        self.assertIn('verify("CI", ci_run_id, ci_attempt, ".github/workflows/ci.yml")', workflow)
+        self.assertIn('".github/workflows/release-readiness.yml"', workflow)
         self.assertIn('"event": "push"', workflow)
+        self.assertIn('"head_branch": source_ref', workflow)
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/$INPUT_SOURCE_REF"', workflow)
         self.assertIn('"conclusion": "success"', workflow)
+        self.assertIn("extended-native:\n    needs: ci-proof\n    if: github.event_name == 'push' || inputs.source_ref == 'main'\n    uses: ./.github/workflows/extended-native.yml", workflow)
+        self.assertIn("source_sha: ${{ inputs.source_sha || github.sha }}", workflow)
+        self.assertIn("workflow_call:", extended)
+        self.assertIn("workflow_dispatch:", extended)
+        for runner in ("ubuntu-24.04-arm", "macos-15-intel", "windows-11-arm"):
+            self.assertIn(runner, extended)
+        self.assertIn("--platform darwin-x64", extended)
+        self.assertIn("-Platform win32-arm64", extended)
+        self.assertIn("--bundles dmg", extended)
+        self.assertIn("--bundles nsis", extended)
+        self.assertIn('export WEBCODEX_GIT_COMMIT="$source_sha"', extended)
+        self.assertIn("export WEBCODEX_GIT_DIRTY=false", extended)
+        self.assertIn('expected="$name $version (commit $source_sha, dirty=false, built_at=$built_at)"', extended)
+        self.assertIn("$env:WEBCODEX_GIT_COMMIT = $source", extended)
+        self.assertIn('$env:WEBCODEX_GIT_DIRTY = "false"', extended)
+        self.assertIn('$expected = "$name $version (commit $source, dirty=false, built_at=$builtAt)"', extended)
+        self.assertNotIn("actions/upload-artifact", extended)
         self.assertNotIn("cargo build --locked --release", workflow)
-        for removed_job in ("release-contract", "core-tests", "frontend", "macos-tests", "native-linux", "native-macos", "native-windows"):
-            self.assertNotIn(f"  {removed_job}:\n", workflow)
+        self.assertNotIn("cargo build --locked --release", extended)
         self.assertIn("server-image:", workflow)
         self.assertIn("platform: linux/amd64", workflow)
         self.assertIn("platform: linux/arm64", workflow)
         self.assertIn("DOCKER_BUILDKIT=1 docker build", workflow)
         self.assertIn("scripts/prepare_server_deployment_assets.py", workflow)
-        self.assertIn("ghcr.io/yyjeqhc/webcodex-server@$digest", workflow)
         self.assertIn("e2e:\n    needs: ci-proof", workflow)
         self.assertIn("eval:\n    needs: ci-proof", workflow)
         self.assertIn("server-image:\n    needs: [ci-proof, e2e, eval]", workflow)
-        self.assertIn("summary:\n    needs: [ci-proof, e2e, eval, server-image]", workflow)
+        self.assertIn("summary:\n    needs: [ci-proof, extended-native, e2e, eval, server-image]", workflow)
+        self.assertIn("summary:\n    needs: [ci-proof, extended-native, e2e, eval, server-image]\n    if: always()", workflow)
+        self.assertIn("expensive evidence was precomputed by the exact release-branch push and was not rebuilt", workflow)
         self.assertNotIn("actions/upload-artifact", workflow)
         self.assertNotIn("docker/login-action", workflow)
         self.assertNotIn("packages: write", workflow)
         self.assertNotIn("push: true", workflow)
 
-    def test_owner_prs_keep_deterministic_linux_ci_before_merge(self) -> None:
+    def test_local_desktop_builders_match_native_ci_contracts(self) -> None:
+        macos = Path("scripts/build_desktop_macos_local.sh").read_text(encoding="utf-8")
+        windows = Path("scripts/build_desktop_windows_local.ps1").read_text(encoding="utf-8")
+        windows_stage = Path("scripts/prepare_desktop_bundle.ps1").read_text(encoding="utf-8")
+        windows_smoke = Path("scripts/desktop_install_windows_smoke.ps1").read_text(encoding="utf-8")
+        windows_npm_smoke = Path("scripts/npm_install_windows_smoke.ps1").read_text(encoding="utf-8")
+        windows_package = Path("scripts/package_release_artifact.ps1").read_text(encoding="utf-8")
+
+        for local in (macos, windows):
+            self.assertIn("npm ci --prefix frontend", local)
+            self.assertIn("npm ci --prefix apps/desktop", local)
+
+        self.assertIn('export CI="true"', macos)
+        self.assertIn('export APPLE_SIGNING_IDENTITY="-"', macos)
+        self.assertIn("--bundles dmg", macos)
+
+        self.assertIn("target\\desktop-local-tauri", windows)
+        self.assertIn("prepare_desktop_bundle.ps1", windows)
+        self.assertIn("--bundles nsis", windows)
+        self.assertIn("node node_modules/@tauri-apps/cli/tauri.js build", windows)
+        self.assertIn("--no-sign -- --locked", windows)
+        self.assertIn("if ($Smoke)", windows)
+        self.assertIn("desktop_install_windows_smoke.ps1", windows)
+        self.assertIn("target\\desktop-local-dist", windows)
+        self.assertIn("[switch]$AllowDirty", windows)
+        self.assertIn("-GitDirty $GitDirty", windows)
+        self.assertIn("$env:WEBCODEX_GIT_COMMIT = $SourceSha.ToLowerInvariant()", windows)
+        self.assertIn('$env:WEBCODEX_GIT_DIRTY = if ($GitDirty) { "true" } else { "false" }', windows)
+        self.assertIn('export WEBCODEX_GIT_COMMIT="$SOURCE_SHA"', macos)
+        self.assertIn("export WEBCODEX_GIT_DIRTY=false", macos)
+        self.assertIn('"dirty-$ShortSource"', windows)
+        for helper in (windows_stage, windows_smoke):
+            self.assertIn("[bool]$GitDirty = $false", helper)
+            self.assertIn("dirty=$dirtyText", helper)
+        self.assertIn("function Remove-FileEventually", windows_smoke)
+        self.assertIn('Remove-FileEventually $uninstaller 30 "Desktop uninstaller remained locked after silent uninstall', windows_smoke)
+        for helper in (windows_stage, windows_smoke, windows_npm_smoke, windows_package):
+            self.assertIn("GetUnresolvedProviderPathFromPSPath", helper)
+
+    def test_daily_ci_avoids_rare_native_runners_and_keeps_path_aware_gates(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        extended = Path(".github/workflows/extended-native.yml").read_text(encoding="utf-8")
         release_build = Path(".github/workflows/release-build.yml").read_text(encoding="utf-8")
 
         def job_block(name: str, next_name: str) -> str:
@@ -251,32 +468,46 @@ class WorkflowContractTests(unittest.TestCase):
         changes = job_block("changes", "contract")
         contract = job_block("contract", "test-linux-rust")
         linux_rust = job_block("test-linux-rust", "test-linux-tooling")
-        linux_tooling = job_block("test-linux-tooling", "test-linux-arm64")
-        linux_arm64 = job_block("test-linux-arm64", "test")
-        aggregate = job_block("test", "test-macos-core")
+        linux_tooling = job_block("test-linux-tooling", "test")
+        aggregate = job_block("test", "test-docker-server")
+        docker = job_block("test-docker-server", "test-macos-core")
         self.assertNotIn("pull_request.user.login", linux_rust)
-        self.assertNotIn("contains(github.event.pull_request.labels.*.name, 'run-ci')", linux_rust)
-        self.assertIn("runs-on: ubuntu-24.04-arm", linux_arm64)
-        self.assertIn("cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner", linux_arm64)
-        self.assertIn("needs.changes.outputs.needs_linux_arm64 == 'true'", linux_arm64)
         self.assertIn("cargo check --locked --workspace --all-targets", linux_tooling)
         self.assertIn("bash scripts/release_check.sh --static-only", linux_tooling)
-        self.assertIn("github.event_name == 'push'", linux_tooling)
+        self.assertNotIn("github.event_name == 'push' ||", linux_tooling)
+        self.assertIn("github.event_name == 'pull_request'", linux_tooling)
         self.assertIn("github.event.pull_request.user.login != github.repository_owner", linux_tooling)
         self.assertIn("contains(github.event.pull_request.labels.*.name, 'run-ci')", linux_tooling)
+        self.assertIn("needs.changes.outputs.needs_docker == 'true'", docker)
+        self.assertIn("platforms: linux/amd64", docker)
+        self.assertIn(
+            "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
+            docker,
+        )
+        self.assertIn("test ! -e /usr/local/bin/webcodex-runner", docker)
 
         self.assertIn("needs: changes", contract)
-        self.assertIn("needs.changes.outputs.needs_frontend == 'true' || needs.changes.outputs.needs_desktop_frontend == 'true'", contract)
         self.assertIn("if: needs.changes.outputs.needs_frontend == 'true'", contract)
         self.assertIn("if: needs.changes.outputs.needs_desktop_frontend == 'true'", contract)
-
-        self.assertIn("ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}", changes)
+        self.assertIn("needs.changes.outputs.needs_plugin_sdk == 'true'", contract)
+        self.assertIn("npm/plugin-sdk/package-lock.json", contract)
+        self.assertIn("plugins/agent-browser/package-lock.json", contract)
+        for command in (
+            "npm ci --prefix npm/plugin-sdk",
+            "npm --prefix npm/plugin-sdk run typecheck",
+            "npm --prefix npm/plugin-sdk run build",
+            "npm --prefix npm/plugin-sdk test",
+            "npm --prefix npm/plugin-sdk run pack:dry-run",
+            "npm ci --prefix plugins/agent-browser",
+            "npm --prefix plugins/agent-browser run typecheck",
+            "npm --prefix plugins/agent-browser test",
+        ):
+            self.assertIn(command, contract)
+        self.assertIn("github.event.before", changes)
         self.assertIn("persist-credentials: false", changes)
         self.assertIn('classifier="scripts/ci_path_risk.py"', changes)
         self.assertIn("reason=full-native:bootstrap-base-missing", changes)
-        self.assertNotIn('git show "$HEAD_SHA:scripts/ci_path_risk.py"', changes)
         self.assertIn('git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"', changes)
-        self.assertIn('if [ "$fetched_head" != "$HEAD_SHA" ]', changes)
         self.assertIn("--external-contributor", changes)
         self.assertIn("--run-ci", changes)
         self.assertNotIn("pull_request_target", workflow)
@@ -284,69 +515,53 @@ class WorkflowContractTests(unittest.TestCase):
         macos_core = job_block("test-macos-core", "test-macos-desktop")
         macos_desktop = job_block("test-macos-desktop", "test-macos")
         macos_aggregate = job_block("test-macos", "test-windows-core")
-        self.assertIn("needs.changes.outputs.needs_macos == 'true'", macos_core)
-        self.assertIn("platform: darwin-x64", macos_core)
-        self.assertIn("runner: macos-15-intel", macos_core)
-        self.assertIn("rust_host: x86_64-apple-darwin", macos_core)
-        self.assertIn("cargo check --locked --workspace", macos_core)
-        self.assertIn("cargo test --locked -p webcodex-runner -p webcodex-computer", macos_core)
-        self.assertNotIn("--bundles dmg", macos_core)
-        self.assertIn("needs.changes.outputs.needs_macos_desktop == 'true'", macos_desktop)
-        self.assertIn("cargo build --locked --profile dogfood -p webcodex -p webcodex-cli -p webcodex-runner", macos_desktop)
-        self.assertIn("--bin-dir target/dogfood", macos_desktop)
+        self.assertIn("platform: darwin-arm64", macos_core)
+        self.assertNotIn("darwin-x64", macos_core)
+        self.assertNotIn("macos-15-intel", macos_core)
+        self.assertIn("python3 scripts/check_production_warnings.py", macos_core)
+        self.assertIn("platform: darwin-arm64", macos_desktop)
+        self.assertNotIn("darwin-x64", macos_desktop)
         self.assertIn("--bundles dmg", macos_desktop)
 
         windows_core = job_block("test-windows-core", "test-windows-runner")
         windows_runner = job_block("test-windows-runner", "test-windows-package")
         windows_package = job_block("test-windows-package", "test-windows-desktop")
-        windows_desktop = job_block("test-windows-desktop", "test-windows-arm64")
+        windows_desktop = job_block("test-windows-desktop", "test-windows")
         self.assertIn("needs.changes.outputs.needs_windows_core == 'true'", windows_core)
-        self.assertIn("cargo check --locked --workspace", windows_core)
         self.assertIn("needs.changes.outputs.needs_windows_runner == 'true'", windows_runner)
         self.assertIn("needs.changes.outputs.needs_windows_package == 'true'", windows_package)
         self.assertIn("needs.changes.outputs.needs_windows_desktop == 'true'", windows_desktop)
-        self.assertIn("cargo build --locked --profile dogfood -p webcodex -p webcodex-cli -p webcodex-runner", windows_desktop)
-        self.assertIn('Join-Path "target\\dogfood"', windows_desktop)
-        windows_arm64 = job_block("test-windows-arm64", "test-windows")
-        self.assertIn("runs-on: windows-11-arm", windows_arm64)
-        self.assertIn("aarch64-pc-windows-msvc", windows_arm64)
-        self.assertIn("needs.changes.outputs.needs_windows_arm64 == 'true'", windows_arm64)
-        self.assertIn("cargo check --locked -p webcodex -p webcodex-cli -p webcodex-runner", windows_arm64)
+        self.assertIn("-Platform win32-x64", windows_desktop)
+
+        for rare in ("macos-15-intel", "windows-11-arm", "ubuntu-24.04-arm", "test-windows-arm64:", "test-linux-arm64:"):
+            self.assertNotIn(rare, workflow)
+        for rare in ("macos-15-intel", "windows-11-arm", "ubuntu-24.04-arm"):
+            self.assertIn(rare, extended)
+
         windows_aggregate = job_block("test-windows", "test-native")
         native_aggregate = workflow[workflow.index("  test-native:\n"):]
         for required_aggregate in (aggregate, macos_aggregate, windows_aggregate, native_aggregate):
-            self.assertIn("if: always()", required_aggregate)
-        self.assertIn("NEEDS_CORE: ${{ needs.changes.outputs.needs_macos }}", macos_aggregate)
-        self.assertIn("NEEDS_CORE: ${{ needs.changes.outputs.needs_windows_core }}", windows_aggregate)
-        self.assertIn("NEEDS_LINUX_ARM64: ${{ needs.changes.outputs.needs_linux_arm64 }}", native_aggregate)
-        self.assertIn("expected=skipped", windows_aggregate)
-        self.assertIn("expected_linux_arm64=skipped", native_aggregate)
+            self.assertIn("if: ${{ !cancelled() }}", required_aggregate)
+            self.assertNotIn("if: always()", required_aggregate)
+        self.assertIn("NEEDS_DOCKER: ${{ needs.changes.outputs.needs_docker }}", native_aggregate)
+        self.assertIn("expected_docker=skipped", native_aggregate)
         self.assertNotIn("FULL_NATIVE_REQUESTED", workflow)
-        for removed_real_process_job in (
-            "test-linux-runner-real-process",
-            "test-macos-runner-real-process",
-            "test-windows-runner-real-process",
-        ):
-            self.assertNotIn(f"  {removed_real_process_job}:\n", workflow)
-        self.assertNotIn("runner_real_process -- --ignored", workflow)
-        self.assertNotIn("desktop_real_process_windows_ -- --ignored", workflow)
         self.assertIn("cargo build --locked --release -p webcodex -p webcodex-cli -p webcodex-runner", release_build)
 
     def test_ci_native_lane_conditions_are_classifier_driven(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
         pairs = {
-            "test-linux-arm64": "needs_linux_arm64",
+            "test-docker-server": "needs_docker",
             "test-macos-core": "needs_macos",
             "test-macos-desktop": "needs_macos_desktop",
             "test-windows-core": "needs_windows_core",
             "test-windows-runner": "needs_windows_runner",
             "test-windows-package": "needs_windows_package",
             "test-windows-desktop": "needs_windows_desktop",
-            "test-windows-arm64": "needs_windows_arm64",
         }
         job_names = list(pairs)
         job_names.extend(("test-macos", "test-windows", "test-native"))
-        for index, (job_name, output_name) in enumerate(pairs.items()):
+        for job_name, output_name in pairs.items():
             start = workflow.index(f"  {job_name}:\n")
             following = [workflow.find(f"  {name}:\n", start + 1) for name in job_names]
             following = [position for position in following if position > start]
@@ -354,15 +569,7 @@ class WorkflowContractTests(unittest.TestCase):
             block = workflow[start:end]
             with self.subTest(job=job_name):
                 self.assertIn("needs: changes", block)
-                self.assertNotIn("needs: [contract, changes]", block)
                 self.assertIn(f"if: needs.changes.outputs.{output_name} == 'true'", block)
-
-        for job_name in ("test-linux-rust", "test-linux-tooling"):
-            start = workflow.index(f"  {job_name}:\n")
-            end = workflow.find("\n  test-", start + 1)
-            block = workflow[start : end if end != -1 else len(workflow)]
-            with self.subTest(job=job_name):
-                self.assertNotIn("needs: contract", block)
 
         for aggregate in ("test", "test-macos", "test-windows", "test-native"):
             start = workflow.index(f"  {aggregate}:\n")
@@ -378,25 +585,30 @@ class WorkflowContractTests(unittest.TestCase):
             "needs_windows_runner",
             "needs_windows_package",
             "needs_windows_desktop",
-            "needs_windows_arm64",
             "needs_macos",
             "needs_macos_desktop",
-            "needs_linux_arm64",
             "needs_desktop_package",
             "needs_full_native",
             "categories",
             "reason",
         ):
             self.assertIn(f"{output}: ${{{{ steps.classify.outputs.{output} }}}}", changes)
-        for frontend_output in ("needs_frontend", "needs_desktop_frontend"):
-            self.assertIn(f"{frontend_output}: ${{{{ steps.classify.outputs.{frontend_output} == 'true'", changes)
-            self.assertIn(f"steps.classify.outputs.{frontend_output} == '' && steps.classify.outputs.needs_full_native == 'true'", changes)
-        self.assertNotIn("needs_runner_real_process", workflow)
+        for rollout_output in (
+            "needs_frontend",
+            "needs_desktop_frontend",
+            "needs_plugin_sdk",
+            "needs_docker",
+        ):
+            self.assertIn(f"{rollout_output}: ${{{{ steps.classify.outputs.{rollout_output} == 'true'", changes)
+            self.assertIn(f"steps.classify.outputs.{rollout_output} == '' && steps.classify.outputs.needs_full_native == 'true'", changes)
+        self.assertNotIn("needs_windows_arm64", workflow)
+        self.assertNotIn("needs_linux_arm64", workflow)
 
     def test_macos_ci_host_check_does_not_use_quiet_grep_under_pipefail(self) -> None:
-        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
-        self.assertNotIn('rustc -vV | grep -Fxq "host:', workflow)
-        self.assertIn("rust_host=\"$(rustc -vV | sed -n 's/^host: //p')\"", workflow)
+        for path in (".github/workflows/ci.yml", ".github/workflows/extended-native.yml"):
+            workflow = Path(path).read_text(encoding="utf-8")
+            self.assertNotIn('rustc -vV | grep -Fxq "host:', workflow)
+            self.assertIn("rust_host=\"$(rustc -vV | sed -n 's/^host: //p')\"", workflow)
 
 
 if __name__ == "__main__":

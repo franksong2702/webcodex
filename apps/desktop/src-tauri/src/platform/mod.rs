@@ -1,5 +1,45 @@
+#[cfg(target_os = "macos")]
+mod macos;
+pub mod opener;
+pub mod permissions;
 #[cfg(target_os = "windows")]
 mod windows;
+
+pub(crate) fn install_session_shutdown(app: &tauri::AppHandle) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        let handle = app.clone();
+        let observer = windows::session_shutdown::SessionShutdownObserver::start(move || {
+            // Complete cleanup before returning WM_ENDSESSION: Windows may
+            // terminate us immediately afterwards. A cancelled query does
+            // not stop the runtime, and no WebView is needed in tray mode.
+            let state = handle.state::<crate::state::AppState>();
+            tauri::async_runtime::block_on(state.shutdown_until(crate::deadline::Deadline::after(
+                crate::state::SESSION_SHUTDOWN_BUDGET,
+            )));
+            handle.exit(0);
+        })?;
+        app.manage(observer);
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+    Ok(())
+}
+
+pub(crate) fn stop_session_shutdown(app: &tauri::AppHandle) {
+    #[cfg(windows)]
+    {
+        use tauri::Manager;
+        if let Some(observer) =
+            app.try_state::<windows::session_shutdown::SessionShutdownObserver>()
+        {
+            observer.close();
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
 
 use crate::error::{DesktopError, DesktopResult};
 use crate::models::PowerShellRuntimeSnapshot;
@@ -127,7 +167,6 @@ fn is_username_character(character: char) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemProxyCandidate {
     pub url: String,
-    pub enabled: bool,
 }
 
 pub fn system_http_proxy_candidate() -> Option<SystemProxyCandidate> {
@@ -135,7 +174,11 @@ pub fn system_http_proxy_candidate() -> Option<SystemProxyCandidate> {
     {
         return windows::system_http_proxy_candidate();
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        return macos::system_http_proxy_candidate();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         None
     }
@@ -177,17 +220,6 @@ pub(crate) fn normalize_proxy_server(value: &str) -> Option<String> {
         return None;
     }
     Some(candidate.trim_end_matches('/').to_string())
-}
-
-pub(crate) fn proxy_is_loopback(url: &str) -> bool {
-    url::Url::parse(url).ok().and_then(|parsed| {
-        parsed.host_str().map(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host == "127.0.0.1"
-                || host == "::1"
-                || host == "[::1]"
-        })
-    }) == Some(true)
 }
 
 #[cfg(test)]
@@ -257,8 +289,6 @@ mod tests {
             normalize_proxy_server("http=127.0.0.1:7890;https=127.0.0.1:7891").as_deref(),
             Some("http://127.0.0.1:7891")
         );
-        assert!(proxy_is_loopback("http://127.0.0.1:7890"));
-        assert!(!proxy_is_loopback("http://proxy.example.test:8080"));
     }
 
     #[test]

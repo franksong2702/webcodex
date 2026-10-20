@@ -1,4 +1,7 @@
-use super::{resolve_validation_recipe, RecipeError, RecipeId, SemanticCheck};
+use super::{
+    resolve_project_validation_recipe, resolve_validation_recipe,
+    resolve_validation_recipe_with_packages, RecipeError, RecipeId, SemanticCheck,
+};
 use std::fs;
 use std::path::Path;
 
@@ -20,6 +23,152 @@ fn resolve(
     resolve_validation_recipe(root, cwd, recipe, checks, test_filter)
 }
 
+#[test]
+fn native_node_rejects_nonregular_nested_marker_before_ancestor_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"scripts":{"check":"echo ancestor"}}"#,
+    );
+    write(temp.path(), "frontend/src/.keep", "");
+    fs::create_dir(temp.path().join("frontend/package.json")).unwrap();
+    let error =
+        super::resolve_node_native_project_check(temp.path(), Some("frontend/src")).unwrap_err();
+    assert_eq!(error.code, "validation_manifest_invalid");
+    fs::remove_dir(temp.path().join("frontend/package.json")).unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            temp.path().join("missing-package.json"),
+            temp.path().join("frontend/package.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            super::resolve_node_native_project_check(temp.path(), Some("frontend/src"))
+                .unwrap_err()
+                .code,
+            "validation_manifest_invalid"
+        );
+    }
+}
+
+#[test]
+fn native_node_project_script_selection_is_closed_and_digest_fenced() {
+    let temp = tempfile::tempdir().unwrap();
+    // Native Node deliberately ignores package-manager selection/lockfiles.
+    write(temp.path(), "yarn.lock", "lockfileVersion: 9\n");
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"packageManager":"pnpm@9.0.0","scripts":{"lint":"eslint .","typecheck":"tsc --noEmit","check":"node check.js","precheck":"node pre.js"}}"#,
+    );
+    let baseline = super::resolve_node_native_project_check(temp.path(), None).unwrap();
+    assert_eq!(baseline.recipe_root_relative, ".");
+    assert_eq!(baseline.steps.len(), 1);
+    assert!(baseline.steps[0].is_structured_node_check());
+    assert_eq!(baseline.steps[0].args, ["--run", "check"]);
+    let serialized = serde_json::to_string(&baseline.steps).unwrap();
+    assert!(!serialized.contains("node check.js"));
+    assert!(!serialized.contains("node pre.js"));
+
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"packageManager":"pnpm@9.0.0","scripts":{"lint":"eslint .","typecheck":"tsc --noEmit","check":"node changed.js"}}"#,
+    );
+    let changed_body = super::resolve_node_native_project_check(temp.path(), None).unwrap();
+    assert_eq!(baseline.steps, changed_body.steps);
+    assert_eq!(baseline.invocation_digest, changed_body.invocation_digest);
+    assert_ne!(baseline.manifest_digest, changed_body.manifest_digest);
+
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"scripts":{"lint":"eslint .","typecheck":"tsc --noEmit"}}"#,
+    );
+    let typecheck = super::resolve_node_native_project_check(temp.path(), None).unwrap();
+    assert_eq!(typecheck.steps[0].args, ["--run", "typecheck"]);
+    assert_ne!(baseline.invocation_digest, typecheck.invocation_digest);
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"scripts":{"lint":"eslint ."}}"#,
+    );
+    let lint = super::resolve_node_native_project_check(temp.path(), None).unwrap();
+    assert_eq!(lint.steps[0].args, ["--run", "lint"]);
+
+    write(
+        temp.path(),
+        "frontend/package.json",
+        r#"{"scripts":{"check":"echo frontend"}}"#,
+    );
+    write(temp.path(), "frontend/src/.keep", "");
+    let nested =
+        super::resolve_node_native_project_check(temp.path(), Some("frontend/src")).unwrap();
+    assert_eq!(nested.recipe_root_relative, "frontend");
+    assert_eq!(nested.steps[0].args, ["--run", "check"]);
+}
+
+#[test]
+fn native_node_project_check_rejects_malformed_and_escaped_manifests() {
+    let temp = tempfile::tempdir().unwrap();
+    for (manifest, expected) in [
+        (r#"{"scripts":{"lint":"yes"}}"#, None),
+        (
+            r#"{"scripts":{"check":null,"lint":"yes"}}"#,
+            Some("validation_manifest_invalid"),
+        ),
+        (
+            r#"{"scripts":{"check":42,"lint":"yes"}}"#,
+            Some("validation_manifest_invalid"),
+        ),
+        (
+            r#"{"scripts":{"check":"","lint":"yes"}}"#,
+            Some("validation_manifest_invalid"),
+        ),
+        (
+            r#"{"scripts":{"check":"   ","lint":"yes"}}"#,
+            Some("validation_manifest_invalid"),
+        ),
+        (r#"{"scripts":{}}"#, Some("validation_check_unavailable")),
+        (
+            r#"{"scripts":{"check":"ok"}"#,
+            Some("validation_manifest_invalid"),
+        ),
+    ] {
+        write(temp.path(), "package.json", manifest);
+        let outcome = super::resolve_node_native_project_check(temp.path(), None);
+        match expected {
+            None => assert_eq!(outcome.unwrap().steps[0].args, ["--run", "lint"]),
+            Some(expected_code) => assert_eq!(outcome.unwrap_err().code, expected_code),
+        }
+    }
+    let oversized = format!(r#"{{"scripts":{{"check":"{}"}}}}"#, "x".repeat(1024 * 1024));
+    write(temp.path(), "package.json", &oversized);
+    assert_eq!(
+        super::resolve_node_native_project_check(temp.path(), None)
+            .unwrap_err()
+            .code,
+        "validation_manifest_invalid"
+    );
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        write(
+            outside.path(),
+            "package.json",
+            r#"{"scripts":{"check":"echo outside"}}"#,
+        );
+        fs::remove_file(temp.path().join("package.json")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("package.json"),
+            temp.path().join("package.json"),
+        )
+        .unwrap();
+        assert!(super::resolve_node_native_project_check(temp.path(), None).is_err());
+    }
+}
 #[test]
 fn recipe_resolution_is_nearest_deterministic_and_project_bounded() {
     struct Case {
@@ -146,6 +295,14 @@ fn recipe_resolution_fails_closed_for_ambiguity_mismatch_and_missing_marker() {
     )
     .unwrap_err();
     assert_eq!(mismatch.code, "validation_recipe_mismatch");
+    assert_eq!(
+        mismatch.details.as_ref().unwrap(),
+        &serde_json::json!({
+            "recipe_root": ".",
+            "candidate_recipes": ["node", "go"],
+            "detected_markers": ["package.json", "go.mod"],
+        })
+    );
 
     let empty = tempfile::tempdir().unwrap();
     let missing = resolve(empty.path(), None, None, &[SemanticCheck::Check], None).unwrap_err();
@@ -325,6 +482,73 @@ fn recipes_emit_only_canonical_argv_and_never_select_mutating_node_format() {
 }
 
 #[test]
+fn scoped_rust_and_go_recipes_bind_canonical_package_argv_into_invocation_identity() {
+    use sha2::{Digest, Sha256};
+
+    let rust = tempfile::tempdir().unwrap();
+    write(
+        rust.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['package-a','package-b']\n",
+    );
+    let rust_plan = resolve_validation_recipe_with_packages(
+        rust.path(),
+        None,
+        Some(RecipeId::Rust),
+        &[SemanticCheck::Check, SemanticCheck::Test],
+        None,
+        Some(&["package-b".into(), "package-a".into()]),
+    )
+    .unwrap();
+    assert_eq!(
+        rust_plan.steps[0].args,
+        [
+            "check",
+            "--all-targets",
+            "-p",
+            "package-a",
+            "-p",
+            "package-b"
+        ]
+    );
+    assert_eq!(
+        rust_plan.steps[1].args,
+        ["test", "-p", "package-a", "-p", "package-b"]
+    );
+    assert_eq!(
+        rust_plan.invocation_digest,
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&rust_plan.steps).unwrap())
+        )
+    );
+
+    let go = tempfile::tempdir().unwrap();
+    write(go.path(), "go.mod", "module example.test/fixture\n");
+    let go_plan = resolve_validation_recipe_with_packages(
+        go.path(),
+        None,
+        Some(RecipeId::Go),
+        &[SemanticCheck::Check, SemanticCheck::Test],
+        None,
+        Some(&["./cmd/...".into(), "./internal".into()]),
+    )
+    .unwrap();
+    assert_eq!(go_plan.steps[0].args, ["vet", "./cmd/...", "./internal"]);
+    assert_eq!(
+        go_plan.steps[1].args,
+        ["test", "-json", "./cmd/...", "./internal"]
+    );
+    assert_eq!(
+        go_plan.invocation_digest,
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&go_plan.steps).unwrap())
+        )
+    );
+}
+
+#[test]
 fn go_test_json_argv_is_bound_into_durable_invocation_identity() {
     use sha2::{Digest, Sha256};
 
@@ -396,6 +620,200 @@ fn node_package_manager_resolution_covers_declared_and_lockfile_evidence() {
             .unwrap()
             .contains("private body"));
     }
+}
+
+#[test]
+fn package_scope_is_rejected_for_non_portable_backends() {
+    let node = tempfile::tempdir().unwrap();
+    write(
+        node.path(),
+        "package.json",
+        r#"{"packageManager":"npm@10","scripts":{"test":"vitest"}}"#,
+    );
+    write(node.path(), "package-lock.json", "{}");
+    let error = resolve_validation_recipe_with_packages(
+        node.path(),
+        None,
+        Some(RecipeId::Node),
+        &[SemanticCheck::Test],
+        None,
+        Some(&["package-a".to_string()]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "validation_scope_unsupported");
+
+    let python = tempfile::tempdir().unwrap();
+    write(
+        python.path(),
+        "pyproject.toml",
+        "[tool.pytest.ini_options]\naddopts = '-q'\n",
+    );
+    let error = resolve_validation_recipe_with_packages(
+        python.path(),
+        None,
+        Some(RecipeId::Python),
+        &[SemanticCheck::Test],
+        None,
+        Some(&["package-a".to_string()]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "validation_scope_unsupported");
+}
+
+#[test]
+fn project_pytest_fences_ancestor_config_and_external_parent_discovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    fs::create_dir_all(project.join("nested")).unwrap();
+
+    write(temp.path(), "pytest.ini", "[pytest]\naddopts=-q\n");
+    let external = resolve_project_validation_recipe(
+        &project,
+        Some("nested"),
+        Some(RecipeId::Python),
+        &[SemanticCheck::Test],
+        None,
+        None,
+        false,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(external.code, "validation_manifest_invalid");
+
+    write(&project, "pytest.ini", "[pytest]\naddopts=-q\n");
+    let before = resolve_project_validation_recipe(
+        &project,
+        Some("nested"),
+        Some(RecipeId::Python),
+        &[SemanticCheck::Test],
+        None,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    write(&project, "pytest.ini", "[pytest]\naddopts=-ra\n");
+    let after = resolve_project_validation_recipe(
+        &project,
+        Some("nested"),
+        Some(RecipeId::Python),
+        &[SemanticCheck::Test],
+        None,
+        None,
+        false,
+        None,
+    )
+    .unwrap();
+    assert_ne!(before.manifest_digest, after.manifest_digest);
+}
+
+#[test]
+fn project_recipe_filtered_execution_is_deterministic_without_repeating_arg_builders() {
+    for (marker, backend, filter) in [
+        ("Cargo.toml", RecipeId::Rust, " selected "),
+        ("go.mod", RecipeId::Go, "^TestA/Sub$"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), marker, "");
+        let plain = resolve(
+            root.path(),
+            None,
+            Some(backend),
+            &[SemanticCheck::Test],
+            None,
+        )
+        .unwrap();
+        let selected = resolve(
+            root.path(),
+            None,
+            Some(backend),
+            &[SemanticCheck::Test],
+            Some(filter),
+        )
+        .unwrap();
+        let expected =
+            crate::project_validation_operation(backend.as_str(), SemanticCheck::Test, None, false)
+                .unwrap()
+                .with_test_filter(Some(filter))
+                .unwrap()
+                .build_readonly_plan()
+                .unwrap();
+        assert_eq!(selected.steps, vec![expected.structured_step]);
+        assert_eq!(selected.manifest_digest, plain.manifest_digest);
+        assert_ne!(selected.invocation_digest, plain.invocation_digest);
+        assert_eq!(
+            resolve(
+                root.path(),
+                None,
+                Some(backend),
+                &[SemanticCheck::Test],
+                Some("")
+            )
+            .unwrap()
+            .invocation_digest,
+            plain.invocation_digest
+        );
+    }
+}
+
+#[test]
+fn rust_member_manifest_digest_tracks_workspace_root_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['member']\nresolver='2'\n",
+    );
+    write(temp.path(), "Cargo.lock", "version = 4\n");
+    write(
+        temp.path(),
+        "member/Cargo.toml",
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    );
+
+    let resolve_member = || {
+        resolve(
+            temp.path(),
+            Some("member"),
+            Some(RecipeId::Rust),
+            &[SemanticCheck::Check],
+            None,
+        )
+        .unwrap()
+    };
+    let original = resolve_member();
+    assert_eq!(original.recipe_root_relative, "member");
+    assert_eq!(original.steps[0].args, ["check", "--all-targets"]);
+
+    write(
+        temp.path(),
+        "member/src/lib.rs",
+        "pub fn value() -> u8 { 1 }\n",
+    );
+    let source_only = resolve_member();
+    assert_eq!(source_only.manifest_digest, original.manifest_digest);
+    assert_eq!(source_only.invocation_digest, original.invocation_digest);
+
+    write(temp.path(), "Cargo.lock", "version = 3\n");
+    let lock_changed = resolve_member();
+    assert_ne!(lock_changed.manifest_digest, original.manifest_digest);
+    assert_eq!(lock_changed.invocation_digest, original.invocation_digest);
+
+    write(temp.path(), "Cargo.lock", "version = 4\n");
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['member']\nresolver='2'\n[profile.dev]\nopt-level=1\n",
+    );
+    let workspace_manifest_changed = resolve_member();
+    assert_ne!(
+        workspace_manifest_changed.manifest_digest,
+        original.manifest_digest
+    );
+    assert_eq!(
+        workspace_manifest_changed.invocation_digest,
+        original.invocation_digest
+    );
 }
 
 #[test]
@@ -519,6 +937,31 @@ fn rust_filter_contract_normalizes_rejects_and_binds_identity() {
         "test_filter_unsupported"
     );
     assert!(!outside.path().join("target").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn marker_symlink_escape_remains_a_manifest_error_after_recipe_detection() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write(
+        outside.path(),
+        "Cargo.toml",
+        "[package]\nname='outside'\nversion='0.1.0'\n",
+    );
+    symlink(
+        outside.path().join("Cargo.toml"),
+        root.path().join("Cargo.toml"),
+    )
+    .unwrap();
+    assert_eq!(
+        resolve(root.path(), None, None, &[SemanticCheck::Check], None)
+            .unwrap_err()
+            .code,
+        "validation_manifest_invalid"
+    );
 }
 
 #[cfg(unix)]
@@ -686,4 +1129,307 @@ fn manifestless_explicit_python_uses_stable_unittest_plan() {
     .unwrap();
     assert_eq!(pytest.steps[0].args, ["-m", "pytest"]);
     assert_ne!(pytest.manifest_digest, seed);
+}
+
+#[test]
+fn project_ruff_requires_local_explicit_config_and_fences_exact_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let plan = |action| {
+        resolve_project_validation_recipe(
+            temp.path(),
+            None,
+            Some(RecipeId::Python),
+            &[action],
+            None,
+            None,
+            false,
+            None,
+        )
+    };
+    for action in [SemanticCheck::Check, SemanticCheck::Format] {
+        assert!(plan(action).is_err(), "manifestless Ruff must fail closed");
+        for manifest in [
+            "",
+            "[tool.black]\n",
+            "[tool.ruff]\n",
+            "[tool.ruff]\ntarget-version=311\n",
+            "[tool.ruff]\ntarget-version='py311'\nextend='../ruff.toml'\n",
+            "[tool.ruff]\ntarget-version='py311'\nextend=''\n",
+            "[tool.ruff]\ntarget-version='ambient'\n",
+        ] {
+            write(temp.path(), "pyproject.toml", manifest);
+            assert!(plan(action).is_err(), "{manifest}");
+        }
+        write(
+            temp.path(),
+            "pyproject.toml",
+            "[tool.ruff]\ntarget-version='py311'\nfix=true\nfix-only=true\n",
+        );
+        let first = plan(action).unwrap();
+        assert!(first.steps[0].is_structured_ruff());
+        assert_eq!(
+            first.steps[0],
+            webcodex_core::runner_protocol::ShellJobValidationStep::python_ruff(action.as_str())
+                .unwrap()
+        );
+        write(
+            temp.path(),
+            "pyproject.toml",
+            "[tool.ruff]\ntarget-version='py312'\n",
+        );
+        let changed = plan(action).unwrap();
+        assert_ne!(first.manifest_digest, changed.manifest_digest);
+        assert_eq!(first.invocation_digest, changed.invocation_digest);
+        for (packages, all, filter, policy) in [
+            (Some(vec!["src".into()]), false, None, None),
+            (None, true, None, None),
+            (None, false, Some("name"), None),
+            (
+                None,
+                false,
+                None,
+                Some(webcodex_core::project_validation::ProjectDependencyPolicy {
+                    mode: webcodex_core::project_validation::ProjectDependencyMode::Locked,
+                }),
+            ),
+        ] {
+            assert!(resolve_project_validation_recipe(
+                temp.path(),
+                None,
+                Some(RecipeId::Python),
+                &[action],
+                filter,
+                packages.as_deref(),
+                all,
+                policy
+            )
+            .is_err());
+        }
+        fs::remove_file(temp.path().join("pyproject.toml")).unwrap();
+    }
+    write(
+        temp.path(),
+        "pyproject.toml",
+        &format!(
+            "[tool.ruff]\ntarget-version='py311'\n#{}",
+            "x".repeat(1024 * 1024)
+        ),
+    );
+    assert_eq!(
+        plan(SemanticCheck::Check).unwrap_err().code,
+        "validation_manifest_invalid"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn project_ruff_rejects_manifest_symlink_escape() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write(
+        outside.path(),
+        "pyproject.toml",
+        "[tool.ruff]\ntarget-version='py311'\n",
+    );
+    std::os::unix::fs::symlink(
+        outside.path().join("pyproject.toml"),
+        temp.path().join("pyproject.toml"),
+    )
+    .unwrap();
+    assert!(resolve_project_validation_recipe(
+        temp.path(),
+        None,
+        Some(RecipeId::Python),
+        &[SemanticCheck::Check],
+        None,
+        None,
+        false,
+        None
+    )
+    .is_err());
+}
+
+#[test]
+fn node_build_reuses_manager_detection_and_fences_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    for (manager, lock) in [
+        ("npm", "package-lock.json"),
+        ("pnpm", "pnpm-lock.yaml"),
+        ("yarn", "yarn.lock"),
+        ("bun", "bun.lockb"),
+    ] {
+        write(
+            temp.path(),
+            "package.json",
+            &format!(r#"{{"packageManager":"{manager}@1","scripts":{{"build":"node build.js"}}}}"#),
+        );
+        let (selected, first) = super::resolve_node_project_build(temp.path(), None).unwrap();
+        assert_eq!(selected, manager);
+        write(temp.path(), lock, "lock");
+        let (_, second) = super::resolve_node_project_build(temp.path(), None).unwrap();
+        assert_ne!(first, second);
+        write(temp.path(), lock, "changed");
+        assert_ne!(
+            second,
+            super::resolve_node_project_build(temp.path(), None)
+                .unwrap()
+                .1
+        );
+        fs::remove_file(temp.path().join(lock)).unwrap();
+    }
+    write(temp.path(), "package-lock.json", "lock");
+    assert_eq!(
+        super::resolve_node_project_build(temp.path(), None)
+            .unwrap_err()
+            .code,
+        "package_manager_ambiguous"
+    );
+    fs::remove_file(temp.path().join("package-lock.json")).unwrap();
+    for manifest in [
+        r#"{"packageManager":"npm@1","scripts":{}}"#,
+        r#"{"packageManager":"npm@1","scripts":{"build":" "}}"#,
+    ] {
+        write(temp.path(), "package.json", manifest);
+        assert_eq!(
+            super::resolve_node_project_build(temp.path(), None)
+                .unwrap_err()
+                .code,
+            "build_script_unavailable"
+        );
+    }
+    write(temp.path(), "package.json", &" ".repeat(1024 * 1024 + 1));
+    assert!(super::resolve_node_project_build(temp.path(), None).is_err());
+}
+
+#[test]
+fn node_json_native_plans_are_closed_and_compound_scripts_keep_ordinary_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    for (script, framework) in [
+        ("vitest", "vitest"),
+        ("vitest run", "vitest"),
+        ("jest", "jest"),
+    ] {
+        write(
+            temp.path(),
+            "package.json",
+            &format!(r#"{{"scripts":{{"test":"{script}"}}}}"#),
+        );
+        let plan = super::resolve_node_native_project_test(temp.path(), None).unwrap();
+        assert_eq!(plan.steps[0].node_json_framework(), Some(framework));
+        assert!(plan.steps[0].is_canonical());
+        let before = plan.manifest_digest;
+        write(temp.path(), "package-lock.json", "one");
+        assert_ne!(
+            before,
+            super::resolve_node_native_project_test(temp.path(), None)
+                .unwrap()
+                .manifest_digest
+        );
+        fs::remove_file(temp.path().join("package-lock.json")).unwrap();
+    }
+    for script in [
+        "vitest run && node after.js",
+        "jest --watch",
+        "NODE_OPTIONS=x jest",
+        "npx vitest",
+        "node custom.js",
+    ] {
+        write(
+            temp.path(),
+            "package.json",
+            &format!(r#"{{"packageManager":"npm@1","scripts":{{"test":"{script}"}}}}"#),
+        );
+        assert_eq!(
+            super::resolve_node_native_project_test(temp.path(), None)
+                .unwrap_err()
+                .code,
+            "structured_test_report_unavailable"
+        );
+        let ordinary = resolve_validation_recipe(
+            temp.path(),
+            None,
+            Some(RecipeId::Node),
+            &[SemanticCheck::Test],
+            None,
+        )
+        .unwrap();
+        assert_eq!(ordinary.steps[0].program, "npm");
+        assert_eq!(ordinary.steps[0].args, ["run", "--silent", "test"]);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn node_owned_inputs_reject_links_special_files_and_oversize_reads() {
+    use std::os::unix::ffi::OsStrExt;
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"scripts":{"build":"node build.js"}}"#,
+    );
+    let path = temp.path().join("package-lock.json");
+    let target = temp.path().join("target");
+    fs::write(&target, "input").unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(super::resolve_node_project_build(temp.path(), None).is_err());
+    fs::remove_file(&path).unwrap();
+    let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // A FIFO must be rejected without waiting for a writer.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    assert!(super::resolve_node_project_build(temp.path(), None).is_err());
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, vec![b' '; 8 * 1024 * 1024 + 1]).unwrap();
+    assert!(super::resolve_node_project_build(temp.path(), None).is_err());
+    fs::write(&path, "input").unwrap();
+    assert!(super::resolve_node_project_build(temp.path(), None).is_ok());
+}
+
+#[test]
+fn explicit_node_lint_never_falls_back_to_check_or_typecheck() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"scripts":{"check":"node check.js","typecheck":"node types.js","lint":"node lint.js"}}"#,
+    );
+    let general = super::resolve_node_native_project_check(temp.path(), None).unwrap();
+    let lint = super::resolve_node_native_project_lint(temp.path(), None).unwrap();
+    assert_eq!(general.steps[0].args, ["--run", "check"]);
+    assert_eq!(lint.steps[0].args, ["--run", "lint"]);
+    assert_ne!(lint.invocation_digest, general.invocation_digest);
+    assert!(lint.steps[0].is_structured_node_check());
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"scripts":{"check":"node check.js","typecheck":"node types.js"}}"#,
+    );
+    assert_eq!(
+        super::resolve_node_native_project_lint(temp.path(), None)
+            .unwrap_err()
+            .code,
+        "validation_check_unavailable"
+    );
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"scripts":{"lint":null,"check":"node check.js"}}"#,
+    );
+    assert_eq!(
+        super::resolve_node_native_project_lint(temp.path(), None)
+            .unwrap_err()
+            .code,
+        "validation_manifest_invalid"
+    );
+    write(
+        temp.path(),
+        "package.json",
+        r#"{"scripts":{"lint":"   ","check":"node check.js"}}"#,
+    );
+    assert_eq!(
+        super::resolve_node_native_project_lint(temp.path(), None)
+            .unwrap_err()
+            .code,
+        "validation_manifest_invalid"
+    );
 }

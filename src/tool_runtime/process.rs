@@ -1,29 +1,29 @@
 use serde_json::json;
-use std::time::Duration;
 
 use super::helpers::{
     bounded_tail, command_failed_message, command_outcome_unknown_message,
     command_rejected_message, command_timeout_message, project_relative_runner_cwd,
     resolve_runner_cwd, COMMAND_STDIO_TAIL_CHARS,
 };
-use super::shell::{
-    command_execution_state_name, dispatch_uncertainty_lifecycle, runner_command_lifecycle,
-};
+use super::shell::command_execution_state_name;
 use super::structured_execution::{
-    await_hidden_structured_job, HiddenStructuredJobWait, StructuredExecutionBudget,
+    await_structured_job_result, await_structured_request_result, StructuredExecutionBudget,
+    StructuredRequestKind,
 };
 use super::tool_audit::{assertion_validation_identity, run_process_validation_identity};
 use super::{ExecutionPurpose, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_http::{
     process_preview, RunnerFeature, ShellJobStartMetadata, ShellJobVisibility,
-    StructuredJobExecution, DETACHED_IDEMPOTENCY_CONFLICT, DETACHED_IDEMPOTENCY_RECOVERY_PREFIX,
+    StructuredJobExecution,
 };
 use crate::runner_protocol::{
     validate_process_argv, ShellCommandExecutionState, ShellJobInfo, ShellJobOpRequest,
     ShellProcessArgv, PROCESS_CWD_MAX_BYTES, PROCESS_STDIN_MAX_BYTES,
-    STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS,
+    STRUCTURED_EXECUTION_DIRECT_SYNC_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS,
 };
+use webcodex_core::runner_skill::RunnerSkillExecutionRequest;
+use webcodex_runner_registry::ExecutionAdmissionError;
 
 fn command_started(state: ShellCommandExecutionState) -> bool {
     !matches!(state, ShellCommandExecutionState::NotStarted)
@@ -31,6 +31,27 @@ fn command_started(state: ShellCommandExecutionState) -> bool {
 
 fn command_completed(state: ShellCommandExecutionState) -> bool {
     matches!(state, ShellCommandExecutionState::Completed)
+}
+
+fn skill_resource_validation_identity_args(request: &RunnerSkillExecutionRequest) -> Vec<String> {
+    let source = match request.expected_source {
+        webcodex_core::runner_skill::RunnerSkillSource::Configured => "configured",
+        webcodex_core::runner_skill::RunnerSkillSource::Managed => "managed",
+    };
+    let mut identity_args = Vec::with_capacity(request.args.len() + 6);
+    identity_args.push(request.skill_id.clone());
+    identity_args.push(source.to_string());
+    identity_args.push(request.path.clone());
+    identity_args.push(request.expected_definition_revision.clone());
+    identity_args.push(
+        request
+            .expected_package_revision
+            .clone()
+            .unwrap_or_else(|| "<live-configured>".to_string()),
+    );
+    identity_args.push(request.expected_resource_sha256.clone());
+    identity_args.extend(request.args.iter().cloned());
+    identity_args
 }
 
 pub(crate) fn success_output(
@@ -116,6 +137,19 @@ pub(crate) fn process_tool_failure_result(
     )
 }
 
+/// Project the typed rejection for this admission attempt. Previously admitted
+/// Jobs retain their own lifecycle; callers handle detached recovery separately.
+pub(crate) fn execution_admission_failure_result(
+    error: ExecutionAdmissionError,
+    next_step: &str,
+) -> ToolResult {
+    process_tool_failure_result(
+        command_rejected_message(error.to_string(), next_step),
+        error.failure_kind(),
+        ShellCommandExecutionState::NotStarted,
+    )
+}
+
 pub(crate) fn outcome_unknown_result(reason: impl AsRef<str>) -> ToolResult {
     process_tool_failure_result(
         command_outcome_unknown_message(reason),
@@ -153,6 +187,7 @@ pub(crate) fn terminal_structured_job_result(
     let state = job
         .command_execution_state
         .unwrap_or(ShellCommandExecutionState::OutcomeUnknown);
+    let artifact_failure = super::project_build::artifact_observation_failure_kind(job);
     let mut result = match state {
         ShellCommandExecutionState::NotStarted => {
             let reason = job
@@ -186,6 +221,21 @@ pub(crate) fn terminal_structured_job_result(
         {
             ToolResult::ok(success_output(0, stdout, stderr, job.duration_ms))
         }
+        ShellCommandExecutionState::Completed if artifact_failure.is_some() => {
+            let mut result = command_failure_result(
+                job.exit_code,
+                stdout,
+                stderr,
+                job.duration_ms,
+                timeout_secs,
+                state,
+            );
+            let kind = artifact_failure.expect("artifact failure guard");
+            let missing = kind == "build_artifacts_missing";
+            result.error = Some(if missing { "Build process exited successfully, but expected packaging artifact observations are missing." } else { "Build process exited successfully, but artifact observation failed." }.into());
+            result.output["failure_kind"] = json!(kind);
+            result
+        }
         ShellCommandExecutionState::Completed => command_failure_result(
             job.exit_code,
             stdout,
@@ -195,6 +245,9 @@ pub(crate) fn terminal_structured_job_result(
             state,
         ),
     };
+    if let Some(artifacts) = &job.build_artifacts {
+        result.output["build_artifacts"] = json!(artifacts);
+    }
     if job.stdout_log_truncated {
         result.output["stdout_truncated"] = json!(true);
     }
@@ -204,9 +257,15 @@ pub(crate) fn terminal_structured_job_result(
     result
 }
 
+// Compatibility boundary for untyped legacy errors. Registry admission errors
+// must retain ExecutionAdmissionError through execution_admission_failure_result.
 pub(crate) fn classify_process_failure(message: &str) -> &'static str {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("interpreter_unavailable") || lower.contains("interpreter is unavailable") {
+    if lower.contains("build_tool_unavailable") {
+        "build_tool_unavailable"
+    } else if lower.contains("interpreter_unavailable")
+        || lower.contains("interpreter is unavailable")
+    {
         "interpreter_unavailable"
     } else if lower.contains("script_setup_failed")
         || lower.contains("temporary script setup failed")
@@ -249,7 +308,7 @@ pub(crate) fn classify_process_failure(message: &str) -> &'static str {
     }
 }
 
-fn validate_process_input(
+pub(super) fn validate_process_input(
     process: &ShellProcessArgv,
     stdin: Option<&str>,
     cwd: Option<&str>,
@@ -293,6 +352,109 @@ fn decorate(
 }
 
 impl ToolRuntime {
+    /// Build a canonical shell call only for exact, lossless process forms.
+    /// The caller re-enters shell authorization and policy before dispatch.
+    /// Runner capabilities must advertise explicit shell selection and, for
+    /// Bash login mode, support for that exact mode.
+    pub(super) async fn process_shell_recovery_call(
+        &self,
+        call: &super::ToolCall,
+        expectation: &super::sessions::ToolCallExpectation,
+        ssh_resource: Option<&str>,
+        resolved: Option<&super::project_resolution::ResolvedProject>,
+    ) -> Option<serde_json::Value> {
+        let super::ToolCall::RunProcess {
+            interactive,
+            project,
+            executable,
+            args,
+            stdin,
+            session_id,
+            timeout_secs,
+            sync_wait_secs,
+            cwd,
+            purpose,
+        } = call
+        else {
+            return None;
+        };
+        let login = executable == "bash" && args.first().is_some_and(|flag| flag == "-lc");
+        if *interactive
+            || !matches!(executable.as_str(), "sh" | "bash")
+            || args.len() != 2
+            || !(args[0] == "-c" || login)
+            || stdin.is_some()
+            || cwd
+                .as_ref()
+                .is_some_and(|cwd| cwd.len() > PROCESS_CWD_MAX_BYTES || cwd.contains('\0'))
+            || ssh_resource.is_some()
+            || !expectation.accepted_exit_codes.is_empty()
+            || expectation.expected_failure
+            || expectation.expected_failure_kind.is_some()
+            || expectation
+                .result_expectation
+                .as_deref()
+                .is_some_and(|value| value != "success")
+        {
+            return None;
+        }
+        let process = ShellProcessArgv {
+            executable: executable.clone(),
+            args: args.clone(),
+        };
+        if validate_process_input(&process, None, cwd.as_deref())
+            .err()
+            .as_deref()
+            != Some(
+                "run_process does not accept shell command modes; use run_shell for shell grammar/short chains or run_script for program-like scripts",
+            )
+        {
+            return None;
+        }
+        let resolved = resolved?;
+        resolve_runner_cwd(&resolved.config, cwd.as_deref()).ok()?;
+        let runner = self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await?;
+        if !runner.capabilities.explicit_shell_selection {
+            return None;
+        }
+        if login && !runner.capabilities.bash_login_shell {
+            return None;
+        }
+        let policy = runner.policy.as_ref()?;
+        if !policy.allow_raw_shell {
+            return None;
+        }
+        let available = policy
+            .shell_profiles
+            .as_ref()?
+            .available_dialects
+            .as_ref()?;
+        if !available.iter().any(|dialect| dialect == executable) {
+            return None;
+        }
+        let mut arguments =
+            json!({"project": project, "shell": executable, "login": login, "command": args[1]});
+        for (name, value) in [
+            ("session_id", json!(session_id)),
+            ("cwd", json!(cwd)),
+            ("timeout_secs", json!(timeout_secs)),
+            ("sync_wait_secs", json!(sync_wait_secs)),
+            ("purpose", json!(purpose)),
+            ("assertion_name", json!(expectation.assertion_name)),
+            ("result_expectation", json!(expectation.result_expectation)),
+        ] {
+            if !value.is_null() {
+                arguments[name] = value;
+            }
+        }
+        // Use the real canonical parser, including wrapper-field validation.
+        super::ToolCall::from_tool_name("run_shell", arguments.clone()).ok()?;
+        Some(super::SuggestedToolCall::mechanically_followable("run_shell", arguments).to_value())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_process_with_contract_for_resource(
         &self,
@@ -323,6 +485,38 @@ impl ToolRuntime {
             auth,
             validation_assertion_name,
             true,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_skill_resource_with_contract(
+        &self,
+        project: String,
+        request: RunnerSkillExecutionRequest,
+        timeout_secs: Option<u64>,
+        sync_wait_secs: Option<u64>,
+        cwd: Option<String>,
+        purpose: Option<ExecutionPurpose>,
+        session_id: Option<String>,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        self.run_process_with_contract_mode(
+            project,
+            String::new(),
+            Vec::new(),
+            None,
+            timeout_secs,
+            sync_wait_secs,
+            cwd,
+            purpose,
+            None,
+            session_id,
+            auth,
+            None,
+            true,
+            Some(request),
         )
         .await
     }
@@ -345,13 +539,15 @@ impl ToolRuntime {
         session_id: Option<String>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let budget = match StructuredExecutionBudget::resolve(timeout_secs) {
+        let requested_timeout_secs =
+            timeout_secs.unwrap_or(STRUCTURED_EXECUTION_TIMEOUT_DEFAULT_SECS);
+        let budget = match StructuredExecutionBudget::resolve_process(timeout_secs) {
             Ok(budget) => budget,
             Err(error) => {
                 return process_tool_failure_result(
                     command_rejected_message(
                         format!("run_detached_process {error}"),
-                        "pass timeout_secs between 1 and 3600, or omit it for the default of 60 seconds.",
+                        "pass a positive timeout_secs, or omit it for the default of 60 seconds; values above 604800 seconds (7 days) are clamped.",
                     ),
                     "invalid_arguments",
                     ShellCommandExecutionState::NotStarted,
@@ -420,7 +616,7 @@ impl ToolRuntime {
             Err(error) => {
                 return process_tool_failure_result(
                     command_rejected_message(
-                        error.to_string(),
+                        &error,
                         "confirm the Runner is registered and connected, then retry.",
                     ),
                     "agent_offline",
@@ -439,6 +635,20 @@ impl ToolRuntime {
             );
         }
         let access = crate::runner_http::runner_access_from_auth(auth);
+        // Runner policy is the final execution authority and may clamp a process
+        // timeout below the protocol/tool maximum. Surface the most recently
+        // registered policy at admission so callers do not mistake the requested
+        // lifetime for the effective one. The Runner still re-applies its live
+        // policy when it prepares the detached launch.
+        let runner_policy_max_timeout_secs = self
+            .runner_registry
+            .get_runner_view_for_auth(&client_id, access.as_ref())
+            .await
+            .and_then(|view| view.policy.map(|policy| policy.max_timeout_secs));
+        let admission_effective_timeout_secs = runner_policy_max_timeout_secs
+            .map(|max_timeout_secs| timeout.min(max_timeout_secs.max(1)))
+            .unwrap_or(timeout);
+        let timeout_clamped = admission_effective_timeout_secs != requested_timeout_secs;
         let detached_initiator = match crate::runner_http::detached_initiator_identity_from_auth(auth)
         {
             Ok(identity) => identity,
@@ -455,8 +665,9 @@ impl ToolRuntime {
         };
         match self
             .runner_registry
-            .start_job_with_metadata_for_access(
+            .start_job_with_metadata_for_access_typed(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some(client_id),
                     cwd: Some(effective_cwd),
@@ -487,28 +698,54 @@ impl ToolRuntime {
             )
             .await
         {
-            Ok(job) => ToolResult::ok(json!({
-                "job_id": job.job_id,
-                "kind": job.kind,
-                "status": job.status,
-                "project": project,
-                "execution_source": "run_detached_process",
-                "purpose": declared_purpose.as_str(),
-                "process_summary": summary,
-                "cwd": resolved_cwd,
-                "shell": "direct_argv",
-                "executor": "agent",
-                "execution_state": "pending",
-                "command_started": false,
-                "command_completed": false,
-                "terminal": false,
-                "effective_timeout_secs": timeout,
-                "created_at": job.created_at,
-                "observation_token": job.observation_token,
-                "last_update_seq": job.last_update_seq,
-            })),
+            Ok(job) => {
+                let continuation = crate::tool_runtime::jobs::observe_job_continuation(
+                    &job.job_id,
+                    job.observation_token.as_deref(),
+                );
+                // Idempotent replay can return an existing terminal Job. Its
+                // original execution truth is not a fresh pending handoff.
+                let terminal = super::jobs::is_terminal_job_status(&job.status);
+                let (execution_state, started, completed) = if terminal {
+                    let state = job
+                        .command_execution_state
+                        .unwrap_or(ShellCommandExecutionState::OutcomeUnknown);
+                    (
+                        command_execution_state_name(state),
+                        command_started(state),
+                        command_completed(state),
+                    )
+                } else {
+                    ("pending", false, false)
+                };
+                ToolResult::ok(json!({
+                    "job_id": job.job_id,
+                    "kind": job.kind,
+                    "status": job.status,
+                    "project": project,
+                    "execution_source": "run_detached_process",
+                    "purpose": declared_purpose.as_str(),
+                    "process_summary": summary,
+                    "cwd": resolved_cwd,
+                    "shell": "direct_argv",
+                    "executor": "agent",
+                    "execution_state": execution_state,
+                    "command_started": started,
+                    "command_completed": completed,
+                    "terminal": terminal,
+                    "requested_timeout_secs": requested_timeout_secs,
+                    "effective_timeout_secs": admission_effective_timeout_secs,
+                    "runner_policy_max_timeout_secs": runner_policy_max_timeout_secs,
+                    "timeout_clamped": timeout_clamped,
+                    "created_at": job.created_at,
+                    "observation_token": job.observation_token,
+                    "continuation_semantics": crate::tool_runtime::jobs::job_observation_continuation_semantics(),
+                    "last_update_seq": job.last_update_seq,
+                    "continuation": continuation,
+                }))
+            }
             Err(error) => {
-                if let Some(job_id) = error.strip_prefix(DETACHED_IDEMPOTENCY_RECOVERY_PREFIX) {
+                if let Some(job_id) = error.recovery_job_id() {
                     return ToolResult::err_with_output(
                         "detached initiation key already identifies a durable logical Job reconstructed after Server restart; the resent body was not redispatched. Observe the returned job_id instead of retrying execution.".to_string(),
                         json!({
@@ -523,24 +760,16 @@ impl ToolRuntime {
                         }),
                     );
                 }
-                if error.starts_with(DETACHED_IDEMPOTENCY_CONFLICT) {
-                    return process_tool_failure_result(
-                        command_rejected_message(
-                            &error,
-                            "use a fresh idempotency_key for a different detached process intent; the existing logical Job was left unchanged.",
-                        ),
-                        "idempotency_conflict",
-                        ShellCommandExecutionState::NotStarted,
+                if error.is_idempotency_conflict() {
+                    return execution_admission_failure_result(
+                        error,
+                        "use a fresh idempotency_key for a different detached process intent; the existing logical Job was left unchanged.",
                     );
                 }
-                process_tool_failure_result(
-                    command_rejected_message(
-                        &error,
+                execution_admission_failure_result(
+                        error,
                         "observe the deterministic logical Job if an initiating response may have been lost; do not retry with a fresh key unless no Job was admitted.",
-                    ),
-                    classify_process_failure(&error),
-                    ShellCommandExecutionState::NotStarted,
-                )
+                    )
             }
         }
     }
@@ -569,6 +798,7 @@ impl ToolRuntime {
             None,
             None,
             false,
+            None,
         )
         .await
     }
@@ -589,15 +819,19 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
         validation_assertion_name: Option<&str>,
         allow_async_handoff: bool,
+        skill_resource: Option<RunnerSkillExecutionRequest>,
     ) -> ToolResult {
-        let budget =
-            match StructuredExecutionBudget::resolve_with_sync_wait(timeout_secs, sync_wait_secs) {
+        let budget = match if skill_resource.is_some() {
+            StructuredExecutionBudget::resolve_with_sync_wait(timeout_secs, sync_wait_secs)
+        } else {
+            StructuredExecutionBudget::resolve_process_with_sync_wait(timeout_secs, sync_wait_secs)
+        } {
             Ok(budget) => budget,
             Err(error) => {
                 return process_tool_failure_result(
                     command_rejected_message(
                         format!("run_process {error}"),
-                        "pass timeout_secs between 1 and 3600 and sync_wait_secs between 1 and 60 without exceeding timeout_secs; both may be omitted for their defaults.",
+                        "pass positive timeout_secs/sync_wait_secs values or omit them for defaults; oversized values are clamped to the supported runtime and synchronous-wait ceilings.",
                     ),
                     "invalid_arguments",
                     ShellCommandExecutionState::NotStarted,
@@ -606,11 +840,34 @@ impl ToolRuntime {
         };
         let timeout = budget.effective_timeout_secs;
         let process = ShellProcessArgv { executable, args };
-        if let Err(error) = validate_process_input(&process, stdin.as_deref(), cwd.as_deref()) {
+        let skill_execution = skill_resource.as_ref();
+        let validation_error = match skill_execution {
+            Some(request) => request.validate().map_err(str::to_string).and_then(|_| {
+                if stdin.is_some() {
+                    Err(
+                        "trusted Skill execution source must be carried only in its typed request"
+                            .to_string(),
+                    )
+                } else if cwd
+                    .as_deref()
+                    .is_some_and(|cwd| cwd.len() > PROCESS_CWD_MAX_BYTES || cwd.contains('\0'))
+                {
+                    Err("cwd is invalid or too long".to_string())
+                } else {
+                    Ok(())
+                }
+            }),
+            None => validate_process_input(&process, stdin.as_deref(), cwd.as_deref()),
+        };
+        if let Err(error) = validation_error {
             return process_tool_failure_result(
                 command_rejected_message(
                     error,
-                    "correct the structured process fields and retry; use run_shell only when shell syntax is required.",
+                    if skill_execution.is_some() {
+                        "correct the trusted Skill resource identity, revisions, arguments, or project-relative cwd and retry."
+                    } else {
+                        "correct the structured process fields and retry; use run_shell only when shell syntax is required."
+                    },
                 ),
                 "invalid_arguments",
                 ShellCommandExecutionState::NotStarted,
@@ -619,22 +876,45 @@ impl ToolRuntime {
         if ssh_resource.is_some() {
             return process_tool_failure_result(
                 command_rejected_message(
-                    "named Session SSH resources do not support native structured argv",
-                    "use run_shell explicitly for this SSH resource, or run_process against the Runner-host project.",
+                    if skill_execution.is_some() {
+                        "named Session SSH resources do not support trusted Skill resource execution"
+                    } else {
+                        "named Session SSH resources do not support native structured argv"
+                    },
+                    if skill_execution.is_some() {
+                        "run the trusted Skill against the Runner-host project."
+                    } else {
+                        "use run_shell explicitly for this SSH resource, or run_process against the Runner-host project."
+                    },
                 ),
                 "unsupported_resource",
                 ShellCommandExecutionState::NotStarted,
             );
         }
-        let summary = process_preview(&process.executable, process.args.iter().map(String::as_str));
+        let summary = match skill_execution {
+            Some(request) => format!("trusted Skill resource {}", request.path),
+            None => process_preview(&process.executable, process.args.iter().map(String::as_str)),
+        };
         let declared_purpose = purpose.unwrap_or_default();
-        let validation_identity = run_process_validation_identity(
-            &process.executable,
-            &process.args,
-            stdin.as_deref(),
-            cwd.as_deref(),
-            Some(declared_purpose.as_str()),
-        )
+        let validation_identity = match skill_execution {
+            Some(request) => {
+                let identity_args = skill_resource_validation_identity_args(request);
+                run_process_validation_identity(
+                    "run_skill_resource",
+                    &identity_args,
+                    None,
+                    cwd.as_deref(),
+                    Some(declared_purpose.as_str()),
+                )
+            }
+            None => run_process_validation_identity(
+                &process.executable,
+                &process.args,
+                stdin.as_deref(),
+                cwd.as_deref(),
+                Some(declared_purpose.as_str()),
+            ),
+        }
         .map(|mut identity| {
             if let Some(assertion_name) = validation_assertion_name {
                 identity.identity = assertion_validation_identity(assertion_name);
@@ -701,8 +981,9 @@ impl ToolRuntime {
         if async_handoff_available && timeout > budget.sync_wait_secs {
             let job = self
                 .runner_registry
-                .start_job_with_metadata_for_access(
+                .start_job_with_metadata_for_access_typed(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: Some(effective_cwd),
@@ -723,7 +1004,10 @@ impl ToolRuntime {
                         purpose: Some(declared_purpose.as_str().to_string()),
                         shell: Some("direct_argv".to_string()),
                         visibility: ShellJobVisibility::HiddenUntilHandoff,
-                        structured_execution: Some(StructuredJobExecution::Process(process)),
+                        structured_execution: Some(match skill_execution {
+                            Some(request) => StructuredJobExecution::SkillResource(request.clone()),
+                            None => StructuredJobExecution::Process(process.clone()),
+                        }),
                         validation_identity: validation_identity
                             .as_ref()
                             .map(|identity| identity.identity.clone()),
@@ -734,7 +1018,11 @@ impl ToolRuntime {
                             .as_ref()
                             .filter(|identity| identity.identity.starts_with("assertion:"))
                             .and_then(|_| validation_assertion_name.map(str::to_string)),
-                        stdin,
+                        stdin: if skill_execution.is_some() {
+                            None
+                        } else {
+                            stdin.clone()
+                        },
                         ..Default::default()
                     },
                     crate::runner_http::runner_access_from_auth(auth).as_ref(),
@@ -744,14 +1032,10 @@ impl ToolRuntime {
             let job = match job {
                 Ok(job) => job,
                 Err(error) => {
-                    let mut result = process_tool_failure_result(
-                            command_rejected_message(
-                                &error,
-                                "confirm the Runner is connected and advertises structured_execution_jobs, then retry only if target state proves no process started.",
-                            ),
-                            classify_process_failure(&error),
-                            ShellCommandExecutionState::NotStarted,
-                        );
+                    let mut result = execution_admission_failure_result(
+                        error,
+                        "confirm the Runner is connected and advertises structured_execution_jobs, then retry only if target state proves no process started.",
+                    );
                     decorate(
                         &mut result.output,
                         declared_purpose,
@@ -768,81 +1052,20 @@ impl ToolRuntime {
                     return result;
                 }
             };
-            let wait = self
-                .structured_execution_sync_wait
-                .min(Duration::from_secs(budget.sync_wait_secs));
-            let handoff = await_hidden_structured_job(
+            let mut result = match await_structured_job_result(
                 self.runner_registry.clone(),
-                job.job_id.clone(),
-                wait,
-                auth.cloned(),
+                job.job_id,
+                self.structured_execution_sync_wait,
+                auth,
+                budget,
+                &summary,
+                declared_purpose,
             )
-            .await;
-            let mut result = match handoff {
-                Ok(HiddenStructuredJobWait::Terminal {
-                    job,
-                    stdout,
-                    stderr,
-                }) => {
-                    let result = terminal_structured_job_result(&job, stdout, stderr, timeout);
-                    self.runner_registry
-                        .remove_projected_hidden_structured_job_record(&job.job_id)
-                        .await;
-                    result
-                }
-                Ok(HiddenStructuredJobWait::Continued {
-                    observation,
-                    execution_state,
-                    command_started,
-                }) => {
-                    let detected_summary =
-                        crate::tool_runtime::jobs::detected_job_summary_with_activity(
-                            Some(&summary),
-                            Some(declared_purpose.as_str()),
-                            &observation.job.status,
-                            observation.job.exit_code.map(i64::from),
-                            &observation.stdout_tail,
-                            &observation.stderr_tail,
-                            observation.job.activity.as_ref(),
-                        );
-                    ToolResult::ok(json!({
-                        "execution_state": execution_state,
-                        "command_started": command_started,
-                        "command_completed": false,
-                        "command_ok": false,
-                        "exit_code": null,
-                        "failure_kind": null,
-                        "tool_failure": false,
-                        "promoted_to_job": true,
-                        "terminal": false,
-                        "job_id": observation.job.job_id,
-                        "job_status": observation.job.status,
-                        "observation_token": observation.job.observation_token,
-                        "activity": observation.job.activity,
-                        "effective_timeout_secs": timeout,
-                        "sync_wait_secs": budget.sync_wait_secs,
-                        "async_handoff_available": true,
-                        "stdout_tail": observation.stdout_tail,
-                        "stderr_tail": observation.stderr_tail,
-                        "stdout_lines": observation.stdout_lines,
-                        "stderr_lines": observation.stderr_lines,
-                        "stdout_truncated": observation.stdout_truncated,
-                        "stderr_truncated": observation.stderr_truncated,
-                        "detected_summary": detected_summary,
-                    }))
-                }
-                Err(error) => outcome_unknown_result(format!(
-                    "the durable process Job could not be observed during handoff: {error}"
-                )),
+            .await
+            {
+                Ok(result) => result,
+                Err(failure) => return failure.into_tool_result(&project, budget),
             };
-            if result.output["promoted_to_job"] != json!(true) {
-                add_structured_continuation_facts(
-                    &mut result,
-                    timeout,
-                    budget.sync_wait_secs,
-                    true,
-                );
-            }
             decorate(
                 &mut result.output,
                 declared_purpose,
@@ -853,125 +1076,54 @@ impl ToolRuntime {
             return result;
         }
         let wait_timeout = timeout;
-        let (request_id, receiver) = match self
-                .runner_registry
-                .enqueue_process(
-                    client_id,
-                    Some(effective_cwd),
-                    process,
-                    stdin,
-                    timeout,
-                    wait_timeout,
-                    "tool_runtime".to_string(),
-                )
-                .await
-            {
-                Ok(enqueued) => enqueued,
-                Err(error) => {
-                    return process_tool_failure_result(
-                        command_rejected_message(
-                            &error,
-                            "confirm the Runner is connected and advertises structured_process_argv, then retry only if target state proves no process started.",
-                        ),
-                        classify_process_failure(&error),
-                        ShellCommandExecutionState::NotStarted,
+        let enqueued = match skill_execution {
+            Some(request) => {
+                self.runner_registry
+                    .enqueue_skill_resource_execution_typed(
+                        client_id,
+                        Some(effective_cwd),
+                        request.clone(),
+                        timeout,
+                        wait_timeout,
+                        "tool_runtime".to_string(),
                     )
-                }
-            };
-        let mut result =
-            match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), receiver).await {
-                Ok(Ok(response)) => {
-                    let state = runner_command_lifecycle(&response, timeout);
-                    let exit_code = response.exit_code;
-                    let stdout = response.stdout.unwrap_or_default();
-                    let stderr = response.stderr.unwrap_or_default();
-                    match state {
-                        ShellCommandExecutionState::NotStarted => {
-                            let reason = response
-                                .error
-                                .as_deref()
-                                .unwrap_or("Runner rejected the process before spawn");
-                            process_tool_failure_result(
-                            command_rejected_message(
-                                reason,
-                                "inspect the rejection, correct executable/argv/cwd, then retry.",
-                            ),
-                            classify_process_failure(reason),
-                            state,
-                        )
-                        }
-                        ShellCommandExecutionState::OutcomeUnknown => {
-                            outcome_unknown_result(response.error.as_deref().unwrap_or(
-                                "the Runner did not return a trustworthy terminal result",
-                            ))
-                        }
-                        ShellCommandExecutionState::TimedOut => command_failure_result(
-                            exit_code,
-                            stdout,
-                            stderr,
-                            response.duration_ms,
-                            timeout,
-                            state,
-                        ),
-                        ShellCommandExecutionState::Completed
-                            if response.error.is_none() && exit_code == Some(0) =>
-                        {
-                            ToolResult::ok(success_output(0, stdout, stderr, response.duration_ms))
-                        }
-                        ShellCommandExecutionState::Completed => command_failure_result(
-                            exit_code,
-                            stdout,
-                            stderr,
-                            response.duration_ms,
-                            timeout,
-                            state,
-                        ),
-                    }
-                }
-                Ok(Err(_)) => {
-                    let dispatch = self
-                        .runner_registry
-                        .cancel_request_dispatch_state(&request_id)
-                        .await;
-                    if dispatch == Some(false) {
-                        process_tool_failure_result(
-                            command_rejected_message(
-                                "process request waiter was dropped before Runner dispatch",
-                                "check Runner connectivity, then retry.",
-                            ),
-                            "runtime_error",
-                            ShellCommandExecutionState::NotStarted,
-                        )
+                    .await
+            }
+            None => {
+                self.runner_registry
+                    .enqueue_process_typed(
+                        client_id,
+                        Some(effective_cwd),
+                        process,
+                        stdin,
+                        timeout,
+                        wait_timeout,
+                        "tool_runtime".to_string(),
+                    )
+                    .await
+            }
+        };
+        let (request_id, receiver) = match enqueued {
+            Ok(enqueued) => enqueued,
+            Err(error) => {
+                return execution_admission_failure_result(
+                    error,
+                    if skill_execution.is_some() {
+                        "confirm the Runner is connected and advertises skill_resource_execution, then retry only if target state proves no process started."
                     } else {
-                        outcome_unknown_result(
-                            "process request waiter was dropped after dispatch may have occurred",
-                        )
-                    }
-                }
-                Err(_) => {
-                    let dispatch = self
-                        .runner_registry
-                        .cancel_request_dispatch_state(&request_id)
-                        .await;
-                    let state = dispatch_uncertainty_lifecycle(dispatch);
-                    if state == ShellCommandExecutionState::NotStarted {
-                        process_tool_failure_result(
-                            command_rejected_message(
-                                format!(
-                                "timed out waiting {wait_timeout} seconds before Runner dispatch"
-                            ),
-                                "check Runner connectivity and availability, then retry.",
-                            ),
-                            "timeout",
-                            state,
-                        )
-                    } else {
-                        outcome_unknown_result(format!(
-                        "timed out waiting {wait_timeout} seconds for the Runner process result"
-                    ))
-                    }
-                }
-            };
+                        "confirm the Runner is connected and advertises structured_process_argv, then retry only if target state proves no process started."
+                    },
+                )
+            }
+        };
+        let mut result = await_structured_request_result(
+            &self.runner_registry,
+            &request_id,
+            receiver,
+            wait_timeout,
+            StructuredRequestKind::Process,
+        )
+        .await;
         decorate(
             &mut result.output,
             declared_purpose,
@@ -990,5 +1142,52 @@ impl ToolRuntime {
             async_handoff_available,
         );
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use webcodex_core::runner_skill::RunnerSkillSource;
+
+    fn validation_identity(request: &RunnerSkillExecutionRequest) -> String {
+        run_process_validation_identity(
+            "run_skill_resource",
+            &skill_resource_validation_identity_args(request),
+            None,
+            Some("."),
+            Some("test"),
+        )
+        .expect("test purpose is validation-like")
+        .identity
+    }
+
+    #[test]
+    fn skill_resource_validation_identity_includes_package_execution_context() {
+        let base = RunnerSkillExecutionRequest {
+            skill_id: "wc_skill_aaaaaaaaaaaaaaaaaaaaaA".to_string(),
+            expected_source: RunnerSkillSource::Managed,
+            path: "scripts/check.py".to_string(),
+            expected_definition_revision: "b".repeat(64),
+            expected_package_revision: Some(
+                "wc_skillpkg_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ),
+            expected_resource_sha256: "c".repeat(64),
+            args: vec!["--fast".to_string()],
+        };
+        let base_identity = validation_identity(&base);
+
+        let mut different_skill = base.clone();
+        different_skill.skill_id = "wc_skill_bbbbbbbbbbbbbbbbbbbbbQ".to_string();
+        assert_ne!(base_identity, validation_identity(&different_skill));
+
+        let mut different_package = base.clone();
+        different_package.expected_package_revision =
+            Some("wc_skillpkg_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string());
+        assert_ne!(base_identity, validation_identity(&different_package));
+
+        let mut different_definition = base.clone();
+        different_definition.expected_definition_revision = "d".repeat(64);
+        assert_ne!(base_identity, validation_identity(&different_definition));
     }
 }

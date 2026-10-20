@@ -33,12 +33,11 @@ fn post_message(store: &SessionStore, session_id: &str, kind: SessionMessageKind
 fn session_tool_contract(tool_name: &str) -> SessionToolContract {
     let (read_like, write_like, shell_like, path_hint) = match tool_name {
         "read_file" => (true, false, false, SessionPathHint::SinglePath),
-        "session_summary" => (true, false, false, SessionPathHint::None),
+        "read_session_summary" => (true, false, false, SessionPathHint::None),
         "run_shell" => (false, true, true, SessionPathHint::None),
-        "write_project_file"
-        | "post_session_message"
-        | "workspace_checkpoint_create"
-        | "close_session" => (false, true, false, SessionPathHint::None),
+        "write_project_file" | "post_session_message" | "set_memory" | "close_session" => {
+            (false, true, false, SessionPathHint::None)
+        }
         other => panic!("unexpected synthetic lifecycle tool contract: {other}"),
     };
     SessionToolContract {
@@ -50,8 +49,6 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
         change_summary_like: false,
         project_write: write_like,
         path_hint,
-        accepts_context_ack: false,
-        advances_context_checkpoint: false,
     }
 }
 
@@ -515,9 +512,9 @@ fn closed_session_coldifies_payload_and_queries_without_reheating() {
     let query_start = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "session_summary",
+        "read_session_summary",
         &json!({"session_id": session.session_id.clone()}),
-        session_tool_contract("session_summary"),
+        session_tool_contract("read_session_summary"),
     );
     store.record_tool_call_finished(query_start, true, &json!({"success": true}), None, None);
     assert_eq!(
@@ -580,7 +577,7 @@ fn close_cleanup_evidence_rewrites_cold_payload_without_reheating() {
 }
 
 #[test]
-fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
+fn cold_round_trip_preserves_evidence_and_active_identity_without_hot_residency() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger = tmp.path().join("sessions.json");
     let store = SessionStore::with_persistence(&ledger, 10, 20);
@@ -654,13 +651,13 @@ fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
     assert!(restored
         .cold_payload_bytes_for_test(&closed.session_id)
         .is_some_and(|bytes| bytes > 0));
-    assert!(restored
-        .hot_payload_entry_count_for_test(&active.session_id)
-        .is_some());
     assert_eq!(
-        restored.cold_payload_bytes_for_test(&active.session_id),
+        restored.hot_payload_entry_count_for_test(&active.session_id),
         None
     );
+    assert!(restored
+        .cold_payload_bytes_for_test(&active.session_id)
+        .is_some());
 
     let after_summary = restored.summary(&closed.session_id, Some(100)).unwrap();
     let after_messages = restored
@@ -688,21 +685,30 @@ fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
 }
 
 #[test]
-fn cold_session_query_touch_preserves_lru_capacity_order() {
+fn cold_session_query_touch_preserves_closed_retention_order_without_evicting_active_sessions() {
     let store = SessionStore::new(2, 10);
-    let first = store.start_session(None, Some("cold survivor".to_string()));
+    let active = store.start_session(None, Some("active survivor".to_string()));
+    let first = store.start_session(None, Some("first closed".to_string()));
     store.close_session(&first.session_id).unwrap();
-    let second = store.start_session(None, Some("old active".to_string()));
+    let second = store.start_session(None, Some("second closed".to_string()));
+    store.close_session(&second.session_id).unwrap();
 
     assert!(store
         .cold_payload_bytes_for_test(&first.session_id)
         .is_some());
     store.summary(&first.session_id, Some(10)).unwrap();
-    let third = store.start_session(None, Some("new active".to_string()));
 
+    let third = store.start_session(None, Some("third closed".to_string()));
+    store.close_session(&third.session_id).unwrap();
+
+    assert!(store.contains_session(&active.session_id));
     assert!(store.contains_session(&first.session_id));
     assert!(!store.contains_session(&second.session_id));
     assert!(store.contains_session(&third.session_id));
+    assert_eq!(
+        store.lifecycle_state(&active.session_id),
+        Some(SessionLifecycle::Active)
+    );
     assert_eq!(
         store.lifecycle_state(&first.session_id),
         Some(SessionLifecycle::Closed)
@@ -711,8 +717,38 @@ fn cold_session_query_touch_preserves_lru_capacity_order() {
         .cold_payload_bytes_for_test(&first.session_id)
         .is_some());
     assert!(store
-        .hot_payload_entry_count_for_test(&third.session_id)
+        .cold_payload_bytes_for_test(&third.session_id)
         .is_some());
+}
+
+#[test]
+fn closed_history_retention_is_separate_from_active_identity_retention() {
+    let store = SessionStore::new(1, 10);
+    let active = store.start_session(None, Some("active survivor".to_string()));
+    let old_closed = store.start_session(None, Some("old closed".to_string()));
+    store.close_session(&old_closed.session_id).unwrap();
+    let new_closed = store.start_session(None, Some("new closed".to_string()));
+    store.close_session(&new_closed.session_id).unwrap();
+
+    assert!(store.contains_session(&active.session_id));
+    assert_eq!(
+        store.lifecycle_state(&active.session_id),
+        Some(SessionLifecycle::Active)
+    );
+    assert!(!store.contains_session(&old_closed.session_id));
+    assert!(store.contains_session(&new_closed.session_id));
+    assert_eq!(
+        store.lifecycle_state(&new_closed.session_id),
+        Some(SessionLifecycle::Closed)
+    );
+    assert!(store
+        .cold_payload_bytes_for_test(&new_closed.session_id)
+        .is_some());
+    let status = store.status();
+    assert_eq!(status.active_sessions, 1);
+    assert_eq!(status.closed_sessions, 1);
+    assert_eq!(status.historical_session_retention_limit, 1);
+    assert_eq!(status.capacity_evictions, 1);
 }
 
 #[test]
@@ -771,8 +807,8 @@ fn closed_session_denies_mutation_tools_allows_query() {
     assert!(store
         .lifecycle_denial(
             &session.session_id,
-            "workspace_checkpoint_create",
-            session_tool_contract("workspace_checkpoint_create")
+            "set_memory",
+            session_tool_contract("set_memory")
         )
         .is_some());
 
@@ -787,8 +823,8 @@ fn closed_session_denies_mutation_tools_allows_query() {
     assert!(store
         .lifecycle_denial(
             &session.session_id,
-            "session_summary",
-            session_tool_contract("session_summary")
+            "read_session_summary",
+            session_tool_contract("read_session_summary")
         )
         .is_none());
     assert!(store
@@ -866,19 +902,31 @@ fn unknown_session_close_fails_without_create() {
 }
 
 #[test]
-fn eviction_does_not_produce_closed_lifecycle() {
-    // Capacity eviction removes the record; it is not a Closed transition.
+fn capacity_pressure_does_not_change_active_lifecycle_or_identity() {
     let store = SessionStore::new(1, 10);
-    let first = store.start_session(None, Some("evict me".to_string()));
-    let _second = store.start_session(None, Some("survivor".to_string()));
-    assert!(!store.contains_session(&first.session_id));
-    assert!(store.summary(&first.session_id, None).is_none());
-    // Evicted id is unknown, not Closed — close must not invent a session.
+    let first = store.start_session(None, Some("keep me active".to_string()));
+    let _second = store.start_session(None, Some("also active".to_string()));
+    assert!(store.contains_session(&first.session_id));
     assert_eq!(
-        store.close_session(&first.session_id).unwrap_err(),
-        SessionCloseError::UnknownSession
+        store.lifecycle_state(&first.session_id),
+        Some(SessionLifecycle::Active)
     );
-    assert!(!store.contains_session(&first.session_id));
+    assert_eq!(
+        store.summary(&first.session_id, None).unwrap().session_id,
+        first.session_id
+    );
+
+    let closed = store.close_session(&first.session_id).unwrap();
+    assert!(!closed.already_closed);
+    assert_eq!(closed.summary.lifecycle, SessionLifecycle::Closed);
+    assert_eq!(
+        store.lifecycle_state(&first.session_id),
+        Some(SessionLifecycle::Closed)
+    );
+    assert!(store.summary(&first.session_id, None).is_some());
+    assert!(store
+        .cold_payload_bytes_for_test(&first.session_id)
+        .is_some());
 }
 
 #[test]

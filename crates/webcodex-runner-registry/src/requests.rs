@@ -1,4 +1,6 @@
 use super::access_control::assert_runner_access;
+use super::dispatch_fence::{McpGatewayDispatchFence, PendingDispatchFence, ProjectDispatchFence};
+use super::execution_admission::ExecutionAdmissionError;
 use super::jobs::{
     command_preview, ensure_dispatch_supported_locked, ensure_queue_capacity_locked,
     request_preview, PendingRequestEnqueueError,
@@ -7,7 +9,6 @@ use super::jobs::{
 use super::projects::RunnerLookupError;
 use super::state::{
     CodingAgentDispatchFence, PendingShellRequest, PluginGatewayDispatchFence, RunnerRegistryInner,
-    SkillStoreDispatchFence,
 };
 use super::validation::{
     validate_file_request, validate_id, validate_process_request, validate_run_request,
@@ -15,6 +16,7 @@ use super::validation::{
 };
 use super::{now_ts, RunnerFeature, RunnerRegistry, RUNNER_ONLINE_WINDOW_SECS};
 use std::fmt;
+use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 use webcodex_core::coding_agent::{
@@ -30,28 +32,45 @@ use webcodex_core::plugin::{
     validate_request as validate_plugin_gateway_request, PluginDispatchState, PluginGatewayRequest,
     PluginGatewayResponse,
 };
+use webcodex_core::runner_instruction::{
+    RunnerInstructionRequest, RUNNER_INSTRUCTION_REQUEST_MAX_BYTES,
+};
 use webcodex_core::runner_operation::{
-    RunnerComputerOperation, RunnerComputerOperationKind, RunnerFileOperation,
-    RunnerInvocationMetadata, RunnerOperation, RunnerPersistentShellOperation,
-    RunnerProcessOperation, RunnerProjectOperation, RunnerProjectOperationKind,
-    RunnerScriptOperation, RunnerShellOperation,
+    RunnerBrowserOperation, RunnerBrowserOperationKind, RunnerComputerOperation,
+    RunnerComputerOperationKind, RunnerFileOperation, RunnerInvocationMetadata, RunnerOperation,
+    RunnerPersistentShellOperation, RunnerProcessOperation, RunnerProjectOperation,
+    RunnerProjectOperationKind, RunnerScriptOperation, RunnerShellOperation,
+    RunnerSkillResourceOperation,
 };
 use webcodex_core::runner_protocol::{
     shell_computer_request_payload_max_bytes, PersistentShellRequest, PersistentShellResult,
     RunnerConfigOperationRequest, RunnerRequest, ShellFileOpRequest, ShellJobContext,
-    ShellProcessArgv, ShellRunRequest, ShellRunResponse, ShellScriptPayload,
+    ShellProcessArgv, ShellRunRequest, ShellRunResponse, ShellScriptLanguage, ShellScriptPayload,
     RAW_SHELL_COMMAND_MAX_BYTES, RUNNER_CAPABILITY_APPLY_PATCH,
     RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE, RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
-    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE, RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE,
+    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT,
+    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
+    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA,
+    RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE, RUNNER_CAPABILITY_APPLY_TEXT_EDIT_RANGE,
     RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
-    RUNNER_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA, RUNNER_CAPABILITY_FILE_READ,
+    RUNNER_CAPABILITY_ARTIFACT_EXPORT_STREAMING_METADATA,
+    RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION, RUNNER_CAPABILITY_FILE_READ,
     RUNNER_CAPABILITY_FILE_WRITE, RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
     RUNNER_CAPABILITY_PERSISTENT_SHELL, RUNNER_CAPABILITY_SSH_PERSISTENT_SHELL,
     RUNNER_CAPABILITY_STRUCTURED_FILE_DELETE, RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
-    RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD, RUNNER_CONFIG_REQUEST_MAX_BYTES,
+    RUNNER_CAPABILITY_STRUCTURED_SCRIPT_JAVASCRIPT, RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
+    RUNNER_CONFIG_REQUEST_MAX_BYTES,
 };
-use webcodex_core::skill_store::SkillStoreRequest;
+use webcodex_core::runner_skill::{RunnerSkillExecutionRequest, RunnerSkillRequest};
 use webcodex_core::ssh_resource::{SshResourceRequest, SSH_RESOURCE_REQUEST_MAX_BYTES};
+use webcodex_core::workflow_session_contract::ExecutionShell;
+
+pub(super) fn capability_upgrade_error(client_id: &str, capability: RunnerFeature) -> String {
+    format!(
+        "capability_unavailable: Runner `{client_id}` does not support {}; upgrade that Runner to use this operation",
+        capability.as_wire_name()
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnqueueLspError {
@@ -103,6 +122,54 @@ impl fmt::Display for EnqueueLspError {
 
 impl std::error::Error for EnqueueLspError {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnqueueRunnerSkillError {
+    InvalidRequest {
+        message: String,
+    },
+    ExactRunnerUnavailable {
+        client_id: String,
+    },
+    ExactRunnerOffline {
+        client_id: String,
+    },
+    RunnerChanged {
+        client_id: String,
+    },
+    UnsupportedCapability {
+        client_id: String,
+        capability: &'static str,
+    },
+    DispatchUnavailable {
+        message: String,
+    },
+}
+
+impl fmt::Display for EnqueueRunnerSkillError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { message } | Self::DispatchUnavailable { message } => {
+                formatter.write_str(message)
+            }
+            Self::ExactRunnerUnavailable { .. } => {
+                formatter.write_str("exact Runner is unavailable")
+            }
+            Self::ExactRunnerOffline { .. } => {
+                formatter.write_str("exact Runner is offline; Skill request was not dispatched")
+            }
+            Self::RunnerChanged { .. } => {
+                formatter.write_str("stale Runner identity; Skill request was not dispatched")
+            }
+            Self::UnsupportedCapability { capability, .. } => write!(
+                formatter,
+                "skill_capability_unavailable: exact Runner does not support {capability}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EnqueueRunnerSkillError {}
+
 impl From<PendingRequestEnqueueError> for EnqueueLspError {
     fn from(error: PendingRequestEnqueueError) -> Self {
         match error {
@@ -118,6 +185,9 @@ impl From<PendingRequestEnqueueError> for EnqueueLspError {
             PendingRequestEnqueueError::QueueFull { client_id, limit } => {
                 Self::QueueFull { client_id, limit }
             }
+            PendingRequestEnqueueError::Maintenance => Self::InvalidRequest {
+                message: "runner admission is paused for maintenance".to_string(),
+            },
         }
     }
 }
@@ -150,9 +220,36 @@ pub(super) fn enqueue_pending_request_locked(
     waiter: Option<oneshot::Sender<ShellRunResponse>>,
     job_id: Option<String>,
 ) -> Result<(), PendingRequestEnqueueError> {
+    enqueue_pending_request_with_fence_locked(
+        telemetry,
+        inner,
+        client_id,
+        request_id,
+        request,
+        waiter,
+        job_id,
+        PendingDispatchFence::Unfenced,
+    )
+}
+
+pub(super) fn enqueue_pending_request_with_fence_locked(
+    telemetry: &dyn crate::RunnerRegistryTelemetry,
+    inner: &mut RunnerRegistryInner,
+    client_id: &str,
+    request_id: String,
+    request: RunnerRequest,
+    waiter: Option<oneshot::Sender<ShellRunResponse>>,
+    job_id: Option<String>,
+    dispatch_fence: PendingDispatchFence,
+) -> Result<(), PendingRequestEnqueueError> {
     let operation = request
         .decode_operation()
         .map_err(|message| PendingRequestEnqueueError::InvalidOperation { message })?;
+    dispatch_fence
+        .validate_operation(&operation)
+        .map_err(|message| PendingRequestEnqueueError::InvalidOperation {
+            message: message.to_string(),
+        })?;
     ensure_dispatch_supported_locked(inner, client_id)?;
     ensure_queue_capacity_locked(inner, client_id)?;
     let runner = inner.runners.get(client_id);
@@ -171,6 +268,7 @@ pub(super) fn enqueue_pending_request_locked(
             .and_then(|record| record.build.as_ref())
             .and_then(|build| build.git_commit.as_deref()),
     );
+    let enqueued_at = Instant::now();
     inner
         .queues_by_runner
         .entry(client_id.to_string())
@@ -183,15 +281,9 @@ pub(super) fn enqueue_pending_request_locked(
             operation,
             waiter,
             job_id,
-            expected_runner_owner: None,
-            expected_project_id: None,
-            expected_project_cwd: None,
-            expected_mcp_gateway_runner_instance_id: None,
-            expected_mcp_gateway_provider_id: None,
-            expected_mcp_gateway_provider_instance_id: None,
-            expected_ssh_resource_runner_instance_id: None,
-            expected_runner_config_runner_instance_id: None,
-            skill_store_fence: None,
+            dispatch_fence,
+            enqueued_at,
+            dispatched_transport: None,
             dispatched: false,
         },
     );
@@ -210,14 +302,40 @@ pub(super) fn remove_pending_request_locked(
     request_id: &str,
 ) -> Option<PendingShellRequest> {
     let pending = take_pending_request_locked(inner, request_id);
-    remove_request_from_queues_locked(inner, request_id);
+    if let Some(pending) = &pending {
+        remove_request_from_runner_queue_locked(inner, &pending.request.client_id, request_id);
+    } else {
+        // No retained owner: preserve conservative orphan cleanup, without
+        // treating the missing request as proof that execution never started.
+        for queue in inner.queues_by_runner.values_mut() {
+            queue.retain(|id| id != request_id);
+        }
+    }
     pending
 }
 
-fn remove_request_from_queues_locked(inner: &mut RunnerRegistryInner, request_id: &str) {
-    for queue in inner.queues_by_runner.values_mut() {
+fn remove_request_from_runner_queue_locked(
+    inner: &mut RunnerRegistryInner,
+    client_id: &str,
+    request_id: &str,
+) {
+    if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
         queue.retain(|id| id != request_id);
     }
+}
+
+/// Retire only a Job request's dispatch bookkeeping under the Registry lock.
+/// Callers establish the exact Runner from the owned Job or pending request.
+/// Job lifecycle, reconnect suppression and typed waiter resolution remain with
+/// their existing owners; this neither stops execution nor makes replay safe.
+pub(super) fn retire_job_request_locked(
+    inner: &mut RunnerRegistryInner,
+    client_id: &str,
+    request_id: &str,
+) {
+    take_pending_request_locked(inner, request_id);
+    inner.request_to_job.remove(request_id);
+    remove_request_from_runner_queue_locked(inner, client_id, request_id);
 }
 
 /// Resolve every in-flight *synchronous* tool request (no `job_id`) owned by
@@ -244,12 +362,9 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
         .map(|(request_id, _)| request_id.clone())
         .collect();
     for request_id in request_ids {
-        let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
+        let Some(mut pending) = remove_pending_request_locked(inner, &request_id) else {
             continue;
         };
-        if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
-            queue.retain(|id| id != &request_id);
-        }
         if let Some(waiter) = pending.waiter.take() {
             let response = ShellRunResponse {
                 success: false,
@@ -260,6 +375,8 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: Some(error.to_string()),
                 request_dispatched: Some(pending.dispatched),
@@ -325,36 +442,63 @@ pub(super) fn resolve_disconnected_sync_requests_locked(
     }
 }
 
-fn apply_text_edits_capability_requirements(body: &ShellFileOpRequest) -> (bool, bool) {
+fn apply_text_edits_capability_requirements(
+    body: &ShellFileOpRequest,
+) -> (bool, bool, bool, bool, bool) {
     if body.op != "apply_text_edits" {
-        return (false, false);
+        return (false, false, false, false, false);
     }
     let Some(content) = body.content.as_deref() else {
-        return (false, false);
+        return (false, false, false, false, false);
     };
     let Ok(payload) = serde_json::from_str::<serde_json::Value>(content) else {
         // Invalid JSON cannot become a valid Runner mutation. Preserve the
         // existing generic-ingress behavior and let the Runner reject it.
-        return (false, false);
+        return (false, false, false, false, false);
     };
     let Some(changes) = payload.get("changes").and_then(serde_json::Value::as_array) else {
-        return (false, false);
+        return (false, false, false, false, false);
     };
 
     let mut requires_occurrence = false;
     let mut requires_line_scope = false;
-    for edit in changes
-        .iter()
-        .filter_map(|change| change.get("edits").and_then(serde_json::Value::as_array))
-        .flatten()
-    {
-        requires_occurrence |= edit.get("occurrence").is_some_and(|value| !value.is_null());
-        requires_line_scope |= edit.get("line_scope").is_some_and(|value| !value.is_null());
-        if requires_occurrence && requires_line_scope {
-            break;
+    let mut requires_local_guard_without_sha = false;
+    let mut requires_expected_match_count = false;
+    let mut requires_range = false;
+    for change in changes {
+        if change.get("kind").and_then(serde_json::Value::as_str) == Some("edit")
+            && change
+                .get("expected_sha256")
+                .is_none_or(serde_json::Value::is_null)
+        {
+            requires_local_guard_without_sha = true;
+        }
+        for edit in change
+            .get("edits")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let is_range =
+                edit.get("kind").and_then(serde_json::Value::as_str) == Some("replace_range");
+            requires_range |= is_range;
+            requires_occurrence |= edit.get("occurrence").is_some_and(|value| !value.is_null());
+            // replace_range reuses line_scope in the internal Runner DTO, but
+            // its semantics are fenced by the dedicated range capability.
+            requires_line_scope |=
+                !is_range && edit.get("line_scope").is_some_and(|value| !value.is_null());
+            requires_expected_match_count |= edit
+                .get("expected_match_count")
+                .is_some_and(|value| !value.is_null());
         }
     }
-    (requires_occurrence, requires_line_scope)
+    (
+        requires_occurrence,
+        requires_line_scope,
+        requires_local_guard_without_sha,
+        requires_expected_match_count,
+        requires_range,
+    )
 }
 
 fn encode_runner_operation(
@@ -404,11 +548,33 @@ impl RunnerRegistry {
                 body.op
             ));
         }
-        let (requires_occurrence, requires_line_scope) =
-            apply_text_edits_capability_requirements(&body);
-        if requires_line_scope {
+        let (
+            requires_occurrence,
+            requires_line_scope,
+            requires_local_guard_without_sha,
+            requires_expected_match_count,
+            requires_range,
+        ) = apply_text_edits_capability_requirements(&body);
+        if requires_line_scope
+            || requires_local_guard_without_sha
+            || requires_expected_match_count
+            || requires_range
+        {
             return self
-                .enqueue_apply_text_edits_with_line_scope(body, requested_by, requires_occurrence)
+                .enqueue_apply_text_edits_with_requirements(
+                    body,
+                    requested_by,
+                    requires_occurrence,
+                    requires_line_scope,
+                    requires_local_guard_without_sha,
+                    requires_expected_match_count,
+                    requires_range,
+                )
+                .await;
+        }
+        if requires_occurrence {
+            return self
+                .enqueue_apply_text_edits_with_occurrence(body, requested_by)
                 .await;
         }
         self.enqueue_validated_file_op(body, requested_by).await
@@ -442,6 +608,19 @@ impl RunnerRegistry {
         let (tx, rx) = oneshot::channel();
         let request = encode_file_operation(&request_id, &body, requested_by)?;
         let mut inner = self.inner.lock().await;
+        if body.op == "list_page" {
+            let runner = inner
+                .runners
+                .get(&body.client_id)
+                .ok_or("unknown directory Runner")?;
+            if !runner.runner_features.supports(RunnerFeature::FileRead)
+                || !runner.runner_features.supports(RunnerFeature::FileListPage)
+            {
+                return Err(
+                    "capability_unavailable: Runner does not support file_list_page".into(),
+                );
+            }
+        }
         enqueue_pending_request_locked(
             self.telemetry.as_ref(),
             &mut inner,
@@ -456,65 +635,66 @@ impl RunnerRegistry {
     }
 
     /// Enqueue an apply_text_edits request containing at least one occurrence
-    /// selector. The capability check and pending admission are intentionally
-    /// performed under the same registry lock: an older or replacement Runner
-    /// must never receive a selector it could silently ignore.
+    /// selector. The capability check and pending admission share one lock.
     pub async fn enqueue_apply_text_edits_with_occurrence(
         &self,
         body: ShellFileOpRequest,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
-        validate_file_request(&body)?;
-        if body.op != "apply_text_edits" {
-            return Err(format!(
-                "occurrence-fenced edit enqueue only accepts op=apply_text_edits (got {})",
-                body.op
-            ));
-        }
-        let request_id = next_request_id();
-        let (tx, rx) = oneshot::channel();
-        let request = encode_file_operation(&request_id, &body, requested_by)?;
-        let mut inner = self.inner.lock().await;
-        let Some(runner) = inner.runners.get(&body.client_id) else {
-            return Err(format!("unknown shell client: {}", body.client_id));
-        };
-        if !runner
-            .runner_features
-            .supports(RunnerFeature::ApplyTextEditOccurrence)
-        {
-            return Err(format!(
-                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
-                body.client_id
-            ));
-        }
-        enqueue_pending_request_locked(
-            self.telemetry.as_ref(),
-            &mut inner,
-            &body.client_id,
-            request_id.clone(),
-            request,
-            Some(tx),
-            None,
-        )?;
-        notify_runner_locked(&inner, &body.client_id);
-        Ok((request_id, rx))
+        let (
+            _,
+            requires_line_scope,
+            requires_local_guard_without_sha,
+            requires_expected_match_count,
+            requires_range,
+        ) = apply_text_edits_capability_requirements(&body);
+        self.enqueue_apply_text_edits_with_requirements(
+            body,
+            requested_by,
+            true,
+            requires_line_scope,
+            requires_local_guard_without_sha,
+            requires_expected_match_count,
+            requires_range,
+        )
+        .await
     }
 
     /// Enqueue an apply_text_edits request containing at least one line_scope.
-    /// The additive line-scope capability (and occurrence capability when the
-    /// same payload also uses occurrence) is checked under the same registry
-    /// lock as pending admission so an older/replacement Runner can never
-    /// receive a safety fence it could silently ignore.
     pub async fn enqueue_apply_text_edits_with_line_scope(
         &self,
         body: ShellFileOpRequest,
         requested_by: String,
         requires_occurrence: bool,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        let (_, _, requires_local_guard_without_sha, requires_expected_match_count, requires_range) =
+            apply_text_edits_capability_requirements(&body);
+        self.enqueue_apply_text_edits_with_requirements(
+            body,
+            requested_by,
+            requires_occurrence,
+            true,
+            requires_local_guard_without_sha,
+            requires_expected_match_count,
+            requires_range,
+        )
+        .await
+    }
+
+    async fn enqueue_apply_text_edits_with_requirements(
+        &self,
+        body: ShellFileOpRequest,
+        requested_by: String,
+        requires_occurrence: bool,
+        requires_line_scope: bool,
+        requires_local_guard_without_sha: bool,
+        requires_expected_match_count: bool,
+        requires_range: bool,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
         validate_file_request(&body)?;
         if body.op != "apply_text_edits" {
             return Err(format!(
-                "line-scoped edit enqueue only accepts op=apply_text_edits (got {})",
+                "guarded edit enqueue only accepts op=apply_text_edits (got {})",
                 body.op
             ));
         }
@@ -525,14 +705,32 @@ impl RunnerRegistry {
         let Some(runner) = inner.runners.get(&body.client_id) else {
             return Err(format!("unknown shell client: {}", body.client_id));
         };
-        if !runner
-            .runner_features
-            .supports(RunnerFeature::ApplyTextEditLineScope)
+        if requires_line_scope
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditLineScope)
         {
             return Err(format!(
                 "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE}",
                 body.client_id
             ));
+        }
+        if requires_range
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditRange)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_RANGE}",
+                body.client_id
+            ));
+        }
+        if requires_expected_match_count
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditExpectedMatchCount)
+        {
+            return Err(format!("capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT}", body.client_id));
         }
         if requires_occurrence
             && !runner
@@ -541,6 +739,16 @@ impl RunnerRegistry {
         {
             return Err(format!(
                 "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
+                body.client_id
+            ));
+        }
+        if requires_local_guard_without_sha
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditLocalGuardWithoutSha)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA}",
                 body.client_id
             ));
         }
@@ -617,6 +825,209 @@ impl RunnerRegistry {
         Ok((request_id, rx))
     }
 
+    /// Enqueue one ToolRuntime project-file read against one exact resolved
+    /// Project and Runner process. Project placement, Runner instance identity,
+    /// and file_read are admitted under one registry lock and revalidated
+    /// immediately before dequeue.
+    pub async fn enqueue_project_file_read(
+        &self,
+        body: ShellFileOpRequest,
+        expected_project_id: &str,
+        expected_project_cwd: &str,
+        expected_runner_instance_id: &str,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_file_request(&body)?;
+        if body.op != "read" {
+            return Err(format!(
+                "project-file read enqueue does not accept op={}",
+                body.op
+            ));
+        }
+        if expected_project_id.is_empty()
+            || expected_project_cwd.is_empty()
+            || expected_runner_instance_id.is_empty()
+            || body.cwd.as_deref().map(str::trim) != Some(expected_project_cwd)
+        {
+            return Err("project-file read target identity is invalid".to_string());
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_file_operation(&request_id, &body, requested_by)?;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let current = inner
+            .runners
+            .get(&body.client_id)
+            .ok_or_else(|| format!("unknown shell client: {}", body.client_id))?;
+        if current.runner_instance_id != expected_runner_instance_id {
+            return Err("stale_runner: target Runner changed before read admission".to_string());
+        }
+        if !current.runner_features.supports(RunnerFeature::FileRead) {
+            return Err(format!(
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_FILE_READ}",
+                body.client_id
+            ));
+        }
+        if !current.projects.iter().any(|project| {
+            !project.disabled
+                && project.id == expected_project_id
+                && project.path == expected_project_cwd
+        }) {
+            return Err(format!(
+                "stale_project: target project {expected_project_id} is no longer registered at the resolved path"
+            ));
+        }
+        let fence = PendingDispatchFence::Project(ProjectDispatchFence {
+            owner: current.owner.clone(),
+            project_id: expected_project_id.to_string(),
+            cwd: expected_project_cwd.to_string(),
+            runner_instance_id: Some(expected_runner_instance_id.to_string()),
+        });
+        enqueue_pending_request_with_fence_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &body.client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+            fence,
+        )?;
+        notify_runner_locked(&inner, &body.client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue one ToolRuntime project-file mutation against one exact resolved
+    /// Project and Runner process. Project placement, Runner instance identity,
+    /// file_write, and apply_text_edits additive capabilities are admitted under
+    /// one registry lock and revalidated immediately before dequeue.
+    pub async fn enqueue_project_file_mutation(
+        &self,
+        body: ShellFileOpRequest,
+        expected_project_id: &str,
+        expected_project_cwd: &str,
+        expected_runner_instance_id: &str,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_file_request(&body)?;
+        if !matches!(body.op.as_str(), "write_project_file" | "apply_text_edits") {
+            return Err(format!(
+                "project-file mutation enqueue does not accept op={}",
+                body.op
+            ));
+        }
+        if expected_project_id.is_empty()
+            || expected_project_cwd.is_empty()
+            || expected_runner_instance_id.is_empty()
+            || body.cwd.as_deref().map(str::trim) != Some(expected_project_cwd)
+        {
+            return Err("project-file mutation target identity is invalid".to_string());
+        }
+        let requirements = apply_text_edits_capability_requirements(&body);
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_file_operation(&request_id, &body, requested_by)?;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let current = inner
+            .runners
+            .get(&body.client_id)
+            .ok_or_else(|| format!("unknown shell client: {}", body.client_id))?;
+        if current.runner_instance_id != expected_runner_instance_id {
+            return Err(
+                "stale_runner: target Runner changed before mutation admission".to_string(),
+            );
+        }
+        if !current.runner_features.supports(RunnerFeature::FileWrite) {
+            return Err(format!(
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_FILE_WRITE}",
+                body.client_id
+            ));
+        }
+        if !current.projects.iter().any(|project| {
+            !project.disabled
+                && project.id == expected_project_id
+                && project.path == expected_project_cwd
+        }) {
+            return Err(format!(
+                "stale_project: target project {expected_project_id} is no longer registered at the resolved path"
+            ));
+        }
+        let (
+            requires_occurrence,
+            requires_line_scope,
+            requires_local_guard_without_sha,
+            requires_expected_match_count,
+            requires_range,
+        ) = requirements;
+        if requires_expected_match_count
+            && !current
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditExpectedMatchCount)
+        {
+            return Err(format!("capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT}", body.client_id));
+        }
+        if requires_line_scope
+            && !current
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditLineScope)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE}",
+                body.client_id
+            ));
+        }
+        if requires_range
+            && !current
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditRange)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_RANGE}",
+                body.client_id
+            ));
+        }
+        if requires_occurrence
+            && !current
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditOccurrence)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_OCCURRENCE}",
+                body.client_id
+            ));
+        }
+        if requires_local_guard_without_sha
+            && !current
+                .runner_features
+                .supports(RunnerFeature::ApplyTextEditLocalGuardWithoutSha)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {} does not support {RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA}",
+                body.client_id
+            ));
+        }
+        let fence = PendingDispatchFence::Project(ProjectDispatchFence {
+            owner: current.owner.clone(),
+            project_id: expected_project_id.to_string(),
+            cwd: expected_project_cwd.to_string(),
+            runner_instance_id: Some(expected_runner_instance_id.to_string()),
+        });
+        enqueue_pending_request_with_fence_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &body.client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+            fence,
+        )?;
+        notify_runner_locked(&inner, &body.client_id);
+        Ok((request_id, rx))
+    }
+
     /// Enqueue the create-only artifact write used by computer_save_snapshot.
     /// Target ownership and file_write are rechecked under the same registry
     /// lock as pending admission so a concurrent Runner replacement cannot
@@ -669,8 +1080,13 @@ impl RunnerRegistry {
                 "stale_project: target project {expected_project_id} is no longer registered at the resolved path"
             ));
         }
-        let expected_runner_owner = current.owner.clone();
-        enqueue_pending_request_locked(
+        let fence = PendingDispatchFence::Project(ProjectDispatchFence {
+            owner: current.owner.clone(),
+            project_id: expected_project_id.to_string(),
+            cwd: expected_project_cwd.to_string(),
+            runner_instance_id: None,
+        });
+        enqueue_pending_request_with_fence_locked(
             self.telemetry.as_ref(),
             &mut inner,
             &body.client_id,
@@ -678,14 +1094,8 @@ impl RunnerRegistry {
             request,
             Some(tx),
             None,
+            fence,
         )?;
-        let pending = inner
-            .pending_by_id
-            .get_mut(&request_id)
-            .expect("computer snapshot artifact request was just enqueued");
-        pending.expected_runner_owner = expected_runner_owner;
-        pending.expected_project_id = Some(expected_project_id.to_string());
-        pending.expected_project_cwd = Some(expected_project_cwd.to_string());
         notify_runner_locked(&inner, &body.client_id);
         Ok((request_id, rx))
     }
@@ -853,7 +1263,7 @@ impl RunnerRegistry {
         body: ShellRunRequest,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
-        self.enqueue_run_with_ssh(body, requested_by, None, None)
+        self.enqueue_run_with_ssh(body, requested_by, None, None, None)
             .await
     }
 
@@ -868,6 +1278,30 @@ impl RunnerRegistry {
         wait_timeout_secs: u64,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        self.enqueue_process_typed(
+            client_id,
+            cwd,
+            process,
+            stdin,
+            timeout_secs,
+            wait_timeout_secs,
+            requested_by,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_process_typed(
+        &self,
+        client_id: String,
+        cwd: Option<String>,
+        process: ShellProcessArgv,
+        stdin: Option<String>,
+        timeout_secs: u64,
+        wait_timeout_secs: u64,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), ExecutionAdmissionError> {
         validate_process_request(
             &client_id,
             cwd.as_deref(),
@@ -875,7 +1309,8 @@ impl RunnerRegistry {
             stdin.as_deref(),
             timeout_secs,
             wait_timeout_secs,
-        )?;
+        )
+        .map_err(ExecutionAdmissionError::invalid_request)?;
         let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
@@ -889,18 +1324,19 @@ impl RunnerRegistry {
                 stdin,
                 timeout_secs,
             }),
-        )?;
+        )
+        .map_err(ExecutionAdmissionError::invalid_request)?;
         let mut inner = self.inner.lock().await;
         let Some(runner) = inner.runners.get(&client_id) else {
-            return Err(format!("unknown shell client: {client_id}"));
+            return Err(ExecutionAdmissionError::unknown_runner(client_id.clone()));
         };
         if !runner
             .runner_features
             .supports(RunnerFeature::StructuredProcessArgv)
         {
-            return Err(format!(
+            return Err(ExecutionAdmissionError::capability_unavailable(format!(
                 "capability_unavailable: runner {client_id} does not support {RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV}"
-            ));
+            )));
         }
         enqueue_pending_request_locked(
             self.telemetry.as_ref(),
@@ -908,6 +1344,99 @@ impl RunnerRegistry {
             &client_id,
             request_id.clone(),
             request,
+            Some(tx),
+            None,
+        )?;
+        notify_runner_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_skill_resource_execution(
+        &self,
+        client_id: String,
+        cwd: Option<String>,
+        request: RunnerSkillExecutionRequest,
+        timeout_secs: u64,
+        wait_timeout_secs: u64,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        self.enqueue_skill_resource_execution_typed(
+            client_id,
+            cwd,
+            request,
+            timeout_secs,
+            wait_timeout_secs,
+            requested_by,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_skill_resource_execution_typed(
+        &self,
+        client_id: String,
+        cwd: Option<String>,
+        request: RunnerSkillExecutionRequest,
+        timeout_secs: u64,
+        wait_timeout_secs: u64,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), ExecutionAdmissionError> {
+        request
+            .validate()
+            .map_err(|error| format!("invalid Runner Skill execution request: {error}"))
+            .map_err(ExecutionAdmissionError::invalid_request)?;
+        if !(webcodex_core::runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS
+            ..=webcodex_core::runner_protocol::STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS)
+            .contains(&timeout_secs)
+            || wait_timeout_secs == 0
+            || wait_timeout_secs > timeout_secs
+        {
+            return Err(ExecutionAdmissionError::invalid_request(
+                "invalid Runner Skill execution timeout".to_string(),
+            ));
+        }
+        let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
+        if normalized_cwd.as_deref().is_some_and(|cwd| {
+            cwd.len() > webcodex_core::runner_protocol::PROCESS_CWD_MAX_BYTES || cwd.contains('\0')
+        }) {
+            return Err(ExecutionAdmissionError::invalid_request(
+                "invalid Runner Skill execution cwd".to_string(),
+            ));
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let runner_request = encode_runner_operation(
+            &request_id,
+            &client_id,
+            requested_by,
+            RunnerOperation::RunSkillResource(RunnerSkillResourceOperation {
+                cwd: normalized_cwd,
+                request,
+                timeout_secs,
+            }),
+        )
+        .map_err(ExecutionAdmissionError::invalid_request)?;
+        let mut inner = self.inner.lock().await;
+        let Some(runner) = inner.runners.get(&client_id) else {
+            return Err(ExecutionAdmissionError::unknown_runner(client_id.clone()));
+        };
+        if !runner
+            .runner_features
+            .supports(RunnerFeature::SkillResourceExecution)
+        {
+            return Err(ExecutionAdmissionError::capability_unavailable(format!(
+                "capability_unavailable: runner {client_id} does not support {}",
+                webcodex_core::runner_protocol::RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION
+            )));
+        }
+        enqueue_pending_request_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            runner_request,
             Some(tx),
             None,
         )?;
@@ -926,6 +1455,30 @@ impl RunnerRegistry {
         wait_timeout_secs: u64,
         requested_by: String,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        self.enqueue_script_typed(
+            client_id,
+            cwd,
+            script,
+            stdin,
+            timeout_secs,
+            wait_timeout_secs,
+            requested_by,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enqueue_script_typed(
+        &self,
+        client_id: String,
+        cwd: Option<String>,
+        script: ShellScriptPayload,
+        stdin: Option<String>,
+        timeout_secs: u64,
+        wait_timeout_secs: u64,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), ExecutionAdmissionError> {
         validate_script_enqueue_request(
             &client_id,
             cwd.as_deref(),
@@ -933,8 +1486,12 @@ impl RunnerRegistry {
             stdin.as_deref(),
             timeout_secs,
             wait_timeout_secs,
-        )?;
+        )
+        .map_err(ExecutionAdmissionError::invalid_request)?;
         let normalized_cwd = cwd.map(|cwd| cwd.trim().to_string());
+        let requires_javascript = script.language == ShellScriptLanguage::Javascript;
+        let requires_typescript = script.language == ShellScriptLanguage::Typescript;
+        let requires_python = script.language == ShellScriptLanguage::Python;
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
         let request = encode_runner_operation(
@@ -947,18 +1504,47 @@ impl RunnerRegistry {
                 stdin,
                 timeout_secs,
             }),
-        )?;
+        )
+        .map_err(ExecutionAdmissionError::invalid_request)?;
         let mut inner = self.inner.lock().await;
         let Some(runner) = inner.runners.get(&client_id) else {
-            return Err(format!("unknown shell client: {client_id}"));
+            return Err(ExecutionAdmissionError::unknown_runner(client_id.clone()));
         };
         if !runner
             .runner_features
             .supports(RunnerFeature::StructuredScriptPayload)
         {
-            return Err(format!(
+            return Err(ExecutionAdmissionError::capability_unavailable(format!(
                 "capability_unavailable: runner {client_id} does not support {RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD}"
-            ));
+            )));
+        }
+        if requires_javascript
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::StructuredScriptJavascript)
+        {
+            return Err(ExecutionAdmissionError::capability_unavailable(format!(
+                "capability_unavailable: runner {client_id} does not support {RUNNER_CAPABILITY_STRUCTURED_SCRIPT_JAVASCRIPT}"
+            )));
+        }
+        if requires_typescript
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::StructuredScriptTypescript)
+        {
+            return Err(ExecutionAdmissionError::capability_unavailable(format!(
+                "capability_unavailable: runner {client_id} does not support {}",
+                webcodex_core::runner_protocol::RUNNER_CAPABILITY_STRUCTURED_SCRIPT_TYPESCRIPT
+            )));
+        }
+        if requires_python
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::StructuredScriptPython)
+        {
+            return Err(ExecutionAdmissionError::capability_unavailable(format!(
+                "capability_unavailable: runner {client_id} does not support structured_script_python"
+            )));
         }
         enqueue_pending_request_locked(
             self.telemetry.as_ref(),
@@ -1048,22 +1634,41 @@ impl RunnerRegistry {
         requested_by: String,
         ssh_resource: Option<String>,
         ssh_session_id: Option<String>,
+        explicit_shell: Option<ExecutionShell>,
     ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
-        validate_run_request(&body)?;
+        self.enqueue_run_with_ssh_typed(
+            body,
+            requested_by,
+            ssh_resource,
+            ssh_session_id,
+            explicit_shell,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
+    pub async fn enqueue_run_with_ssh_typed(
+        &self,
+        body: ShellRunRequest,
+        requested_by: String,
+        ssh_resource: Option<String>,
+        ssh_session_id: Option<String>,
+        explicit_shell: Option<ExecutionShell>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), ExecutionAdmissionError> {
+        validate_run_request(&body).map_err(ExecutionAdmissionError::invalid_request)?;
         // A Workflow Session may execute locally without an SSH resource.
         // Only remote execution without the Session that owns the resource is
         // invalid.
         if ssh_resource.is_some() && ssh_session_id.is_none() {
-            return Err(
+            return Err(ExecutionAdmissionError::invalid_request(
                 "ssh_session_required: an SSH resource requires a Workflow Session id".to_string(),
-            );
+            ));
         }
         let normalized_cwd = body.cwd.clone().map(|cwd| cwd.trim().to_string());
-        let ssh_context = ssh_resource
-            .zip(ssh_session_id)
-            .map(|(resource, session_id)| ShellJobContext {
+        let shell_context = if let Some(resource) = ssh_resource {
+            Some(ShellJobContext {
                 runtime_project_id: None,
-                workflow_session_id: Some(session_id),
+                workflow_session_id: ssh_session_id,
                 ssh_resource: Some(resource),
                 project_cwd: None,
                 cwd: normalized_cwd.clone(),
@@ -1073,12 +1678,33 @@ impl RunnerRegistry {
                 validation_steps: Vec::new(),
                 validation: None,
                 structured_execution: None,
-            });
+            })
+        } else {
+            explicit_shell.map(|shell| ShellJobContext {
+                runtime_project_id: None,
+                workflow_session_id: None,
+                ssh_resource: None,
+                project_cwd: None,
+                cwd: normalized_cwd.clone(),
+                purpose: None,
+                shell: Some(shell.as_str().to_string()),
+                command_preview: command_preview(&body.command),
+                validation_steps: Vec::new(),
+                validation: None,
+                structured_execution: None,
+            })
+        };
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
-        let has_ssh_context = ssh_context
+        let has_ssh_context = shell_context
             .as_ref()
             .is_some_and(|context| context.ssh_resource.is_some());
+        let has_explicit_shell = explicit_shell.is_some() && !has_ssh_context;
+        if body.login && (has_ssh_context || explicit_shell != Some(ExecutionShell::Bash)) {
+            return Err(ExecutionAdmissionError::invalid_request(
+                "bash login mode requires local shell=bash".to_string(),
+            ));
+        }
         let request = encode_runner_operation(
             &request_id,
             &body.client_id,
@@ -1086,22 +1712,47 @@ impl RunnerRegistry {
             RunnerOperation::RunShell(RunnerShellOperation {
                 cwd: normalized_cwd,
                 command: body.command.clone(),
+                shell: explicit_shell.filter(|_| !has_ssh_context),
+                login: body.login,
                 stdin: body.stdin.clone(),
                 max_bytes: None,
                 timeout_secs: body.timeout_secs,
-                job_context: ssh_context,
+                job_context: shell_context,
             }),
-        )?;
+        )
+        .map_err(ExecutionAdmissionError::invalid_request)?;
         let mut inner = self.inner.lock().await;
-        if has_ssh_context {
+        if has_ssh_context || has_explicit_shell || body.login {
             let Some(runner) = inner.runners.get(&body.client_id) else {
-                return Err(format!("unknown shell client: {}", body.client_id));
+                return Err(ExecutionAdmissionError::unknown_runner(
+                    body.client_id.clone(),
+                ));
             };
-            if !runner.runner_features.supports(RunnerFeature::SshShell) {
-                return Err(format!(
+            if has_ssh_context && !runner.runner_features.supports(RunnerFeature::SshShell) {
+                return Err(ExecutionAdmissionError::capability_unavailable(format!(
                     "agent_capability_unavailable: runner {} does not support ssh_shell",
                     body.client_id
-                ));
+                )));
+            }
+            if has_explicit_shell
+                && !runner
+                    .runner_features
+                    .supports(RunnerFeature::ExplicitShellSelection)
+            {
+                return Err(ExecutionAdmissionError::capability_unavailable(format!(
+                    "capability_unavailable: runner {} does not support {}",
+                    body.client_id, RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION
+                )));
+            }
+            if body.login
+                && !runner
+                    .runner_features
+                    .supports(RunnerFeature::BashLoginShell)
+            {
+                return Err(ExecutionAdmissionError::capability_unavailable(format!(
+                    "capability_unavailable: runner {} does not support bash_login_shell",
+                    body.client_id
+                )));
             }
         }
         enqueue_pending_request_locked(
@@ -1183,61 +1834,66 @@ impl RunnerRegistry {
         remove_pending_request_locked(&mut inner, request_id).map(|pending| pending.dispatched)
     }
 
-    /// Enqueue one closed Runner-global Skill store operation for one exact
-    /// live Runner process. Read and management capabilities are independent;
-    /// the exact process lease and capability are revalidated again at dequeue.
-    pub async fn enqueue_skill_store(
+    /// Enqueue one canonical Runner-local Skill request for one exact live Runner process.
+    /// Runtime and management capabilities are independent and revalidated at dequeue.
+    pub async fn enqueue_runner_skill_typed(
         &self,
         client_id: &str,
         expected_runner_instance_id: &str,
-        operation: SkillStoreRequest,
+        operation: RunnerSkillRequest,
         auth: Option<&crate::RunnerAccess>,
         requested_by: String,
-    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), EnqueueRunnerSkillError> {
+        operation
+            .validate()
+            .map_err(|_| EnqueueRunnerSkillError::InvalidRequest {
+                message: "invalid Runner Skill request".to_string(),
+            })?;
         let management = operation.requires_management_capability();
-        let content = serde_json::to_string(&operation)
-            .map_err(|_| "invalid Skill store request".to_string())?;
-        if content.len() > 32 * 1024 {
-            return Err("invalid Skill store request".to_string());
-        }
         let request_id = next_request_id();
         let (tx, rx) = oneshot::channel();
         let request = encode_runner_operation(
             &request_id,
             client_id,
             requested_by,
-            RunnerOperation::SkillStore(operation),
+            RunnerOperation::Skill(operation),
         )
-        .map_err(|_| "invalid Skill store request".to_string())?;
+        .map_err(|_| EnqueueRunnerSkillError::InvalidRequest {
+            message: "invalid Runner Skill request".to_string(),
+        })?;
         let mut inner = self.inner.lock().await;
-        let runner = inner
-            .runners
-            .get(client_id)
-            .ok_or_else(|| "exact Runner is unavailable".to_string())?;
-        assert_runner_access(auth, runner)
-            .map_err(|_| "exact Runner is unavailable".to_string())?;
+        let runner = inner.runners.get(client_id).ok_or_else(|| {
+            EnqueueRunnerSkillError::ExactRunnerUnavailable {
+                client_id: client_id.to_string(),
+            }
+        })?;
+        assert_runner_access(auth, runner).map_err(|_| {
+            EnqueueRunnerSkillError::ExactRunnerUnavailable {
+                client_id: client_id.to_string(),
+            }
+        })?;
         if runner.runner_instance_id != expected_runner_instance_id {
-            return Err(
-                "stale Runner identity; Skill store request was not dispatched".to_string(),
-            );
+            return Err(EnqueueRunnerSkillError::RunnerChanged {
+                client_id: client_id.to_string(),
+            });
         }
         let required = if management {
-            RunnerFeature::SkillStoreManage
+            RunnerFeature::SkillManagement
         } else {
-            RunnerFeature::SkillStoreRead
+            RunnerFeature::SkillRuntime
         };
         if !runner.runner_features.supports(required) {
-            return Err(format!(
-                "skill_store_capability_unavailable: exact Runner does not support {}",
-                required.as_wire_name()
-            ));
+            return Err(EnqueueRunnerSkillError::UnsupportedCapability {
+                client_id: client_id.to_string(),
+                capability: required.as_wire_name(),
+            });
         }
         if now_ts().saturating_sub(runner.last_seen) > RUNNER_ONLINE_WINDOW_SECS {
-            return Err(
-                "exact Runner is offline; Skill store request was not dispatched".to_string(),
-            );
+            return Err(EnqueueRunnerSkillError::ExactRunnerOffline {
+                client_id: client_id.to_string(),
+            });
         }
-        enqueue_pending_request_locked(
+        enqueue_pending_request_with_fence_locked(
             self.telemetry.as_ref(),
             &mut inner,
             client_id,
@@ -1245,15 +1901,13 @@ impl RunnerRegistry {
             request,
             Some(tx),
             None,
-        )?;
-        let pending = inner
-            .pending_by_id
-            .get_mut(&request_id)
-            .expect("Skill store request was just enqueued");
-        pending.skill_store_fence = Some(SkillStoreDispatchFence {
-            runner_instance_id: expected_runner_instance_id.to_string(),
-            management,
-        });
+            PendingDispatchFence::Skill {
+                runner_instance_id: expected_runner_instance_id.to_string(),
+            },
+        )
+        .map_err(|error| EnqueueRunnerSkillError::DispatchUnavailable {
+            message: error.to_string(),
+        })?;
         notify_runner_locked(&inner, client_id);
         Ok((request_id, rx))
     }
@@ -1308,7 +1962,7 @@ impl RunnerRegistry {
         if now_ts().saturating_sub(runner.last_seen) > super::RUNNER_ONLINE_WINDOW_SECS {
             return Err("exact Runner is offline; request was not started".to_string());
         }
-        enqueue_pending_request_locked(
+        enqueue_pending_request_with_fence_locked(
             self.telemetry.as_ref(),
             &mut inner,
             client_id,
@@ -1316,15 +1970,12 @@ impl RunnerRegistry {
             request,
             None,
             None,
+            PendingDispatchFence::McpGateway(McpGatewayDispatchFence {
+                runner_instance_id: expected_runner_instance_id.to_string(),
+                provider_id: expected_provider_id,
+                provider_instance_id: expected_provider_instance_id,
+            }),
         )?;
-        let pending = inner
-            .pending_by_id
-            .get_mut(&request_id)
-            .expect("MCP gateway request was just enqueued");
-        pending.expected_mcp_gateway_runner_instance_id =
-            Some(expected_runner_instance_id.to_string());
-        pending.expected_mcp_gateway_provider_id = Some(expected_provider_id);
-        pending.expected_mcp_gateway_provider_instance_id = Some(expected_provider_instance_id);
         inner.mcp_gateway_waiters.insert(request_id.clone(), tx);
         notify_runner_locked(&inner, client_id);
         Ok((request_id, rx))
@@ -1447,7 +2098,7 @@ impl RunnerRegistry {
         if now_ts().saturating_sub(runner.last_seen) > RUNNER_ONLINE_WINDOW_SECS {
             return Err("exact Runner is offline; request was not started".to_string());
         }
-        enqueue_pending_request_locked(
+        enqueue_pending_request_with_fence_locked(
             self.telemetry.as_ref(),
             &mut inner,
             client_id,
@@ -1455,13 +2106,10 @@ impl RunnerRegistry {
             request,
             Some(tx),
             None,
+            PendingDispatchFence::SshResource {
+                runner_instance_id: expected_runner_instance_id.to_string(),
+            },
         )?;
-        inner
-            .pending_by_id
-            .get_mut(&request_id)
-            .expect("SSH resource request was just enqueued")
-            .expected_ssh_resource_runner_instance_id =
-            Some(expected_runner_instance_id.to_string());
         notify_runner_locked(&inner, client_id);
         Ok((request_id, rx))
     }
@@ -1512,7 +2160,7 @@ impl RunnerRegistry {
         if now_ts().saturating_sub(runner.last_seen) > RUNNER_ONLINE_WINDOW_SECS {
             return Err("exact Runner is offline; request was not started".to_string());
         }
-        enqueue_pending_request_locked(
+        enqueue_pending_request_with_fence_locked(
             self.telemetry.as_ref(),
             &mut inner,
             client_id,
@@ -1520,13 +2168,75 @@ impl RunnerRegistry {
             request,
             Some(tx),
             None,
+            PendingDispatchFence::RunnerConfig {
+                runner_instance_id: expected_runner_instance_id.to_string(),
+            },
         )?;
-        inner
-            .pending_by_id
-            .get_mut(&request_id)
-            .expect("Runner config request was just enqueued")
-            .expected_runner_config_runner_instance_id =
-            Some(expected_runner_instance_id.to_string());
+        notify_runner_locked(&inner, client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue one narrow configured-instruction snapshot request against one
+    /// exact live Runner process. The request carries no filesystem path.
+    pub async fn enqueue_runner_instruction(
+        &self,
+        client_id: &str,
+        expected_runner_instance_id: &str,
+        operation: RunnerInstructionRequest,
+        auth: Option<&crate::RunnerAccess>,
+        requested_by: String,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        operation.validate().map_err(|_| {
+            "invalid_runner_instruction_request: request was not started".to_string()
+        })?;
+        let content = serde_json::to_string(&operation).map_err(|_| {
+            "invalid_runner_instruction_request: request was not started".to_string()
+        })?;
+        if content.len() > RUNNER_INSTRUCTION_REQUEST_MAX_BYTES {
+            return Err("invalid_runner_instruction_request: request was not started".to_string());
+        }
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_runner_operation(
+            &request_id,
+            client_id,
+            requested_by,
+            RunnerOperation::RunnerInstruction(operation),
+        )
+        .map_err(|_| "invalid_runner_instruction_request: request was not started".to_string())?;
+        let mut inner = self.inner.lock().await;
+        let runner = inner
+            .runners
+            .get(client_id)
+            .ok_or_else(|| "exact Runner is unavailable".to_string())?;
+        assert_runner_access(auth, runner)
+            .map_err(|_| "exact Runner is unavailable".to_string())?;
+        if runner.runner_instance_id != expected_runner_instance_id {
+            return Err("runner_replaced: request was not started".to_string());
+        }
+        if !runner
+            .runner_features
+            .supports(RunnerFeature::InstructionRuntime)
+        {
+            return Err(
+                "capability_unavailable: Runner instruction runtime is unsupported".to_string(),
+            );
+        }
+        if now_ts().saturating_sub(runner.last_seen) > RUNNER_ONLINE_WINDOW_SECS {
+            return Err("exact Runner is offline; request was not started".to_string());
+        }
+        enqueue_pending_request_with_fence_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+            PendingDispatchFence::RunnerInstruction {
+                runner_instance_id: expected_runner_instance_id.to_string(),
+            },
+        )?;
         notify_runner_locked(&inner, client_id);
         Ok((request_id, rx))
     }
@@ -1858,7 +2568,7 @@ impl RunnerRegistry {
         if let Some(required_feature) = required_features
             .iter()
             .copied()
-            .find(|feature| !current.runner_features.supports(*feature))
+            .find(|feature| !current.supports(*feature))
         {
             return Err(format!(
                 "runner {client_id} does not support {}",
@@ -1875,6 +2585,438 @@ impl RunnerRegistry {
             None,
         )
         .map_err(|error| error.to_string())?;
+        notify_runner_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue one precise Browser Runner operation. Capability admission is
+    /// rechecked under the registry lock so an older/re-registered Runner can
+    /// never receive an unknown Browser kind or fall through to another family.
+    pub async fn enqueue_browser(
+        &self,
+        client_id: String,
+        kind: &'static str,
+        payload: String,
+        requested_by: String,
+        auth: Option<&crate::RunnerAccess>,
+        timeout_secs: u64,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        validate_id(&client_id, "client_id")?;
+        let operation_kind = RunnerBrowserOperationKind::from_wire(kind)
+            .ok_or_else(|| "invalid browser request kind".to_string())?;
+        if payload.len() > operation_kind.max_payload_bytes() || payload.contains('\0') {
+            return Err("browser request payload is invalid or too large".to_string());
+        }
+        let semantic_query = operation_kind == RunnerBrowserOperationKind::Snapshot
+            && serde_json::from_str::<serde_json::Value>(&payload)
+                .map_err(|_| "invalid browser snapshot payload".to_string())?
+                .get("query")
+                .is_some_and(|value| !value.is_null());
+        let complex_batch = operation_kind == RunnerBrowserOperationKind::Batch
+            && operation_kind.requires_complex_controls(
+                &serde_json::from_str::<serde_json::Value>(&payload)
+                    .map_err(|_| "invalid browser batch payload".to_string())?,
+            );
+        // Match the canonical enum exhaustively: adding a wire operation must
+        // also choose its registry admission, not silently hit a string fallback.
+        use RunnerBrowserOperationKind as BrowserKind;
+        let required_features: &[RunnerFeature] = match operation_kind {
+            BrowserKind::DiscoverExternal => &[
+                RunnerFeature::BrowserObserve,
+                RunnerFeature::BrowserExtensionBridge,
+            ],
+            BrowserKind::AttachExternal => &[
+                RunnerFeature::BrowserControl,
+                RunnerFeature::BrowserExtensionBridge,
+            ],
+            BrowserKind::LaunchManaged => &[
+                RunnerFeature::BrowserLaunch,
+                RunnerFeature::BrowserManagedProfile,
+            ],
+            BrowserKind::BeginUserHandoff | BrowserKind::FinishUserHandoff => &[
+                RunnerFeature::BrowserControl,
+                RunnerFeature::BrowserUserHandoff,
+                RunnerFeature::BrowserSurfaceHandoff,
+                RunnerFeature::ComputerObserve,
+            ],
+            BrowserKind::ResolveSurface => &[
+                RunnerFeature::BrowserObserve,
+                RunnerFeature::BrowserSurfaceHandoff,
+                RunnerFeature::ComputerObserve,
+            ],
+            BrowserKind::ListBrowsers
+            | BrowserKind::ListPages
+            | BrowserKind::Screenshot
+            | BrowserKind::Console
+            | BrowserKind::Network
+            | BrowserKind::Diagnostics => &[RunnerFeature::BrowserObserve],
+            BrowserKind::Snapshot if semantic_query => &[
+                RunnerFeature::BrowserObserve,
+                RunnerFeature::BrowserElementActionAdmission,
+                RunnerFeature::BrowserSemanticQuery,
+            ],
+            BrowserKind::Snapshot => &[
+                RunnerFeature::BrowserObserve,
+                RunnerFeature::BrowserElementActionAdmission,
+            ],
+            BrowserKind::Launch => &[RunnerFeature::BrowserLaunch],
+            BrowserKind::NewPage
+            | BrowserKind::Navigate
+            | BrowserKind::Reload
+            | BrowserKind::Key
+            | BrowserKind::ClosePage
+            | BrowserKind::ClearDiagnostics
+            | BrowserKind::CloseBrowser => &[RunnerFeature::BrowserControl],
+            BrowserKind::Click
+            | BrowserKind::InputText
+            | BrowserKind::SelectOption
+            | BrowserKind::SetValue
+            | BrowserKind::UploadFile => &[
+                RunnerFeature::BrowserControl,
+                RunnerFeature::BrowserElementActionAdmission,
+            ],
+            BrowserKind::SelectChoice | BrowserKind::SetDate => &[
+                RunnerFeature::BrowserControl,
+                RunnerFeature::BrowserElementActionAdmission,
+                RunnerFeature::BrowserComplexControls,
+            ],
+            BrowserKind::Batch if complex_batch => &[
+                RunnerFeature::BrowserControl,
+                RunnerFeature::BrowserBatch,
+                RunnerFeature::BrowserElementActionAdmission,
+                RunnerFeature::BrowserComplexControls,
+            ],
+            BrowserKind::Batch => &[
+                RunnerFeature::BrowserControl,
+                RunnerFeature::BrowserBatch,
+                RunnerFeature::BrowserElementActionAdmission,
+            ],
+        };
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_runner_operation(
+            &request_id,
+            &client_id,
+            requested_by,
+            RunnerOperation::Browser(RunnerBrowserOperation {
+                kind: operation_kind,
+                payload,
+                timeout_secs: timeout_secs.max(1),
+            }),
+        )?;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let current = inner
+            .runners
+            .get(&client_id)
+            .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
+        assert_runner_access(auth, current)?;
+        if let Some(required_feature) = required_features
+            .iter()
+            .copied()
+            .find(|feature| !current.runner_features.supports(*feature))
+        {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support {}",
+                required_feature.as_wire_name()
+            ));
+        }
+        enqueue_pending_request_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        notify_runner_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Enqueue Runner-owned project build planning. The returned typed plan
+    /// carries canonical argv and admission provenance; no build starts here.
+    pub async fn enqueue_project_build_plan(
+        &self,
+        client_id: String,
+        payload: webcodex_core::project_build::ProjectBuildRequest,
+        access: Option<&crate::RunnerAccess>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        payload.validate()?;
+        let requires_node =
+            payload.adapter == webcodex_core::project_build::ProjectBuildAdapter::Node;
+        let requires_all_packages = payload
+            .scope
+            .as_ref()
+            .is_some_and(webcodex_core::project_build::ProjectBuildScope::selects_all_packages);
+        let requires_dependency_policy = payload.dependency_policy.is_some();
+        let requires_python =
+            payload.adapter == webcodex_core::project_build::ProjectBuildAdapter::Python;
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_runner_operation(
+            &request_id,
+            &client_id,
+            "tool_runtime".into(),
+            RunnerOperation::PlanProjectBuild(payload),
+        )?;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner.runners.get(&client_id).ok_or("unknown Runner")?;
+        assert_runner_access(access, runner)?;
+        if !runner.runner_features.supports(RunnerFeature::ProjectBuild) {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectBuild,
+            ));
+        }
+        if requires_node
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectBuildNode)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectBuildNode,
+            ));
+        }
+        if requires_python
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectBuildPython)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectBuildPython,
+            ));
+        }
+        if requires_all_packages
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectAllPackages)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectAllPackages,
+            ));
+        }
+        if requires_dependency_policy
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectDependencyPolicy)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectDependencyPolicy,
+            ));
+        }
+        enqueue_pending_request_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )?;
+        notify_runner_locked(&inner, &client_id);
+        Ok((request_id, rx))
+    }
+
+    /// Read-only planning plus an instance fence for the later mutating Job.
+    pub async fn enqueue_project_format_plan(
+        &self,
+        client_id: String,
+        payload: webcodex_core::project_format::ProjectFormatRequest,
+        access: Option<&crate::RunnerAccess>,
+    ) -> Result<(String, String, oneshot::Receiver<ShellRunResponse>), String> {
+        payload.validate().map_err(str::to_string)?;
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_runner_operation(
+            &request_id,
+            &client_id,
+            "tool_runtime".into(),
+            RunnerOperation::PlanProjectFormat(payload.clone()),
+        )?;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        if !inner.has_receipt_store() {
+            return Err("format_execution_unavailable".into());
+        }
+        let runner = inner.runners.get(&client_id).ok_or("unknown Runner")?;
+        assert_runner_access(access, runner)?;
+        if !runner
+            .runner_features
+            .supports(RunnerFeature::ProjectFormat)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectFormat,
+            ));
+        }
+        if payload.requires_go()
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectFormatGo)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectFormatGo,
+            ));
+        }
+        if !runner.projects.iter().any(|project| {
+            project.id == payload.project_id && !project.disabled && project.allow_patch
+        }) {
+            return Err("format_project_unavailable".into());
+        }
+        let instance = runner.runner_instance_id.clone();
+        enqueue_pending_request_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )?;
+        notify_runner_locked(&inner, &client_id);
+        Ok((request_id, instance, rx))
+    }
+
+    /// Resolve a declarative project validation plan on the authorized Runner.
+    /// Additive fields require their own capability before anything is enqueued.
+    pub async fn enqueue_project_validation_plan(
+        &self,
+        client_id: String,
+        payload: webcodex_core::project_validation::ProjectValidationRequest,
+        access: Option<&crate::RunnerAccess>,
+    ) -> Result<(String, oneshot::Receiver<ShellRunResponse>), String> {
+        payload.validate()?;
+        let python_capability = (payload.adapter
+            == webcodex_core::project_validation::ProjectValidationAdapter::Python)
+            .then_some(
+                if payload.action
+                    == webcodex_core::project_validation::ProjectValidationAction::Test
+                {
+                    RunnerFeature::ProjectValidationPythonPytest
+                } else {
+                    RunnerFeature::ProjectValidationPythonRuff
+                },
+            );
+        let node_capability = (payload.adapter
+            == webcodex_core::project_validation::ProjectValidationAdapter::Node)
+            .then_some(
+                if payload.action
+                    == webcodex_core::project_validation::ProjectValidationAction::Test
+                {
+                    RunnerFeature::ProjectValidationNodeTap
+                } else {
+                    RunnerFeature::ProjectValidationNodeScriptCheck
+                },
+            );
+        let requires_package_scope = payload
+            .scope
+            .as_ref()
+            .and_then(webcodex_core::project_validation::ProjectValidationScope::explicit_packages)
+            .is_some();
+        let requires_all_packages = payload.scope.as_ref().is_some_and(
+            webcodex_core::project_validation::ProjectValidationScope::selects_all_packages,
+        );
+        let requires_dependency_policy = payload.dependency_policy.is_some();
+        let requires_resolution_offline = payload.dependency_resolution_policy.is_some();
+        let requires_test_options = payload.test.is_some();
+        let request_id = next_request_id();
+        let (tx, rx) = oneshot::channel();
+        let request = encode_runner_operation(
+            &request_id,
+            &client_id,
+            "tool_runtime".into(),
+            RunnerOperation::PlanProjectValidation(payload),
+        )?;
+        let mut inner = self.inner.lock().await;
+        self.prune_expired_shared_key_runners_locked(&mut inner, now_ts());
+        let runner = inner.runners.get(&client_id).ok_or("unknown Runner")?;
+        assert_runner_access(access, runner)?;
+        if !runner
+            .runner_features
+            .supports(RunnerFeature::ProjectValidation)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectValidation,
+            ));
+        }
+        if let Some(capability) = python_capability {
+            if !runner.runner_features.supports(capability) {
+                return Err(capability_upgrade_error(&client_id, capability));
+            }
+        }
+        if let Some(capability) = node_capability {
+            if !runner.runner_features.supports(capability) {
+                return Err(capability_upgrade_error(&client_id, capability));
+            }
+        }
+        if requires_all_packages
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectAllPackages)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectAllPackages,
+            ));
+        }
+        if requires_dependency_policy
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectDependencyPolicy)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectDependencyPolicy,
+            ));
+        }
+        if requires_resolution_offline
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectDependencyResolutionOffline)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectDependencyResolutionOffline,
+            ));
+        }
+        if requires_test_options
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectValidationTestOptions)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectValidationTestOptions,
+            ));
+        }
+        if requires_package_scope
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ProjectValidationPackageScope)
+        {
+            return Err(capability_upgrade_error(
+                &client_id,
+                RunnerFeature::ProjectValidationPackageScope,
+            ));
+        }
+        enqueue_pending_request_locked(
+            self.telemetry.as_ref(),
+            &mut inner,
+            &client_id,
+            request_id.clone(),
+            request,
+            Some(tx),
+            None,
+        )?;
         notify_runner_locked(&inner, &client_id);
         Ok((request_id, rx))
     }

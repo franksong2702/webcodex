@@ -2,7 +2,7 @@
 //!
 //! This is a **custom QUIC stream transport** for Runner connections, NOT
 //! HTTP/3. It runs a separate `quinn` UDP listener in parallel with the HTTP
-//! server (which keeps serving GPT Actions over TCP 443 via Nginx unchanged).
+//! server (which keeps serving MCP over TCP 443 via Nginx unchanged).
 //! Nginx is not involved in QUIC.
 //!
 //! QUIC is an alternative transport for the existing Runner envelope protocol.
@@ -28,7 +28,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 
 /// The rustls crypto provider used for the QUIC transport. The dependency tree
@@ -365,9 +365,23 @@ async fn handle_quic_connection(
         mpsc::channel::<RunnerEnvelope>(crate::runner_session::OUTGOING_CHANNEL_CAPACITY);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
+            let envelope_kind = env.kind();
+            let send_started = Instant::now();
             if write_quic_frame(&mut send, &env).await.is_err() {
+                crate::runner_http::observe_server_stream_writer_send(
+                    RunnerTransport::Quic,
+                    envelope_kind,
+                    None,
+                    crate::runner_http::RunnerStreamMetricOutcome::TransportError,
+                );
                 return crate::runner_session::WriterExit::TransportFailed;
             }
+            crate::runner_http::observe_server_stream_writer_send(
+                RunnerTransport::Quic,
+                envelope_kind,
+                Some(send_started.elapsed()),
+                crate::runner_http::RunnerStreamMetricOutcome::Success,
+            );
         }
         if send.finish().is_err() {
             crate::runner_session::WriterExit::TransportFailed
@@ -388,7 +402,7 @@ async fn handle_quic_connection(
             connection_id: &connection_id,
             notify,
             cancel,
-            transport_label: "quic",
+            transport: RunnerTransport::Quic,
         },
         out_tx,
         reader,
@@ -564,17 +578,26 @@ mod tests {
     ) -> QuicRegisterFrame {
         let capabilities = crate::test_support::current_runner_capabilities(RunnerCapabilities {
             shell: true,
+            browser_managed_profile: false,
+            browser_surface_handoff: false,
+            browser_user_handoff: false,
+            browser_extension_bridge: false,
+            explicit_shell_selection: false,
+            bash_login_shell: false,
             file_read: true,
             file_write: true,
+            file_list_page: false,
             artifact_export_chunk_read: false,
             artifact_export_streaming_metadata: false,
             structured_file_delete: true,
             apply_text_edit_occurrence: false,
             apply_text_edit_line_scope: false,
+            apply_text_edit_range: false,
+            apply_text_edit_expected_match_count: false,
+            apply_text_edit_local_guard_without_sha: false,
             apply_patch: false,
             apply_patch_match_metadata: false,
             apply_patch_matching_mode: false,
-            apply_patch_strict_matching: false,
             git: false,
             jobs: true,
             async_jobs: true,
@@ -585,21 +608,52 @@ mod tests {
             structured_validation_argv: true,
             structured_cargo_test_count_assertion: true,
             structured_cargo_test_execution_policy: true,
+            structured_cargo_test_lib: true,
+            structured_cargo_check_packages: true,
             structured_go_test_json: true,
+            project_validation_v1: false,
+            project_build_v1: false,
+            project_build_node_v1: false,
+            project_validation_node_json_v1: false,
+            project_build_python_v1: false,
+            project_format_v1: false,
+            project_format_go_v1: false,
+            project_dependency_policy_v1: false,
+            project_dependency_resolution_offline_v1: false,
+            project_go_single_module_v1: false,
+            project_validation_package_scope_v1: false,
+            project_all_packages_v1: false,
+            project_validation_test_options_v1: false,
+            project_validation_python_pytest_v1: false,
+            project_validation_python_ruff_v1: false,
+            project_validation_node_script_check_v1: false,
+            project_validation_node_tap_v1: false,
             structured_go_test_tool: true,
             structured_go_test_packages: true,
             structured_process_argv: true,
             structured_script_payload: false,
+            structured_script_javascript: false,
+            structured_script_typescript: false,
+            structured_script_python: false,
             internal_posix_script: false,
             structured_execution_jobs: false,
+            job_process_input: false,
             detached_process_jobs: false,
             lsp_read_only_navigation: false,
             lsp_call_hierarchy: false,
             project_lifecycle: false,
             project_path_registration: false,
             managed_worktree: false,
-            skill_store_read: false,
-            skill_store_manage: false,
+            skill_runtime: false,
+            skill_resource_execution: false,
+            skill_management: false,
+            browser_observe: false,
+            browser_control: false,
+            browser_element_action_admission: false,
+            browser_batch: false,
+            browser_semantic_query: false,
+            browser_complex_controls: false,
+            browser_launch: false,
             computer_observe: false,
             computer_application_discovery: false,
             computer_application_launch: false,
@@ -618,11 +672,14 @@ mod tests {
             job_state_reconciliation: false,
             coding_agent_runs: false,
             native_tool_plugins: false,
+            mcp_gateway_resource_links: false,
             managed_ssh_resources: false,
             runner_config_control: false,
+            instruction_runtime: false,
         });
         QuicRegisterFrame::new(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -636,7 +693,7 @@ mod tests {
                 owner: Some("tester".to_string()),
                 hostname: None,
                 host_context: None,
-                capabilities: capabilities,
+                capabilities,
                 policy: None,
             },
             auth_token,
@@ -994,6 +1051,7 @@ mod tests {
         let (request_id, rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "quic-gen2-rt".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),
@@ -1029,6 +1087,8 @@ mod tests {
                     exit_code: Some(0),
                     stdout: Some("hi\n".to_string()),
                     stderr: Some(String::new()),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(2),
                     error: None,
                 }
@@ -1092,6 +1152,7 @@ mod tests {
         let job = registry
             .start_job(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some("quic-job".to_string()),
                     cwd: None,
@@ -1133,14 +1194,15 @@ mod tests {
                     status: "running".to_string(),
                     stdout_chunk: Some("hi".to_string()),
                     stderr_chunk: None,
-                    stdout_tail: None,
-                    stderr_tail: None,
                     log_snapshot: None,
                     exit_code: None,
                     duration_ms: None,
                     error: None,
                     command_execution_state: None,
                     validation_progress: None,
+                    test_count_evidence: None,
+                    format_mutation: None,
+                    build_artifacts: None,
                     activity: None,
                     finished: false,
                 },
@@ -1196,6 +1258,7 @@ mod tests {
         let job = registry
             .start_job(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some("quic-disc".to_string()),
                     cwd: None,
@@ -1246,6 +1309,7 @@ mod tests {
         let err = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "quic-disc".to_string(),
                     cwd: None,
                     command: "echo after".to_string(),
@@ -1510,7 +1574,7 @@ mod tests {
     }
 
     /// A QUIC-registered Runner must surface protocol generation 2 and the
-    /// `quic` transport in `list_runners` (used by runtime_status / list_runners).
+    /// `quic` transport in `list_runners` (used by get_runtime_status / list_runners).
     #[tokio::test]
     async fn quic_runner_surfaces_transport_and_protocol_in_list() {
         let (cert_der, key_der) = self_signed_cert();
@@ -1612,6 +1676,7 @@ mod tests {
         let (request_id, _rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "quic-steal".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),

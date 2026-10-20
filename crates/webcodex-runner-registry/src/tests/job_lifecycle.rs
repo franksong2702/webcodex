@@ -24,6 +24,7 @@ async fn terminal_observed_poll_complete_and_log() {
     let registry = RunnerRegistry::default();
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -45,6 +46,7 @@ async fn terminal_observed_poll_complete_and_log() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: Some("/tmp".to_string()),
@@ -89,6 +91,10 @@ async fn terminal_observed_poll_complete_and_log() {
     assert_eq!(polled.command, "printf hello");
     let running = registry.get_job(&job.job_id).await.unwrap();
     assert_eq!(running.status, "agent_queued");
+    assert_eq!(
+        running.started_at, None,
+        "dispatch alone must not claim the shell command started"
+    );
     registry
         .complete(RunnerResultRequest {
             client_id: "oe".to_string(),
@@ -97,6 +103,8 @@ async fn terminal_observed_poll_complete_and_log() {
             exit_code: Some(0),
             stdout: Some("hello\n".to_string()),
             stderr: Some(String::new()),
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(20),
             error: None,
         })
@@ -141,6 +149,7 @@ async fn job_update_rejects_mismatched_request_id_without_mutating_target_job() 
     let registry = RunnerRegistry::default();
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -161,6 +170,7 @@ async fn job_update_rejects_mismatched_request_id_without_mutating_target_job() 
         .unwrap();
 
     let start = |command: &str| ShellJobOpRequest {
+        login: false,
         op: "start".to_string(),
         client_id: Some("oe".to_string()),
         cwd: None,
@@ -193,14 +203,15 @@ async fn job_update_rejects_mismatched_request_id_without_mutating_target_job() 
         status: "running".to_string(),
         stdout_chunk: None,
         stderr_chunk: None,
-        stdout_tail: None,
-        stderr_tail: None,
         log_snapshot: None,
         exit_code: None,
         duration_ms: None,
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
+        format_mutation: None,
+        build_artifacts: None,
         activity: None,
         finished: false,
     };
@@ -227,10 +238,11 @@ async fn job_update_rejects_mismatched_request_id_without_mutating_target_job() 
 }
 
 #[tokio::test]
-async fn terminal_observed_queued_stop_records_server_time() {
+async fn dispatched_raw_shell_accepts_prestart_not_started_terminal_update() {
     let registry = RunnerRegistry::default();
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -252,6 +264,98 @@ async fn terminal_observed_queued_stop_records_server_time() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
+                op: "start".to_string(),
+                client_id: Some("oe".to_string()),
+                cwd: None,
+                command: Some("printf ok".to_string()),
+                timeout_secs: Some(30),
+                job_id: None,
+                since_stdout_line: None,
+                since_stderr_line: None,
+                tail_lines: None,
+                limit: None,
+                codex: None,
+            },
+            "test".to_string(),
+        )
+        .await
+        .unwrap();
+    let request = registry
+        .poll(RunnerPollRequest {
+            client_id: "oe".to_string(),
+            runner_instance_id: "inst".to_string(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let terminal = registry
+        .update_job(RunnerJobUpdateRequest {
+            client_id: "oe".to_string(),
+            runner_instance_id: "inst".to_string(),
+            job_id: job.job_id.clone(),
+            request_id: Some(request.request_id),
+            update_seq: None,
+            status: "failed".to_string(),
+            stdout_chunk: None,
+            stderr_chunk: None,
+            log_snapshot: None,
+            exit_code: None,
+            duration_ms: Some(0),
+            error: Some("invalid Runner Job request: pre-spawn rejection".to_string()),
+            command_execution_state: Some(ShellCommandExecutionState::NotStarted),
+            validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
+            activity: None,
+            finished: true,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(terminal.status, "failed");
+    assert_eq!(
+        terminal.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+    assert_eq!(terminal.started_at, None);
+    assert!(!terminal
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("protocol violation"));
+}
+
+#[tokio::test]
+async fn terminal_observed_queued_stop_records_server_time() {
+    let registry = RunnerRegistry::default();
+    registry
+        .register(RunnerRegisterRequest {
+            computer_session_availability: None,
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
+            client_id: "oe".to_string(),
+            runner_instance_id: "inst".to_string(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            display_name: None,
+            owner: None,
+            hostname: None,
+            host_context: None,
+            capabilities: async_job_capabilities(),
+            policy: None,
+        })
+        .await
+        .unwrap();
+    let job = registry
+        .start_job(
+            ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: None,
@@ -294,6 +398,7 @@ async fn registry_shell_job_stop_running_delivers_stop_to_client() {
     let registry = RunnerRegistry::default();
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -315,6 +420,7 @@ async fn registry_shell_job_stop_running_delivers_stop_to_client() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: None,
@@ -346,6 +452,14 @@ async fn registry_shell_job_stop_running_delivers_stop_to_client() {
         .await
         .unwrap();
     assert_eq!(stop_requested.status, "stop_requested");
+    let capacity = registry.active_job_summary_by_runner_for_auth(None).await;
+    let capacity = capacity.get("oe").expect("Runner capacity aggregate");
+    assert_eq!(capacity.active, 1);
+    assert_eq!(
+        capacity.running, 1,
+        "stopping Job still occupies its execution slot"
+    );
+    assert_eq!(capacity.queued, 0);
     let duplicate = registry
         .stop_job(&job.job_id, "test".to_string())
         .await
@@ -379,6 +493,7 @@ async fn registry_marks_running_job_lost_when_client_stale() {
     let registry = RunnerRegistry::default();
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -400,6 +515,7 @@ async fn registry_marks_running_job_lost_when_client_stale() {
     let job = registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("oe".to_string()),
                 cwd: None,

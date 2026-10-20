@@ -55,6 +55,7 @@ async fn register_coding_agent_task_runner(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: Some(1_700_000_000),
             build: None,
             job_concurrency_limit: None,
@@ -389,10 +390,10 @@ fn tool_call_parser_keeps_agent_task_and_connector_task_identities_distinct() {
     .unwrap();
     assert_eq!(call.tool_name(), "create_agent_task");
 
-    let task_id = format!("wc_agent_task_{}", "1".repeat(32));
-    let attempt_id = format!("wc_agent_task_attempt_{}", "2".repeat(32));
-    let fence = format!("wc_agent_task_fence_{}", "3".repeat(32));
-    let assignee = format!("wc_dagent_{}", "4".repeat(32));
+    let task_id = "wc_agent_task_ERERERERERERERER".to_string();
+    let attempt_id = "wc_agent_task_attempt_IiIiIiIiIiIiIiIi".to_string();
+    let fence = "wc_agent_task_fence_MzMzMzMzMzMzMzMzMzMzMw".to_string();
+    let assignee = "wc_dagent_RERERERERERERERE".to_string();
     let heartbeat = ToolCall::from_tool_name(
         "heartbeat_agent_task_attempt",
         json!({
@@ -431,7 +432,7 @@ fn tool_call_parser_keeps_agent_task_and_connector_task_identities_distinct() {
         "start_agent_task_attempt",
         json!({
             "task_id": "wc_task_connector_identity",
-            "assignee_agent_id": format!("wc_dagent_{}", "5".repeat(32)),
+            "assignee_agent_id": "wc_dagent_VVVVVVVVVVVVVVVV".to_string(),
             "idempotency_key": "wrong-domain"
         })
     )
@@ -496,6 +497,66 @@ fn runtime_surface_exposes_fence_only_for_exact_start_and_never_requires_endpoin
         1
     );
     assert!(started.output["attempt"].get("attempt_fence").is_none());
+
+    let endpoint_execution = runtime.start_agent_task_endpoint_continuation(
+        None,
+        task_id.clone(),
+        attempt_id.clone(),
+        assignee.clone(),
+        fence.clone(),
+        1,
+    );
+    assert!(
+        endpoint_execution.success,
+        "{:?}",
+        endpoint_execution.output
+    );
+    assert_eq!(
+        endpoint_execution.output["execution"]["wake_state"],
+        "pending"
+    );
+    assert!(endpoint_execution.output["execution"]["endpoint_id"].is_null());
+    assert!(endpoint_execution.output["execution"]["endpoint_controller_generation"].is_null());
+    assert_eq!(endpoint_execution.output["replayed"], false);
+    assert_eq!(endpoint_execution.output["state_changed"], true);
+    let wake_id = endpoint_execution.output["execution"]["wake_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let endpoint_replay = runtime.start_agent_task_endpoint_continuation(
+        None,
+        task_id.clone(),
+        attempt_id.clone(),
+        assignee.clone(),
+        fence.clone(),
+        1,
+    );
+    assert!(endpoint_replay.success, "{:?}", endpoint_replay.output);
+    assert_eq!(endpoint_replay.output["execution"]["wake_id"], wake_id);
+    assert_eq!(endpoint_replay.output["replayed"], true);
+    assert_eq!(endpoint_replay.output["state_changed"], false);
+
+    let endpoint_bound_read = runtime.read_agent_task(None, task_id.clone());
+    assert!(endpoint_bound_read.success);
+    assert_eq!(
+        endpoint_bound_read.output["task"]["summary"]["execution_bound"],
+        true
+    );
+    assert_eq!(
+        endpoint_bound_read.output["task"]["summary"]["execution_status"],
+        "not_started"
+    );
+    assert_eq!(
+        endpoint_bound_read.output["task"]["summary"]["recovery_kind"],
+        "none"
+    );
+    assert!(endpoint_bound_read.output["task"]
+        .get("attempt_fence")
+        .is_none());
+    assert!(!endpoint_bound_read.output["task"]
+        .to_string()
+        .contains("consume_token"));
     assert_eq!(
         _db.conn_for_tests()
             .query_row(
@@ -515,6 +576,8 @@ fn runtime_surface_exposes_fence_only_for_exact_start_and_never_requires_endpoin
         assignee.clone(),
         fence.clone(),
         1,
+        None,
+        None,
     );
     assert!(heartbeat.success, "{:?}", heartbeat.output);
     assert_eq!(heartbeat.output["attempt"]["attempt_id"], attempt_id);
@@ -538,11 +601,15 @@ fn runtime_surface_exposes_fence_only_for_exact_start_and_never_requires_endpoin
     let terminal = runtime.read_agent_task(None, task_id);
     assert!(terminal.success);
     assert_eq!(terminal.output["task"]["summary"]["state"], "succeeded");
+    assert_eq!(
+        terminal.output["task"]["summary"]["execution_status"],
+        "terminal"
+    );
     assert!(terminal.output["task"].get("attempt_fence").is_none());
 }
 
 #[tokio::test]
-async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime() {
+async fn coding_run_attempt_ref_executes_then_reconciles_from_reopened_db_and_fresh_runtime() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("agent-task-a4a-runtime.db");
     let db = Arc::new(crate::db::Database::open(&db_path).unwrap());
@@ -612,29 +679,149 @@ async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime(
         "start_agent_task_attempt must not enqueue CodingAgent work"
     );
 
+    let original_ref = started.output["attempt_ref"].as_str().unwrap().to_string();
+    let foreign_auth = auth_context(Some("foreign-owner"), false);
+    for (caller, selector, task_field, expected) in [
+        (&auth, Some("~ta0"), None, "invalid_agent_task_attempt_ref"),
+        (
+            &auth,
+            Some("~ta999"),
+            None,
+            "unknown_agent_task_attempt_ref",
+        ),
+        (
+            &foreign_auth,
+            Some(original_ref.as_str()),
+            None,
+            "unknown_agent_task_attempt_ref",
+        ),
+        (
+            &auth,
+            Some(original_ref.as_str()),
+            Some(task_id.as_str()),
+            "ambiguous_agent_task_attempt_selector",
+        ),
+        (
+            &auth,
+            None,
+            Some(task_id.as_str()),
+            "incomplete_agent_task_attempt_selector",
+        ),
+    ] {
+        let rejected = runtime
+            .start_agent_task_coding_run_with_selector(
+                Some(caller),
+                project.clone(),
+                selector.map(str::to_string),
+                task_field.map(str::to_string),
+                None,
+                None,
+                None,
+                None,
+                "codex".to_string(),
+                None,
+                Some(300),
+            )
+            .await;
+        assert!(!rejected.success, "{:?}", rejected.output);
+        assert_eq!(rejected.output["error_kind"], expected);
+        assert!(!rejected.output.to_string().contains(&fence));
+    }
+    let wrong_project = runtime
+        .start_agent_task_coding_run_with_selector(
+            Some(&auth),
+            "other-project".to_string(),
+            Some(original_ref.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "codex".to_string(),
+            None,
+            Some(300),
+        )
+        .await;
+    assert_eq!(
+        wrong_project.output["error_kind"],
+        "agent_task_project_mismatch"
+    );
+
+    db.conn_for_tests().execute(
+        "UPDATE wc_agent_task_attempts SET attempt_controller_generation = 2 WHERE attempt_id = ?1",
+        [attempt_id.as_str()],
+    ).unwrap();
+    let stale = runtime
+        .start_agent_task_coding_run_with_selector(
+            Some(&auth),
+            project.clone(),
+            Some(original_ref.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "codex".to_string(),
+            None,
+            Some(300),
+        )
+        .await;
+    assert_eq!(stale.output["error_kind"], "agent_task_attempt_stale");
+    assert!(
+        probe_agent_request_for_instance(&runtime, client_id, instance_id)
+            .await
+            .is_none(),
+        "rejected selectors must never dispatch a CodingAgent request"
+    );
+    let task = runtime.read_agent_task(Some(&auth), task_id.clone());
+    let attempt_ref = task.output["task"]["summary"]["attempt_ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        attempt_ref, original_ref,
+        "generation replacement must issue a new selector"
+    );
+
     let mut start_task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
-        let task_id = task_id.clone();
-        let attempt_id = attempt_id.clone();
-        let assignee = assignee.clone();
-        let fence = fence.clone();
-        let auth = auth.clone();
+        let attempt_ref = attempt_ref.clone();
+        let mut auth = auth.clone();
+        // The public kernel requires explicit task and execution authority, unlike direct helpers.
+        auth.scopes = [
+            SCOPE_COMMUNICATION_READ,
+            SCOPE_COMMUNICATION_MANAGE,
+            SCOPE_CODING_AGENT_RUN,
+            SCOPE_PROJECT_WRITE,
+        ]
+        .map(str::to_string)
+        .to_vec();
         async move {
-            runtime
-                .start_agent_task_coding_run(
-                    Some(&auth),
-                    project,
-                    task_id,
-                    attempt_id,
-                    assignee,
-                    fence,
-                    1,
-                    "codex".to_string(),
-                    None,
-                    Some(300),
+            let outcome = runtime
+                .call_tool_with_context(
+                    crate::tool_runtime::kernel::ToolCallRequest {
+                        tool_name: "start_agent_task_coding_run".to_string(),
+                        arguments: json!({
+                            "project": project, "attempt_ref": attempt_ref,
+                            "provider_id": "codex", "timeout_secs": 300,
+                        }),
+                    },
+                    crate::tool_runtime::kernel::ToolCallContext {
+                        transport: crate::tool_runtime::kernel::ToolTransport::Api,
+                        session_id: None,
+                        auth: Some(&auth),
+                        window: None,
+                        record_oauth_scope_denials: true,
+                        host_file_import_trust:
+                            crate::tool_runtime::kernel::HostFileImportTrust::Untrusted,
+                    },
                 )
-                .await
+                .await;
+            assert!(outcome.success, "{:?}", outcome.error_status);
+            outcome
+                .result
+                .expect("kernel dispatch must return CodingAgent result")
         }
     });
     let request = tokio::select! {
@@ -682,6 +869,8 @@ async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime(
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -785,18 +974,44 @@ async fn coding_run_executes_then_reconciles_from_reopened_db_and_fresh_runtime(
 #[test]
 fn agent_task_audit_projection_never_records_instruction_fence_keys_or_terminal_text() {
     const INSTRUCTION: &str = "PRIVATE_AGENT_TASK_INSTRUCTION_DO_NOT_LOG";
-    const FENCE: &str = "wc_agent_task_fence_11111111111111111111111111111111";
+    const FENCE: &str = "wc_agent_task_fence_EREREREREREREREREREREQ";
     const START_KEY: &str = "PRIVATE_START_REPLAY_KEY_DO_NOT_LOG";
     const COMPLETION_KEY: &str = "PRIVATE_COMPLETION_KEY_DO_NOT_LOG";
     const RESULT: &str = "PRIVATE_TERMINAL_RESULT_DO_NOT_LOG";
     const REASON: &str = "PRIVATE_TERMINAL_REASON_DO_NOT_LOG";
+
+    let coding_ref_summary =
+        crate::tool_runtime::tool_audit::session_log_arguments_for_tool_request(
+            "start_agent_task_coding_run",
+            &json!({
+                "project": "agent:special:task-project",
+                "attempt_ref": "~ta1",
+                "provider_id": "codex",
+            }),
+        );
+    assert_eq!(coding_ref_summary["attempt_ref"], "~ta1");
+    assert_eq!(coding_ref_summary["project"], "agent:special:task-project");
+    assert_eq!(coding_ref_summary["provider_id"], "codex");
+    assert_eq!(coding_ref_summary["attempt_fence_present"], false);
+    for omitted in [
+        "task_id",
+        "attempt_id",
+        "assignee_agent_id",
+        "attempt_fence",
+        "attempt_controller_generation",
+    ] {
+        assert!(
+            coding_ref_summary.get(omitted).is_none(),
+            "unexpected {omitted}: {coding_ref_summary}"
+        );
+    }
 
     let create_summary = crate::tool_runtime::tool_audit::session_log_arguments_for_tool_request(
         "create_agent_task",
         &json!({
             "title": "private title",
             "instruction": INSTRUCTION,
-            "assignee_agent_id": format!("wc_dagent_{}", "a".repeat(32)),
+            "assignee_agent_id": "wc_dagent_qqqqqqqqqqqqqqqq".to_string(),
             "referenced_project_id": "agent:special:reference-only",
             "idempotency_key": START_KEY,
         }),
@@ -811,9 +1026,9 @@ fn agent_task_audit_projection_never_records_instruction_fence_keys_or_terminal_
     let complete_summary = crate::tool_runtime::tool_audit::session_log_arguments_for_tool_request(
         "complete_agent_task_attempt",
         &json!({
-            "task_id": format!("wc_agent_task_{}", "1".repeat(32)),
-            "attempt_id": format!("wc_agent_task_attempt_{}", "2".repeat(32)),
-            "assignee_agent_id": format!("wc_dagent_{}", "a".repeat(32)),
+            "task_id": "wc_agent_task_ERERERERERERERER".to_string(),
+            "attempt_id": "wc_agent_task_attempt_IiIiIiIiIiIiIiIi".to_string(),
+            "assignee_agent_id": "wc_dagent_qqqqqqqqqqqqqqqq".to_string(),
             "attempt_fence": FENCE,
             "attempt_controller_generation": 3,
             "outcome": "succeeded",
@@ -831,11 +1046,11 @@ fn agent_task_audit_projection_never_records_instruction_fence_keys_or_terminal_
         "start_agent_task_attempt",
         &json!({
             "task": {
-                "task_id": format!("wc_agent_task_{}", "1".repeat(32)),
+                "task_id": "wc_agent_task_ERERERERERERERER".to_string(),
                 "state": "active"
             },
             "attempt": {
-                "attempt_id": format!("wc_agent_task_attempt_{}", "2".repeat(32)),
+                "attempt_id": "wc_agent_task_attempt_IiIiIiIiIiIiIiIi".to_string(),
                 "attempt_number": 1,
                 "state": "active",
                 "attempt_controller_generation": 1,
@@ -899,7 +1114,7 @@ fn foreign_runtime_task_ids_are_existence_hidden_and_project_reference_grants_no
         .as_str()
         .unwrap()
         .to_string();
-    let missing_id = format!("wc_agent_task_{}", "f".repeat(32));
+    let missing_id = "wc_agent_task_________________".to_string();
 
     let foreign = runtime.read_agent_task(Some(&alice), task_id);
     let missing = runtime.read_agent_task(Some(&alice), missing_id);
