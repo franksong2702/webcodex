@@ -520,6 +520,10 @@ no-proxy/no-redirect download, file-size limits, and Project write permissions
 remain in force. This does not make fake IPs reachable without a correctly
 configured local TUN.
 
+For import-stage diagnostics and exact-host Fake-IP DNS troubleshooting, see
+[Conversation attachment import](CONVERSATION_FILE_IMPORT.md). Resolver changes
+must retain the import trust gates and address-policy/pinning protections.
+
 List and revoke clients with `POST /api/oauth/clients/list` and
 `POST /api/oauth/clients/revoke`. OAuth uses the authorization-code flow;
 dynamic client registration, OIDC, and the device-code flow are not

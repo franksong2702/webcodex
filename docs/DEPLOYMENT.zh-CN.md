@@ -456,6 +456,9 @@ ChatGPT MCP host-file import 采用两级 trust。正常 active authenticated OA
 DNS 地址固定、TLS 主机名校验、禁止代理与重定向、文件大小限制及 Project 写入权限均保持不变。
 如果本机没有正确配置 TUN，该例外也不会让 Fake-IP 自动可达。
 
+导入阶段诊断与精确主机的 Fake-IP DNS 排障见[会话附件导入](CONVERSATION_FILE_IMPORT.md)。
+解析器配置变更必须保留导入信任边界、地址策略与地址固定保护。
+
 用 `POST /api/oauth/clients/list` 与 `POST /api/oauth/clients/revoke` 列出与
 撤销 client。OAuth 使用 authorization-code 流程；动态 client 注册、OIDC 与
 device-code 流程未实现。宿主提供 `offline_access` 时保持勾选——它是协议级

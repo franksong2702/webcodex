@@ -454,6 +454,8 @@ Rust/Go 构建使用当前 `project_build`；项目级验证不会执行修改�
   适用于 host 能绑定为 file parameter 的本轮新生成文件。Control 端负责下载原始
   bytes，并通过现有有界 artifact write 路径提交；调用方不应自行构造下载 URL，
   也不应手工 Base64 转运这些文件。
+  仅在核验目标文件字节数与 SHA-256 后，才用已确认导入的路径创建文档链接。
+  部分成功的处理、安全诊断和 Fake-IP DNS 排障见[附件导入](CONVERSATION_FILE_IMPORT.md)。
 - `inspect_project_artifact` 是首选的 Project → Model / Host 读取入口：
   `action=metadata` 用于 existence/size/MIME/digest/image/archive metadata；
   `action=inspect` 只读取一个有 snapshot fence 的有界 Base64 segment；

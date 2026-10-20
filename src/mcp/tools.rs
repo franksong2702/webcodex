@@ -1807,6 +1807,7 @@ pub(super) fn host_file_import_trust_for_call(
     auth: Option<&AuthContext>,
     config: Option<&crate::Config>,
     db: Option<&crate::Database>,
+    server_trace_id: Option<&str>,
 ) -> HostFileImportTrust {
     if tool_name != Some("import_host_files") {
         return HostFileImportTrust::Untrusted;
@@ -1821,7 +1822,7 @@ pub(super) fn host_file_import_trust_for_call(
             Some(db) => mcp_host_file_import_trust_decision_from_state(config, db, auth),
         },
     };
-    log_mcp_host_file_import_trust_decision(auth, &decision);
+    log_mcp_host_file_import_trust_decision(auth, &decision, server_trace_id);
     decision.trust
 }
 
@@ -1854,6 +1855,7 @@ fn mcp_token_kind_classification(auth: Option<&AuthContext>) -> &'static str {
 fn log_mcp_host_file_import_trust_decision(
     auth: Option<&AuthContext>,
     decision: &HostFileImportTrustDecision,
+    server_trace_id: Option<&str>,
 ) {
     #[cfg(test)]
     {
@@ -1865,21 +1867,39 @@ fn log_mcp_host_file_import_trust_decision(
     let allowed_client_id_present = auth
         .and_then(|auth| auth.allowed_client_id.as_deref())
         .is_some_and(|client_id| !client_id.trim().is_empty());
-    tracing::info!(
-        target: "webcodex::mcp",
-        trust = decision.trust.is_trusted(),
-        reason = decision.reason.as_str(),
-        auth_kind = mcp_auth_kind_classification(auth),
-        token_kind = mcp_token_kind_classification(auth),
-        allowed_client_id_present,
-        config_present = decision.config_present,
-        database_present = decision.database_present,
-        oauth_enabled = decision.oauth_enabled,
-        configured_trusted_client_count = decision.configured_trusted_client_count,
-        client_id_configured = ?decision.client_id_configured,
-        active_client_registration_found = ?decision.active_client_registration_found,
-        "mcp_host_file_import_trust_decision"
-    );
+    let safe_trace_id = server_trace_id
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .map(|id| id.hyphenated().to_string());
+    let server_trace_id = safe_trace_id.as_deref();
+    // Denials must remain observable when an operator filters normal traffic
+    // at WARN. Keep successful decisions at INFO and log classifications only.
+    macro_rules! log_decision {
+        ($level:expr) => {
+            tracing::event!(
+                target: "webcodex::mcp",
+                $level,
+                tool = "import_host_files",
+                server_trace_id,
+                trust = decision.trust.is_trusted(),
+                reason = decision.reason.as_str(),
+                auth_kind = mcp_auth_kind_classification(auth),
+                token_kind = mcp_token_kind_classification(auth),
+                allowed_client_id_present,
+                config_present = decision.config_present,
+                database_present = decision.database_present,
+                oauth_enabled = decision.oauth_enabled,
+                configured_trusted_client_count = decision.configured_trusted_client_count,
+                client_id_configured = ?decision.client_id_configured,
+                active_client_registration_found = ?decision.active_client_registration_found,
+                "mcp_host_file_import_trust_decision"
+            );
+        };
+    }
+    if decision.trust == HostFileImportTrust::Untrusted {
+        log_decision!(tracing::Level::WARN);
+    } else {
+        log_decision!(tracing::Level::INFO);
+    }
 }
 
 fn canonicalize_recording_session_id(
