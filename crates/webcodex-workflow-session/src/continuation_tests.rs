@@ -234,7 +234,7 @@ fn validation_summary(events: Vec<Value>) -> Value {
 fn unfinished_mutation_survives_ledger_reload_and_new_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("session.json");
-    let initial = SessionStore::with_persistence(&path, 16, 200);
+    let initial = SessionStore::with_persistence(&path, 16, 600);
     let session = create_session(&initial, "uncertain write");
     add_instruction(&initial, &session, "first attempt");
     let pending = initial.record_tool_call_started(
@@ -244,10 +244,28 @@ fn unfinished_mutation_survives_ledger_reload_and_new_attempt() {
         &json!({"project": PROJECT, "paths": ["src/pending.rs"]}),
         synthetic_contract(false, true, SessionPathHint::PathList),
     );
+    // Keep the unfinished start in the JSON ledger but outside the summary.
+    for index in 0..220 {
+        record_read(
+            &initial,
+            &session,
+            &format!("filler-{index}.rs"),
+            json!({"ok": true}),
+        );
+    }
     initial.flush_persistence();
     drop(initial);
 
-    let restored = SessionStore::with_persistence(&path, 16, 200);
+    let restored = SessionStore::with_persistence(&path, 16, 600);
+    let summary = restored.summary(&session, Some(200)).unwrap();
+    assert!(summary.events_truncated);
+    assert!(!summary.retention_truncated);
+    assert!(summary.unclosed_mutating_call);
+    assert!(!summary.events.iter().any(|event| event.write_like));
+    assert!(serde_json::to_value(&summary)
+        .unwrap()
+        .get("unclosed_mutating_call")
+        .is_none());
     add_instruction(&restored, &session, "continue after disconnect");
     let feedback = feedback_for(&restored, &session);
     assert_eq!(feedback["attempt"]["activity"]["meaningful_tool_calls"], 0);
@@ -318,6 +336,191 @@ fn unfinished_mutation_on_different_project_still_blocks_owning_session() {
         .unwrap()
         .contains(&json!("unconfirmed_tool_execution")));
     store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+/// Reused or corrupted invocation identities cannot let one finish certify
+/// multiple write-like starts, even when their exact identity collides.
+#[test]
+fn duplicate_mutating_starts_with_one_finish_remain_unconfirmed() {
+    let store = store(20);
+    let session = create_session(&store, "duplicate mutating identity");
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/a.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    let summary = store.summary(&session, Some(20)).unwrap();
+    let start = summary
+        .events
+        .iter()
+        .find(|e| e.kind == "tool_call_started")
+        .unwrap()
+        .clone();
+    let finish = summary
+        .events
+        .iter()
+        .find(|e| e.kind == "tool_call_finished")
+        .unwrap()
+        .clone();
+    let unclosed = |events: &[crate::SessionEvent]| {
+        crate::continuation::has_unclosed_mutating_call(events.iter(), &session)
+    };
+    assert!(unclosed(&[start.clone(), start.clone(), finish.clone()]));
+    assert!(unclosed(&[start.clone(), finish.clone(), finish.clone()]));
+    assert!(unclosed(&[finish.clone(), start.clone()]));
+    assert!(unclosed(&[start.clone(), finish.clone(), start.clone()]));
+    assert!(!unclosed(&[
+        start.clone(),
+        finish.clone(),
+        start.clone(),
+        finish.clone(),
+    ]));
+    let mut missing_call_id = start.clone();
+    missing_call_id.call_id = None;
+    assert!(unclosed(&[missing_call_id, finish.clone()]));
+    let mut empty_call_id = start.clone();
+    empty_call_id.call_id = Some(String::new());
+    assert!(unclosed(&[empty_call_id, finish.clone()]));
+    let mut foreign_finish = finish.clone();
+    foreign_finish.session_id.push_str("_other");
+    assert!(unclosed(&[start.clone(), foreign_finish]));
+    let mut wrong_tool = finish.clone();
+    wrong_tool.tool_name.push_str("_other");
+    assert!(unclosed(&[start.clone(), wrong_tool]));
+    let mut wrong_logical_id = finish;
+    wrong_logical_id.logical_invocation_id = Some("other-invocation".into());
+    assert!(unclosed(&[start, wrong_logical_id]));
+}
+
+/// The unclosed-call check must run over the full retained history, not only
+/// the bounded summary window: an unfinished mutation pushed past the
+/// model-facing tail by later completed calls still blocks a resume.
+#[test]
+fn unfinished_mutation_beyond_summary_window_still_blocks_continuation() {
+    let store = store(600);
+    let session = create_session(&store, "old unfinished write");
+    add_instruction(&store, &session, "attempt");
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/old.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let started_event_id = started.as_ref().unwrap().event_id.clone();
+    // Completed reads push the mutation start past the 200-event summary
+    // window while the store still retains it.
+    for index in 0..220 {
+        record_read(
+            &store,
+            &session,
+            &format!("filler-{index}.rs"),
+            json!({"ok": true}),
+        );
+    }
+    let summary = store.summary(&session, Some(200)).unwrap();
+    assert!(summary.events_truncated, "window must be exceeded");
+    assert!(!summary.retention_truncated, "start must still be retained");
+    assert!(
+        !summary
+            .events
+            .iter()
+            .any(|event| event.event_id == started_event_id),
+        "start must be outside the returned window"
+    );
+
+    let unconfirmed = feedback_for(&store, &session);
+    assert_eq!(unconfirmed["attempt"]["outcome"]["status"], "blocked");
+    assert!(unconfirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+
+    // Confirming the old mutation clears the block.
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    assert!(
+        !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unconfirmed_tool_execution"))
+    );
+}
+
+/// A finished mutation beyond the window must not keep the attempt blocked;
+/// only genuinely unfinished ones do.
+#[test]
+fn finished_mutation_beyond_summary_window_does_not_block_continuation() {
+    let store = store(600);
+    let session = create_session(&store, "old finished write");
+    add_instruction(&store, &session, "attempt");
+    let started = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/old.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.record_tool_call_finished(started, true, &json!({"applied": true}), None, None);
+    for index in 0..220 {
+        record_read(
+            &store,
+            &session,
+            &format!("filler-{index}.rs"),
+            json!({"ok": true}),
+        );
+    }
+    let confirmed = feedback_for(&store, &session);
+    assert!(!confirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+}
+
+/// Two mutations beyond the window: finishing one must not confirm the other.
+#[test]
+fn unfinished_mutation_beyond_window_is_not_confirmed_by_sibling_finish() {
+    let store = store(600);
+    let session = create_session(&store, "sibling writes");
+    add_instruction(&store, &session, "attempt");
+    let first = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/first.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    let second = store.record_tool_call_started(
+        Some(&session),
+        SessionTransport::Api,
+        "synthetic_write",
+        &json!({"project": PROJECT, "paths": ["src/second.rs"]}),
+        synthetic_contract(false, true, SessionPathHint::PathList),
+    );
+    store.record_tool_call_finished(second, true, &json!({"applied": true}), None, None);
+    for index in 0..220 {
+        record_read(
+            &store,
+            &session,
+            &format!("filler-{index}.rs"),
+            json!({"ok": true}),
+        );
+    }
+    let unconfirmed = feedback_for(&store, &session);
+    assert_eq!(unconfirmed["attempt"]["outcome"]["status"], "blocked");
+    assert!(unconfirmed["attempt"]["outcome"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("unconfirmed_tool_execution")));
+    store.record_tool_call_finished(first, true, &json!({"applied": true}), None, None);
     assert!(
         !feedback_for(&store, &session)["attempt"]["outcome"]["reason_codes"]
             .as_array()

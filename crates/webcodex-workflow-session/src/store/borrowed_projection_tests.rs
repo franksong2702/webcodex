@@ -86,6 +86,10 @@ fn borrowed_summary_matches_parent_for_every_tail_and_wrapped_deque() {
             Some(usize::MAX),
         ] {
             assert_eq!(
+                summarize_record(&record, limit, None).unclosed_mutating_call,
+                reference_summary(&record, limit, None).unclosed_mutating_call,
+            );
+            assert_eq!(
                 serde_json::to_value(summarize_record(&record, limit, None)).unwrap(),
                 serde_json::to_value(reference_summary(&record, limit, None)).unwrap()
             );
@@ -125,6 +129,10 @@ fn borrowed_hot_cold_summary_and_path_evidence_are_identical_and_non_promoting()
     store.start_session(None, None);
     assert!(store.cold_payload_bytes_for_test(&id).is_some());
     let before = store.status();
+    assert_eq!(
+        store.summary(&id, Some(8)).unwrap().unclosed_mutating_call,
+        hot_summary.unclosed_mutating_call,
+    );
     assert_eq!(
         serde_json::to_value(store.summary(&id, Some(8)).unwrap()).unwrap(),
         serde_json::to_value(hot_summary).unwrap()
