@@ -13,6 +13,45 @@ BUILD_SCRIPT = Path(__file__).resolve().parents[2] / "crates/webcodex-build-info
 
 
 class BuildIdentityTests(unittest.TestCase):
+    def build_fixture(self, run, package):
+        # Cargo's build-directory package spelling is not a stable interface.
+        # Resolve the one dependency-free fixture from its structured messages.
+        messages = run(package, "cargo", "build", "--offline", "--quiet", "--message-format=json")
+        events = [json.loads(line) for line in messages.splitlines()]
+        scripts = [event for event in events if event.get("reason") == "build-script-executed"]
+        binaries = [event for event in events if event.get("reason") == "compiler-artifact"
+                    and event.get("executable")]
+        self.assertEqual(len(scripts), 1, scripts)
+        self.assertEqual(len(binaries), 1, binaries)
+        self.assertEqual(scripts[0]["package_id"], binaries[0]["package_id"])
+        output = Path(scripts[0]["out_dir"]).parent / "output"
+        self.assertTrue(output.is_file(), output)
+        return run(package, binaries[0]["executable"]), output
+
+    def test_fixture_output_path_follows_cargo_messages(self):
+        for directory in ("identity-fixture-hash", "identity_fixture-hash"):
+            with self.subTest(directory=directory), tempfile.TemporaryDirectory() as tmp:
+                package = Path(tmp) / "package"
+                out_dir = Path(tmp) / "custom-build-dir" / directory / "out"
+                out_dir.mkdir(parents=True)
+                output = out_dir.parent / "output"
+                output.write_text("fixture build output", encoding="utf-8")
+                executable = str(Path(tmp) / "fixture-bin")
+                events = [
+                    {"reason": "build-script-executed", "package_id": "fixture", "out_dir": str(out_dir)},
+                    {"reason": "compiler-artifact", "package_id": "fixture", "executable": executable},
+                ]
+
+                def run(cwd, *args):
+                    self.assertEqual(cwd, package)
+                    if args[0] == "cargo":
+                        self.assertEqual(args, ("cargo", "build", "--offline", "--quiet", "--message-format=json"))
+                        return "\n".join(json.dumps(event) for event in events)
+                    self.assertEqual(args, (executable,))
+                    return "fixture identity"
+
+                self.assertEqual(self.build_fixture(run, package), ("fixture identity", output))
+
     def test_packed_branch_without_reflog_refreshes_and_then_stays_cached(self):
         for linked_worktree in (False, True):
             with self.subTest(linked_worktree=linked_worktree), tempfile.TemporaryDirectory() as tmp:
@@ -59,11 +98,17 @@ class BuildIdentityTests(unittest.TestCase):
                 head_log = Path(run(repo, "git", "rev-parse", "--git-path", "logs/HEAD"))
                 self.assertFalse((repo / head_log).exists())
 
+                outputs = []
+
                 def build():
-                    return run(package, "cargo", "run", "--offline", "--quiet")
+                    value, output = self.build_fixture(run, package)
+                    if outputs:
+                        self.assertEqual(outputs, [output])
+                    else:
+                        outputs.append(output)
+                    return value
 
                 before = build()
-                outputs = list((root / "target/debug/build").glob("identity-fixture-*/output"))
                 self.assertEqual(len(outputs), 1)
                 stamp = outputs[0].stat().st_mtime_ns
                 self.assertEqual(build(), before)
@@ -120,15 +165,21 @@ class BuildIdentityTests(unittest.TestCase):
                     repo = checkout
                     package = repo / "crates/fixture"
 
+                outputs = []
+
                 def build():
-                    return run(package, "cargo", "run", "--offline", "--quiet")
+                    value, output = self.build_fixture(run, package)
+                    if outputs:
+                        self.assertEqual(outputs, [output])
+                    else:
+                        outputs.append(output)
+                    return value
 
                 head = run(repo, "git", "rev-parse", "HEAD")
                 self.assertEqual(build(), "false")
                 (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
                 self.assertEqual(run(repo, "git", "rev-parse", "HEAD"), head)
                 self.assertEqual(build(), "true")
-                outputs = list((root / "target/debug/build").glob("identity-fixture-*/output"))
                 self.assertEqual(len(outputs), 1)
                 dirty_stamp = outputs[0].stat().st_mtime_ns
                 (repo / "other.txt").write_text("also dirty\n", encoding="utf-8")
@@ -152,7 +203,6 @@ class BuildIdentityTests(unittest.TestCase):
 
                 env["WEBCODEX_GIT_DIRTY"] = "false"
                 self.assertEqual(build(), "false")
-                outputs = list((root / "target/debug/build").glob("identity-fixture-*/output"))
                 self.assertEqual(len(outputs), 1)
                 stamp = outputs[0].stat().st_mtime_ns
                 (repo / "tracked.txt").write_text("dirty with pinned identity\n", encoding="utf-8")

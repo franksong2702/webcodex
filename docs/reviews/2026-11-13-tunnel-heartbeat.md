@@ -33,6 +33,29 @@ lets normal CI validate it; no skipped check is treated as native acceptance.
 No real Host, Windows/macOS, deployed Server/Runner or restart acceptance is claimed.
 No deployment, release, credentials, permissions, proxy settings or service restart.
 
+### First exact-head CI
+
+[Run 43354889474](https://github.com/franksong2702/webcodex/actions/runs/43354889474)
+on `9bc6de5119d01a4153050638bd4ad2702c80742f` ran the Linux Server, Runner and
+workspace-crate suites successfully. Windows core executed the new contention /
+expiry test (1 passed) and Server heartbeat tests (3 passed). This is CI evidence,
+not deployed Host acceptance or a successful overall run.
+
+Tooling and contract lanes failed in the unchanged build-identity fixture:
+`test_packed_branch_without_reflog_refreshes_and_then_stays_cached` and
+`test_tracked_dirty_state_refreshes_at_same_head` each failed for normal and linked
+worktrees because a hard-coded Cargo output glob returned zero files. CI installed
+Rust 1.100.0, updated November 12. The old local 1.99.1 fixture passes; the original
+four failures remain recorded and are not waived.
+
+The follow-up fixture uses Cargo JSON `build-script-executed.out_dir` and the
+matching executable artifact instead of guessing package-directory spelling.
+It still requires exactly one build script and executable, the same package ID,
+one stable output path, unchanged cached-output timestamps, and all original
+identity/dirty-state assertions. No production build behavior or gate is removed.
+Independent review of the delta and all six build-identity tests passed locally
+with Rust/Cargo 1.99.1; Rust 1.100.0 validation remains the new exact-head CI gate.
+
 ## Other upstream changes inspected
 
 Upstream main is `3c1419678e9c5f513e1f0fcc24d48ca1cd897f93`; latest stable is
