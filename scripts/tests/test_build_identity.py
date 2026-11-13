@@ -13,6 +13,29 @@ BUILD_SCRIPT = Path(__file__).resolve().parents[2] / "crates/webcodex-build-info
 
 
 class BuildIdentityTests(unittest.TestCase):
+    def install_observed_build_script(self, package):
+        # Instrument only the disposable fixture. Run the shipped collector
+        # unchanged, then record execution in the documented OUT_DIR workspace.
+        source = BUILD_SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(source.count("fn main() {"), 1)
+        source = source.replace("fn main() {", "fn collect_build_identity() {", 1)
+        source += r'''
+fn main() {
+    collect_build_identity();
+    let marker = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
+        .join("fixture-build-executions");
+    let previous = std::fs::read_to_string(&marker)
+        .map(|value| value.parse::<u64>().unwrap())
+        .unwrap_or(0);
+    std::fs::write(marker, (previous + 1).to_string()).unwrap();
+}
+'''
+        (package / "build.rs").write_text(source, encoding="utf-8")
+
+    @staticmethod
+    def marker_state(output):
+        return int(output.read_text(encoding="utf-8")), output.stat().st_mtime_ns
+
     def build_fixture(self, run, package):
         # Cargo's build-directory package spelling is not a stable interface.
         # Resolve the one dependency-free fixture from its structured messages.
@@ -24,18 +47,19 @@ class BuildIdentityTests(unittest.TestCase):
         self.assertEqual(len(scripts), 1, scripts)
         self.assertEqual(len(binaries), 1, binaries)
         self.assertEqual(scripts[0]["package_id"], binaries[0]["package_id"])
-        output = Path(scripts[0]["out_dir"]).parent / "output"
+        output = Path(scripts[0]["out_dir"]) / "fixture-build-executions"
         self.assertTrue(output.is_file(), output)
         return run(package, binaries[0]["executable"]), output
 
     def test_fixture_output_path_follows_cargo_messages(self):
-        for directory in ("identity-fixture-hash", "identity_fixture-hash"):
+        for directory in ("identity-fixture-hash", "identity_fixture-hash", "identity-fixture/hash"):
             with self.subTest(directory=directory), tempfile.TemporaryDirectory() as tmp:
                 package = Path(tmp) / "package"
                 out_dir = Path(tmp) / "custom-build-dir" / directory / "out"
                 out_dir.mkdir(parents=True)
-                output = out_dir.parent / "output"
-                output.write_text("fixture build output", encoding="utf-8")
+                output = out_dir / "fixture-build-executions"
+                output.write_text("1", encoding="utf-8")
+                self.assertFalse((out_dir.parent / "output").exists())
                 executable = str(Path(tmp) / "fixture-bin")
                 events = [
                     {"reason": "build-script-executed", "package_id": "fixture", "out_dir": str(out_dir)},
@@ -82,7 +106,7 @@ class BuildIdentityTests(unittest.TestCase):
                     '[package]\nname = "identity-fixture"\nversion = "0.0.0"\n'
                     'edition = "2021"\n', encoding="utf-8",
                 )
-                shutil.copyfile(BUILD_SCRIPT, package / "build.rs")
+                self.install_observed_build_script(package)
                 (package / "src/main.rs").write_text(
                     'fn main() { println!("{}", env!("WEBCODEX_BUILD_GIT_COMMIT")); }\n',
                     encoding="utf-8",
@@ -110,16 +134,17 @@ class BuildIdentityTests(unittest.TestCase):
 
                 before = build()
                 self.assertEqual(len(outputs), 1)
-                stamp = outputs[0].stat().st_mtime_ns
+                stamp = self.marker_state(outputs[0])
                 self.assertEqual(build(), before)
-                self.assertEqual(outputs[0].stat().st_mtime_ns, stamp)
+                self.assertEqual(self.marker_state(outputs[0]), stamp)
                 run(repo, "git", "commit", "--allow-empty", "-m", "new identity")
                 expected = run(repo, "git", "rev-parse", "--short=12", "HEAD")
                 self.assertNotEqual(before, expected)
                 self.assertEqual(build(), expected)
-                stamp = outputs[0].stat().st_mtime_ns
+                self.assertGreater(self.marker_state(outputs[0])[0], stamp[0])
+                stamp = self.marker_state(outputs[0])
                 self.assertEqual(build(), expected)
-                self.assertEqual(outputs[0].stat().st_mtime_ns, stamp)
+                self.assertEqual(self.marker_state(outputs[0]), stamp)
 
     def test_tracked_dirty_state_refreshes_at_same_head(self):
         for linked_worktree in (False, True):
@@ -152,7 +177,7 @@ class BuildIdentityTests(unittest.TestCase):
                     '[package]\nname = "identity-fixture"\nversion = "0.0.0"\n'
                     'edition = "2021"\n', encoding="utf-8",
                 )
-                shutil.copyfile(BUILD_SCRIPT, package / "build.rs")
+                self.install_observed_build_script(package)
                 (package / "src/main.rs").write_text(
                     'fn main() { println!("{}", env!("WEBCODEX_BUILD_GIT_DIRTY")); }\n',
                     encoding="utf-8",
@@ -177,14 +202,16 @@ class BuildIdentityTests(unittest.TestCase):
 
                 head = run(repo, "git", "rev-parse", "HEAD")
                 self.assertEqual(build(), "false")
+                clean_count = self.marker_state(outputs[0])[0]
                 (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
                 self.assertEqual(run(repo, "git", "rev-parse", "HEAD"), head)
                 self.assertEqual(build(), "true")
+                self.assertGreater(self.marker_state(outputs[0])[0], clean_count)
                 self.assertEqual(len(outputs), 1)
-                dirty_stamp = outputs[0].stat().st_mtime_ns
+                dirty_stamp = self.marker_state(outputs[0])
                 (repo / "other.txt").write_text("also dirty\n", encoding="utf-8")
                 self.assertEqual(build(), "true")
-                self.assertEqual(outputs[0].stat().st_mtime_ns, dirty_stamp)
+                self.assertEqual(self.marker_state(outputs[0]), dirty_stamp)
 
                 run(repo, "git", "restore", "tracked.txt")
                 self.assertEqual(run(repo, "git", "rev-parse", "HEAD"), head)
@@ -195,19 +222,19 @@ class BuildIdentityTests(unittest.TestCase):
 
                 (repo / "tracked.txt").unlink()
                 self.assertEqual(build(), "true")
-                deleted_stamp = outputs[0].stat().st_mtime_ns
+                deleted_stamp = self.marker_state(outputs[0])
                 self.assertEqual(build(), "true")
-                self.assertEqual(outputs[0].stat().st_mtime_ns, deleted_stamp)
+                self.assertEqual(self.marker_state(outputs[0]), deleted_stamp)
                 run(repo, "git", "restore", "tracked.txt")
                 self.assertEqual(build(), "false")
 
                 env["WEBCODEX_GIT_DIRTY"] = "false"
                 self.assertEqual(build(), "false")
                 self.assertEqual(len(outputs), 1)
-                stamp = outputs[0].stat().st_mtime_ns
+                stamp = self.marker_state(outputs[0])
                 (repo / "tracked.txt").write_text("dirty with pinned identity\n", encoding="utf-8")
                 self.assertEqual(build(), "false")
-                self.assertEqual(outputs[0].stat().st_mtime_ns, stamp)
+                self.assertEqual(self.marker_state(outputs[0]), stamp)
 
 
     def test_stat_only_change_is_clean_without_refreshing_index(self):

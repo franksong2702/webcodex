@@ -56,6 +56,17 @@ identity/dirty-state assertions. No production build behavior or gate is removed
 Independent review of the delta and all six build-identity tests passed locally
 with Rust/Cargo 1.99.1; Rust 1.100.0 validation remains the new exact-head CI gate.
 
+The second run, [43357001385](https://github.com/franksong2702/webcodex/actions/runs/43357001385),
+exposed an incomplete first adaptation: Cargo 1.100 also no longer provides the
+internal sibling `output` file. Its Linux Rust, Docker, Windows and macOS execution
+lanes passed, but the tooling/contract gates still failed; aggregate failures and
+MCP-conformance skip are not counted as success.
+
+The corrected fixture now wraps the unchanged production collector only inside
+its disposable test project and writes a private execution marker under documented
+`OUT_DIR`. The marker observes actual build-script execution, without relying on
+Cargo's private directory or output layout. Production source is unchanged.
+
 ## Other upstream changes inspected
 
 Upstream main is `3c1419678e9c5f513e1f0fcc24d48ca1cd897f93`; latest stable is
